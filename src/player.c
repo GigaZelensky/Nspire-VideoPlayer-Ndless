@@ -2,6 +2,7 @@
 #include <libndls.h>
 #include <os.h>
 #include <SDL/SDL.h>
+#include <SDL/SDL_ttf.h>
 
 #include "overclock.h"
 
@@ -29,6 +30,11 @@
 #define POINTER_GAIN_NUM 5
 #define POINTER_GAIN_DEN 4
 #define ENABLE_STARTUP_OVERCLOCK 0
+#define PREFETCH_FILE_BLOCK_SIZE 4096U
+#define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
+#define PREFETCH_PAUSED_SLICE_MS 12U
+#define SUBTITLE_TTF_PATH "subtitles.ttf"
+#define SUBTITLE_FONT_COUNT 4
 
 #pragma pack(push, 1)
 typedef struct {
@@ -84,8 +90,7 @@ typedef struct {
 typedef struct {
     nSDL_Font *white;
     nSDL_Font *outline;
-    nSDL_Font *subtitle_white;
-    nSDL_Font *subtitle_outline;
+    TTF_Font *subtitle_fonts[SUBTITLE_FONT_COUNT];
 } Fonts;
 
 typedef enum {
@@ -109,10 +114,23 @@ typedef struct {
     bool moved;
 } PointerState;
 
+typedef enum {
+    PREFETCH_IDLE = 0,
+    PREFETCH_READING,
+    PREFETCH_INFLATING,
+    PREFETCH_READY,
+} PrefetchState;
+
 typedef struct {
     uint8_t *chunk_storage;
     size_t chunk_storage_size;
     int chunk_index;
+    PrefetchState state;
+    size_t read_offset;
+    size_t inflate_write_offset;
+    bool inflate_initialized;
+    z_stream stream;
+    uint8_t input_buffer[PREFETCH_FILE_BLOCK_SIZE];
 } PrefetchedChunk;
 
 typedef struct {
@@ -133,6 +151,10 @@ typedef struct {
     int decoded_local_frame;
     uint32_t current_frame;
     SDL_Surface *frame_surface;
+    const char *current_subtitle_text;
+    SDL_Surface *cached_subtitle_surface;
+    int cached_subtitle_size;
+    int cached_subtitle_max_width;
 } Movie;
 
 typedef struct {
@@ -149,6 +171,9 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index);
 static bool prefetch_chunk(Movie *movie, int chunk_index);
 static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks);
 static void clear_prefetched_chunk(PrefetchedChunk *chunk);
+static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk);
+static void prefetch_do_work(Movie *movie, int current_chunk, uint32_t deadline_ms);
+static void free_fonts(Fonts *fonts);
 
 static uint16_t read_le16(const uint8_t *src)
 {
@@ -355,6 +380,20 @@ static void free_movie_files(MovieFile *files, size_t count)
     free(files);
 }
 
+static void clear_subtitle_cache(Movie *movie)
+{
+    if (!movie) {
+        return;
+    }
+    if (movie->cached_subtitle_surface) {
+        SDL_FreeSurface(movie->cached_subtitle_surface);
+    }
+    movie->cached_subtitle_surface = NULL;
+    movie->current_subtitle_text = NULL;
+    movie->cached_subtitle_size = -1;
+    movie->cached_subtitle_max_width = -1;
+}
+
 static void destroy_movie(Movie *movie)
 {
     uint32_t index;
@@ -380,6 +419,7 @@ static void destroy_movie(Movie *movie)
     free(movie->block_scratch);
     free(movie->chunk_storage);
     free(movie->frame_offsets);
+    clear_subtitle_cache(movie);
     for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
         clear_prefetched_chunk(&movie->prefetched[prefetch_index]);
     }
@@ -391,38 +431,49 @@ static void destroy_movie(Movie *movie)
     movie->decoded_local_frame = -1;
 }
 
+static int subtitle_point_size(int subtitle_size)
+{
+    static const int point_sizes[SUBTITLE_FONT_COUNT] = {14, 18, 22, 26};
+
+    subtitle_size = clamp_int(subtitle_size, 0, SUBTITLE_FONT_COUNT - 1);
+    return point_sizes[subtitle_size];
+}
+
 static bool init_fonts(Fonts *fonts)
 {
+    int index;
+
     memset(fonts, 0, sizeof(*fonts));
     fonts->white = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 255, 255, 255);
     fonts->outline = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 0, 0, 0);
-    fonts->subtitle_white = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 255, 255, 255);
-    fonts->subtitle_outline = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 0, 0, 0);
-    if (fonts->subtitle_white) {
-        nSDL_SetFontSpacing(fonts->subtitle_white, 0, 0);
-    }
-    if (fonts->subtitle_outline) {
-        nSDL_SetFontSpacing(fonts->subtitle_outline, 0, 0);
-    }
-    if (!fonts->white || !fonts->outline || !fonts->subtitle_white || !fonts->subtitle_outline) {
+    if (!fonts->white || !fonts->outline) {
+        free_fonts(fonts);
         return false;
+    }
+    for (index = 0; index < SUBTITLE_FONT_COUNT; ++index) {
+        fonts->subtitle_fonts[index] = TTF_OpenFont(SUBTITLE_TTF_PATH, subtitle_point_size(index));
+        if (!fonts->subtitle_fonts[index]) {
+            free_fonts(fonts);
+            return false;
+        }
     }
     return true;
 }
 
 static void free_fonts(Fonts *fonts)
 {
+    int index;
+
     if (fonts->white) {
         nSDL_FreeFont(fonts->white);
     }
     if (fonts->outline) {
         nSDL_FreeFont(fonts->outline);
     }
-    if (fonts->subtitle_white) {
-        nSDL_FreeFont(fonts->subtitle_white);
-    }
-    if (fonts->subtitle_outline) {
-        nSDL_FreeFont(fonts->subtitle_outline);
+    for (index = 0; index < SUBTITLE_FONT_COUNT; ++index) {
+        if (fonts->subtitle_fonts[index]) {
+            TTF_CloseFont(fonts->subtitle_fonts[index]);
+        }
     }
     memset(fonts, 0, sizeof(*fonts));
 }
@@ -1328,15 +1379,36 @@ static bool configure_chunk_view(Movie *movie, int chunk_index)
     return true;
 }
 
+static bool prefetch_deadline_reached(uint32_t deadline_ms)
+{
+    return (int32_t) (monotonic_clock_now_ms() - deadline_ms) >= 0;
+}
+
+static void reset_prefetched_chunk(PrefetchedChunk *chunk)
+{
+    if (!chunk) {
+        return;
+    }
+    chunk->chunk_storage = NULL;
+    chunk->chunk_storage_size = 0;
+    chunk->chunk_index = -1;
+    chunk->state = PREFETCH_IDLE;
+    chunk->read_offset = 0;
+    chunk->inflate_write_offset = 0;
+    chunk->inflate_initialized = false;
+    memset(&chunk->stream, 0, sizeof(chunk->stream));
+}
+
 static void clear_prefetched_chunk(PrefetchedChunk *chunk)
 {
     if (!chunk) {
         return;
     }
+    if (chunk->inflate_initialized) {
+        inflateEnd(&chunk->stream);
+    }
     free(chunk->chunk_storage);
-    chunk->chunk_storage = NULL;
-    chunk->chunk_storage_size = 0;
-    chunk->chunk_index = -1;
+    reset_prefetched_chunk(chunk);
 }
 
 static PrefetchedChunk *find_prefetched_chunk(Movie *movie, int chunk_index)
@@ -1348,6 +1420,186 @@ static PrefetchedChunk *find_prefetched_chunk(Movie *movie, int chunk_index)
         }
     }
     return NULL;
+}
+
+static PrefetchedChunk *find_prefetch_work_chunk(Movie *movie, int current_chunk)
+{
+    PrefetchedChunk *best = NULL;
+    int index;
+    int wanted_min = current_chunk + 1;
+    int wanted_max = current_chunk + PREFETCH_CHUNK_COUNT;
+
+    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+        PrefetchedChunk *candidate = &movie->prefetched[index];
+        if (candidate->chunk_index < wanted_min || candidate->chunk_index > wanted_max) {
+            continue;
+        }
+        if (candidate->state == PREFETCH_IDLE || candidate->state == PREFETCH_READY) {
+            continue;
+        }
+        if (!best || candidate->chunk_index < best->chunk_index) {
+            best = candidate;
+        }
+    }
+    return best;
+}
+
+static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk)
+{
+    const ChunkIndexEntry *entry;
+    size_t remaining;
+    size_t read_size;
+    uint8_t *read_target;
+
+    if (!movie || !chunk || chunk->chunk_index < 0) {
+        return false;
+    }
+    entry = movie->chunk_index + chunk->chunk_index;
+    if (chunk->read_offset > entry->packed_size) {
+        return false;
+    }
+    remaining = (size_t) entry->packed_size - chunk->read_offset;
+    if (remaining == 0) {
+        if (entry->packed_size == entry->unpacked_size) {
+            chunk->state = PREFETCH_READY;
+            return true;
+        }
+        if (chunk->stream.avail_in == 0) {
+            return false;
+        }
+        chunk->state = PREFETCH_INFLATING;
+        return true;
+    }
+
+    read_size = remaining > PREFETCH_FILE_BLOCK_SIZE ? PREFETCH_FILE_BLOCK_SIZE : remaining;
+    read_target = entry->packed_size == entry->unpacked_size
+        ? (chunk->chunk_storage + chunk->read_offset)
+        : chunk->input_buffer;
+
+    if (fseek(movie->file, (long) (entry->offset + chunk->read_offset), SEEK_SET) != 0) {
+        return false;
+    }
+    if (fread(read_target, 1, read_size, movie->file) != read_size) {
+        return false;
+    }
+
+    chunk->read_offset += read_size;
+    if (entry->packed_size == entry->unpacked_size) {
+        if (chunk->read_offset == entry->packed_size) {
+            chunk->state = PREFETCH_READY;
+        }
+        return true;
+    }
+
+    chunk->stream.next_in = chunk->input_buffer;
+    chunk->stream.avail_in = (uInt) read_size;
+    chunk->state = PREFETCH_INFLATING;
+    return true;
+}
+
+static bool prefetch_inflate_step(Movie *movie, PrefetchedChunk *chunk)
+{
+    const ChunkIndexEntry *entry;
+    size_t remaining_out;
+    uInt input_before;
+    uInt output_size;
+    size_t produced;
+    uInt consumed;
+    int zresult;
+
+    if (!movie || !chunk || chunk->chunk_index < 0 || !chunk->inflate_initialized) {
+        return false;
+    }
+    entry = movie->chunk_index + chunk->chunk_index;
+    if (chunk->stream.avail_in == 0) {
+        if (chunk->read_offset < entry->packed_size) {
+            chunk->state = PREFETCH_READING;
+            return true;
+        }
+        return false;
+    }
+    if (chunk->inflate_write_offset > entry->unpacked_size) {
+        return false;
+    }
+
+    remaining_out = (size_t) entry->unpacked_size - chunk->inflate_write_offset;
+    if (remaining_out == 0) {
+        return false;
+    }
+
+    input_before = chunk->stream.avail_in;
+    output_size = (uInt) (remaining_out > PREFETCH_INFLATE_OUTPUT_SLICE ? PREFETCH_INFLATE_OUTPUT_SLICE : remaining_out);
+    chunk->stream.next_out = chunk->chunk_storage + chunk->inflate_write_offset;
+    chunk->stream.avail_out = output_size;
+    zresult = inflate(&chunk->stream, Z_NO_FLUSH);
+    produced = (size_t) (output_size - chunk->stream.avail_out);
+    consumed = input_before - chunk->stream.avail_in;
+    chunk->inflate_write_offset += produced;
+
+    if (zresult == Z_STREAM_END) {
+        if (chunk->inflate_write_offset != entry->unpacked_size ||
+            chunk->read_offset != entry->packed_size ||
+            chunk->stream.avail_in != 0) {
+            return false;
+        }
+        inflateEnd(&chunk->stream);
+        chunk->inflate_initialized = false;
+        memset(&chunk->stream, 0, sizeof(chunk->stream));
+        chunk->state = PREFETCH_READY;
+        return true;
+    }
+    if (zresult != Z_OK) {
+        return false;
+    }
+    if (produced == 0 && consumed == 0) {
+        return false;
+    }
+    if (chunk->stream.avail_in == 0) {
+        if (chunk->read_offset < entry->packed_size) {
+            chunk->state = PREFETCH_READING;
+        } else {
+            return false;
+        }
+    } else {
+        chunk->state = PREFETCH_INFLATING;
+    }
+    return true;
+}
+
+static bool prefetch_process_chunk(Movie *movie, PrefetchedChunk *chunk, uint32_t deadline_ms, bool respect_deadline)
+{
+    while (chunk && chunk->state != PREFETCH_READY) {
+        if (chunk->state == PREFETCH_READING) {
+            if (!prefetch_read_step(movie, chunk)) {
+                return false;
+            }
+        } else if (chunk->state == PREFETCH_INFLATING) {
+            if (!prefetch_inflate_step(movie, chunk)) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        if (respect_deadline && prefetch_deadline_reached(deadline_ms)) {
+            break;
+        }
+    }
+    return true;
+}
+
+static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk)
+{
+    if (!chunk) {
+        return false;
+    }
+    if (chunk->state == PREFETCH_READY) {
+        return true;
+    }
+    if (!prefetch_process_chunk(movie, chunk, 0, false)) {
+        return false;
+    }
+    return chunk->state == PREFETCH_READY;
 }
 
 static bool load_chunk(Movie *movie, int chunk_index)
@@ -1366,12 +1618,17 @@ static bool load_chunk(Movie *movie, int chunk_index)
     entry = movie->chunk_index + chunk_index;
     prefetched = find_prefetched_chunk(movie, chunk_index);
     if (prefetched) {
+        if (prefetched->state != PREFETCH_READY) {
+            if (!prefetch_finish_chunk(movie, prefetched)) {
+                clear_prefetched_chunk(prefetched);
+                return false;
+            }
+        }
         free(movie->chunk_storage);
         movie->chunk_storage = prefetched->chunk_storage;
         movie->chunk_storage_size = prefetched->chunk_storage_size;
         prefetched->chunk_storage = NULL;
-        prefetched->chunk_storage_size = 0;
-        prefetched->chunk_index = -1;
+        reset_prefetched_chunk(prefetched);
         if (!configure_chunk_view(movie, chunk_index)) {
             return false;
         }
@@ -1425,12 +1682,9 @@ static bool load_chunk(Movie *movie, int chunk_index)
 static bool prefetch_chunk(Movie *movie, int chunk_index)
 {
     const ChunkIndexEntry *entry;
-    uint8_t *bytes;
-    uint8_t *packed_bytes;
-    size_t chunk_storage_size;
-    uLongf unpacked_size;
     PrefetchedChunk *slot = NULL;
     int index;
+
     if (chunk_index < 0 || (uint32_t) chunk_index >= movie->header.chunk_count) {
         return false;
     }
@@ -1452,40 +1706,27 @@ static bool prefetch_chunk(Movie *movie, int chunk_index)
         }
         clear_prefetched_chunk(slot);
     }
+
     entry = movie->chunk_index + chunk_index;
-    packed_bytes = (uint8_t *) malloc(entry->packed_size);
-    if (!packed_bytes) {
+    clear_prefetched_chunk(slot);
+    slot->chunk_storage = (uint8_t *) malloc(entry->unpacked_size);
+    if (!slot->chunk_storage) {
         return false;
     }
-    if (fseek(movie->file, (long) entry->offset, SEEK_SET) != 0) {
-        free(packed_bytes);
-        return false;
-    }
-    if (fread(packed_bytes, 1, entry->packed_size, movie->file) != entry->packed_size) {
-        free(packed_bytes);
-        return false;
-    }
-    if (entry->packed_size != entry->unpacked_size) {
-        bytes = (uint8_t *) malloc(entry->unpacked_size);
-        if (!bytes) {
-            free(packed_bytes);
-            return false;
-        }
-        unpacked_size = entry->unpacked_size;
-        if (uncompress(bytes, &unpacked_size, packed_bytes, entry->packed_size) != Z_OK || unpacked_size != entry->unpacked_size) {
-            free(packed_bytes);
-            free(bytes);
-            return false;
-        }
-        free(packed_bytes);
-        chunk_storage_size = entry->unpacked_size;
-    } else {
-        bytes = packed_bytes;
-        chunk_storage_size = entry->packed_size;
-    }
-    slot->chunk_storage = bytes;
-    slot->chunk_storage_size = chunk_storage_size;
+    slot->chunk_storage_size = entry->unpacked_size;
     slot->chunk_index = chunk_index;
+    slot->state = PREFETCH_READING;
+    slot->read_offset = 0;
+    slot->inflate_write_offset = 0;
+
+    if (entry->packed_size != entry->unpacked_size) {
+        memset(&slot->stream, 0, sizeof(slot->stream));
+        if (inflateInit(&slot->stream) != Z_OK) {
+            clear_prefetched_chunk(slot);
+            return false;
+        }
+        slot->inflate_initialized = true;
+    }
     return true;
 }
 
@@ -1517,12 +1758,26 @@ static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks)
     }
 }
 
+static void prefetch_do_work(Movie *movie, int current_chunk, uint32_t deadline_ms)
+{
+    while (!prefetch_deadline_reached(deadline_ms)) {
+        PrefetchedChunk *slot = find_prefetch_work_chunk(movie, current_chunk);
+        if (!slot) {
+            break;
+        }
+        if (!prefetch_process_chunk(movie, slot, deadline_ms, true)) {
+            clear_prefetched_chunk(slot);
+            break;
+        }
+    }
+}
+
 static int prefetch_budget_for_state(bool paused, uint32_t spare_ms)
 {
     if (paused) {
         return PREFETCH_CHUNK_COUNT;
     }
-    if (spare_ms > 10) {
+    if (spare_ms > 0) {
         return 1;
     }
     return 0;
@@ -1544,10 +1799,13 @@ static int prefetch_target_chunk(const Movie *movie)
 
 static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
 {
+    uint32_t time_slice_ms = paused && spare_ms > PREFETCH_PAUSED_SLICE_MS ? PREFETCH_PAUSED_SLICE_MS : spare_ms;
     int current_chunk = prefetch_target_chunk(movie);
     int budget = prefetch_budget_for_state(paused, spare_ms);
-    if (current_chunk >= 0 && budget > 0) {
+    if (current_chunk >= 0 && budget > 0 && time_slice_ms > 0) {
+        uint32_t deadline_ms = monotonic_clock_now_ms() + time_slice_ms;
         prefetch_ahead(movie, current_chunk, budget);
+        prefetch_do_work(movie, current_chunk, deadline_ms);
     }
 }
  
@@ -1674,6 +1932,8 @@ static bool load_movie(const char *path, Movie *movie)
     uint32_t chunk_index_read;
     memset(movie, 0, sizeof(*movie));
     movie->loaded_chunk = -1;
+    movie->cached_subtitle_size = -1;
+    movie->cached_subtitle_max_width = -1;
     {
         int prefetch_index;
         for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
@@ -1824,20 +2084,37 @@ static const char *active_subtitle(const Movie *movie, uint32_t now_ms)
     return NULL;
 }
 
-static void draw_outlined_text(SDL_Surface *surface, nSDL_Font *white_font, nSDL_Font *outline_font, int x, int y, const char *text)
+static TTF_Font *subtitle_font_for_size(const Fonts *fonts, int subtitle_size)
 {
-    nSDL_DrawString(surface, outline_font, x - 1, y, text);
-    nSDL_DrawString(surface, outline_font, x + 1, y, text);
-    nSDL_DrawString(surface, outline_font, x, y - 1, text);
-    nSDL_DrawString(surface, outline_font, x, y + 1, text);
-    nSDL_DrawString(surface, white_font, x, y, text);
+    if (!fonts) {
+        return NULL;
+    }
+    subtitle_size = clamp_int(subtitle_size, 0, SUBTITLE_FONT_COUNT - 1);
+    return fonts->subtitle_fonts[subtitle_size];
 }
 
-static int wrap_subtitle(nSDL_Font *font, const char *text, int max_width, char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN])
+static int subtitle_text_width(TTF_Font *font, const char *text)
+{
+    int width = 0;
+
+    if (!font || !text || !*text) {
+        return 0;
+    }
+    if (TTF_SizeUTF8(font, text, &width, NULL) != 0) {
+        return 0;
+    }
+    return width;
+}
+
+static int wrap_subtitle_ttf(TTF_Font *font, const char *text, int max_width, char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN])
 {
     char current[MAX_SUBTITLE_LINE_LEN];
     size_t pos = 0;
     int line_count = 0;
+
+    if (!font || !text || max_width <= 0) {
+        return 0;
+    }
     current[0] = '\0';
     memset(lines, 0, sizeof(char) * MAX_SUBTITLE_LINES * MAX_SUBTITLE_LINE_LEN);
 
@@ -1868,6 +2145,7 @@ static int wrap_subtitle(nSDL_Font *font, const char *text, int max_width, char 
         } else {
             char candidate[MAX_SUBTITLE_LINE_LEN];
             size_t current_len = strlen(current);
+
             if (current_len + 1 + word_len >= sizeof(candidate)) {
                 strncpy(lines[line_count], current, MAX_SUBTITLE_LINE_LEN - 1);
                 line_count++;
@@ -1879,7 +2157,7 @@ static int wrap_subtitle(nSDL_Font *font, const char *text, int max_width, char 
                 memcpy(candidate, current, current_len);
                 candidate[current_len] = ' ';
                 memcpy(candidate + current_len + 1, word, word_len + 1);
-                if (nSDL_GetStringWidth(font, candidate) > max_width) {
+                if (subtitle_text_width(font, candidate) > max_width) {
                     strncpy(lines[line_count], current, MAX_SUBTITLE_LINE_LEN - 1);
                     line_count++;
                     if (line_count >= MAX_SUBTITLE_LINES) {
@@ -1897,6 +2175,149 @@ static int wrap_subtitle(nSDL_Font *font, const char *text, int max_width, char 
         line_count++;
     }
     return line_count;
+}
+
+static SDL_Surface *create_rgba_surface(int width, int height)
+{
+    Uint32 rmask;
+    Uint32 gmask;
+    Uint32 bmask;
+    Uint32 amask;
+
+    if (width <= 0 || height <= 0) {
+        return NULL;
+    }
+#if SDL_BYTEORDER == SDL_BIG_ENDIAN
+    rmask = 0xFF000000U;
+    gmask = 0x00FF0000U;
+    bmask = 0x0000FF00U;
+    amask = 0x000000FFU;
+#else
+    rmask = 0x000000FFU;
+    gmask = 0x0000FF00U;
+    bmask = 0x00FF0000U;
+    amask = 0xFF000000U;
+#endif
+    return SDL_CreateRGBSurface(SDL_SWSURFACE, width, height, 32, rmask, gmask, bmask, amask);
+}
+
+static void blit_surface_at(SDL_Surface *dst, SDL_Surface *src, int x, int y)
+{
+    SDL_Rect rect;
+
+    if (!dst || !src) {
+        return;
+    }
+    rect.x = (Sint16) x;
+    rect.y = (Sint16) y;
+    rect.w = 0;
+    rect.h = 0;
+    SDL_BlitSurface(src, NULL, dst, &rect);
+}
+
+static void update_subtitle_cache(Movie *movie, const Fonts *fonts, const char *text, int subtitle_size, int max_width)
+{
+    TTF_Font *font;
+    char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN];
+    SDL_Surface *white_surfaces[MAX_SUBTITLE_LINES] = {0};
+    SDL_Surface *outline_surfaces[MAX_SUBTITLE_LINES] = {0};
+    SDL_Surface *combined = NULL;
+    SDL_Surface *optimized = NULL;
+    SDL_Color white = {255, 255, 255, 0};
+    SDL_Color black = {0, 0, 0, 0};
+    int line_widths[MAX_SUBTITLE_LINES] = {0};
+    int line_heights[MAX_SUBTITLE_LINES] = {0};
+    int subtitle_w = 0;
+    int subtitle_h = 0;
+    int line_count;
+    int index;
+    int y = 2;
+    const int line_spacing = 2;
+
+    if (!movie) {
+        return;
+    }
+    subtitle_size = clamp_int(subtitle_size, 0, SUBTITLE_FONT_COUNT - 1);
+    if (movie->cached_subtitle_surface &&
+        movie->current_subtitle_text == text &&
+        movie->cached_subtitle_size == subtitle_size &&
+        movie->cached_subtitle_max_width == max_width) {
+        return;
+    }
+
+    clear_subtitle_cache(movie);
+    if (!text || !*text || max_width <= 0) {
+        return;
+    }
+
+    font = subtitle_font_for_size(fonts, subtitle_size);
+    if (!font) {
+        return;
+    }
+
+    line_count = wrap_subtitle_ttf(font, text, max_width, lines);
+    if (line_count <= 0) {
+        return;
+    }
+
+    for (index = 0; index < line_count; ++index) {
+        white_surfaces[index] = TTF_RenderUTF8_Blended(font, lines[index], white);
+        outline_surfaces[index] = TTF_RenderUTF8_Blended(font, lines[index], black);
+        if (!white_surfaces[index] || !outline_surfaces[index]) {
+            goto cleanup;
+        }
+        line_widths[index] = white_surfaces[index]->w;
+        line_heights[index] = white_surfaces[index]->h;
+        if (line_widths[index] > subtitle_w) {
+            subtitle_w = line_widths[index];
+        }
+        subtitle_h += line_heights[index];
+        if (index + 1 < line_count) {
+            subtitle_h += line_spacing;
+        }
+    }
+
+    combined = create_rgba_surface(subtitle_w + 4, subtitle_h + 4);
+    if (!combined) {
+        goto cleanup;
+    }
+    SDL_FillRect(combined, NULL, SDL_MapRGBA(combined->format, 0, 0, 0, 0));
+
+    for (index = 0; index < line_count; ++index) {
+        int x = 2 + (subtitle_w - line_widths[index]) / 2;
+
+        blit_surface_at(combined, outline_surfaces[index], x - 1, y - 1);
+        blit_surface_at(combined, outline_surfaces[index], x + 1, y - 1);
+        blit_surface_at(combined, outline_surfaces[index], x - 1, y + 1);
+        blit_surface_at(combined, outline_surfaces[index], x + 1, y + 1);
+        blit_surface_at(combined, white_surfaces[index], x, y);
+        y += line_heights[index] + line_spacing;
+    }
+
+    optimized = SDL_DisplayFormatAlpha(combined);
+    if (optimized) {
+        SDL_FreeSurface(combined);
+        combined = optimized;
+    }
+
+    movie->cached_subtitle_surface = combined;
+    movie->current_subtitle_text = text;
+    movie->cached_subtitle_size = subtitle_size;
+    movie->cached_subtitle_max_width = max_width;
+    combined = NULL;
+
+cleanup:
+    if (combined) {
+        SDL_FreeSurface(combined);
+    }
+    for (index = 0; index < MAX_SUBTITLE_LINES; ++index) {
+        if (white_surfaces[index]) {
+            SDL_FreeSurface(white_surfaces[index]);
+        }
+        if (outline_surfaces[index]) {
+            SDL_FreeSurface(outline_surfaces[index]);
+        }
+    }
 }
 
 static SDL_Rect progress_bar_rect(void)
@@ -1917,27 +2338,6 @@ static void draw_cursor(SDL_Surface *screen, int x, int y)
     SDL_FillRect(screen, &white_h, SDL_MapRGB(screen->format, 255, 255, 255));
     SDL_FillRect(screen, &white_v, SDL_MapRGB(screen->format, 255, 255, 255));
     SDL_FillRect(screen, &center, SDL_MapRGB(screen->format, 255, 255, 255));
-}
-
-static int subtitle_scale_num(int subtitle_size)
-{
-    static const int numerators[4] = {1, 4, 5, 2};
-    subtitle_size = clamp_int(subtitle_size, 0, 3);
-    return numerators[subtitle_size];
-}
-
-static int subtitle_scale_den(int subtitle_size)
-{
-    static const int denominators[4] = {1, 3, 3, 1};
-    subtitle_size = clamp_int(subtitle_size, 0, 3);
-    return denominators[subtitle_size];
-}
-
-static void subtitle_fonts_for_size(const Fonts *fonts, int subtitle_size, nSDL_Font **white_font, nSDL_Font **outline_font)
-{
-    (void) subtitle_size;
-    *white_font = fonts->subtitle_white;
-    *outline_font = fonts->subtitle_outline;
 }
 
 static void compute_video_rects(const Movie *movie, ScaleMode scale_mode, SDL_Rect *src, SDL_Rect *dst)
@@ -2017,168 +2417,14 @@ static void draw_mode_badge(SDL_Surface *screen, const Fonts *fonts, ScaleMode s
     nSDL_DrawString(screen, fonts->white, badge.x + 5, badge.y + 4, label);
 }
 
-static void draw_scaled_outlined_text(
-    SDL_Surface *screen,
-    nSDL_Font *white_font,
-    nSDL_Font *outline_font,
-    int x,
-    int y,
-    const char *text,
-    int scale_num,
-    int scale_den
-)
-{
-    int text_w = nSDL_GetStringWidth(white_font, text);
-    int text_h = nSDL_GetStringHeight(white_font, text);
-    SDL_Surface *text_surface;
-    Uint32 key;
-    int dst_w;
-    int dst_h;
-    int dst_x;
-    int dst_y;
-    Uint16 key16;
-    Uint16 *src_pixels;
-    Uint16 *dst_pixels;
-    int src_pitch;
-    int dst_pitch;
-    if (scale_num <= 0 || scale_den <= 0) {
-        return;
-    }
-    if (scale_num == scale_den) {
-        draw_outlined_text(screen, white_font, outline_font, x, y, text);
-        return;
-    }
-    text_surface = SDL_CreateRGBSurface(
-        SDL_SWSURFACE,
-        text_w + 4,
-        text_h + 4,
-        screen->format->BitsPerPixel,
-        screen->format->Rmask,
-        screen->format->Gmask,
-        screen->format->Bmask,
-        screen->format->Amask
-    );
-    if (!text_surface) {
-        draw_outlined_text(screen, white_font, outline_font, x, y, text);
-        return;
-    }
-    key = SDL_MapRGB(text_surface->format, 255, 0, 255);
-    SDL_FillRect(text_surface, NULL, key);
-    draw_outlined_text(text_surface, white_font, outline_font, 2, 2, text);
-    dst_w = (text_surface->w * scale_num) / scale_den;
-    dst_h = (text_surface->h * scale_num) / scale_den;
-    if (dst_w <= 0 || dst_h <= 0 || screen->format->BitsPerPixel != 16 || text_surface->format->BitsPerPixel != 16) {
-        SDL_FreeSurface(text_surface);
-        draw_outlined_text(screen, white_font, outline_font, x, y, text);
-        return;
-    }
-    if (SDL_MUSTLOCK(text_surface)) {
-        SDL_LockSurface(text_surface);
-    }
-    if (SDL_MUSTLOCK(screen)) {
-        SDL_LockSurface(screen);
-    }
-    key16 = (Uint16) key;
-    src_pixels = (Uint16 *) text_surface->pixels;
-    dst_pixels = (Uint16 *) screen->pixels;
-    src_pitch = text_surface->pitch / 2;
-    dst_pitch = screen->pitch / 2;
-    for (dst_y = 0; dst_y < dst_h; ++dst_y) {
-        int src_y;
-        int draw_y = y + dst_y;
-        if (draw_y < 0 || draw_y >= screen->h) {
-            continue;
-        }
-        if (dst_h > 1 && text_surface->h > 1) {
-            src_y = (dst_y * (text_surface->h - 1) + ((dst_h - 1) / 2)) / (dst_h - 1);
-        } else {
-            src_y = 0;
-        }
-        for (dst_x = 0; dst_x < dst_w; ++dst_x) {
-            int src_x;
-            Uint16 sample;
-            int draw_x = x + dst_x;
-            if (draw_x < 0 || draw_x >= screen->w) {
-                continue;
-            }
-            if (dst_w > 1 && text_surface->w > 1) {
-                src_x = (dst_x * (text_surface->w - 1) + ((dst_w - 1) / 2)) / (dst_w - 1);
-            } else {
-                src_x = 0;
-            }
-            sample = src_pixels[src_y * src_pitch + src_x];
-            if (sample != key16) {
-                dst_pixels[draw_y * dst_pitch + draw_x] = sample;
-            }
-        }
-    }
-    if (SDL_MUSTLOCK(screen)) {
-        SDL_UnlockSurface(screen);
-    }
-    if (SDL_MUSTLOCK(text_surface)) {
-        SDL_UnlockSurface(text_surface);
-    }
-    SDL_FreeSurface(text_surface);
-}
-
-static void draw_subtitle(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *video_rect, const char *text, bool overlay_visible, int subtitle_size)
-{
-    char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN];
-    int line_count;
-    int line_index;
-    int base_y;
-    int max_width = video_rect->w - 12;
-    int bottom_limit = overlay_visible ? (SCREEN_H - UI_BAR_H - 8) : (video_rect->y + video_rect->h - 8);
-    nSDL_Font *white_font;
-    nSDL_Font *outline_font;
-    int scale_num;
-    int scale_den;
-    int line_height;
-    if (!text || !*text) {
-        return;
-    }
-    subtitle_size = clamp_int(subtitle_size, 0, 3);
-    subtitle_fonts_for_size(fonts, subtitle_size, &white_font, &outline_font);
-    scale_num = subtitle_scale_num(subtitle_size);
-    scale_den = subtitle_scale_den(subtitle_size);
-    line_height = nSDL_GetStringHeight(white_font, "Ag");
-    if (line_height < 10) {
-        line_height = 10;
-    }
-    line_height = (line_height * scale_num) / scale_den;
-    if (line_height < 10) {
-        line_height = 10;
-    }
-    line_count = wrap_subtitle(white_font, text, (max_width * scale_den) / scale_num, lines);
-    if (line_count <= 0) {
-        return;
-    }
-    base_y = bottom_limit - (line_count * (line_height + 2));
-    if (base_y < video_rect->y + 4) {
-        base_y = video_rect->y + 4;
-    }
-    for (line_index = 0; line_index < line_count; ++line_index) {
-        int width = (nSDL_GetStringWidth(white_font, lines[line_index]) * scale_num) / scale_den;
-        int x = video_rect->x + (video_rect->w - width) / 2;
-        draw_scaled_outlined_text(
-            screen,
-            white_font,
-            outline_font,
-            x,
-            base_y + (line_index * (line_height + 2)),
-            lines[line_index],
-            scale_num,
-            scale_den
-        );
-    }
-}
 
 static void draw_progress(
     SDL_Surface *screen,
     const Fonts *fonts,
     const Movie *movie,
     uint32_t current_ms,
-    const PointerState *pointer
+    const PointerState *pointer,
+    const ClockState *clock_state
 )
 {
     SDL_Rect overlay = {0, SCREEN_H - UI_BAR_H, SCREEN_W, UI_BAR_H};
@@ -2188,6 +2434,7 @@ static void draw_progress(
     char current_text[24];
     char total_text[24];
     char left_text[56];
+    char clock_text[24];
     char hint_text[80];
     uint32_t duration_ms = movie_duration_ms(movie);
     snprintf(hint_text, sizeof(hint_text), "CLICK SEEK  L/R +/-5s  TAB STEP  / MODE  +/- SUB");
@@ -2217,6 +2464,16 @@ static void draw_progress(
     format_clock(duration_ms, total_text, sizeof(total_text));
     snprintf(left_text, sizeof(left_text), "%s / %s", current_text, total_text);
     nSDL_DrawString(screen, fonts->white, 12, SCREEN_H - UI_BAR_H + 6, left_text);
+    if (clock_state) {
+        snprintf(clock_text, sizeof(clock_text), "%s", clock_state_label(clock_state));
+        nSDL_DrawString(
+            screen,
+            fonts->white,
+            SCREEN_W - nSDL_GetStringWidth(fonts->white, clock_text) - 12,
+            SCREEN_H - UI_BAR_H + 6,
+            clock_text
+        );
+    }
     nSDL_DrawString(
         screen,
         fonts->white,
@@ -2226,12 +2483,23 @@ static void draw_progress(
     );
 }
 
-static void render_movie(SDL_Surface *screen, const Fonts *fonts, Movie *movie, bool paused, bool show_ui, ScaleMode scale_mode, int subtitle_size, const PointerState *pointer)
+static void render_movie(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    Movie *movie,
+    bool paused,
+    bool show_ui,
+    ScaleMode scale_mode,
+    int subtitle_size,
+    const PointerState *pointer,
+    const ClockState *clock_state
+)
 {
     SDL_Rect src;
     SDL_Rect dst;
     uint32_t current_ms = movie_frame_time_ms(movie, movie->current_frame);
     const char *subtitle = active_subtitle(movie, current_ms);
+    int max_subtitle_width;
     compute_video_rects(movie, scale_mode, &src, &dst);
     SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
     if (src.w == movie->header.video_width && src.h == movie->header.video_height &&
@@ -2240,10 +2508,34 @@ static void render_movie(SDL_Surface *screen, const Fonts *fonts, Movie *movie, 
     } else {
         SDL_SoftStretch(movie->frame_surface, &src, screen, &dst);
     }
-    draw_subtitle(screen, fonts, &dst, subtitle, show_ui, subtitle_size);
+    max_subtitle_width = dst.w > 12 ? (dst.w - 12) : dst.w;
+    update_subtitle_cache(movie, fonts, subtitle, subtitle_size, max_subtitle_width);
+    if (movie->cached_subtitle_surface) {
+        SDL_Rect subtitle_rect;
+        int bottom_limit = show_ui ? (SCREEN_H - UI_BAR_H - 8) : (dst.y + dst.h - 8);
+        int max_x = screen->w - movie->cached_subtitle_surface->w;
+
+        subtitle_rect.x = (Sint16) (dst.x + (dst.w - movie->cached_subtitle_surface->w) / 2);
+        subtitle_rect.y = (Sint16) (bottom_limit - movie->cached_subtitle_surface->h);
+        subtitle_rect.w = 0;
+        subtitle_rect.h = 0;
+        if (max_x < 0) {
+            max_x = 0;
+        }
+        if (subtitle_rect.x < 0) {
+            subtitle_rect.x = 0;
+        }
+        if (subtitle_rect.x > max_x) {
+            subtitle_rect.x = (Sint16) max_x;
+        }
+        if (subtitle_rect.y < dst.y + 4) {
+            subtitle_rect.y = (Sint16) (dst.y + 4);
+        }
+        SDL_BlitSurface(movie->cached_subtitle_surface, NULL, screen, &subtitle_rect);
+    }
     if (show_ui) {
         draw_mode_badge(screen, fonts, scale_mode);
-        draw_progress(screen, fonts, movie, current_ms, pointer);
+        draw_progress(screen, fonts, movie, current_ms, pointer, clock_state);
         if (pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
@@ -2410,10 +2702,10 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         show_msgbox("ND Video Player", "Failed to open movie file.");
         return -1;
     }
+    clock_state_init(&playback_clock_state);
+    playback_clock_active = true;
     if (ENABLE_STARTUP_OVERCLOCK) {
-        clock_state_init(&playback_clock_state);
         clock_state_apply_boost(&playback_clock_state);
-        playback_clock_active = true;
     }
     pointer_init(&pointer);
     frame_ms = movie_frame_interval_ms(&movie);
@@ -2430,7 +2722,10 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         uint32_t now_ms = monotonic_clock_now_ms();
         bool show_ui = paused || (now_ms <= ui_visible_until);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
+        bool tab_edge = key_pressed_edge(KEY_NSPIRE_TAB, &prev_tab);
+        bool divide_edge = key_pressed_edge(KEY_NSPIRE_DIVIDE, &prev_divide);
         bool click_edge = key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click);
+        bool overclock_toggle = divide_edge && isKeyPressed(KEY_NSPIRE_TAB);
 
         if (pointer.moved || pointer_click) {
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
@@ -2466,8 +2761,16 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             reset_playback_timeline(&movie, now_ms, &playback_anchor_ms, &playback_anchor_frame, &next_frame_due);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
-        if (key_pressed_edge(KEY_NSPIRE_DIVIDE, &prev_divide)) {
-            scale_mode = (ScaleMode) ((scale_mode + 1) % 4);
+        if (divide_edge) {
+            if (overclock_toggle) {
+                if (playback_clock_state.cx2_applied) {
+                    clock_state_restore(&playback_clock_state);
+                } else {
+                    clock_state_apply_boost(&playback_clock_state);
+                }
+            } else {
+                scale_mode = (ScaleMode) ((scale_mode + 1) % 4);
+            }
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (key_pressed_edge(KEY_NSPIRE_PLUS, &prev_plus) && subtitle_size < 3) {
@@ -2478,7 +2781,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             subtitle_size--;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
-        if (paused && key_pressed_edge(KEY_NSPIRE_TAB, &prev_tab) && movie.current_frame + 1 < movie.header.frame_count) {
+        if (paused && tab_edge && !overclock_toggle && movie.current_frame + 1 < movie.header.frame_count) {
             if (!decode_to_frame(&movie, movie.current_frame + 1)) {
                 show_msgbox("ND Video Player", "Movie decode failed.");
                 result = -1;
@@ -2530,7 +2833,17 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             }
         }
         show_ui = paused || (monotonic_clock_now_ms() <= ui_visible_until);
-        render_movie(screen, fonts, &movie, paused, show_ui, scale_mode, subtitle_size, &pointer);
+        render_movie(
+            screen,
+            fonts,
+            &movie,
+            paused,
+            show_ui,
+            scale_mode,
+            subtitle_size,
+            &pointer,
+            playback_clock_active ? &playback_clock_state : NULL
+        );
         if (paused || frame_ms == 0) {
             prefetch_tick(&movie, true, 1000);
             msleep(16);
@@ -2580,8 +2893,15 @@ int main(int argc, char **argv)
         monotonic_clock_shutdown();
         return 1;
     }
+    if (TTF_Init() != 0) {
+        show_msgbox("ND Video Player", "Failed to initialize SDL_ttf.");
+        SDL_Quit();
+        monotonic_clock_shutdown();
+        return 1;
+    }
     if (!init_fonts(&fonts)) {
-        show_msgbox("ND Video Player", "Failed to load fonts.");
+        show_msgbox("ND Video Player", "Failed to load fonts or subtitles.ttf.");
+        TTF_Quit();
         SDL_Quit();
         monotonic_clock_shutdown();
         return 1;
@@ -2608,6 +2928,7 @@ int main(int argc, char **argv)
     }
 
     free_fonts(&fonts);
+    TTF_Quit();
     SDL_Quit();
     monotonic_clock_shutdown();
     return result == 0 ? 0 : 1;

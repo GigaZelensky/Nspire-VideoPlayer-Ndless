@@ -12,7 +12,7 @@ GXX = nspire-g++
 LD  = nspire-ld
 
 GCCFLAGS = -Wall -Wextra -Wno-unused-parameter -std=c99 -marm -ffunction-sections -fdata-sections
-LDFLAGS = -Wl,--gc-sections -lSDL -lz
+LDFLAGS = -Wl,--gc-sections -lSDL_ttf -lfreetype -lSDL -lz
 PACKFLAGS = --name "ND Video Player" --author "GigaZelensky" --version 1 --ndless-min 45
 
 ifeq ($(DEBUG),FALSE)

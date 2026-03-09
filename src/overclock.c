@@ -17,10 +17,10 @@
  * - stock CX II appears to sit around multiplier 33 (396 MHz)
  * - users report 492 MHz as the rough upper edge
  *
- * The player uses a conservative preset below that ceiling to reduce the
- * chance of hard resets while still giving the decoder real extra headroom.
+ * The player uses a mild preset above stock to reduce the chance of hard
+ * resets while still giving the decoder some extra headroom.
  */
-#define CX2_OVERCLOCK_MULT 39U  /* 468 MHz */
+#define CX2_OVERCLOCK_MULT 35U  /* 420 MHz */
 #define CX2_OVERCLOCK_DIV1 1U
 #define CX2_OVERCLOCK_DIV2 0U
 
@@ -103,8 +103,6 @@ void clock_state_init(ClockState *state)
         state->original_config30 = read_reg(CX2_CLOCK_MEM30);
         state->original_config20 = read_reg(CX2_CLOCK_MEM20);
         state->original_config10 = read_reg(CX2_CLOCK_MEM10);
-    } else {
-        state->legacy_cpu_speed = set_cpu_speed(CPU_SPEED_150MHZ);
     }
 }
 
@@ -119,6 +117,8 @@ void clock_state_apply_boost(ClockState *state)
     }
 
     if (!state->cx2_hardware) {
+        state->legacy_cpu_speed = set_cpu_speed(CPU_SPEED_150MHZ);
+        state->cx2_applied = true;
         return;
     }
 
@@ -142,7 +142,10 @@ void clock_state_restore(ClockState *state)
             state->cx2_applied = false;
         }
     } else {
-        set_cpu_speed(state->legacy_cpu_speed);
+        if (state->cx2_applied) {
+            set_cpu_speed(state->legacy_cpu_speed);
+            state->cx2_applied = false;
+        }
     }
 }
 
@@ -153,9 +156,12 @@ const char *clock_state_label(const ClockState *state)
     }
     if (state->cx2_hardware) {
         if (state->cx2_applied) {
-            return "468MHz";
+            return "420MHz";
         }
         return "stock";
     }
-    return "150MHz";
+    if (state->cx2_applied) {
+        return "150MHz";
+    }
+    return "stock";
 }
