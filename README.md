@@ -1,101 +1,196 @@
 # Nspire-VideoPlayer-Ndless
 
-This is the standalone native Ndless repo split out from the Lua/TNS generator repo.
+Native Ndless video player and PC-side encoder for the TI-Nspire CX II line.
 
-It does not use ScriptApp image resources, giant `.tns` payloads, or `_R.IMG`. The calculator executable is a normal Ndless program, and the movie is a separate streamed container file stored on the calculator filesystem.
+This project keeps the player and the movie data separate:
 
-## Design
+- `ndvideo.tns` is the Ndless launcher
+- each movie is a streamed `.nvp` container stored on the calculator filesystem
 
-- Runtime: native C app in [`src/player.c`](./src/player.c)
-- Encoder: PC-side packer in [`tools/encode_ndless_video.py`](./tools/encode_ndless_video.py)
-- Storage model: copy one `ndvideo.tns` launcher plus one or more `.nvp` movie files onto the calculator
-- RAM model: only the current framebuffer, subtitle table, and current chunk stay in memory
+The player has been tested on the **TI-Nspire CX II-T**.
 
-The current codec is deliberately runtime-cheap:
+## Features
 
-- RGB565 output
-- chunked movie file
-- every chunk starts with a keyframe
-- predicted frames store only changed blocks
-- keyframes and blocks use a tiny 16-bit RLE so the player does not depend on TI document image decoding
+- Native C/Ndless runtime, no ScriptApp resource packing and no giant embedded movie `.tns` payloads
+- Streamed movie playback from calculator storage
+- RGB565 video output
+- Chunked container with keyframes, block deltas, motion reuse, and chunk-level zlib compression
+- Incremental chunk prefetching and decompression to reduce playback stutter
+- Accurate frame pacing with a hardware-backed monotonic timer
+- Subtitle support for text subtitles stored in the `.nvp` container
+- Subtitle controls:
+  - 4 placement modes: bottom of screen, bottom of video, top of video, top of screen
+  - 4 visible size levels plus hidden
+  - built-in subtitle font cycling
+  - temporary on-screen font-name preview when changing subtitle font
+- Playback speed control from `0.25x` to `2.0x`
+- Scale modes: `FIT`, `FILL`, `STRETCH`, `1:1`
+- Bottom playback UI with:
+  - current time / total time
+  - negative time remaining
+  - progress bar
+  - prefetched chunk visualization
+- Touchpad cursor support
+- Seeking by touching anywhere inside the bottom UI band, not just the thin progress line
+- In-player help overlay opened with `Catalog`
+- Movie picker for browsing multiple `.nvp` / `.nvp.tns` files
+
+## Current Limits
+
+- No audio yet
+- Subtitle rendering is text-only
+- The runtime is tuned for low RAM usage and filesystem streaming, not full in-memory playback
 
 ## Controls
 
-- `Enter`: play/pause
-- touchpad center click: play/pause, or seek when the progress bar is visible and selected
+### Picker
+
+- `Up` / `Down`: select movie
+- `Enter`: open movie
+- `Esc`: exit
+
+### Playback
+
+- `Enter`: play / pause
+- touchpad click: play / pause, or seek when clicking inside the bottom UI band
 - `Left` / `Right`: seek `-5s` / `+5s`
 - `Tab`: single-frame step while paused
-- `/`: cycle scale mode (`fit`, `fill`, `native`)
-- `+` / `-`: subtitle size (`3` levels)
-- moving the touchpad shows the playback UI while the video is playing
-- touchpad crosshair: seek directly on the visible progress bar
-- `Esc`: back to the movie picker / exit
-- `Up` / `Down`: choose a movie in the picker
+- `/`: cycle scale mode
+- `{` / `}`: decrease / increase playback speed
+- `^`: cycle subtitle placement
+- `+` / `-`: increase / decrease subtitle size, down to hidden
+- `F`: cycle subtitle font
+- move the touchpad: show the cursor and reveal the UI
+- `Catalog`: open / close the controls overlay
+- `Esc`: close the controls overlay, or leave the movie if the overlay is not open
+
+## Subtitle Fonts
+
+The player can cycle through the built-in Ndless SDL bitmap fonts for subtitles:
+
+- `Tinytype`
+- `VGA`
+- `Thin`
+- `Space`
+- `Fantasy`
+
+These are built-in `nSDL` fonts. They are still bitmap fonts, not anti-aliased vector text.
+
+## Repository Layout
+
+- [`src/player.c`](./src/player.c): native player
+- [`src/initfini.c`](./src/initfini.c): startup / shutdown glue
+- [`tools/encode_ndless_video.py`](./tools/encode_ndless_video.py): PC-side encoder
+- [`tools/pack_zehn.py`](./tools/pack_zehn.py): Zehn packer used by the build
+- [`Makefile`](./Makefile): player build entry point
 
 ## Build
 
-This path uses the official Ndless SDK for the ARM compile/link stage, but it does not depend on the upstream host `genzehn` binary. The repo-local packer in [`tools/pack_zehn.py`](./tools/pack_zehn.py) writes the Zehn payload and wraps it with the official `zehn_loader.tns`.
+The build uses the official Ndless SDK for compile/link, and the repo-local packer instead of relying on the upstream host `genzehn` binary.
 
-Prerequisites:
+### Requirements
 
 - official Ndless SDK cloned at `./external/Ndless/ndless-sdk`
-- ARM GCC toolchain available and `_NDLESS_TOOLCHAIN_PATH` pointed at its `bin` directory
+- ARM GCC toolchain available, with `_NDLESS_TOOLCHAIN_PATH` pointing at its `bin` directory
 - `make`
 - `bash`
 - `python`
 - `pyelftools`
 
+### Build Command
+
 ```bash
 make
 ```
 
-The build output lands in [`dist`](./dist):
+### Build Output
+
+The build writes to [`dist`](./dist):
 
 - `ndvideo.tns`: calculator launcher
 - `ndvideo.elf`: native ARM ELF
-- `ndvideo.zehn`: raw Zehn payload
+- `ndvideo.zehn`: packed Zehn payload
 
-## Encode
+The current build is packaged with:
 
-```powershell
-python .\tools\encode_ndless_video.py "C:\path\to\video.mp4" --output ".\movies\video.nvp"
+- Ndless minimum version `4.5`
+- hardware-accelerated / HWW support flag enabled
+- no `lcd_blit` compatibility fallback flag
+
+## Encoder
+
+The encoder turns a normal video file into a streamed `.nvp` movie container for the player.
+
+### Python Requirements
+
+Install the encoder dependencies with:
+
+```bash
+pip install imageio-ffmpeg numpy pillow
 ```
 
-With subtitles:
+The encoder uses:
+
+- `imageio-ffmpeg`
+- `numpy`
+- `Pillow`
+
+### Encoder Features
+
+- video resize / fit into the TI-Nspire canvas
+- RGB565 conversion
+- configurable target framerate or source-framerate preservation
+- optional subtitle import:
+  - external `.srt`
+  - embedded subtitles extracted from the source file
+- configurable block size, chunk size, keyframe cadence, motion search, posterization, and zlib level
+- `.json` encode stats sidecar output
+
+### Basic Encode Example
 
 ```powershell
-python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --output ".\movies\video.nvp"
+python .\tools\encode_ndless_video.py "C:\path\to\video.mp4" --output ".\dist\video.nvp"
 ```
 
-To preserve the source framerate instead of targeting a fixed one:
+### Encode With Embedded Subtitles
 
 ```powershell
-python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --fps source --output ".\movies\video.nvp"
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --output ".\dist\video.nvp"
 ```
 
-The encoder automatically fits the video into the configured canvas, converts it to RGB565, uses chunked inter-frame compression plus chunk-level zlib compression, and writes a single streamed `.nvp` file plus a JSON stats file.
+### Preserve Source Framerate
+
+```powershell
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --fps source --output ".\dist\video.nvp"
+```
+
+### Useful Encoder Options
+
+- `--fps`
+- `--max-width`
+- `--max-height`
+- `--block-size`
+- `--chunk-frames`
+- `--keyframe-interval`
+- `--change-ratio`
+- `--keyframe-block-ratio`
+- `--motion-search-radius`
+- `--motion-search-step`
+- `--motion-error-ratio`
+- `--posterize-bits`
+- `--zlib-level`
+- `--start`
+- `--duration`
+
+Run `python tools/encode_ndless_video.py --help` for the full CLI.
 
 ## Install On Calculator
 
 1. Build `ndvideo.tns`.
-2. Encode your movie into a `.nvp` file.
-3. If TI's desktop software refuses raw `.nvp` files, rename or copy them as `.nvp.tns` for transfer.
-4. Copy `ndvideo.tns` and the movie file(s) into the same folder on the calculator.
+2. Encode a movie into a `.nvp` file.
+3. Copy `ndvideo.tns` and one or more movie files to the same calculator directory.
+4. If TI's transfer software refuses a raw `.nvp`, rename or copy it as `.nvp.tns` before transfer.
 5. Launch `ndvideo.tns` through Ndless.
-6. Pick the movie and play it locally from calculator storage.
+6. Pick a movie from the file picker and play it locally from calculator storage.
 
-Current ready-to-copy test outputs in [`dist`](./dist):
-
-- `ndvideo.tns`
-- `cs2-30s.nvp`
-- `cs2-30s.nvp.tns`
-- `family-guy-30s-subs.nvp`
-- `family-guy-30s-subs.nvp.tns`
-
-No PC connection is needed during playback. The PC is only used to preprocess the source video into the calculator-friendly container.
-
-## Current Limits
-
-- No audio yet
-- Subtitle rendering supports text tracks only
-- The runtime is optimized for low RAM and predictable decode cost first; compression can be pushed harder later
+No PC connection is needed during playback. The PC is only used for preprocessing source video into the `.nvp` container.

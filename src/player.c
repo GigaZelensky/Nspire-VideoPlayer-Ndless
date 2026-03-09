@@ -3,8 +3,6 @@
 #include <os.h>
 #include <SDL/SDL.h>
 
-#include "overclock.h"
-
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -15,7 +13,7 @@
 
 #define SCREEN_W 320
 #define SCREEN_H 240
-#define UI_BAR_H 40
+#define UI_BAR_H 28
 #define SEEK_STEP_MS 5000
 #define PICKER_MAX_FILES 128
 #define PICKER_VISIBLE_ROWS 9
@@ -28,7 +26,15 @@
 #define POINTER_UI_TIMEOUT_MS 1800U
 #define POINTER_GAIN_NUM 5
 #define POINTER_GAIN_DEN 4
-#define ENABLE_STARTUP_OVERCLOCK 0
+#define PREFETCH_FILE_BLOCK_SIZE 4096U
+#define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
+#define PREFETCH_PAUSED_SLICE_MS 12U
+#define MONOTONIC_TIMER_VALUE_ADDR 0x900C0004U
+#define MONOTONIC_TIMER_CONTROL_ADDR 0x900C0008U
+#define MONOTONIC_TIMER_CLOCK_SOURCE_ADDR 0x900C0080U
+#define MONOTONIC_TIMER_CLOCK_SOURCE_32768HZ 0x0AU
+#define MONOTONIC_TIMER_CONTROL_ENABLE_32BIT 0x82U
+#define MONOTONIC_TIMER_MAX_DELTA_TICKS (TIMER_TICKS_PER_SEC * 10U)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -84,8 +90,8 @@ typedef struct {
 typedef struct {
     nSDL_Font *white;
     nSDL_Font *outline;
-    nSDL_Font *subtitle_white;
-    nSDL_Font *subtitle_outline;
+    nSDL_Font *subtitle_white[NSP_NUMFONTS];
+    nSDL_Font *subtitle_outline[NSP_NUMFONTS];
 } Fonts;
 
 typedef enum {
@@ -94,6 +100,20 @@ typedef enum {
     SCALE_STRETCH = 2,
     SCALE_NATIVE = 3,
 } ScaleMode;
+
+typedef enum {
+    SUBTITLE_POS_BAR_BOTTOM = 0,
+    SUBTITLE_POS_VIDEO_BOTTOM,
+    SUBTITLE_POS_VIDEO_TOP,
+    SUBTITLE_POS_BAR_TOP,
+    SUBTITLE_POS_COUNT,
+} SubtitlePlacement;
+
+typedef struct {
+    uint8_t numerator;
+    uint8_t denominator;
+    const char *label;
+} PlaybackRate;
 
 typedef struct {
     touchpad_info_t *info;
@@ -109,10 +129,23 @@ typedef struct {
     bool moved;
 } PointerState;
 
+typedef enum {
+    PREFETCH_IDLE = 0,
+    PREFETCH_READING,
+    PREFETCH_INFLATING,
+    PREFETCH_READY,
+} PrefetchState;
+
 typedef struct {
     uint8_t *chunk_storage;
     size_t chunk_storage_size;
     int chunk_index;
+    PrefetchState state;
+    size_t read_offset;
+    size_t inflate_write_offset;
+    bool inflate_initialized;
+    z_stream stream;
+    uint8_t input_buffer[PREFETCH_FILE_BLOCK_SIZE];
 } PrefetchedChunk;
 
 typedef struct {
@@ -137,18 +170,61 @@ typedef struct {
 
 typedef struct {
     bool initialized;
+    bool using_hw_timer;
+    uint32_t ticks_per_second;
+    volatile unsigned *load_reg;
+    volatile unsigned *value_reg;
+    volatile unsigned *control_reg;
+    volatile unsigned *int_clear_reg;
+    volatile unsigned *bgload_reg;
     uint32_t last_value;
     uint64_t elapsed_ticks;
     unsigned original_load;
     unsigned original_control;
+    unsigned original_bgload;
+    volatile unsigned *speed_reg;
+    unsigned original_speed;
 } MonotonicClock;
 
 static MonotonicClock g_clock;
+static const PlaybackRate g_playback_rates[] = {
+    {1, 4, "0.25x"},
+    {1, 2, "0.5x"},
+    {3, 4, "0.75x"},
+    {1, 1, "1.0x"},
+    {5, 4, "1.25x"},
+    {3, 2, "1.5x"},
+    {7, 4, "1.75x"},
+    {2, 1, "2.0x"},
+};
+static const int g_subtitle_font_choices[] = {
+    NSDL_FONT_TINYTYPE,
+    NSDL_FONT_VGA,
+    NSDL_FONT_THIN,
+    NSDL_FONT_SPACE,
+    NSDL_FONT_FANTASY,
+};
+static const char *g_subtitle_font_names[] = {
+    "Tinytype",
+    "VGA",
+    "Thin",
+    "Space",
+    "Fantasy",
+};
+
+#define PLAYBACK_RATE_DEFAULT_INDEX 3U
+#define PLAYBACK_RATE_COUNT ((size_t) (sizeof(g_playback_rates) / sizeof(g_playback_rates[0])))
+#define SUBTITLE_FONT_DEFAULT_INDEX 2U
+#define SUBTITLE_FONT_CHOICE_COUNT ((size_t) (sizeof(g_subtitle_font_choices) / sizeof(g_subtitle_font_choices[0])))
+#define SUBTITLE_FONT_OVERLAY_MS 1200U
 
 static bool decode_to_frame(Movie *movie, uint32_t frame_index);
 static bool prefetch_chunk(Movie *movie, int chunk_index);
 static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks);
 static void clear_prefetched_chunk(PrefetchedChunk *chunk);
+static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk);
+static void prefetch_do_work(Movie *movie, int current_chunk, uint32_t deadline_ms);
+static void free_fonts(Fonts *fonts);
 
 static uint16_t read_le16(const uint8_t *src)
 {
@@ -219,22 +295,91 @@ static int clamp_int(int value, int min_value, int max_value)
     return value;
 }
 
+static bool monotonic_clock_try_init_hw_timer(void)
+{
+    if (is_classic) {
+        return false;
+    }
+
+    g_clock.value_reg = (volatile unsigned *) MONOTONIC_TIMER_VALUE_ADDR;
+    g_clock.control_reg = (volatile unsigned *) MONOTONIC_TIMER_CONTROL_ADDR;
+    g_clock.speed_reg = (volatile unsigned *) MONOTONIC_TIMER_CLOCK_SOURCE_ADDR;
+    g_clock.original_control = *g_clock.control_reg;
+    g_clock.original_speed = *g_clock.speed_reg;
+
+    *g_clock.control_reg = 0;
+    *g_clock.speed_reg = MONOTONIC_TIMER_CLOCK_SOURCE_32768HZ;
+    *g_clock.control_reg = MONOTONIC_TIMER_CONTROL_ENABLE_32BIT;
+
+    g_clock.last_value = (uint32_t) *g_clock.value_reg;
+    g_clock.using_hw_timer = true;
+    return true;
+}
+
 static void monotonic_clock_init(void)
 {
     memset(&g_clock, 0, sizeof(g_clock));
     g_clock.initialized = true;
+    g_clock.ticks_per_second = TIMER_TICKS_PER_SEC;
+    monotonic_clock_try_init_hw_timer();
+}
+
+static uint32_t monotonic_clock_ticks_per_second(void)
+{
+    if (g_clock.ticks_per_second) {
+        return g_clock.ticks_per_second;
+    }
+    return TIMER_TICKS_PER_SEC;
+}
+
+static uint64_t monotonic_clock_now_ticks(void)
+{
+    uint32_t ticks_per_second = monotonic_clock_ticks_per_second();
+    uint64_t sdl_ticks;
+    if (!g_clock.initialized) {
+        return 0;
+    }
+    if (g_clock.using_hw_timer) {
+        uint32_t current_value = (uint32_t) *g_clock.value_reg;
+        uint32_t elapsed = g_clock.last_value - current_value;
+        if (elapsed > MONOTONIC_TIMER_MAX_DELTA_TICKS) {
+            g_clock.using_hw_timer = false;
+            sdl_ticks = (((uint64_t) SDL_GetTicks()) * ticks_per_second) / 1000ULL;
+            if (sdl_ticks > g_clock.elapsed_ticks) {
+                g_clock.elapsed_ticks = sdl_ticks;
+            }
+            return g_clock.elapsed_ticks;
+        }
+        g_clock.elapsed_ticks += (uint64_t) elapsed;
+        g_clock.last_value = current_value;
+        return g_clock.elapsed_ticks;
+    }
+    sdl_ticks = (((uint64_t) SDL_GetTicks()) * ticks_per_second) / 1000ULL;
+    if (sdl_ticks > g_clock.elapsed_ticks) {
+        g_clock.elapsed_ticks = sdl_ticks;
+    }
+    return g_clock.elapsed_ticks;
+}
+
+static uint32_t monotonic_clock_ticks_to_ms(uint64_t ticks)
+{
+    return (uint32_t) ((ticks * 1000ULL) / monotonic_clock_ticks_per_second());
 }
 
 static uint32_t monotonic_clock_now_ms(void)
 {
-    if (!g_clock.initialized) {
-        return 0;
-    }
-    return (uint32_t) SDL_GetTicks();
+    return monotonic_clock_ticks_to_ms(monotonic_clock_now_ticks());
 }
 
 static void monotonic_clock_shutdown(void)
 {
+    if (g_clock.control_reg) {
+        *g_clock.control_reg = 0;
+        if (g_clock.speed_reg) {
+            *g_clock.speed_reg = g_clock.original_speed;
+        }
+        *g_clock.control_reg = g_clock.original_control;
+    }
     memset(&g_clock, 0, sizeof(g_clock));
 }
 
@@ -306,12 +451,20 @@ static void format_clock(uint32_t total_ms, char *buffer, size_t buffer_size)
     }
 }
 
-static uint32_t movie_frame_interval_ms(const Movie *movie)
+static uint64_t movie_frame_interval_ticks(const Movie *movie)
 {
     if (!movie->header.fps_num) {
         return 0;
     }
-    return (uint32_t) ((((uint64_t) 1000 * movie->header.fps_den) + (movie->header.fps_num / 2)) / movie->header.fps_num);
+    return (((uint64_t) monotonic_clock_ticks_per_second()) * movie->header.fps_den) / movie->header.fps_num;
+}
+
+static const PlaybackRate *playback_rate_for_index(size_t rate_index)
+{
+    if (rate_index >= PLAYBACK_RATE_COUNT) {
+        return &g_playback_rates[PLAYBACK_RATE_DEFAULT_INDEX];
+    }
+    return &g_playback_rates[rate_index];
 }
 
 static uint32_t movie_frame_time_ms(const Movie *movie, uint32_t frame_index)
@@ -322,6 +475,15 @@ static uint32_t movie_frame_time_ms(const Movie *movie, uint32_t frame_index)
     return (uint32_t) (((uint64_t) frame_index * 1000ULL * movie->header.fps_den) / movie->header.fps_num);
 }
 
+static uint64_t movie_frame_time_scaled_ticks(const Movie *movie, uint32_t frame_index, const PlaybackRate *rate)
+{
+    if (!movie->header.fps_num || !rate || !rate->numerator) {
+        return 0;
+    }
+    return (((uint64_t) frame_index) * monotonic_clock_ticks_per_second() * movie->header.fps_den * rate->denominator)
+        / (((uint64_t) movie->header.fps_num) * rate->numerator);
+}
+
 static uint32_t movie_frames_from_ms(const Movie *movie, uint32_t total_ms)
 {
     if (!movie->header.fps_num || !movie->header.fps_den) {
@@ -330,16 +492,26 @@ static uint32_t movie_frames_from_ms(const Movie *movie, uint32_t total_ms)
     return (uint32_t) (((uint64_t) total_ms * movie->header.fps_num) / (1000ULL * movie->header.fps_den));
 }
 
+static uint32_t movie_frames_from_scaled_ticks(const Movie *movie, uint64_t total_ticks, const PlaybackRate *rate)
+{
+    if (!movie->header.fps_num || !movie->header.fps_den || !rate || !rate->denominator) {
+        return 0;
+    }
+    return (uint32_t) ((total_ticks * movie->header.fps_num * rate->numerator)
+        / (((uint64_t) monotonic_clock_ticks_per_second()) * movie->header.fps_den * rate->denominator));
+}
+
 static uint32_t movie_duration_ms(const Movie *movie)
 {
     return movie_frame_time_ms(movie, movie->header.frame_count);
 }
 
-static void reset_playback_timeline(const Movie *movie, uint32_t now_ms, uint32_t *anchor_ms, uint32_t *anchor_frame, uint32_t *next_frame_due)
+static void reset_playback_timeline(const Movie *movie, const PlaybackRate *playback_rate, uint64_t *anchor_ticks, uint32_t *anchor_frame, uint64_t *next_frame_due_ticks)
 {
-    *anchor_ms = now_ms;
+    uint64_t now_ticks = monotonic_clock_now_ticks();
+    *anchor_ticks = now_ticks;
     *anchor_frame = movie->current_frame;
-    *next_frame_due = now_ms + movie_frame_time_ms(movie, 1);
+    *next_frame_due_ticks = now_ticks + movie_frame_time_scaled_ticks(movie, 1, playback_rate);
 }
 
 static void free_movie_files(MovieFile *files, size_t count)
@@ -393,18 +565,35 @@ static void destroy_movie(Movie *movie)
 
 static bool init_fonts(Fonts *fonts)
 {
+    size_t index;
+
     memset(fonts, 0, sizeof(*fonts));
     fonts->white = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 255, 255, 255);
     fonts->outline = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 0, 0, 0);
-    fonts->subtitle_white = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 255, 255, 255);
-    fonts->subtitle_outline = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 0, 0, 0);
-    if (fonts->subtitle_white) {
-        nSDL_SetFontSpacing(fonts->subtitle_white, 0, 0);
+    for (index = 0; index < SUBTITLE_FONT_CHOICE_COUNT; ++index) {
+        int font_id = g_subtitle_font_choices[index];
+        fonts->subtitle_white[font_id] = nSDL_LoadFont(font_id, 255, 255, 255);
+        fonts->subtitle_outline[font_id] = nSDL_LoadFont(font_id, 0, 0, 0);
+        if (fonts->subtitle_white[font_id]) {
+            nSDL_SetFontSpacing(fonts->subtitle_white[font_id], 0, 0);
+        }
+        if (fonts->subtitle_outline[font_id]) {
+            nSDL_SetFontSpacing(fonts->subtitle_outline[font_id], 0, 0);
+        }
     }
-    if (fonts->subtitle_outline) {
-        nSDL_SetFontSpacing(fonts->subtitle_outline, 0, 0);
+    if (!fonts->white || !fonts->outline) {
+        free_fonts(fonts);
+        return false;
     }
-    if (!fonts->white || !fonts->outline || !fonts->subtitle_white || !fonts->subtitle_outline) {
+    for (index = 0; index < SUBTITLE_FONT_CHOICE_COUNT; ++index) {
+        int font_id = g_subtitle_font_choices[index];
+        if (!fonts->subtitle_white[font_id] || !fonts->subtitle_outline[font_id]) {
+            free_fonts(fonts);
+            return false;
+        }
+    }
+    if (!fonts->subtitle_white[NSDL_FONT_TINYTYPE] || !fonts->subtitle_outline[NSDL_FONT_TINYTYPE]) {
+        free_fonts(fonts);
         return false;
     }
     return true;
@@ -412,17 +601,21 @@ static bool init_fonts(Fonts *fonts)
 
 static void free_fonts(Fonts *fonts)
 {
+    int font_id;
+
     if (fonts->white) {
         nSDL_FreeFont(fonts->white);
     }
     if (fonts->outline) {
         nSDL_FreeFont(fonts->outline);
     }
-    if (fonts->subtitle_white) {
-        nSDL_FreeFont(fonts->subtitle_white);
-    }
-    if (fonts->subtitle_outline) {
-        nSDL_FreeFont(fonts->subtitle_outline);
+    for (font_id = 0; font_id < NSP_NUMFONTS; ++font_id) {
+        if (fonts->subtitle_white[font_id]) {
+            nSDL_FreeFont(fonts->subtitle_white[font_id]);
+        }
+        if (fonts->subtitle_outline[font_id]) {
+            nSDL_FreeFont(fonts->subtitle_outline[font_id]);
+        }
     }
     memset(fonts, 0, sizeof(*fonts));
 }
@@ -1328,15 +1521,36 @@ static bool configure_chunk_view(Movie *movie, int chunk_index)
     return true;
 }
 
+static bool prefetch_deadline_reached(uint32_t deadline_ms)
+{
+    return (int32_t) (monotonic_clock_now_ms() - deadline_ms) >= 0;
+}
+
+static void reset_prefetched_chunk(PrefetchedChunk *chunk)
+{
+    if (!chunk) {
+        return;
+    }
+    chunk->chunk_storage = NULL;
+    chunk->chunk_storage_size = 0;
+    chunk->chunk_index = -1;
+    chunk->state = PREFETCH_IDLE;
+    chunk->read_offset = 0;
+    chunk->inflate_write_offset = 0;
+    chunk->inflate_initialized = false;
+    memset(&chunk->stream, 0, sizeof(chunk->stream));
+}
+
 static void clear_prefetched_chunk(PrefetchedChunk *chunk)
 {
     if (!chunk) {
         return;
     }
+    if (chunk->inflate_initialized) {
+        inflateEnd(&chunk->stream);
+    }
     free(chunk->chunk_storage);
-    chunk->chunk_storage = NULL;
-    chunk->chunk_storage_size = 0;
-    chunk->chunk_index = -1;
+    reset_prefetched_chunk(chunk);
 }
 
 static PrefetchedChunk *find_prefetched_chunk(Movie *movie, int chunk_index)
@@ -1348,6 +1562,186 @@ static PrefetchedChunk *find_prefetched_chunk(Movie *movie, int chunk_index)
         }
     }
     return NULL;
+}
+
+static PrefetchedChunk *find_prefetch_work_chunk(Movie *movie, int current_chunk)
+{
+    PrefetchedChunk *best = NULL;
+    int index;
+    int wanted_min = current_chunk + 1;
+    int wanted_max = current_chunk + PREFETCH_CHUNK_COUNT;
+
+    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+        PrefetchedChunk *candidate = &movie->prefetched[index];
+        if (candidate->chunk_index < wanted_min || candidate->chunk_index > wanted_max) {
+            continue;
+        }
+        if (candidate->state == PREFETCH_IDLE || candidate->state == PREFETCH_READY) {
+            continue;
+        }
+        if (!best || candidate->chunk_index < best->chunk_index) {
+            best = candidate;
+        }
+    }
+    return best;
+}
+
+static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk)
+{
+    const ChunkIndexEntry *entry;
+    size_t remaining;
+    size_t read_size;
+    uint8_t *read_target;
+
+    if (!movie || !chunk || chunk->chunk_index < 0) {
+        return false;
+    }
+    entry = movie->chunk_index + chunk->chunk_index;
+    if (chunk->read_offset > entry->packed_size) {
+        return false;
+    }
+    remaining = (size_t) entry->packed_size - chunk->read_offset;
+    if (remaining == 0) {
+        if (entry->packed_size == entry->unpacked_size) {
+            chunk->state = PREFETCH_READY;
+            return true;
+        }
+        if (chunk->stream.avail_in == 0) {
+            return false;
+        }
+        chunk->state = PREFETCH_INFLATING;
+        return true;
+    }
+
+    read_size = remaining > PREFETCH_FILE_BLOCK_SIZE ? PREFETCH_FILE_BLOCK_SIZE : remaining;
+    read_target = entry->packed_size == entry->unpacked_size
+        ? (chunk->chunk_storage + chunk->read_offset)
+        : chunk->input_buffer;
+
+    if (fseek(movie->file, (long) (entry->offset + chunk->read_offset), SEEK_SET) != 0) {
+        return false;
+    }
+    if (fread(read_target, 1, read_size, movie->file) != read_size) {
+        return false;
+    }
+
+    chunk->read_offset += read_size;
+    if (entry->packed_size == entry->unpacked_size) {
+        if (chunk->read_offset == entry->packed_size) {
+            chunk->state = PREFETCH_READY;
+        }
+        return true;
+    }
+
+    chunk->stream.next_in = chunk->input_buffer;
+    chunk->stream.avail_in = (uInt) read_size;
+    chunk->state = PREFETCH_INFLATING;
+    return true;
+}
+
+static bool prefetch_inflate_step(Movie *movie, PrefetchedChunk *chunk)
+{
+    const ChunkIndexEntry *entry;
+    size_t remaining_out;
+    uInt input_before;
+    uInt output_size;
+    size_t produced;
+    uInt consumed;
+    int zresult;
+
+    if (!movie || !chunk || chunk->chunk_index < 0 || !chunk->inflate_initialized) {
+        return false;
+    }
+    entry = movie->chunk_index + chunk->chunk_index;
+    if (chunk->stream.avail_in == 0) {
+        if (chunk->read_offset < entry->packed_size) {
+            chunk->state = PREFETCH_READING;
+            return true;
+        }
+        return false;
+    }
+    if (chunk->inflate_write_offset > entry->unpacked_size) {
+        return false;
+    }
+
+    remaining_out = (size_t) entry->unpacked_size - chunk->inflate_write_offset;
+    if (remaining_out == 0) {
+        return false;
+    }
+
+    input_before = chunk->stream.avail_in;
+    output_size = (uInt) (remaining_out > PREFETCH_INFLATE_OUTPUT_SLICE ? PREFETCH_INFLATE_OUTPUT_SLICE : remaining_out);
+    chunk->stream.next_out = chunk->chunk_storage + chunk->inflate_write_offset;
+    chunk->stream.avail_out = output_size;
+    zresult = inflate(&chunk->stream, Z_NO_FLUSH);
+    produced = (size_t) (output_size - chunk->stream.avail_out);
+    consumed = input_before - chunk->stream.avail_in;
+    chunk->inflate_write_offset += produced;
+
+    if (zresult == Z_STREAM_END) {
+        if (chunk->inflate_write_offset != entry->unpacked_size ||
+            chunk->read_offset != entry->packed_size ||
+            chunk->stream.avail_in != 0) {
+            return false;
+        }
+        inflateEnd(&chunk->stream);
+        chunk->inflate_initialized = false;
+        memset(&chunk->stream, 0, sizeof(chunk->stream));
+        chunk->state = PREFETCH_READY;
+        return true;
+    }
+    if (zresult != Z_OK) {
+        return false;
+    }
+    if (produced == 0 && consumed == 0) {
+        return false;
+    }
+    if (chunk->stream.avail_in == 0) {
+        if (chunk->read_offset < entry->packed_size) {
+            chunk->state = PREFETCH_READING;
+        } else {
+            return false;
+        }
+    } else {
+        chunk->state = PREFETCH_INFLATING;
+    }
+    return true;
+}
+
+static bool prefetch_process_chunk(Movie *movie, PrefetchedChunk *chunk, uint32_t deadline_ms, bool respect_deadline)
+{
+    while (chunk && chunk->state != PREFETCH_READY) {
+        if (chunk->state == PREFETCH_READING) {
+            if (!prefetch_read_step(movie, chunk)) {
+                return false;
+            }
+        } else if (chunk->state == PREFETCH_INFLATING) {
+            if (!prefetch_inflate_step(movie, chunk)) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        if (respect_deadline && prefetch_deadline_reached(deadline_ms)) {
+            break;
+        }
+    }
+    return true;
+}
+
+static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk)
+{
+    if (!chunk) {
+        return false;
+    }
+    if (chunk->state == PREFETCH_READY) {
+        return true;
+    }
+    if (!prefetch_process_chunk(movie, chunk, 0, false)) {
+        return false;
+    }
+    return chunk->state == PREFETCH_READY;
 }
 
 static bool load_chunk(Movie *movie, int chunk_index)
@@ -1366,12 +1760,17 @@ static bool load_chunk(Movie *movie, int chunk_index)
     entry = movie->chunk_index + chunk_index;
     prefetched = find_prefetched_chunk(movie, chunk_index);
     if (prefetched) {
+        if (prefetched->state != PREFETCH_READY) {
+            if (!prefetch_finish_chunk(movie, prefetched)) {
+                clear_prefetched_chunk(prefetched);
+                return false;
+            }
+        }
         free(movie->chunk_storage);
         movie->chunk_storage = prefetched->chunk_storage;
         movie->chunk_storage_size = prefetched->chunk_storage_size;
         prefetched->chunk_storage = NULL;
-        prefetched->chunk_storage_size = 0;
-        prefetched->chunk_index = -1;
+        reset_prefetched_chunk(prefetched);
         if (!configure_chunk_view(movie, chunk_index)) {
             return false;
         }
@@ -1425,12 +1824,9 @@ static bool load_chunk(Movie *movie, int chunk_index)
 static bool prefetch_chunk(Movie *movie, int chunk_index)
 {
     const ChunkIndexEntry *entry;
-    uint8_t *bytes;
-    uint8_t *packed_bytes;
-    size_t chunk_storage_size;
-    uLongf unpacked_size;
     PrefetchedChunk *slot = NULL;
     int index;
+
     if (chunk_index < 0 || (uint32_t) chunk_index >= movie->header.chunk_count) {
         return false;
     }
@@ -1452,40 +1848,27 @@ static bool prefetch_chunk(Movie *movie, int chunk_index)
         }
         clear_prefetched_chunk(slot);
     }
+
     entry = movie->chunk_index + chunk_index;
-    packed_bytes = (uint8_t *) malloc(entry->packed_size);
-    if (!packed_bytes) {
+    clear_prefetched_chunk(slot);
+    slot->chunk_storage = (uint8_t *) malloc(entry->unpacked_size);
+    if (!slot->chunk_storage) {
         return false;
     }
-    if (fseek(movie->file, (long) entry->offset, SEEK_SET) != 0) {
-        free(packed_bytes);
-        return false;
-    }
-    if (fread(packed_bytes, 1, entry->packed_size, movie->file) != entry->packed_size) {
-        free(packed_bytes);
-        return false;
-    }
-    if (entry->packed_size != entry->unpacked_size) {
-        bytes = (uint8_t *) malloc(entry->unpacked_size);
-        if (!bytes) {
-            free(packed_bytes);
-            return false;
-        }
-        unpacked_size = entry->unpacked_size;
-        if (uncompress(bytes, &unpacked_size, packed_bytes, entry->packed_size) != Z_OK || unpacked_size != entry->unpacked_size) {
-            free(packed_bytes);
-            free(bytes);
-            return false;
-        }
-        free(packed_bytes);
-        chunk_storage_size = entry->unpacked_size;
-    } else {
-        bytes = packed_bytes;
-        chunk_storage_size = entry->packed_size;
-    }
-    slot->chunk_storage = bytes;
-    slot->chunk_storage_size = chunk_storage_size;
+    slot->chunk_storage_size = entry->unpacked_size;
     slot->chunk_index = chunk_index;
+    slot->state = PREFETCH_READING;
+    slot->read_offset = 0;
+    slot->inflate_write_offset = 0;
+
+    if (entry->packed_size != entry->unpacked_size) {
+        memset(&slot->stream, 0, sizeof(slot->stream));
+        if (inflateInit(&slot->stream) != Z_OK) {
+            clear_prefetched_chunk(slot);
+            return false;
+        }
+        slot->inflate_initialized = true;
+    }
     return true;
 }
 
@@ -1517,12 +1900,26 @@ static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks)
     }
 }
 
+static void prefetch_do_work(Movie *movie, int current_chunk, uint32_t deadline_ms)
+{
+    while (!prefetch_deadline_reached(deadline_ms)) {
+        PrefetchedChunk *slot = find_prefetch_work_chunk(movie, current_chunk);
+        if (!slot) {
+            break;
+        }
+        if (!prefetch_process_chunk(movie, slot, deadline_ms, true)) {
+            clear_prefetched_chunk(slot);
+            break;
+        }
+    }
+}
+
 static int prefetch_budget_for_state(bool paused, uint32_t spare_ms)
 {
     if (paused) {
         return PREFETCH_CHUNK_COUNT;
     }
-    if (spare_ms > 10) {
+    if (spare_ms > 0) {
         return 1;
     }
     return 0;
@@ -1544,10 +1941,13 @@ static int prefetch_target_chunk(const Movie *movie)
 
 static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
 {
+    uint32_t time_slice_ms = paused && spare_ms > PREFETCH_PAUSED_SLICE_MS ? PREFETCH_PAUSED_SLICE_MS : spare_ms;
     int current_chunk = prefetch_target_chunk(movie);
     int budget = prefetch_budget_for_state(paused, spare_ms);
-    if (current_chunk >= 0 && budget > 0) {
+    if (current_chunk >= 0 && budget > 0 && time_slice_ms > 0) {
+        uint32_t deadline_ms = monotonic_clock_now_ms() + time_slice_ms;
         prefetch_ahead(movie, current_chunk, budget);
+        prefetch_do_work(movie, current_chunk, deadline_ms);
     }
 }
  
@@ -1838,9 +2238,13 @@ static int wrap_subtitle(nSDL_Font *font, const char *text, int max_width, char 
     char current[MAX_SUBTITLE_LINE_LEN];
     size_t pos = 0;
     int line_count = 0;
+
+    if (!font || !text || max_width <= 0) {
+        return 0;
+    }
+
     current[0] = '\0';
     memset(lines, 0, sizeof(char) * MAX_SUBTITLE_LINES * MAX_SUBTITLE_LINE_LEN);
-
     while (text[pos] != '\0' && line_count < MAX_SUBTITLE_LINES) {
         char word[64];
         size_t word_len = 0;
@@ -1899,26 +2303,6 @@ static int wrap_subtitle(nSDL_Font *font, const char *text, int max_width, char 
     return line_count;
 }
 
-static SDL_Rect progress_bar_rect(void)
-{
-    SDL_Rect rect = {16, SCREEN_H - 14, SCREEN_W - 32, 6};
-    return rect;
-}
-
-static void draw_cursor(SDL_Surface *screen, int x, int y)
-{
-    SDL_Rect black_h = {(Sint16) (x - 6), (Sint16) (y - 1), 13, 3};
-    SDL_Rect black_v = {(Sint16) (x - 1), (Sint16) (y - 6), 3, 13};
-    SDL_Rect white_h = {(Sint16) (x - 5), (Sint16) y, 11, 1};
-    SDL_Rect white_v = {(Sint16) x, (Sint16) (y - 5), 1, 11};
-    SDL_Rect center = {(Sint16) (x - 1), (Sint16) (y - 1), 3, 3};
-    SDL_FillRect(screen, &black_h, SDL_MapRGB(screen->format, 0, 0, 0));
-    SDL_FillRect(screen, &black_v, SDL_MapRGB(screen->format, 0, 0, 0));
-    SDL_FillRect(screen, &white_h, SDL_MapRGB(screen->format, 255, 255, 255));
-    SDL_FillRect(screen, &white_v, SDL_MapRGB(screen->format, 255, 255, 255));
-    SDL_FillRect(screen, &center, SDL_MapRGB(screen->format, 255, 255, 255));
-}
-
 static int subtitle_scale_num(int subtitle_size)
 {
     static const int numerators[4] = {1, 4, 5, 2};
@@ -1933,88 +2317,47 @@ static int subtitle_scale_den(int subtitle_size)
     return denominators[subtitle_size];
 }
 
-static void subtitle_fonts_for_size(const Fonts *fonts, int subtitle_size, nSDL_Font **white_font, nSDL_Font **outline_font)
+static int subtitle_font_id_for_index(size_t subtitle_font_index)
 {
-    (void) subtitle_size;
-    *white_font = fonts->subtitle_white;
-    *outline_font = fonts->subtitle_outline;
+    if (subtitle_font_index >= SUBTITLE_FONT_CHOICE_COUNT) {
+        return g_subtitle_font_choices[SUBTITLE_FONT_DEFAULT_INDEX];
+    }
+    return g_subtitle_font_choices[subtitle_font_index];
 }
 
-static void compute_video_rects(const Movie *movie, ScaleMode scale_mode, SDL_Rect *src, SDL_Rect *dst)
+static const char *subtitle_font_name_for_index(size_t subtitle_font_index)
 {
-    double video_aspect = (double) movie->header.video_width / movie->header.video_height;
-    double screen_aspect = (double) SCREEN_W / SCREEN_H;
-
-    src->x = 0;
-    src->y = 0;
-    src->w = movie->header.video_width;
-    src->h = movie->header.video_height;
-
-    if (scale_mode == SCALE_NATIVE) {
-        dst->w = movie->header.video_width;
-        dst->h = movie->header.video_height;
-        dst->x = (SCREEN_W - dst->w) / 2;
-        dst->y = (SCREEN_H - dst->h) / 2;
-        return;
+    if (subtitle_font_index >= SUBTITLE_FONT_CHOICE_COUNT) {
+        return g_subtitle_font_names[SUBTITLE_FONT_DEFAULT_INDEX];
     }
+    return g_subtitle_font_names[subtitle_font_index];
+}
 
-    if (scale_mode == SCALE_FILL) {
-        dst->x = 0;
-        dst->y = 0;
-        dst->w = SCREEN_W;
-        dst->h = SCREEN_H;
-        if (video_aspect > screen_aspect) {
-            src->w = (Uint16) ((double) movie->header.video_height * screen_aspect);
-            src->x = (movie->header.video_width - src->w) / 2;
-        } else {
-            src->h = (Uint16) ((double) movie->header.video_width / screen_aspect);
-            src->y = (movie->header.video_height - src->h) / 2;
-        }
-        return;
-    }
-
-    if (scale_mode == SCALE_STRETCH) {
-        dst->x = 0;
-        dst->y = 0;
-        dst->w = SCREEN_W;
-        dst->h = SCREEN_H;
-        return;
-    }
-
-    if (video_aspect > screen_aspect) {
-        dst->w = SCREEN_W;
-        dst->h = (Uint16) ((double) SCREEN_W / video_aspect);
-        dst->x = 0;
-        dst->y = (SCREEN_H - dst->h) / 2;
-    } else {
-        dst->h = SCREEN_H;
-        dst->w = (Uint16) ((double) SCREEN_H * video_aspect);
-        dst->x = (SCREEN_W - dst->w) / 2;
-        dst->y = 0;
+static SubtitlePlacement subtitle_opposite_placement(SubtitlePlacement placement)
+{
+    switch (placement) {
+        case SUBTITLE_POS_VIDEO_BOTTOM:
+            return SUBTITLE_POS_VIDEO_TOP;
+        case SUBTITLE_POS_VIDEO_TOP:
+            return SUBTITLE_POS_VIDEO_BOTTOM;
+        case SUBTITLE_POS_BAR_TOP:
+            return SUBTITLE_POS_BAR_BOTTOM;
+        case SUBTITLE_POS_BAR_BOTTOM:
+        default:
+            return SUBTITLE_POS_BAR_TOP;
     }
 }
 
-static const char *scale_mode_text(ScaleMode scale_mode)
+static void subtitle_fonts_for_style(const Fonts *fonts, size_t subtitle_font_index, nSDL_Font **white_font, nSDL_Font **outline_font)
 {
-    if (scale_mode == SCALE_FILL) {
-        return "FILL";
-    }
-    if (scale_mode == SCALE_STRETCH) {
-        return "STRETCH";
-    }
-    if (scale_mode == SCALE_NATIVE) {
-        return "1:1";
-    }
-    return "FIT";
-}
+    int font_id = subtitle_font_id_for_index(subtitle_font_index);
 
-static void draw_mode_badge(SDL_Surface *screen, const Fonts *fonts, ScaleMode scale_mode)
-{
-    const char *label = scale_mode_text(scale_mode);
-    int text_w = nSDL_GetStringWidth(fonts->white, label);
-    SDL_Rect badge = {(Sint16) (SCREEN_W - text_w - 18), 8, (Uint16) (text_w + 10), 16};
-    SDL_FillRect(screen, &badge, SDL_MapRGB(screen->format, 18, 18, 24));
-    nSDL_DrawString(screen, fonts->white, badge.x + 5, badge.y + 4, label);
+    *white_font = fonts->subtitle_white[font_id];
+    *outline_font = fonts->subtitle_outline[font_id];
+    if (!*white_font || !*outline_font) {
+        *white_font = fonts->subtitle_white[NSDL_FONT_TINYTYPE];
+        *outline_font = fonts->subtitle_outline[NSDL_FONT_TINYTYPE];
+    }
 }
 
 static void draw_scaled_outlined_text(
@@ -2121,24 +2464,41 @@ static void draw_scaled_outlined_text(
     SDL_FreeSurface(text_surface);
 }
 
-static void draw_subtitle(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *video_rect, const char *text, bool overlay_visible, int subtitle_size)
+static void draw_subtitle(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    const SDL_Rect *video_rect,
+    const char *text,
+    bool overlay_visible,
+    size_t subtitle_font_index,
+    int subtitle_size,
+    SubtitlePlacement placement
+)
 {
     char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN];
     int line_count;
     int line_index;
+    int base_x;
     int base_y;
-    int max_width = video_rect->w - 12;
-    int bottom_limit = overlay_visible ? (SCREEN_H - UI_BAR_H - 8) : (video_rect->y + video_rect->h - 8);
+    int area_width;
+    int max_width;
     nSDL_Font *white_font;
     nSDL_Font *outline_font;
     int scale_num;
     int scale_den;
     int line_height;
+    int total_height;
+    int area_top;
+    int area_bottom;
+    int area_height;
     if (!text || !*text) {
         return;
     }
+    if (subtitle_size < 0) {
+        return;
+    }
     subtitle_size = clamp_int(subtitle_size, 0, 3);
-    subtitle_fonts_for_size(fonts, subtitle_size, &white_font, &outline_font);
+    subtitle_fonts_for_style(fonts, subtitle_font_index, &white_font, &outline_font);
     scale_num = subtitle_scale_num(subtitle_size);
     scale_den = subtitle_scale_den(subtitle_size);
     line_height = nSDL_GetStringHeight(white_font, "Ag");
@@ -2149,17 +2509,63 @@ static void draw_subtitle(SDL_Surface *screen, const Fonts *fonts, const SDL_Rec
     if (line_height < 10) {
         line_height = 10;
     }
+    if (placement == SUBTITLE_POS_BAR_BOTTOM || placement == SUBTITLE_POS_BAR_TOP) {
+        base_x = 0;
+        area_width = SCREEN_W;
+    } else {
+        base_x = video_rect->x;
+        area_width = video_rect->w;
+    }
+    max_width = area_width - 12;
+    if (max_width <= 0) {
+        return;
+    }
     line_count = wrap_subtitle(white_font, text, (max_width * scale_den) / scale_num, lines);
     if (line_count <= 0) {
         return;
     }
-    base_y = bottom_limit - (line_count * (line_height + 2));
-    if (base_y < video_rect->y + 4) {
-        base_y = video_rect->y + 4;
+    total_height = line_count * line_height;
+    if (line_count > 1) {
+        total_height += (line_count - 1) * 2;
+    }
+    switch (placement) {
+        case SUBTITLE_POS_BAR_BOTTOM:
+            area_top = video_rect->y + video_rect->h + 2;
+            area_bottom = (overlay_visible ? (SCREEN_H - UI_BAR_H) : SCREEN_H) - 2;
+            area_height = area_bottom - area_top;
+            if (area_height >= total_height) {
+                base_y = area_top + (area_height - total_height) / 2;
+            } else {
+                base_y = area_bottom - total_height;
+                if (base_y < 2) {
+                    base_y = 2;
+                }
+            }
+            break;
+        case SUBTITLE_POS_VIDEO_TOP:
+            base_y = video_rect->y + 4;
+            break;
+        case SUBTITLE_POS_BAR_TOP:
+            area_top = 2;
+            area_bottom = video_rect->y - 2;
+            area_height = area_bottom - area_top;
+            if (area_height >= total_height) {
+                base_y = area_top + (area_height - total_height) / 2;
+            } else {
+                base_y = 4;
+            }
+            break;
+        case SUBTITLE_POS_VIDEO_BOTTOM:
+        default:
+            base_y = (video_rect->y + video_rect->h - 8) - total_height;
+            if (base_y < video_rect->y + 4) {
+                base_y = video_rect->y + 4;
+            }
+            break;
     }
     for (line_index = 0; line_index < line_count; ++line_index) {
         int width = (nSDL_GetStringWidth(white_font, lines[line_index]) * scale_num) / scale_den;
-        int x = video_rect->x + (video_rect->w - width) / 2;
+        int x = base_x + (area_width - width) / 2;
         draw_scaled_outlined_text(
             screen,
             white_font,
@@ -2171,6 +2577,206 @@ static void draw_subtitle(SDL_Surface *screen, const Fonts *fonts, const SDL_Rec
             scale_den
         );
     }
+}
+
+static SDL_Rect progress_bar_rect(void)
+{
+    SDL_Rect rect = {14, SCREEN_H - 11, SCREEN_W - 28, 5};
+    return rect;
+}
+
+static void draw_cursor(SDL_Surface *screen, int x, int y)
+{
+    SDL_Rect black_h = {(Sint16) (x - 6), (Sint16) (y - 1), 13, 3};
+    SDL_Rect black_v = {(Sint16) (x - 1), (Sint16) (y - 6), 3, 13};
+    SDL_Rect white_h = {(Sint16) (x - 5), (Sint16) y, 11, 1};
+    SDL_Rect white_v = {(Sint16) x, (Sint16) (y - 5), 1, 11};
+    SDL_Rect center = {(Sint16) (x - 1), (Sint16) (y - 1), 3, 3};
+    SDL_FillRect(screen, &black_h, SDL_MapRGB(screen->format, 0, 0, 0));
+    SDL_FillRect(screen, &black_v, SDL_MapRGB(screen->format, 0, 0, 0));
+    SDL_FillRect(screen, &white_h, SDL_MapRGB(screen->format, 255, 255, 255));
+    SDL_FillRect(screen, &white_v, SDL_MapRGB(screen->format, 255, 255, 255));
+    SDL_FillRect(screen, &center, SDL_MapRGB(screen->format, 255, 255, 255));
+}
+
+static void compute_video_rects(const Movie *movie, ScaleMode scale_mode, SDL_Rect *src, SDL_Rect *dst)
+{
+    double video_aspect = (double) movie->header.video_width / movie->header.video_height;
+    double screen_aspect = (double) SCREEN_W / SCREEN_H;
+
+    src->x = 0;
+    src->y = 0;
+    src->w = movie->header.video_width;
+    src->h = movie->header.video_height;
+
+    if (scale_mode == SCALE_NATIVE) {
+        dst->w = movie->header.video_width;
+        dst->h = movie->header.video_height;
+        dst->x = (SCREEN_W - dst->w) / 2;
+        dst->y = (SCREEN_H - dst->h) / 2;
+        return;
+    }
+
+    if (scale_mode == SCALE_FILL) {
+        dst->x = 0;
+        dst->y = 0;
+        dst->w = SCREEN_W;
+        dst->h = SCREEN_H;
+        if (video_aspect > screen_aspect) {
+            src->w = (Uint16) ((double) movie->header.video_height * screen_aspect);
+            src->x = (movie->header.video_width - src->w) / 2;
+        } else {
+            src->h = (Uint16) ((double) movie->header.video_width / screen_aspect);
+            src->y = (movie->header.video_height - src->h) / 2;
+        }
+        return;
+    }
+
+    if (scale_mode == SCALE_STRETCH) {
+        dst->x = 0;
+        dst->y = 0;
+        dst->w = SCREEN_W;
+        dst->h = SCREEN_H;
+        return;
+    }
+
+    if (video_aspect > screen_aspect) {
+        dst->w = SCREEN_W;
+        dst->h = (Uint16) ((double) SCREEN_W / video_aspect);
+        dst->x = 0;
+        dst->y = (SCREEN_H - dst->h) / 2;
+    } else {
+        dst->h = SCREEN_H;
+        dst->w = (Uint16) ((double) SCREEN_H * video_aspect);
+        dst->x = (SCREEN_W - dst->w) / 2;
+        dst->y = 0;
+    }
+}
+
+static const char *scale_mode_text(ScaleMode scale_mode)
+{
+    if (scale_mode == SCALE_FILL) {
+        return "FILL";
+    }
+    if (scale_mode == SCALE_STRETCH) {
+        return "STRETCH";
+    }
+    if (scale_mode == SCALE_NATIVE) {
+        return "1:1";
+    }
+    return "FIT";
+}
+
+static int top_overlay_y_for_rect(const SDL_Rect *video_rect, int overlay_h)
+{
+    if (video_rect && video_rect->y > overlay_h) {
+        return (video_rect->y - overlay_h) / 2;
+    }
+    return 8;
+}
+
+static int draw_text_badge(SDL_Surface *screen, const Fonts *fonts, int right_x, int y, const char *label)
+{
+    int text_w = nSDL_GetStringWidth(fonts->white, label);
+    SDL_Rect badge = {(Sint16) (right_x - text_w - 10), (Sint16) y, (Uint16) (text_w + 10), 16};
+    SDL_FillRect(screen, &badge, SDL_MapRGB(screen->format, 18, 18, 24));
+    nSDL_DrawString(screen, fonts->white, badge.x + 5, badge.y + 4, label);
+    return badge.x - 6;
+}
+
+static void draw_status_badges(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *video_rect, ScaleMode scale_mode, const PlaybackRate *playback_rate)
+{
+    int right_x = SCREEN_W - 8;
+    int y = top_overlay_y_for_rect(video_rect, 16);
+
+    right_x = draw_text_badge(screen, fonts, right_x, y, playback_rate ? playback_rate->label : "1.0x");
+    draw_text_badge(screen, fonts, right_x, y, scale_mode_text(scale_mode));
+}
+
+static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect, bool paused)
+{
+    Uint32 background = SDL_MapRGB(screen->format, 18, 18, 24);
+    Uint32 inner = SDL_MapRGB(screen->format, 8, 10, 14);
+    Uint32 foreground = SDL_MapRGB(screen->format, 255, 255, 255);
+    int y = top_overlay_y_for_rect(video_rect, 22);
+    SDL_Rect outer = {8, (Sint16) y, 22, 22};
+    SDL_Rect fill = {9, (Sint16) (y + 1), 20, 20};
+
+    SDL_FillRect(screen, &outer, background);
+    SDL_FillRect(screen, &fill, inner);
+    if (paused) {
+        SDL_Rect left_bar = {14, (Sint16) (y + 5), 3, 10};
+        SDL_Rect right_bar = {21, (Sint16) (y + 5), 3, 10};
+        SDL_FillRect(screen, &left_bar, foreground);
+        SDL_FillRect(screen, &right_bar, foreground);
+    } else {
+        int column;
+        for (column = 0; column < 8; ++column) {
+            int height = 1 + ((7 - column) * 10) / 7;
+            SDL_Rect slice = {
+                (Sint16) (14 + column),
+                (Sint16) ((y + 10) - (height / 2)),
+                1,
+                (Uint16) height
+            };
+            SDL_FillRect(screen, &slice, foreground);
+        }
+    }
+}
+
+static void draw_help_row(SDL_Surface *screen, const Fonts *fonts, int x, int y, int panel_w, const char *shortcut, const char *description)
+{
+    SDL_Rect row_rect = {(Sint16) x, (Sint16) (y - 2), (Uint16) panel_w, 13};
+    SDL_Rect key_rect = {(Sint16) x, (Sint16) (y - 2), 72, 13};
+
+    SDL_FillRect(screen, &row_rect, SDL_MapRGB(screen->format, 10, 14, 20));
+    SDL_FillRect(screen, &key_rect, SDL_MapRGB(screen->format, 18, 24, 34));
+    nSDL_DrawString(screen, fonts->white, x + 6, y, shortcut);
+    nSDL_DrawString(screen, fonts->white, x + 80, y, description);
+}
+
+static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
+{
+    SDL_Rect shadow = {18, 18, 288, 180};
+    SDL_Rect panel = {14, 14, 288, 180};
+    SDL_Rect header = {14, 14, 288, 22};
+    SDL_Rect accent = {14, 36, 288, 2};
+    SDL_Rect footer = {14, 182, 288, 12};
+    const char *close_text = "CAT close";
+    int y = 40;
+
+    SDL_FillRect(screen, &shadow, SDL_MapRGB(screen->format, 0, 0, 0));
+    SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 8, 10, 14));
+    SDL_FillRect(screen, &header, SDL_MapRGB(screen->format, 12, 18, 28));
+    SDL_FillRect(screen, &accent, SDL_MapRGB(screen->format, 32, 182, 255));
+    SDL_FillRect(screen, &footer, SDL_MapRGB(screen->format, 12, 18, 28));
+
+    nSDL_DrawString(screen, fonts->white, panel.x + 10, panel.y + 6, "Playback Controls");
+    nSDL_DrawString(screen, fonts->white, panel.x + panel.w - 10 - nSDL_GetStringWidth(fonts->white, close_text), panel.y + 6, close_text);
+
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "ENTER", "Play or pause");
+    y += 12;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "CLICK", "Toggle or seek bar");
+    y += 12;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "L / R", "Seek -/+5s");
+    y += 12;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "TAB", "Step one frame");
+    y += 12;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "/", "Scale mode");
+    y += 12;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "{ / }", "Playback speed");
+    y += 12;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "^", "Subtitle position");
+    y += 12;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "+ / -", "Subtitle size");
+    y += 12;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "F", "Cycle subtitle font");
+    y += 12;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "TOUCHPAD", "Move cursor / show UI");
+    y += 12;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "ESC", "Close menu or exit");
+
+    nSDL_DrawString(screen, fonts->white, panel.x + 10, panel.y + panel.h - 10, "CAT closes help. ESC exits movie.");
 }
 
 static void draw_progress(
@@ -2188,9 +2794,9 @@ static void draw_progress(
     char current_text[24];
     char total_text[24];
     char left_text[56];
-    char hint_text[80];
+    char remaining_text[24];
+    char right_text[32];
     uint32_t duration_ms = movie_duration_ms(movie);
-    snprintf(hint_text, sizeof(hint_text), "CLICK SEEK  L/R +/-5s  TAB STEP  / MODE  +/- SUB");
     SDL_FillRect(screen, &overlay, SDL_MapRGB(screen->format, 0, 0, 0));
     SDL_FillRect(screen, &bar_back, SDL_MapRGB(screen->format, 52, 52, 68));
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
@@ -2215,23 +2821,40 @@ static void draw_progress(
     }
     format_clock(current_ms, current_text, sizeof(current_text));
     format_clock(duration_ms, total_text, sizeof(total_text));
+    format_clock(duration_ms > current_ms ? (duration_ms - current_ms) : 0, remaining_text, sizeof(remaining_text));
     snprintf(left_text, sizeof(left_text), "%s / %s", current_text, total_text);
-    nSDL_DrawString(screen, fonts->white, 12, SCREEN_H - UI_BAR_H + 6, left_text);
+    snprintf(right_text, sizeof(right_text), "-%s", remaining_text);
+    nSDL_DrawString(screen, fonts->white, 12, SCREEN_H - UI_BAR_H + 7, left_text);
     nSDL_DrawString(
         screen,
         fonts->white,
-        (SCREEN_W - nSDL_GetStringWidth(fonts->white, hint_text)) / 2,
-        SCREEN_H - UI_BAR_H + 18,
-        hint_text
+        SCREEN_W - 12 - nSDL_GetStringWidth(fonts->white, right_text),
+        SCREEN_H - UI_BAR_H + 7,
+        right_text
     );
 }
 
-static void render_movie(SDL_Surface *screen, const Fonts *fonts, Movie *movie, bool paused, bool show_ui, ScaleMode scale_mode, int subtitle_size, const PointerState *pointer)
+static void render_movie(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    Movie *movie,
+    bool paused,
+    bool show_ui,
+    bool help_menu_open,
+    ScaleMode scale_mode,
+    const PlaybackRate *playback_rate,
+    size_t subtitle_font_index,
+    bool subtitle_font_overlay_visible,
+    int subtitle_size,
+    SubtitlePlacement subtitle_placement,
+    const PointerState *pointer
+)
 {
     SDL_Rect src;
     SDL_Rect dst;
     uint32_t current_ms = movie_frame_time_ms(movie, movie->current_frame);
     const char *subtitle = active_subtitle(movie, current_ms);
+
     compute_video_rects(movie, scale_mode, &src, &dst);
     SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
     if (src.w == movie->header.video_width && src.h == movie->header.video_height &&
@@ -2240,13 +2863,32 @@ static void render_movie(SDL_Surface *screen, const Fonts *fonts, Movie *movie, 
     } else {
         SDL_SoftStretch(movie->frame_surface, &src, screen, &dst);
     }
-    draw_subtitle(screen, fonts, &dst, subtitle, show_ui, subtitle_size);
+    draw_subtitle(screen, fonts, &dst, subtitle, show_ui, subtitle_font_index, subtitle_size, subtitle_placement);
+    if (subtitle_font_overlay_visible) {
+        int preview_size = subtitle_size < 0 ? 0 : clamp_int(subtitle_size, 0, 1);
+        draw_subtitle(
+            screen,
+            fonts,
+            &dst,
+            subtitle_font_name_for_index(subtitle_font_index),
+            show_ui,
+            subtitle_font_index,
+            preview_size,
+            subtitle_opposite_placement(subtitle_placement)
+        );
+    }
     if (show_ui) {
-        draw_mode_badge(screen, fonts, scale_mode);
+        if (!help_menu_open) {
+            draw_playback_badge(screen, &dst, paused);
+            draw_status_badges(screen, fonts, &dst, scale_mode, playback_rate);
+        }
         draw_progress(screen, fonts, movie, current_ms, pointer);
-        if (pointer && pointer->visible) {
+        if (!help_menu_open && pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
+    }
+    if (help_menu_open) {
+        draw_help_menu(screen, fonts);
     }
     SDL_Flip(screen);
 }
@@ -2381,55 +3023,74 @@ static void seek_to_ratio(Movie *movie, uint32_t numerator, uint32_t denominator
 static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
 {
     Movie movie;
-    ClockState playback_clock_state;
-    bool playback_clock_active = false;
     bool prev_enter = false;
     bool prev_left = false;
     bool prev_right = false;
     bool prev_tab = false;
     bool prev_esc = false;
     bool prev_click = false;
+    bool prev_cat = false;
     bool prev_divide = false;
+    bool prev_exp = false;
+    bool prev_tenx = false;
+    bool prev_lp = false;
+    bool prev_rp = false;
+    bool prev_lthan = false;
+    bool prev_gthan = false;
+    bool prev_f = false;
     bool prev_plus = false;
     bool prev_minus = false;
     bool paused = false;
-    uint32_t frame_ms;
-    uint32_t next_frame_due;
-    uint32_t playback_anchor_ms;
+    uint64_t frame_interval_ticks;
+    uint64_t next_frame_due_ticks;
+    uint64_t playback_anchor_ticks;
     uint32_t playback_anchor_frame;
     uint32_t ui_visible_until;
+    uint32_t subtitle_font_overlay_until = 0;
     int result = 0;
     ScaleMode scale_mode = SCALE_FIT;
-    int subtitle_size = 2;
+    size_t playback_rate_index = PLAYBACK_RATE_DEFAULT_INDEX;
+    size_t subtitle_font_index = SUBTITLE_FONT_DEFAULT_INDEX;
+    int subtitle_size = 0;
+    SubtitlePlacement subtitle_placement = SUBTITLE_POS_BAR_BOTTOM;
     PointerState pointer;
+    bool help_menu_open = false;
+    bool help_resume_playback = false;
 
     if (!load_movie(path, &movie)) {
-        if (playback_clock_active) {
-            clock_state_restore(&playback_clock_state);
-        }
         show_msgbox("ND Video Player", "Failed to open movie file.");
         return -1;
     }
-    if (ENABLE_STARTUP_OVERCLOCK) {
-        clock_state_init(&playback_clock_state);
-        clock_state_apply_boost(&playback_clock_state);
-        playback_clock_active = true;
-    }
     pointer_init(&pointer);
-    frame_ms = movie_frame_interval_ms(&movie);
-    playback_anchor_ms = monotonic_clock_now_ms();
+    prev_tab = isKeyPressed(KEY_NSPIRE_TAB);
+    frame_interval_ticks = movie_frame_interval_ticks(&movie);
+    playback_anchor_ticks = monotonic_clock_now_ticks();
     playback_anchor_frame = movie.current_frame;
-    next_frame_due = playback_anchor_ms + movie_frame_time_ms(&movie, 1);
-    ui_visible_until = playback_anchor_ms + POINTER_UI_TIMEOUT_MS;
+    next_frame_due_ticks = playback_anchor_ticks + movie_frame_time_scaled_ticks(&movie, 1, playback_rate_for_index(playback_rate_index));
+    ui_visible_until = monotonic_clock_ticks_to_ms(playback_anchor_ticks) + POINTER_UI_TIMEOUT_MS;
     {
         prefetch_tick(&movie, true, 1000);
     }
 
     while (1) {
         bool pointer_click = pointer_update(&pointer);
-        uint32_t now_ms = monotonic_clock_now_ms();
-        bool show_ui = paused || (now_ms <= ui_visible_until);
+        uint64_t now_ticks = monotonic_clock_now_ticks();
+        uint32_t now_ms = monotonic_clock_ticks_to_ms(now_ticks);
+        const PlaybackRate *playback_rate = playback_rate_for_index(playback_rate_index);
+        bool show_ui = help_menu_open || paused || (now_ms <= ui_visible_until);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
+        bool tab_edge = key_pressed_edge(KEY_NSPIRE_TAB, &prev_tab);
+        bool cat_edge = key_pressed_edge(KEY_NSPIRE_CAT, &prev_cat);
+        bool divide_edge = key_pressed_edge(KEY_NSPIRE_DIVIDE, &prev_divide);
+        bool exp_edge = key_pressed_edge(KEY_NSPIRE_EXP, &prev_exp);
+        bool tenx_edge = key_pressed_edge(KEY_NSPIRE_TENX, &prev_tenx);
+        bool lp_edge = key_pressed_edge(KEY_NSPIRE_LP, &prev_lp);
+        bool rp_edge = key_pressed_edge(KEY_NSPIRE_RP, &prev_rp);
+        bool lthan_edge = key_pressed_edge(KEY_NSPIRE_LTHAN, &prev_lthan);
+        bool gthan_edge = key_pressed_edge(KEY_NSPIRE_GTHAN, &prev_gthan);
+        bool speed_down_edge = lp_edge || lthan_edge;
+        bool speed_up_edge = rp_edge || gthan_edge;
+        bool subtitle_font_edge = key_pressed_edge(KEY_NSPIRE_F, &prev_f);
         bool click_edge = key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click);
 
         if (pointer.moved || pointer_click) {
@@ -2441,8 +3102,55 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             show_ui = true;
         }
+        if (cat_edge) {
+            if (help_menu_open) {
+                help_menu_open = false;
+                if (help_resume_playback) {
+                    paused = false;
+                }
+                help_resume_playback = false;
+            } else {
+                help_menu_open = true;
+                help_resume_playback = !paused;
+                paused = true;
+            }
+            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+            show_ui = true;
+        }
         if (key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc)) {
-            break;
+            if (help_menu_open) {
+                help_menu_open = false;
+                if (help_resume_playback) {
+                    paused = false;
+                }
+                help_resume_playback = false;
+                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+                show_ui = true;
+            } else {
+                break;
+            }
+        }
+        if (help_menu_open) {
+            render_movie(
+                screen,
+                fonts,
+                &movie,
+                paused,
+                true,
+                true,
+                scale_mode,
+                playback_rate,
+                subtitle_font_index,
+                false,
+                subtitle_size,
+                subtitle_placement,
+                &pointer
+            );
+            prefetch_tick(&movie, true, 1000);
+            msleep(16);
+            continue;
         }
         if (enter_edge) {
             if (movie.current_frame + 1 >= movie.header.frame_count) {
@@ -2451,47 +3159,73 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             } else {
                 paused = !paused;
             }
-            reset_playback_timeline(&movie, now_ms, &playback_anchor_ms, &playback_anchor_frame, &next_frame_due);
+            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left)) {
             clamp_seek(&movie, -SEEK_STEP_MS);
             paused = true;
-            reset_playback_timeline(&movie, now_ms, &playback_anchor_ms, &playback_anchor_frame, &next_frame_due);
+            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right)) {
             clamp_seek(&movie, SEEK_STEP_MS);
             paused = true;
-            reset_playback_timeline(&movie, now_ms, &playback_anchor_ms, &playback_anchor_frame, &next_frame_due);
+            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
-        if (key_pressed_edge(KEY_NSPIRE_DIVIDE, &prev_divide)) {
+        if (divide_edge) {
             scale_mode = (ScaleMode) ((scale_mode + 1) % 4);
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (speed_down_edge && playback_rate_index > 0) {
+            playback_rate_index--;
+            playback_rate = playback_rate_for_index(playback_rate_index);
+            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (speed_up_edge && playback_rate_index + 1 < PLAYBACK_RATE_COUNT) {
+            playback_rate_index++;
+            playback_rate = playback_rate_for_index(playback_rate_index);
+            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (exp_edge || tenx_edge) {
+            subtitle_placement = (SubtitlePlacement) ((subtitle_placement + 1) % SUBTITLE_POS_COUNT);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (key_pressed_edge(KEY_NSPIRE_PLUS, &prev_plus) && subtitle_size < 3) {
             subtitle_size++;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
-        if (key_pressed_edge(KEY_NSPIRE_MINUS, &prev_minus) && subtitle_size > 0) {
+        if (key_pressed_edge(KEY_NSPIRE_MINUS, &prev_minus) && subtitle_size > -1) {
             subtitle_size--;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
-        if (paused && key_pressed_edge(KEY_NSPIRE_TAB, &prev_tab) && movie.current_frame + 1 < movie.header.frame_count) {
-            if (!decode_to_frame(&movie, movie.current_frame + 1)) {
-                show_msgbox("ND Video Player", "Movie decode failed.");
-                result = -1;
-                break;
+        if (subtitle_font_edge) {
+            subtitle_font_index = (subtitle_font_index + 1) % SUBTITLE_FONT_CHOICE_COUNT;
+            subtitle_font_overlay_until = now_ms + SUBTITLE_FONT_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (tab_edge) {
+            if (!paused) {
+                paused = true;
+            } else if (movie.current_frame + 1 < movie.header.frame_count) {
+                if (!decode_to_frame(&movie, movie.current_frame + 1)) {
+                    show_msgbox("ND Video Player", "Movie decode failed.");
+                    result = -1;
+                    break;
+                }
             }
-            reset_playback_timeline(&movie, now_ms, &playback_anchor_ms, &playback_anchor_frame, &next_frame_due);
+            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (pointer_click) {
             SDL_Rect bar = progress_bar_rect();
-            if (show_ui && pointer.x >= bar.x && pointer.x < bar.x + bar.w && pointer.y >= bar.y - 3 && pointer.y <= bar.y + (int) bar.h + 3) {
-                seek_to_ratio(&movie, (uint32_t) (pointer.x - bar.x), (uint32_t) bar.w);
-                reset_playback_timeline(&movie, now_ms, &playback_anchor_ms, &playback_anchor_frame, &next_frame_due);
+            if (show_ui && pointer.y >= SCREEN_H - UI_BAR_H && pointer.y < SCREEN_H) {
+                int seek_x = clamp_int(pointer.x, bar.x, bar.x + bar.w);
+                seek_to_ratio(&movie, (uint32_t) (seek_x - bar.x), (uint32_t) bar.w);
+                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             } else {
                 if (movie.current_frame + 1 >= movie.header.frame_count) {
@@ -2500,14 +3234,14 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 } else {
                     paused = !paused;
                 }
-                reset_playback_timeline(&movie, now_ms, &playback_anchor_ms, &playback_anchor_frame, &next_frame_due);
+                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             }
         }
-        if (!paused && frame_ms > 0) {
-            if ((int32_t) (now_ms - next_frame_due) >= 0) {
-                uint32_t elapsed_ms = now_ms - playback_anchor_ms;
-                uint32_t frames_to_advance = movie_frames_from_ms(&movie, elapsed_ms);
+        if (!paused && frame_interval_ticks > 0) {
+            if (now_ticks >= next_frame_due_ticks) {
+                uint64_t elapsed_ticks = now_ticks - playback_anchor_ticks;
+                uint32_t frames_to_advance = movie_frames_from_scaled_ticks(&movie, elapsed_ticks, playback_rate);
                 uint32_t target_frame = playback_anchor_frame + frames_to_advance;
                 if (target_frame >= movie.header.frame_count) {
                     if (movie.current_frame + 1 < movie.header.frame_count) {
@@ -2525,31 +3259,47 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                         result = -1;
                         break;
                     }
-                    next_frame_due = playback_anchor_ms + movie_frame_time_ms(&movie, (target_frame - playback_anchor_frame) + 1);
+                    next_frame_due_ticks = playback_anchor_ticks + movie_frame_time_scaled_ticks(&movie, (target_frame - playback_anchor_frame) + 1, playback_rate);
                 }
             }
         }
         show_ui = paused || (monotonic_clock_now_ms() <= ui_visible_until);
-        render_movie(screen, fonts, &movie, paused, show_ui, scale_mode, subtitle_size, &pointer);
-        if (paused || frame_ms == 0) {
+        render_movie(
+            screen,
+            fonts,
+            &movie,
+            paused,
+            show_ui,
+            false,
+            scale_mode,
+            playback_rate,
+            subtitle_font_index,
+            now_ms <= subtitle_font_overlay_until,
+            subtitle_size,
+            subtitle_placement,
+            &pointer
+        );
+        if (paused || frame_interval_ticks == 0) {
             prefetch_tick(&movie, true, 1000);
             msleep(16);
         } else {
-            uint32_t after_render_ms = monotonic_clock_now_ms();
-            uint32_t spare_ms = next_frame_due > after_render_ms ? (next_frame_due - after_render_ms) : 0;
+            uint64_t after_render_ticks = monotonic_clock_now_ticks();
+            uint64_t spare_ticks = next_frame_due_ticks > after_render_ticks ? (next_frame_due_ticks - after_render_ticks) : 0;
+            uint32_t spare_ms = monotonic_clock_ticks_to_ms(spare_ticks);
             prefetch_tick(&movie, false, spare_ms);
-            uint32_t wait_ms = next_frame_due > after_render_ms ? (next_frame_due - after_render_ms) : 1;
+            after_render_ticks = monotonic_clock_now_ticks();
+            spare_ticks = next_frame_due_ticks > after_render_ticks ? (next_frame_due_ticks - after_render_ticks) : 0;
+            uint32_t wait_ms = monotonic_clock_ticks_to_ms(spare_ticks);
             if (wait_ms > 8) {
                 wait_ms = 8;
             }
-            msleep(wait_ms);
+            if (wait_ms > 0) {
+                msleep(wait_ms);
+            }
         }
     }
 
     destroy_movie(&movie);
-    if (playback_clock_active) {
-        clock_state_restore(&playback_clock_state);
-    }
     return result;
 }
 

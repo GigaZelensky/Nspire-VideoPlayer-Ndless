@@ -13,7 +13,7 @@ LD  = nspire-ld
 
 GCCFLAGS = -Wall -Wextra -Wno-unused-parameter -std=c99 -marm -ffunction-sections -fdata-sections
 LDFLAGS = -Wl,--gc-sections -lSDL -lz
-PACKFLAGS = --name "ND Video Player" --author "GigaZelensky" --version 1 --ndless-min 45
+PACKFLAGS = --name "ND Video Player" --author "GigaZelensky" --version 1 --ndless-min 45 --hww-support --no-uses-lcd-blit
 
 ifeq ($(DEBUG),FALSE)
 	GCCFLAGS += -Os

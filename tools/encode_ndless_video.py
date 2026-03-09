@@ -297,17 +297,6 @@ def motion_penalty_from_error(changed_pixels: int, weighted_error: int, colorful
     return max(changed_pixels * MOTION_ERROR_WEIGHT, visual_penalty)
 
 
-def estimate_chunk_colorfulness(raw_frames: list[np.ndarray]) -> float:
-    if not raw_frames:
-        return 0.0
-    sample_step = 4
-    total = 0.0
-    for frame in raw_frames:
-        sample = frame[::sample_step, ::sample_step].astype(np.int16)
-        total += float(np.mean(np.max(sample, axis=2) - np.min(sample, axis=2))) / 255.0
-    return total / len(raw_frames)
-
-
 def rle16_encode(words: np.ndarray) -> bytes:
     flat = np.asarray(words, dtype="<u2").reshape(-1)
     output = bytearray()
@@ -723,74 +712,6 @@ def encode_motion_records(
     return b"".join(record_bytes), changed_blocks, motion_copies_local, literal_blocks_local
 
 
-def estimate_chunk_complexity(raw_frames: list[np.ndarray]) -> float:
-    if len(raw_frames) < 2:
-        return 0.0
-    sample_step = 4
-    gray_samples = [
-        np.mean(frame[::sample_step, ::sample_step], axis=2).astype(np.int16)
-        for frame in raw_frames
-    ]
-    color_samples = [
-        frame[::sample_step, ::sample_step].astype(np.int16)
-        for frame in raw_frames
-    ]
-    previous_sample = gray_samples[0]
-    previous_color = color_samples[0]
-    complexity_values: list[float] = []
-    for sample_index, current_sample in enumerate(gray_samples[1:], start=1):
-        current_color = color_samples[sample_index]
-        diff = np.abs(current_sample - previous_sample)
-        motion_ratio = float(np.count_nonzero(diff > 18)) / diff.size
-        delta_ratio = float(np.mean(diff)) / 255.0
-        color_diff = np.abs(current_color - previous_color)
-        chroma_ratio = float(np.mean(np.max(color_diff, axis=2))) / 255.0
-        saturation_ratio = float(np.mean(np.max(current_color, axis=2) - np.min(current_color, axis=2))) / 255.0
-        pan_score = 0.0
-        if motion_ratio > 0.10:
-            no_shift_error = float(np.mean(diff))
-            best_shift_error = no_shift_error
-            for shift_y in range(-2, 3):
-                for shift_x in range(-2, 3):
-                    if shift_x == 0 and shift_y == 0:
-                        continue
-                    if shift_y >= 0:
-                        current_y0 = shift_y
-                        previous_y0 = 0
-                        overlap_h = current_sample.shape[0] - shift_y
-                    else:
-                        current_y0 = 0
-                        previous_y0 = -shift_y
-                        overlap_h = current_sample.shape[0] + shift_y
-                    if shift_x >= 0:
-                        current_x0 = shift_x
-                        previous_x0 = 0
-                        overlap_w = current_sample.shape[1] - shift_x
-                    else:
-                        current_x0 = 0
-                        previous_x0 = -shift_x
-                        overlap_w = current_sample.shape[1] + shift_x
-                    if overlap_h < 4 or overlap_w < 4:
-                        continue
-                    shifted_current = current_sample[current_y0:current_y0 + overlap_h, current_x0:current_x0 + overlap_w]
-                    shifted_previous = previous_sample[previous_y0:previous_y0 + overlap_h, previous_x0:previous_x0 + overlap_w]
-                    shifted_error = float(np.mean(np.abs(shifted_current - shifted_previous)))
-                    if shifted_error < best_shift_error:
-                        best_shift_error = shifted_error
-            if no_shift_error > 0.0:
-                pan_score = motion_ratio * max(0.0, (no_shift_error - best_shift_error) / no_shift_error)
-        complexity_values.append(
-            (motion_ratio * 0.33)
-            + (delta_ratio * 0.15)
-            + (pan_score * 0.24)
-            + (chroma_ratio * 0.20)
-            + (saturation_ratio * 0.08)
-        )
-        previous_sample = current_sample
-        previous_color = current_color
-    return float(np.mean(complexity_values))
-
-
 def iter_chunks(items: list[np.ndarray], size: int) -> Iterator[list[np.ndarray]]:
     for start in range(0, len(items), size):
         yield items[start:start + size]
@@ -898,159 +819,6 @@ def compress_chunk_payload(chunk_blob: bytes, zlib_level: int) -> bytes:
     return chunk_blob
 
 
-def encode_chunk_budgeted(
-    raw_frames: list[np.ndarray],
-    *,
-    block_size: int,
-    keyframe_interval: int,
-    change_ratio: float,
-    keyframe_block_ratio: float,
-    motion_search_radius: int,
-    motion_search_step: int,
-    motion_error_ratio: float,
-    posterize_bits: int,
-    min_posterize_bits: int,
-    zlib_level: int,
-    max_chunk_kib: int,
-    frame_index_base: int = 0,
-    initial_previous_raw_frame: np.ndarray | None = None,
-) -> tuple[bytes, list[int], int, int, int, int, int, int, int, int]:
-    variants = [
-        (
-            max(change_ratio - 0.03, 0.0),
-            max(keyframe_block_ratio - 0.06, 0.10),
-            motion_search_radius + 2,
-            motion_search_step,
-            max(motion_error_ratio - 0.03, 0.0),
-            min(7, posterize_bits + 1) if posterize_bits > 0 else 0,
-        ),
-        (
-            max(change_ratio - 0.015, 0.0),
-            max(keyframe_block_ratio - 0.03, 0.10),
-            motion_search_radius + 2,
-            motion_search_step,
-            max(motion_error_ratio - 0.015, 0.0),
-            posterize_bits,
-        ),
-        (
-            change_ratio,
-            keyframe_block_ratio,
-            motion_search_radius,
-            motion_search_step,
-            motion_error_ratio,
-            posterize_bits,
-        ),
-    ]
-    if max_chunk_kib > 0:
-        variants.extend(
-            [
-                (
-                    min(change_ratio + 0.03, 0.60),
-                    min(keyframe_block_ratio + 0.03, 0.99),
-                    motion_search_radius,
-                    motion_search_step,
-                    min(motion_error_ratio + 0.04, 0.50),
-                    posterize_bits,
-                ),
-                (
-                    min(change_ratio + 0.06, 0.70),
-                    min(keyframe_block_ratio + 0.05, 0.99),
-                    motion_search_radius,
-                    motion_search_step,
-                    min(motion_error_ratio + 0.08, 0.60),
-                    posterize_bits,
-                ),
-                (
-                    min(change_ratio + 0.10, 0.80),
-                    min(keyframe_block_ratio + 0.08, 0.99),
-                    motion_search_radius,
-                    motion_search_step,
-                    min(motion_error_ratio + 0.12, 0.70),
-                    max(min_posterize_bits, max(1, posterize_bits - 1) if posterize_bits > 0 else 0),
-                ),
-                (
-                    min(change_ratio + 0.14, 0.90),
-                    min(keyframe_block_ratio + 0.10, 0.99),
-                    motion_search_radius,
-                    motion_search_step,
-                    min(motion_error_ratio + 0.16, 0.80),
-                    max(min_posterize_bits, max(1, posterize_bits - 1) if posterize_bits > 0 else 0),
-                ),
-                (
-                    min(change_ratio + 0.18, 0.92),
-                    min(keyframe_block_ratio + 0.14, 0.99),
-                    motion_search_radius,
-                    motion_search_step,
-                    min(motion_error_ratio + 0.22, 0.85),
-                    max(
-                        min_posterize_bits,
-                        max(1, posterize_bits - 2) if posterize_bits > 1 else (1 if posterize_bits > 0 else 0),
-                    ),
-                ),
-                (
-                    min(change_ratio + 0.24, 0.95),
-                    min(keyframe_block_ratio + 0.18, 0.99),
-                    motion_search_radius,
-                    motion_search_step,
-                    min(motion_error_ratio + 0.28, 0.90),
-                    max(
-                        min_posterize_bits,
-                        max(1, posterize_bits - 3) if posterize_bits > 2 else (1 if posterize_bits > 0 else 0),
-                    ),
-                ),
-            ]
-        )
-
-    limit_bytes = max_chunk_kib * 1024
-    best: tuple[bytes, list[int], int, int, int, int, int, int, int, int] | None = None
-    prepared_cache: dict[int, list[np.ndarray]] = {}
-
-    for tier_index, variant in enumerate(variants):
-        variant_posterize_bits = variant[5]
-        if variant_posterize_bits not in prepared_cache:
-            prepared_cache[variant_posterize_bits] = [
-                image_to_rgb565_words(preprocess_frame(frame, variant_posterize_bits))
-                for frame in raw_frames
-            ]
-        initial_previous_frame = None
-        if initial_previous_raw_frame is not None:
-            initial_previous_frame = image_to_rgb565_words(
-                preprocess_frame(initial_previous_raw_frame, variant_posterize_bits)
-            )
-        chunk_blob, frame_offsets, keyframes, predicted, repeated, block_updates, motion_copies, literal_blocks = encode_chunk(
-            prepared_cache[variant_posterize_bits],
-            block_size=block_size,
-            keyframe_interval=keyframe_interval,
-            change_ratio=variant[0],
-            keyframe_block_ratio=variant[1],
-            motion_search_radius=variant[2],
-            motion_search_step=variant[3],
-            motion_error_ratio=variant[4],
-            frame_index_base=frame_index_base,
-            initial_previous_frame=initial_previous_frame,
-        )
-        candidate = (
-            chunk_blob,
-            frame_offsets,
-            len(chunk_blob),
-            keyframes,
-            predicted,
-            repeated,
-            block_updates,
-            motion_copies,
-            literal_blocks,
-            tier_index,
-        )
-        if best is None or len(chunk_blob) < len(best[0]):
-            best = candidate
-        if limit_bytes <= 0 or len(chunk_blob) <= limit_bytes:
-            return candidate
-
-    if best is None:
-        raise RuntimeError("Chunk encoding unexpectedly produced no variants.")
-    return best
-
-
 def write_header(
     handle,
     *,
@@ -1128,10 +896,6 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         args.max_height,
     )
     expected_frames = int(round((args.duration or duration) * fps)) if duration else 0
-    estimated_chunk_total = math.ceil(expected_frames / args.chunk_frames) if expected_frames else 0
-    target_total_bytes = int(args.target_size_mib * 1024 * 1024) if args.target_size_mib > 0 else 0
-    average_chunk_budget = (target_total_bytes / estimated_chunk_total) if target_total_bytes > 0 and estimated_chunk_total > 0 else 0.0
-    budget_bank = 0.0
 
     log(
         f"Encoding {input_path.name} -> {target_width}x{target_height} @ {fps:.3f}fps "
@@ -1168,60 +932,29 @@ def encode(args: argparse.Namespace) -> EncodeStats:
     def flush_chunk() -> None:
         nonlocal chunk_count, keyframes, predicted, repeated, block_updates, motion_copies, literal_blocks
         nonlocal current_chunk_frames, previous_chunk_last_frame
-        nonlocal budget_bank
         if not current_chunk_frames:
             return
         first_frame = frame_count - len(current_chunk_frames)
-        chunk_budget_kib = args.max_chunk_kib
-        chunk_complexity = estimate_chunk_complexity(current_chunk_frames)
-        chunk_colorfulness = estimate_chunk_colorfulness(current_chunk_frames)
-        adaptive_change_ratio = args.change_ratio
-        adaptive_keyframe_block_ratio = args.keyframe_block_ratio
-        adaptive_posterize_bits = args.posterize_bits
-        min_posterize_bits = 0
-        adaptive_motion_error_ratio = args.motion_error_ratio
-        if chunk_colorfulness >= 0.24:
-            adaptive_change_ratio = max(0.0, adaptive_change_ratio - 0.015)
-            adaptive_keyframe_block_ratio = max(0.10, adaptive_keyframe_block_ratio - 0.05)
-            adaptive_motion_error_ratio = max(0.0, adaptive_motion_error_ratio - 0.02)
-            if args.posterize_bits > 0:
-                adaptive_posterize_bits = min(7, args.posterize_bits + 1)
-                min_posterize_bits = max(min_posterize_bits, args.posterize_bits)
-        elif chunk_colorfulness >= 0.16:
-            adaptive_change_ratio = max(0.0, adaptive_change_ratio - 0.008)
-            adaptive_keyframe_block_ratio = max(0.10, adaptive_keyframe_block_ratio - 0.03)
-            adaptive_motion_error_ratio = max(0.0, adaptive_motion_error_ratio - 0.01)
-            if args.posterize_bits > 0:
-                adaptive_posterize_bits = min(7, args.posterize_bits + 1)
-                min_posterize_bits = max(min_posterize_bits, args.posterize_bits)
-        if target_total_bytes > 0 and estimated_chunk_total > 0:
-            remaining_chunks = max(1, estimated_chunk_total - chunk_count)
-            remaining_bytes = max(0, target_total_bytes - output_handle.tell())
-            smoothed_budget = average_chunk_budget + max(
-                -average_chunk_budget * 0.60,
-                min(budget_bank, average_chunk_budget * 2.40),
+        prepared_frames = [
+            image_to_rgb565_words(preprocess_frame(frame, args.posterize_bits))
+            for frame in current_chunk_frames
+        ]
+        initial_previous_frame = None
+        if previous_chunk_last_frame is not None:
+            initial_previous_frame = image_to_rgb565_words(
+                preprocess_frame(previous_chunk_last_frame, args.posterize_bits)
             )
-            desired_budget = max(remaining_bytes / remaining_chunks, smoothed_budget)
-            desired_budget *= 0.72 + min(1.0, chunk_complexity / 0.16) * 0.98
-            desired_budget *= 1.0 + min(0.08, max(0.0, chunk_colorfulness - 0.18) * 0.30)
-            chunk_budget_kib = max(1, math.ceil(desired_budget / 1024))
-            if args.max_chunk_kib > 0:
-                chunk_budget_kib = min(chunk_budget_kib, args.max_chunk_kib)
-        chunk_blob, frame_offsets, chunk_unpacked_size, chunk_keyframes, chunk_predicted, chunk_repeated, chunk_blocks, chunk_motion, chunk_literal, chunk_tier = encode_chunk_budgeted(
-            current_chunk_frames,
+        chunk_blob, frame_offsets, chunk_keyframes, chunk_predicted, chunk_repeated, chunk_blocks, chunk_motion, chunk_literal = encode_chunk(
+            prepared_frames,
             block_size=args.block_size,
             keyframe_interval=args.keyframe_interval,
-            change_ratio=adaptive_change_ratio,
-            keyframe_block_ratio=adaptive_keyframe_block_ratio,
+            change_ratio=args.change_ratio,
+            keyframe_block_ratio=args.keyframe_block_ratio,
             motion_search_radius=args.motion_search_radius,
             motion_search_step=args.motion_search_step,
-            motion_error_ratio=adaptive_motion_error_ratio,
-            posterize_bits=adaptive_posterize_bits,
-            min_posterize_bits=min_posterize_bits,
-            zlib_level=args.zlib_level,
-            max_chunk_kib=chunk_budget_kib,
+            motion_error_ratio=args.motion_error_ratio,
             frame_index_base=first_frame,
-            initial_previous_raw_frame=previous_chunk_last_frame,
+            initial_previous_frame=initial_previous_frame,
         )
         stored_chunk_blob = bytearray()
         stored_chunk_blob += struct.pack("<I", len(chunk_blob))
@@ -1242,21 +975,16 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         block_updates += chunk_blocks
         motion_copies += chunk_motion
         literal_blocks += chunk_literal
-        if average_chunk_budget > 0:
-            budget_bank += average_chunk_budget - len(stored_blob)
         elapsed = time.time() - start_time
         progress = min(100.0, (frame_count / expected_frames) * 100.0) if expected_frames else 0.0
         fps_done = frame_count / elapsed if elapsed > 0 else 0.0
         eta_frames = max(0, expected_frames - frame_count) if expected_frames else 0
         eta = (eta_frames / fps_done) if fps_done > 0 and eta_frames else 0.0
         log(
-                f"Chunk {chunk_count:03d}: {progress:5.1f}% | ETA {format_duration_hms(eta)} | "
-                f"frames {first_frame}-{frame_count - 1} | size {len(stored_blob) / 1024:.1f} KiB | "
-                f"total size {total_size_bytes / (1024 * 1024):.2f} MiB | "
-                f"I={chunk_keyframes} P={chunk_predicted - chunk_repeated} N={chunk_repeated} M={chunk_motion} L={chunk_literal}"
-                f" | C={chunk_complexity:.3f}"
-            f"{'' if chunk_tier == 0 else f' | T={chunk_tier + 1}'}"
-            f"{'' if chunk_budget_kib <= 0 else f' | B={chunk_budget_kib}'}",
+            f"Chunk {chunk_count:03d}: {progress:5.1f}% | ETA {format_duration_hms(eta)} | "
+            f"frames {first_frame}-{frame_count - 1} | size {len(stored_blob) / 1024:.1f} KiB | "
+            f"total size {total_size_bytes / (1024 * 1024):.2f} MiB | "
+            f"I={chunk_keyframes} P={chunk_predicted - chunk_repeated} N={chunk_repeated} M={chunk_motion} L={chunk_literal}",
             quiet=args.quiet,
         )
         previous_chunk_last_frame = current_chunk_frames[-1].copy()
@@ -1348,8 +1076,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--motion-error-ratio", type=float, default=0.08, help="Allowed differing-pixel ratio for motion copied blocks")
     parser.add_argument("--posterize-bits", type=int, default=0, help="Optional 1-7 bit posterization per RGB channel before encoding")
     parser.add_argument("--zlib-level", type=int, default=9, help="Chunk compression level (0-9)")
-    parser.add_argument("--max-chunk-kib", type=int, default=0, help="Soft cap per compressed chunk; retries oversized chunks with more aggressive delta settings")
-    parser.add_argument("--target-size-mib", type=float, default=0.0, help="Approximate total output size target; smooths chunk budgets across the whole encode")
     parser.add_argument("--start", type=float, default=0.0, help="Optional clip start offset in seconds")
     parser.add_argument("--duration", type=float, help="Optional clip duration in seconds")
     parser.add_argument("--quiet", action="store_true", help="Silence progress logging")
