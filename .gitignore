@@ -1,0 +1,10 @@
+build/
+dist/
+movies/
+*.o
+*.elf
+*.tns
+*.zehn
+*.nvp
+*.json
+*.srt
