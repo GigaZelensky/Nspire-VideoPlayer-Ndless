@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <zlib.h>
 
@@ -22,6 +23,7 @@
 #define MAX_SUBTITLE_LINE_LEN 96
 #define PREFETCH_CHUNK_COUNT 5
 #define TIMER_TICKS_PER_SEC 32768U
+#define PREFETCH_MAX_TOTAL_BYTES (12U * 1024U * 1024U)
 #define POINTER_FIXED_SHIFT 6
 #define POINTER_UI_TIMEOUT_MS 1800U
 #define POINTER_GAIN_NUM 5
@@ -35,6 +37,8 @@
 #define MONOTONIC_TIMER_CLOCK_SOURCE_32768HZ 0x0AU
 #define MONOTONIC_TIMER_CONTROL_ENABLE_32BIT 0x82U
 #define MONOTONIC_TIMER_MAX_DELTA_TICKS (TIMER_TICKS_PER_SEC * 10U)
+#define DEBUG_RING_SIZE 64
+#define DEBUG_LINE_LEN 128
 
 #pragma pack(push, 1)
 typedef struct {
@@ -115,6 +119,20 @@ typedef struct {
     const char *label;
 } PlaybackRate;
 
+typedef enum {
+    MEMORY_OVERLAY_OFF = 0,
+    MEMORY_OVERLAY_ALWAYS,
+} MemoryOverlayMode;
+
+typedef struct {
+    bool valid;
+    size_t used_bytes;
+    size_t prefetched_bytes;
+    size_t free_bytes;
+    size_t total_bytes;
+    unsigned percent_used;
+} MemoryStats;
+
 typedef struct {
     touchpad_info_t *info;
     int x;
@@ -187,6 +205,9 @@ typedef struct {
 } MonotonicClock;
 
 static MonotonicClock g_clock;
+static char g_debug_ring[DEBUG_RING_SIZE][DEBUG_LINE_LEN];
+static size_t g_debug_ring_count = 0;
+static size_t g_debug_ring_next = 0;
 static const PlaybackRate g_playback_rates[] = {
     {1, 4, "0.25x"},
     {1, 2, "0.5x"},
@@ -225,6 +246,153 @@ static void clear_prefetched_chunk(PrefetchedChunk *chunk);
 static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk);
 static void prefetch_do_work(Movie *movie, int current_chunk, uint32_t deadline_ms);
 static void free_fonts(Fonts *fonts);
+static uint32_t monotonic_clock_now_ms(void);
+
+static void debug_tracef(const char *fmt, ...)
+{
+    char line[DEBUG_LINE_LEN];
+    size_t slot_index;
+    va_list args;
+    uint32_t now_ms = g_clock.initialized ? monotonic_clock_now_ms() : 0;
+
+    va_start(args, fmt);
+    vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+
+    slot_index = g_debug_ring_next;
+    snprintf(
+        g_debug_ring[slot_index],
+        sizeof(g_debug_ring[slot_index]),
+        "[%10lu] %.*s",
+        (unsigned long) now_ms,
+        (int) (sizeof(g_debug_ring[slot_index]) - 14),
+        line
+    );
+    g_debug_ring_next = (g_debug_ring_next + 1U) % DEBUG_RING_SIZE;
+    if (g_debug_ring_count < DEBUG_RING_SIZE) {
+        g_debug_ring_count++;
+    }
+}
+
+static void debug_dump_recent(const char *path)
+{
+    FILE *log_file;
+    size_t index;
+
+    if (!path) {
+        return;
+    }
+    log_file = fopen(path, "wb");
+    if (!log_file) {
+        return;
+    }
+    fputs("ND Video Player recent debug log\n", log_file);
+    for (index = 0; index < g_debug_ring_count; ++index) {
+        size_t ring_index = (g_debug_ring_next + DEBUG_RING_SIZE - g_debug_ring_count + index) % DEBUG_RING_SIZE;
+        fputs(g_debug_ring[ring_index], log_file);
+        fputc('\n', log_file);
+    }
+    fclose(log_file);
+}
+
+static size_t total_prefetched_chunk_bytes(const Movie *movie)
+{
+    size_t total = 0;
+    int index;
+
+    if (!movie) {
+        return 0;
+    }
+    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+        if (movie->prefetched[index].chunk_index >= 0 && movie->prefetched[index].chunk_storage) {
+            total += movie->prefetched[index].chunk_storage_size;
+        }
+    }
+    return total;
+}
+
+static void clear_all_prefetched_chunks(Movie *movie)
+{
+    int index;
+
+    if (!movie) {
+        return;
+    }
+    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+        clear_prefetched_chunk(&movie->prefetched[index]);
+    }
+}
+
+static PrefetchedChunk *find_farthest_prefetched_chunk(Movie *movie)
+{
+    PrefetchedChunk *victim = NULL;
+    int index;
+
+    if (!movie) {
+        return NULL;
+    }
+    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+        PrefetchedChunk *candidate = &movie->prefetched[index];
+        if (candidate->chunk_index < 0) {
+            continue;
+        }
+        if (!victim || candidate->chunk_index > victim->chunk_index) {
+            victim = candidate;
+        }
+    }
+    return victim;
+}
+
+static bool ensure_prefetch_budget(Movie *movie, int requested_chunk, size_t required_bytes)
+{
+    size_t total_bytes;
+
+    if (!movie) {
+        return false;
+    }
+    total_bytes = total_prefetched_chunk_bytes(movie);
+    while (total_bytes + required_bytes > PREFETCH_MAX_TOTAL_BYTES) {
+        PrefetchedChunk *victim = find_farthest_prefetched_chunk(movie);
+        if (!victim || victim->chunk_index <= requested_chunk) {
+            debug_tracef(
+                "prefetch budget skip chunk=%d need=%lu total=%lu cap=%lu",
+                requested_chunk,
+                (unsigned long) required_bytes,
+                (unsigned long) total_bytes,
+                (unsigned long) PREFETCH_MAX_TOTAL_BYTES
+            );
+            return false;
+        }
+        debug_tracef(
+            "prefetch evict chunk=%d for chunk=%d total=%lu need=%lu",
+            victim->chunk_index,
+            requested_chunk,
+            (unsigned long) total_bytes,
+            (unsigned long) required_bytes
+        );
+        clear_prefetched_chunk(victim);
+        total_bytes = total_prefetched_chunk_bytes(movie);
+    }
+    return true;
+}
+
+static void report_movie_decode_failure(const Movie *movie, const char *reason)
+{
+    if (movie) {
+        debug_tracef(
+            "decode failed reason=%s frame=%lu loaded_chunk=%d decoded_local=%d prefetched=%lu",
+            reason ? reason : "unknown",
+            (unsigned long) movie->current_frame,
+            movie->loaded_chunk,
+            movie->decoded_local_frame,
+            (unsigned long) total_prefetched_chunk_bytes(movie)
+        );
+    } else {
+        debug_tracef("decode failed reason=%s", reason ? reason : "unknown");
+    }
+    debug_dump_recent("ndvideo-debug.log");
+    show_msgbox("ND Video Player", "Movie decode failed.");
+}
 
 static uint16_t read_le16(const uint8_t *src)
 {
@@ -449,6 +617,80 @@ static void format_clock(uint32_t total_ms, char *buffer, size_t buffer_size)
             (unsigned long) minutes,
             (unsigned long) seconds);
     }
+}
+
+static MemoryStats query_memory_stats(const Movie *movie)
+{
+    MemoryStats stats;
+    size_t framebuffer_words;
+    size_t block_scratch_words;
+    int index;
+
+    memset(&stats, 0, sizeof(stats));
+    if (!movie) {
+        return stats;
+    }
+
+    if (movie->chunk_index) {
+        stats.used_bytes += (size_t) movie->header.chunk_count * sizeof(ChunkIndexEntry);
+    }
+    if (movie->subtitles) {
+        stats.used_bytes += (size_t) movie->header.subtitle_count * sizeof(SubtitleCue);
+    }
+
+    framebuffer_words = (size_t) movie->header.video_width * movie->header.video_height;
+    if (movie->framebuffer) {
+        stats.used_bytes += framebuffer_words * sizeof(uint16_t);
+    }
+    if (movie->previous_framebuffer) {
+        stats.used_bytes += framebuffer_words * sizeof(uint16_t);
+    }
+
+    block_scratch_words = (size_t) ((movie->header.video_width > (movie->header.block_size * movie->header.block_size))
+        ? movie->header.video_width
+        : (movie->header.block_size * movie->header.block_size));
+    if (movie->block_scratch) {
+        stats.used_bytes += block_scratch_words * sizeof(uint16_t);
+    }
+    if (movie->frame_offsets && movie->loaded_chunk >= 0 && (uint32_t) movie->loaded_chunk < movie->header.chunk_count) {
+        stats.used_bytes += (size_t) movie->chunk_index[movie->loaded_chunk].frame_count * sizeof(uint32_t);
+    }
+    if (movie->chunk_storage) {
+        stats.used_bytes += movie->chunk_storage_size;
+    }
+
+    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+        if (movie->prefetched[index].chunk_index >= 0 && movie->prefetched[index].chunk_storage) {
+            stats.prefetched_bytes += movie->prefetched[index].chunk_storage_size;
+        }
+    }
+
+    stats.used_bytes += stats.prefetched_bytes;
+    stats.total_bytes = PREFETCH_MAX_TOTAL_BYTES;
+    stats.free_bytes = stats.total_bytes > stats.prefetched_bytes
+        ? (stats.total_bytes - stats.prefetched_bytes)
+        : 0;
+    if (stats.total_bytes > 0) {
+        stats.percent_used = (unsigned) (((stats.prefetched_bytes * 100U) + (stats.total_bytes / 2U)) / stats.total_bytes);
+        if (stats.percent_used > 100U) {
+            stats.percent_used = 100U;
+        }
+    }
+    stats.valid = true;
+    return stats;
+}
+
+static void format_memory_compact(size_t bytes, char *buffer, size_t buffer_size)
+{
+    const size_t mib = 1024U * 1024U;
+    size_t whole = bytes / mib;
+    size_t tenth = ((bytes % mib) * 10U + (mib / 2U)) / mib;
+
+    if (tenth >= 10U) {
+        whole++;
+        tenth = 0;
+    }
+    snprintf(buffer, buffer_size, "%lu.%luM", (unsigned long) whole, (unsigned long) tenth);
 }
 
 static uint64_t movie_frame_interval_ticks(const Movie *movie)
@@ -1744,11 +1986,109 @@ static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk)
     return chunk->state == PREFETCH_READY;
 }
 
+static bool load_chunk_from_file(Movie *movie, int chunk_index, bool allow_prefetch_retry)
+{
+    const ChunkIndexEntry *entry = movie->chunk_index + chunk_index;
+    uint8_t *packed_bytes = NULL;
+    uLongf unpacked_size;
+
+retry:
+    free(movie->chunk_storage);
+    movie->chunk_storage = NULL;
+    movie->chunk_storage_size = 0;
+
+    packed_bytes = (uint8_t *) malloc(entry->packed_size);
+    if (!packed_bytes) {
+        if (allow_prefetch_retry && total_prefetched_chunk_bytes(movie) > 0) {
+            debug_tracef(
+                "load chunk=%d retry after packed alloc fail packed=%lu prefetched=%lu",
+                chunk_index,
+                (unsigned long) entry->packed_size,
+                (unsigned long) total_prefetched_chunk_bytes(movie)
+            );
+            clear_all_prefetched_chunks(movie);
+            allow_prefetch_retry = false;
+            goto retry;
+        }
+        debug_tracef("load chunk=%d packed alloc fail packed=%lu", chunk_index, (unsigned long) entry->packed_size);
+        return false;
+    }
+    if (fseek(movie->file, (long) entry->offset, SEEK_SET) != 0) {
+        debug_tracef("load chunk=%d fseek fail offset=%lu", chunk_index, (unsigned long) entry->offset);
+        free(packed_bytes);
+        return false;
+    }
+    if (fread(packed_bytes, 1, entry->packed_size, movie->file) != entry->packed_size) {
+        debug_tracef("load chunk=%d fread fail packed=%lu", chunk_index, (unsigned long) entry->packed_size);
+        free(packed_bytes);
+        return false;
+    }
+    if (entry->packed_size != entry->unpacked_size) {
+        movie->chunk_storage = (uint8_t *) malloc(entry->unpacked_size);
+        if (!movie->chunk_storage) {
+            free(packed_bytes);
+            if (allow_prefetch_retry && total_prefetched_chunk_bytes(movie) > 0) {
+                debug_tracef(
+                    "load chunk=%d retry after unpacked alloc fail unpacked=%lu prefetched=%lu",
+                    chunk_index,
+                    (unsigned long) entry->unpacked_size,
+                    (unsigned long) total_prefetched_chunk_bytes(movie)
+                );
+                clear_all_prefetched_chunks(movie);
+                allow_prefetch_retry = false;
+                goto retry;
+            }
+            debug_tracef("load chunk=%d unpacked alloc fail unpacked=%lu", chunk_index, (unsigned long) entry->unpacked_size);
+            return false;
+        }
+        unpacked_size = entry->unpacked_size;
+        if (uncompress(movie->chunk_storage, &unpacked_size, packed_bytes, entry->packed_size) != Z_OK || unpacked_size != entry->unpacked_size) {
+            debug_tracef(
+                "load chunk=%d uncompress fail packed=%lu unpacked=%lu actual=%lu",
+                chunk_index,
+                (unsigned long) entry->packed_size,
+                (unsigned long) entry->unpacked_size,
+                (unsigned long) unpacked_size
+            );
+            free(packed_bytes);
+            free(movie->chunk_storage);
+            movie->chunk_storage = NULL;
+            return false;
+        }
+        free(packed_bytes);
+        movie->chunk_storage_size = entry->unpacked_size;
+    } else {
+        movie->chunk_storage = packed_bytes;
+        movie->chunk_storage_size = entry->packed_size;
+    }
+    if (!configure_chunk_view(movie, chunk_index)) {
+        debug_tracef(
+            "load chunk=%d configure fail storage=%lu frame_count=%u table=%lu",
+            chunk_index,
+            (unsigned long) movie->chunk_storage_size,
+            (unsigned) entry->frame_count,
+            (unsigned long) entry->frame_table_offset
+        );
+        free(movie->chunk_storage);
+        movie->chunk_storage = NULL;
+        movie->chunk_storage_size = 0;
+        return false;
+    }
+    movie->loaded_chunk = chunk_index;
+    movie->decoded_local_frame = -1;
+    debug_tracef(
+        "load chunk=%d sync packed=%lu unpacked=%lu prefetched=%lu",
+        chunk_index,
+        (unsigned long) entry->packed_size,
+        (unsigned long) entry->unpacked_size,
+        (unsigned long) total_prefetched_chunk_bytes(movie)
+    );
+    return true;
+}
+
 static bool load_chunk(Movie *movie, int chunk_index)
 {
     const ChunkIndexEntry *entry;
-    uint8_t *packed_bytes = NULL;
-    uLongf unpacked_size;
     PrefetchedChunk *prefetched;
     if (chunk_index < 0 || (uint32_t) chunk_index >= movie->header.chunk_count) {
         return false;
@@ -1762,8 +2102,16 @@ static bool load_chunk(Movie *movie, int chunk_index)
     if (prefetched) {
         if (prefetched->state != PREFETCH_READY) {
             if (!prefetch_finish_chunk(movie, prefetched)) {
+                debug_tracef(
+                    "prefetch finish fail chunk=%d state=%d read=%lu write=%lu avail_in=%u",
+                    chunk_index,
+                    (int) prefetched->state,
+                    (unsigned long) prefetched->read_offset,
+                    (unsigned long) prefetched->inflate_write_offset,
+                    prefetched->stream.avail_in
+                );
                 clear_prefetched_chunk(prefetched);
-                return false;
+                return load_chunk_from_file(movie, chunk_index, true);
             }
         }
         free(movie->chunk_storage);
@@ -1772,53 +2120,31 @@ static bool load_chunk(Movie *movie, int chunk_index)
         prefetched->chunk_storage = NULL;
         reset_prefetched_chunk(prefetched);
         if (!configure_chunk_view(movie, chunk_index)) {
-            return false;
+            debug_tracef(
+                "prefetched configure fail chunk=%d storage=%lu frame_count=%u table=%lu",
+                chunk_index,
+                (unsigned long) movie->chunk_storage_size,
+                (unsigned) entry->frame_count,
+                (unsigned long) entry->frame_table_offset
+            );
+            free(movie->chunk_storage);
+            movie->chunk_storage = NULL;
+            movie->chunk_storage_size = 0;
+            return load_chunk_from_file(movie, chunk_index, false);
         }
         movie->loaded_chunk = chunk_index;
         movie->decoded_local_frame = -1;
+        debug_tracef(
+            "load chunk=%d prefetched packed=%lu unpacked=%lu prefetched=%lu",
+            chunk_index,
+            (unsigned long) entry->packed_size,
+            (unsigned long) entry->unpacked_size,
+            (unsigned long) total_prefetched_chunk_bytes(movie)
+        );
         return true;
     }
 
-    free(movie->chunk_storage);
-    movie->chunk_storage = NULL;
-    movie->chunk_storage_size = 0;
-    packed_bytes = (uint8_t *) malloc(entry->packed_size);
-    if (!packed_bytes) {
-        return false;
-    }
-    if (fseek(movie->file, (long) entry->offset, SEEK_SET) != 0) {
-        free(packed_bytes);
-        return false;
-    }
-    if (fread(packed_bytes, 1, entry->packed_size, movie->file) != entry->packed_size) {
-        free(packed_bytes);
-        return false;
-    }
-    if (entry->packed_size != entry->unpacked_size) {
-        movie->chunk_storage = (uint8_t *) malloc(entry->unpacked_size);
-        if (!movie->chunk_storage) {
-            free(packed_bytes);
-            return false;
-        }
-        unpacked_size = entry->unpacked_size;
-        if (uncompress(movie->chunk_storage, &unpacked_size, packed_bytes, entry->packed_size) != Z_OK || unpacked_size != entry->unpacked_size) {
-            free(packed_bytes);
-            free(movie->chunk_storage);
-            movie->chunk_storage = NULL;
-            return false;
-        }
-        free(packed_bytes);
-        movie->chunk_storage_size = entry->unpacked_size;
-    } else {
-        movie->chunk_storage = packed_bytes;
-        movie->chunk_storage_size = entry->packed_size;
-    }
-    if (!configure_chunk_view(movie, chunk_index)) {
-        return false;
-    }
-    movie->loaded_chunk = chunk_index;
-    movie->decoded_local_frame = -1;
-    return true;
+    return load_chunk_from_file(movie, chunk_index, true);
 }
 
 static bool prefetch_chunk(Movie *movie, int chunk_index)
@@ -1850,9 +2176,18 @@ static bool prefetch_chunk(Movie *movie, int chunk_index)
     }
 
     entry = movie->chunk_index + chunk_index;
+    if (!ensure_prefetch_budget(movie, chunk_index, entry->unpacked_size)) {
+        return false;
+    }
     clear_prefetched_chunk(slot);
     slot->chunk_storage = (uint8_t *) malloc(entry->unpacked_size);
     if (!slot->chunk_storage) {
+        debug_tracef(
+            "prefetch alloc fail chunk=%d unpacked=%lu total=%lu",
+            chunk_index,
+            (unsigned long) entry->unpacked_size,
+            (unsigned long) total_prefetched_chunk_bytes(movie)
+        );
         return false;
     }
     slot->chunk_storage_size = entry->unpacked_size;
@@ -1864,11 +2199,19 @@ static bool prefetch_chunk(Movie *movie, int chunk_index)
     if (entry->packed_size != entry->unpacked_size) {
         memset(&slot->stream, 0, sizeof(slot->stream));
         if (inflateInit(&slot->stream) != Z_OK) {
+            debug_tracef("prefetch inflateInit fail chunk=%d", chunk_index);
             clear_prefetched_chunk(slot);
             return false;
         }
         slot->inflate_initialized = true;
     }
+    debug_tracef(
+        "prefetch start chunk=%d packed=%lu unpacked=%lu total=%lu",
+        chunk_index,
+        (unsigned long) entry->packed_size,
+        (unsigned long) entry->unpacked_size,
+        (unsigned long) total_prefetched_chunk_bytes(movie)
+    );
     return true;
 }
 
@@ -1908,6 +2251,14 @@ static void prefetch_do_work(Movie *movie, int current_chunk, uint32_t deadline_
             break;
         }
         if (!prefetch_process_chunk(movie, slot, deadline_ms, true)) {
+            debug_tracef(
+                "prefetch work fail chunk=%d state=%d read=%lu write=%lu avail_in=%u",
+                slot->chunk_index,
+                (int) slot->state,
+                (unsigned long) slot->read_offset,
+                (unsigned long) slot->inflate_write_offset,
+                slot->stream.avail_in
+            );
             clear_prefetched_chunk(slot);
             break;
         }
@@ -1985,9 +2336,11 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
     bool have_contiguous_seed = false;
 
     if (chunk_index < 0) {
+        debug_tracef("decode frame=%lu invalid chunk", (unsigned long) frame_index);
         return false;
     }
     if (!load_chunk(movie, chunk_index)) {
+        debug_tracef("decode frame=%lu load chunk=%d fail", (unsigned long) frame_index, chunk_index);
         return false;
     }
     entry = movie->chunk_index + chunk_index;
@@ -2002,9 +2355,16 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
         if (!have_contiguous_seed) {
             uint32_t seed_frame = entry->first_frame - 1;
             if (!decode_to_frame(movie, seed_frame)) {
+                debug_tracef(
+                    "decode frame=%lu seed frame=%lu fail chunk=%d",
+                    (unsigned long) frame_index,
+                    (unsigned long) seed_frame,
+                    chunk_index
+                );
                 return false;
             }
             if (!load_chunk(movie, chunk_index)) {
+                debug_tracef("decode frame=%lu reload chunk=%d after seed fail", (unsigned long) frame_index, chunk_index);
                 return false;
             }
             entry = movie->chunk_index + chunk_index;
@@ -2020,6 +2380,16 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
             ? movie->frame_offsets[replay_index + 1]
             : movie->chunk_size;
         if (!decode_frame_record(movie, movie->chunk_bytes + start, end - start)) {
+            debug_tracef(
+                "frame decode fail frame=%lu chunk=%d local=%lu tag=%c start=%lu end=%lu size=%lu",
+                (unsigned long) (entry->first_frame + replay_index),
+                chunk_index,
+                (unsigned long) replay_index,
+                (end > start && movie->chunk_bytes) ? movie->chunk_bytes[start] : '?',
+                (unsigned long) start,
+                (unsigned long) end,
+                (unsigned long) (end - start)
+            );
             return false;
         }
         movie->decoded_local_frame = (int) replay_index;
@@ -2680,17 +3050,26 @@ static int draw_text_badge(SDL_Surface *screen, const Fonts *fonts, int right_x,
     int text_w = nSDL_GetStringWidth(fonts->white, label);
     SDL_Rect badge = {(Sint16) (right_x - text_w - 10), (Sint16) y, (Uint16) (text_w + 10), 16};
     SDL_FillRect(screen, &badge, SDL_MapRGB(screen->format, 18, 18, 24));
-    nSDL_DrawString(screen, fonts->white, badge.x + 5, badge.y + 4, label);
+    nSDL_DrawString(screen, fonts->white, badge.x + 5, badge.y + 4, "%s", label);
     return badge.x - 6;
 }
 
-static void draw_status_badges(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *video_rect, ScaleMode scale_mode, const PlaybackRate *playback_rate)
+static int draw_left_text_badge(SDL_Surface *screen, const Fonts *fonts, int left_x, int y, const char *label)
+{
+    int text_w = nSDL_GetStringWidth(fonts->white, label);
+    SDL_Rect badge = {(Sint16) left_x, (Sint16) y, (Uint16) (text_w + 10), 16};
+    SDL_FillRect(screen, &badge, SDL_MapRGB(screen->format, 18, 18, 24));
+    nSDL_DrawString(screen, fonts->white, badge.x + 5, badge.y + 4, "%s", label);
+    return badge.x + badge.w + 6;
+}
+
+static int draw_status_badges(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *video_rect, ScaleMode scale_mode, const PlaybackRate *playback_rate)
 {
     int right_x = SCREEN_W - 8;
     int y = top_overlay_y_for_rect(video_rect, 16);
 
     right_x = draw_text_badge(screen, fonts, right_x, y, playback_rate ? playback_rate->label : "1.0x");
-    draw_text_badge(screen, fonts, right_x, y, scale_mode_text(scale_mode));
+    return draw_text_badge(screen, fonts, right_x, y, scale_mode_text(scale_mode));
 }
 
 static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect, bool paused)
@@ -2724,6 +3103,55 @@ static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect,
     }
 }
 
+static void draw_memory_badge(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    const Movie *movie,
+    const SDL_Rect *video_rect,
+    int right_limit,
+    bool playback_badge_visible
+)
+{
+    MemoryStats stats = query_memory_stats(movie);
+    char app_text[16];
+    char prefetched_text[16];
+    char total_text[16];
+    char free_text[16];
+    char label_full[80];
+    char label_medium[64];
+    char label_short[48];
+    const char *label = NULL;
+    int left_x;
+    int y;
+
+    if (!stats.valid) {
+        return;
+    }
+
+    format_memory_compact(stats.used_bytes, app_text, sizeof(app_text));
+    format_memory_compact(stats.prefetched_bytes, prefetched_text, sizeof(prefetched_text));
+    format_memory_compact(stats.total_bytes, total_text, sizeof(total_text));
+    format_memory_compact(stats.free_bytes, free_text, sizeof(free_text));
+    snprintf(label_full, sizeof(label_full), "RAM %s P%s/%s %u%% F%s", app_text, prefetched_text, total_text, stats.percent_used, free_text);
+    snprintf(label_medium, sizeof(label_medium), "RAM %s P%s %u%%", app_text, prefetched_text, stats.percent_used);
+    snprintf(label_short, sizeof(label_short), "RAM %s %u%%", app_text, stats.percent_used);
+
+    left_x = playback_badge_visible ? 36 : 8;
+    y = top_overlay_y_for_rect(video_rect, 16);
+
+    if (left_x + nSDL_GetStringWidth(fonts->white, label_full) + 10 <= right_limit) {
+        label = label_full;
+    } else if (left_x + nSDL_GetStringWidth(fonts->white, label_medium) + 10 <= right_limit) {
+        label = label_medium;
+    } else if (left_x + nSDL_GetStringWidth(fonts->white, label_short) + 10 <= right_limit) {
+        label = label_short;
+    }
+
+    if (label) {
+        draw_left_text_badge(screen, fonts, left_x, y, label);
+    }
+}
+
 static void draw_help_row(SDL_Surface *screen, const Fonts *fonts, int x, int y, int panel_w, const char *shortcut, const char *description)
 {
     SDL_Rect row_rect = {(Sint16) x, (Sint16) (y - 2), (Uint16) panel_w, 13};
@@ -2731,8 +3159,8 @@ static void draw_help_row(SDL_Surface *screen, const Fonts *fonts, int x, int y,
 
     SDL_FillRect(screen, &row_rect, SDL_MapRGB(screen->format, 10, 14, 20));
     SDL_FillRect(screen, &key_rect, SDL_MapRGB(screen->format, 18, 24, 34));
-    nSDL_DrawString(screen, fonts->white, x + 6, y, shortcut);
-    nSDL_DrawString(screen, fonts->white, x + 80, y, description);
+    nSDL_DrawString(screen, fonts->white, x + 6, y, "%s", shortcut);
+    nSDL_DrawString(screen, fonts->white, x + 80, y, "%s", description);
 }
 
 static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
@@ -2743,7 +3171,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     SDL_Rect accent = {14, 36, 288, 2};
     SDL_Rect footer = {14, 182, 288, 12};
     const char *close_text = "CAT close";
-    int y = 40;
+    int y = 38;
 
     SDL_FillRect(screen, &shadow, SDL_MapRGB(screen->format, 0, 0, 0));
     SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 8, 10, 14));
@@ -2752,7 +3180,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     SDL_FillRect(screen, &footer, SDL_MapRGB(screen->format, 12, 18, 28));
 
     nSDL_DrawString(screen, fonts->white, panel.x + 10, panel.y + 6, "Playback Controls");
-    nSDL_DrawString(screen, fonts->white, panel.x + panel.w - 10 - nSDL_GetStringWidth(fonts->white, close_text), panel.y + 6, close_text);
+    nSDL_DrawString(screen, fonts->white, panel.x + panel.w - 10 - nSDL_GetStringWidth(fonts->white, close_text), panel.y + 6, "%s", close_text);
 
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "ENTER", "Play or pause");
     y += 12;
@@ -2771,6 +3199,8 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "+ / -", "Subtitle size");
     y += 12;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "F", "Cycle subtitle font");
+    y += 12;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "M", "Memory overlay");
     y += 12;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "TOUCHPAD", "Move cursor / show UI");
     y += 12;
@@ -2824,12 +3254,13 @@ static void draw_progress(
     format_clock(duration_ms > current_ms ? (duration_ms - current_ms) : 0, remaining_text, sizeof(remaining_text));
     snprintf(left_text, sizeof(left_text), "%s / %s", current_text, total_text);
     snprintf(right_text, sizeof(right_text), "-%s", remaining_text);
-    nSDL_DrawString(screen, fonts->white, 12, SCREEN_H - UI_BAR_H + 7, left_text);
+    nSDL_DrawString(screen, fonts->white, 12, SCREEN_H - UI_BAR_H + 7, "%s", left_text);
     nSDL_DrawString(
         screen,
         fonts->white,
         SCREEN_W - 12 - nSDL_GetStringWidth(fonts->white, right_text),
         SCREEN_H - UI_BAR_H + 7,
+        "%s",
         right_text
     );
 }
@@ -2843,6 +3274,7 @@ static void render_movie(
     bool help_menu_open,
     ScaleMode scale_mode,
     const PlaybackRate *playback_rate,
+    MemoryOverlayMode memory_overlay_mode,
     size_t subtitle_font_index,
     bool subtitle_font_overlay_visible,
     int subtitle_size,
@@ -2852,8 +3284,11 @@ static void render_movie(
 {
     SDL_Rect src;
     SDL_Rect dst;
+    int memory_right_limit = SCREEN_W - 8;
     uint32_t current_ms = movie_frame_time_ms(movie, movie->current_frame);
     const char *subtitle = active_subtitle(movie, current_ms);
+    bool playback_badge_visible = show_ui && !help_menu_open;
+    bool memory_badge_visible = !help_menu_open && (memory_overlay_mode == MEMORY_OVERLAY_ALWAYS);
 
     compute_video_rects(movie, scale_mode, &src, &dst);
     SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
@@ -2879,13 +3314,18 @@ static void render_movie(
     }
     if (show_ui) {
         if (!help_menu_open) {
-            draw_playback_badge(screen, &dst, paused);
-            draw_status_badges(screen, fonts, &dst, scale_mode, playback_rate);
+            if (playback_badge_visible) {
+                draw_playback_badge(screen, &dst, paused);
+            }
+            memory_right_limit = draw_status_badges(screen, fonts, &dst, scale_mode, playback_rate);
         }
         draw_progress(screen, fonts, movie, current_ms, pointer);
         if (!help_menu_open && pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
+    }
+    if (memory_badge_visible) {
+        draw_memory_badge(screen, fonts, movie, &dst, memory_right_limit, playback_badge_visible);
     }
     if (help_menu_open) {
         draw_help_menu(screen, fonts);
@@ -2923,17 +3363,17 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
             SDL_Rect accent = {8, (Sint16) (y - 4), 4, 18};
             SDL_FillRect(screen, &row, SDL_MapRGB(screen->format, 26, 118, 180));
             SDL_FillRect(screen, &accent, SDL_MapRGB(screen->format, 32, 182, 255));
-            nSDL_DrawString(screen, fonts->white, 24, y, files[index].name);
+            nSDL_DrawString(screen, fonts->white, 24, y, "%s", files[index].name);
         } else {
             SDL_FillRect(screen, &row, SDL_MapRGB(screen->format, 16, 20, 28));
-            nSDL_DrawString(screen, fonts->white, 12, y, files[index].name);
+            nSDL_DrawString(screen, fonts->white, 12, y, "%s", files[index].name);
         }
         y += 20;
     }
     {
         char footer[32];
         snprintf(footer, sizeof(footer), "%lu file(s)", (unsigned long) count);
-        nSDL_DrawString(screen, fonts->white, SCREEN_W - 10 - nSDL_GetStringWidth(fonts->white, footer), SCREEN_H - 16, footer);
+        nSDL_DrawString(screen, fonts->white, SCREEN_W - 10 - nSDL_GetStringWidth(fonts->white, footer), SCREEN_H - 16, "%s", footer);
     }
     SDL_Flip(screen);
 }
@@ -3038,6 +3478,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     bool prev_lthan = false;
     bool prev_gthan = false;
     bool prev_f = false;
+    bool prev_m = false;
     bool prev_plus = false;
     bool prev_minus = false;
     bool paused = false;
@@ -3051,18 +3492,28 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     ScaleMode scale_mode = SCALE_FIT;
     size_t playback_rate_index = PLAYBACK_RATE_DEFAULT_INDEX;
     size_t subtitle_font_index = SUBTITLE_FONT_DEFAULT_INDEX;
+    MemoryOverlayMode memory_overlay_mode = MEMORY_OVERLAY_OFF;
     int subtitle_size = 0;
     SubtitlePlacement subtitle_placement = SUBTITLE_POS_BAR_BOTTOM;
     PointerState pointer;
     bool help_menu_open = false;
     bool help_resume_playback = false;
 
+    g_debug_ring_count = 0;
+    g_debug_ring_next = 0;
     if (!load_movie(path, &movie)) {
         show_msgbox("ND Video Player", "Failed to open movie file.");
         return -1;
     }
+    debug_tracef(
+        "play start path=%s frames=%lu chunks=%lu",
+        path,
+        (unsigned long) movie.header.frame_count,
+        (unsigned long) movie.header.chunk_count
+    );
     pointer_init(&pointer);
     prev_tab = isKeyPressed(KEY_NSPIRE_TAB);
+    prev_m = isKeyPressed(KEY_NSPIRE_M);
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
     playback_anchor_ticks = monotonic_clock_now_ticks();
     playback_anchor_frame = movie.current_frame;
@@ -3091,6 +3542,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         bool speed_down_edge = lp_edge || lthan_edge;
         bool speed_up_edge = rp_edge || gthan_edge;
         bool subtitle_font_edge = key_pressed_edge(KEY_NSPIRE_F, &prev_f);
+        bool memory_overlay_edge = key_pressed_edge(KEY_NSPIRE_M, &prev_m);
         bool click_edge = key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click);
 
         if (pointer.moved || pointer_click) {
@@ -3142,6 +3594,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 true,
                 scale_mode,
                 playback_rate,
+                memory_overlay_mode,
                 subtitle_font_index,
                 false,
                 subtitle_size,
@@ -3207,12 +3660,18 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             subtitle_font_overlay_until = now_ms + SUBTITLE_FONT_OVERLAY_MS;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
+        if (memory_overlay_edge) {
+            memory_overlay_mode = (memory_overlay_mode == MEMORY_OVERLAY_OFF)
+                ? MEMORY_OVERLAY_ALWAYS
+                : MEMORY_OVERLAY_OFF;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
         if (tab_edge) {
             if (!paused) {
                 paused = true;
             } else if (movie.current_frame + 1 < movie.header.frame_count) {
                 if (!decode_to_frame(&movie, movie.current_frame + 1)) {
-                    show_msgbox("ND Video Player", "Movie decode failed.");
+                    report_movie_decode_failure(&movie, "tab step");
                     result = -1;
                     break;
                 }
@@ -3246,7 +3705,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 if (target_frame >= movie.header.frame_count) {
                     if (movie.current_frame + 1 < movie.header.frame_count) {
                         if (!decode_to_frame(&movie, movie.header.frame_count - 1)) {
-                            show_msgbox("ND Video Player", "Movie decode failed.");
+                            report_movie_decode_failure(&movie, "final frame");
                             result = -1;
                             break;
                         }
@@ -3255,7 +3714,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                     ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
                 } else {
                     if (target_frame > movie.current_frame && !decode_to_frame(&movie, target_frame)) {
-                        show_msgbox("ND Video Player", "Movie decode failed.");
+                        report_movie_decode_failure(&movie, "playback advance");
                         result = -1;
                         break;
                     }
@@ -3273,6 +3732,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             false,
             scale_mode,
             playback_rate,
+            memory_overlay_mode,
             subtitle_font_index,
             now_ms <= subtitle_font_overlay_until,
             subtitle_size,
