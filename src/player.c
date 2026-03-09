@@ -22,15 +22,13 @@
 #define MAX_PATH_LEN 512
 #define MAX_SUBTITLE_LINES 3
 #define MAX_SUBTITLE_LINE_LEN 96
-#define PREFETCH_WINDOW_COUNT 2
+#define PREFETCH_CHUNK_COUNT 5
 #define TIMER_TICKS_PER_SEC 32768U
 #define POINTER_FIXED_SHIFT 6
 #define POINTER_UI_TIMEOUT_MS 1800U
 #define POINTER_GAIN_NUM 5
 #define POINTER_GAIN_DEN 4
-#define NDLESS_OS_COUNT 47
 #define ENABLE_STARTUP_OVERCLOCK 0
-#define ENABLE_ASYNC_LOADER 1
 
 #pragma pack(push, 1)
 typedef struct {
@@ -112,45 +110,10 @@ typedef struct {
 } PointerState;
 
 typedef struct {
-    uint8_t *packed_bytes;
-    size_t packed_buffer_size;
-    uint8_t *window_bytes;
-    size_t window_buffer_size;
-    uint32_t offset;
-    uint32_t packed_size;
-    uint32_t unpacked_size;
-    int first_chunk;
-    int last_chunk;
-    bool ready;
+    uint8_t *chunk_storage;
+    size_t chunk_storage_size;
+    int chunk_index;
 } PrefetchedChunk;
-
-typedef enum {
-    LOADER_UNAVAILABLE = 0,
-    LOADER_IDLE = 1,
-    LOADER_REQUESTED = 2,
-    LOADER_LOADING = 3,
-    LOADER_READY = 4,
-    LOADER_ERROR = 5,
-} LoaderState;
-
-typedef int (*pthread_create_func_t)(uintptr_t *thread, const void *attr, void *(*start)(void *), void *arg);
-
-typedef struct {
-    FILE *file;
-    volatile int state;
-    volatile int stop_requested;
-    uintptr_t thread_handle;
-    bool thread_started;
-    uint32_t request_generation;
-    uint32_t active_generation;
-    uint32_t ready_generation;
-    uint32_t request_offset;
-    uint32_t request_packed_size;
-    uint32_t request_unpacked_size;
-    int request_first_chunk;
-    int request_last_chunk;
-    PrefetchedChunk slot;
-} BackgroundLoader;
 
 typedef struct {
     FILE *file;
@@ -160,18 +123,13 @@ typedef struct {
     uint16_t *framebuffer;
     uint16_t *previous_framebuffer;
     uint16_t *block_scratch;
-    uint8_t *window_bytes;
-    size_t window_size;
-    uint32_t loaded_window_offset;
-    uint32_t loaded_window_packed_size;
-    uint32_t loaded_window_unpacked_size;
-    int loaded_window_first_chunk;
-    int loaded_window_last_chunk;
+    uint8_t *chunk_storage;
+    size_t chunk_storage_size;
     uint8_t *chunk_bytes;
     uint32_t *frame_offsets;
     size_t chunk_size;
     int loaded_chunk;
-    PrefetchedChunk prefetched[PREFETCH_WINDOW_COUNT];
+    PrefetchedChunk prefetched[PREFETCH_CHUNK_COUNT];
     int decoded_local_frame;
     uint32_t current_frame;
     SDL_Surface *frame_surface;
@@ -186,13 +144,11 @@ typedef struct {
 } MonotonicClock;
 
 static MonotonicClock g_clock;
-static BackgroundLoader g_loader;
 
 static bool decode_to_frame(Movie *movie, uint32_t frame_index);
 static bool prefetch_chunk(Movie *movie, int chunk_index);
-static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_windows);
+static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks);
 static void clear_prefetched_chunk(PrefetchedChunk *chunk);
-static void loader_reset_slot(void);
 
 static uint16_t read_le16(const uint8_t *src)
 {
@@ -280,249 +236,6 @@ static uint32_t monotonic_clock_now_ms(void)
 static void monotonic_clock_shutdown(void)
 {
     memset(&g_clock, 0, sizeof(g_clock));
-}
-
-static pthread_create_func_t resolve_pthread_create(void)
-{
-    static const unsigned pthread_create_addrs[NDLESS_OS_COUNT] = {
-        [45] = 0x1048e9c0,
-    };
-    unsigned address = nl_osvalue(pthread_create_addrs, NDLESS_OS_COUNT);
-    if (!address) {
-        return NULL;
-    }
-    return (pthread_create_func_t) address;
-}
-
-static bool read_packed_window_bytes(FILE *file, uint32_t offset, uint32_t packed_size, uint8_t *buffer, size_t buffer_size)
-{
-    if (!file || !buffer || buffer_size < packed_size) {
-        return false;
-    }
-    if (fseek(file, (long) offset, SEEK_SET) != 0) {
-        return false;
-    }
-    return fread(buffer, 1, packed_size, file) == packed_size;
-}
-
-static bool read_window_bytes_by_spec(FILE *file, uint32_t offset, uint32_t packed_size, uint32_t unpacked_size, uint8_t **window_bytes, size_t *window_size)
-{
-    uint8_t *packed_bytes = NULL;
-    uLongf inflate_size;
-
-    *window_bytes = NULL;
-    *window_size = 0;
-
-    packed_bytes = (uint8_t *) malloc(packed_size);
-    if (!packed_bytes) {
-        return false;
-    }
-    if (!read_packed_window_bytes(file, offset, packed_size, packed_bytes, packed_size)) {
-        free(packed_bytes);
-        return false;
-    }
-    if (packed_size != unpacked_size) {
-        *window_bytes = (uint8_t *) malloc(unpacked_size);
-        if (!*window_bytes) {
-            free(packed_bytes);
-            return false;
-        }
-        inflate_size = unpacked_size;
-        if (uncompress(*window_bytes, &inflate_size, packed_bytes, packed_size) != Z_OK || inflate_size != unpacked_size) {
-            free(packed_bytes);
-            free(*window_bytes);
-            *window_bytes = NULL;
-            return false;
-        }
-        free(packed_bytes);
-        *window_size = unpacked_size;
-    } else {
-        *window_bytes = packed_bytes;
-        *window_size = packed_size;
-    }
-    return true;
-}
-
-static void *loader_thread_main(void *unused)
-{
-    (void) unused;
-    while (!g_loader.stop_requested) {
-        uint32_t generation;
-        uint32_t offset;
-        uint32_t packed_size;
-        uint32_t unpacked_size;
-        int first_chunk;
-        int last_chunk;
-        uint8_t *window_bytes = NULL;
-        size_t window_size = 0;
-
-        if (g_loader.state != LOADER_REQUESTED || !g_loader.file) {
-            msleep(2);
-            continue;
-        }
-
-        generation = g_loader.request_generation;
-        offset = g_loader.request_offset;
-        packed_size = g_loader.request_packed_size;
-        unpacked_size = g_loader.request_unpacked_size;
-        first_chunk = g_loader.request_first_chunk;
-        last_chunk = g_loader.request_last_chunk;
-
-        g_loader.active_generation = generation;
-        g_loader.state = LOADER_LOADING;
-
-        if (!read_window_bytes_by_spec(g_loader.file, offset, packed_size, unpacked_size, &window_bytes, &window_size)) {
-            g_loader.state = LOADER_ERROR;
-            msleep(4);
-            if (g_loader.state == LOADER_ERROR) {
-                g_loader.state = LOADER_IDLE;
-            }
-            continue;
-        }
-
-        if (g_loader.stop_requested) {
-            break;
-        }
-
-        if (g_loader.active_generation == g_loader.request_generation && g_loader.active_generation == generation) {
-            loader_reset_slot();
-            g_loader.slot.offset = offset;
-            g_loader.slot.packed_size = packed_size;
-            g_loader.slot.unpacked_size = unpacked_size;
-            g_loader.slot.first_chunk = first_chunk;
-            g_loader.slot.last_chunk = last_chunk;
-            g_loader.slot.window_bytes = window_bytes;
-            g_loader.slot.window_buffer_size = window_size;
-            g_loader.slot.ready = true;
-            g_loader.ready_generation = generation;
-            g_loader.state = LOADER_READY;
-        } else {
-            free(window_bytes);
-            g_loader.state = LOADER_IDLE;
-        }
-    }
-    return NULL;
-}
-
-static void loader_reset_slot(void)
-{
-    clear_prefetched_chunk(&g_loader.slot);
-}
-
-static void loader_init(void)
-{
-    pthread_create_func_t create_thread;
-    memset(&g_loader, 0, sizeof(g_loader));
-    g_loader.state = LOADER_UNAVAILABLE;
-    g_loader.slot.first_chunk = -1;
-    g_loader.slot.last_chunk = -1;
-    create_thread = resolve_pthread_create();
-    if (!create_thread) {
-        return;
-    }
-    g_loader.state = LOADER_IDLE;
-    if (create_thread(&g_loader.thread_handle, NULL, loader_thread_main, NULL) == 0) {
-        g_loader.thread_started = true;
-        return;
-    }
-    g_loader.state = LOADER_UNAVAILABLE;
-}
-
-static void loader_shutdown(void)
-{
-    g_loader.stop_requested = 1;
-    msleep(20);
-    if (g_loader.file) {
-        fclose(g_loader.file);
-        g_loader.file = NULL;
-    }
-    loader_reset_slot();
-    memset(&g_loader, 0, sizeof(g_loader));
-}
-
-static void loader_set_movie_path(const char *path)
-{
-    if (g_loader.state == LOADER_UNAVAILABLE) {
-        return;
-    }
-    while (g_loader.state == LOADER_LOADING) {
-        msleep(2);
-    }
-    if (g_loader.file) {
-        fclose(g_loader.file);
-        g_loader.file = NULL;
-    }
-    loader_reset_slot();
-    g_loader.request_generation++;
-    g_loader.active_generation = 0;
-    g_loader.ready_generation = 0;
-    g_loader.state = LOADER_IDLE;
-    if (path) {
-        g_loader.file = fopen(path, "rb");
-        if (!g_loader.file) {
-            g_loader.state = LOADER_UNAVAILABLE;
-        }
-    }
-}
-
-static bool loader_matches_slot(const ChunkIndexEntry *entry, int chunk_index)
-{
-    return g_loader.slot.ready &&
-        chunk_index >= g_loader.slot.first_chunk &&
-        chunk_index <= g_loader.slot.last_chunk &&
-        g_loader.slot.offset == entry->offset &&
-        g_loader.slot.packed_size == entry->packed_size &&
-        g_loader.slot.unpacked_size == entry->unpacked_size;
-}
-
-static bool loader_request_window(const ChunkIndexEntry *entry, int first_chunk, int last_chunk)
-{
-    if (g_loader.state == LOADER_UNAVAILABLE || !g_loader.file) {
-        return false;
-    }
-    if (loader_matches_slot(entry, first_chunk) ||
-        (g_loader.state == LOADER_REQUESTED &&
-            g_loader.request_offset == entry->offset &&
-            g_loader.request_packed_size == entry->packed_size &&
-            g_loader.request_unpacked_size == entry->unpacked_size)) {
-        return true;
-    }
-    if (g_loader.state == LOADER_LOADING) {
-        return false;
-    }
-    loader_reset_slot();
-    g_loader.request_offset = entry->offset;
-    g_loader.request_packed_size = entry->packed_size;
-    g_loader.request_unpacked_size = entry->unpacked_size;
-    g_loader.request_first_chunk = first_chunk;
-    g_loader.request_last_chunk = last_chunk;
-    g_loader.request_generation++;
-    g_loader.state = LOADER_REQUESTED;
-    return true;
-}
-
-static bool loader_claim_window(Movie *movie, int chunk_index)
-{
-    const ChunkIndexEntry *entry = movie->chunk_index + chunk_index;
-    if (!loader_matches_slot(entry, chunk_index) || !g_loader.slot.window_bytes) {
-        return false;
-    }
-
-    free(movie->frame_offsets);
-    movie->frame_offsets = NULL;
-    free(movie->window_bytes);
-    movie->window_bytes = g_loader.slot.window_bytes;
-    movie->window_size = g_loader.slot.window_buffer_size;
-    g_loader.slot.window_bytes = NULL;
-    g_loader.slot.window_buffer_size = 0;
-    movie->loaded_window_offset = g_loader.slot.offset;
-    movie->loaded_window_packed_size = g_loader.slot.packed_size;
-    movie->loaded_window_unpacked_size = g_loader.slot.unpacked_size;
-    movie->loaded_window_first_chunk = g_loader.slot.first_chunk;
-    movie->loaded_window_last_chunk = g_loader.slot.last_chunk;
-    loader_reset_slot();
-    g_loader.state = LOADER_IDLE;
-    return true;
 }
 
 static void pointer_init(PointerState *pointer)
@@ -649,7 +362,6 @@ static void destroy_movie(Movie *movie)
     if (!movie) {
         return;
     }
-    loader_set_movie_path(NULL);
     if (movie->file) {
         fclose(movie->file);
     }
@@ -666,16 +378,15 @@ static void destroy_movie(Movie *movie)
     free(movie->framebuffer);
     free(movie->previous_framebuffer);
     free(movie->block_scratch);
-    free(movie->window_bytes);
+    free(movie->chunk_storage);
     free(movie->frame_offsets);
-    for (prefetch_index = 0; prefetch_index < PREFETCH_WINDOW_COUNT; ++prefetch_index) {
-        free(movie->prefetched[prefetch_index].packed_bytes);
+    for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
+        clear_prefetched_chunk(&movie->prefetched[prefetch_index]);
     }
     memset(movie, 0, sizeof(*movie));
     movie->loaded_chunk = -1;
-    for (prefetch_index = 0; prefetch_index < PREFETCH_WINDOW_COUNT; ++prefetch_index) {
-        movie->prefetched[prefetch_index].first_chunk = -1;
-        movie->prefetched[prefetch_index].last_chunk = -1;
+    for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
+        movie->prefetched[prefetch_index].chunk_index = -1;
     }
     movie->decoded_local_frame = -1;
 }
@@ -1569,47 +1280,6 @@ static bool load_frame_offsets(Movie *movie, const ChunkIndexEntry *entry, const
     return build_frame_offsets(movie, entry, chunk_bytes, chunk_size, frame_offsets);
 }
 
-static bool read_window_bytes(FILE *file, const ChunkIndexEntry *entry, uint8_t **window_bytes, size_t *window_size)
-{
-    uint8_t *packed_bytes = NULL;
-    uLongf unpacked_size;
-
-    *window_bytes = NULL;
-    *window_size = 0;
-    packed_bytes = (uint8_t *) malloc(entry->packed_size);
-    if (!packed_bytes) {
-        return false;
-    }
-    if (fseek(file, (long) entry->offset, SEEK_SET) != 0) {
-        free(packed_bytes);
-        return false;
-    }
-    if (fread(packed_bytes, 1, entry->packed_size, file) != entry->packed_size) {
-        free(packed_bytes);
-        return false;
-    }
-    if (entry->packed_size != entry->unpacked_size) {
-        *window_bytes = (uint8_t *) malloc(entry->unpacked_size);
-        if (!*window_bytes) {
-            free(packed_bytes);
-            return false;
-        }
-        unpacked_size = entry->unpacked_size;
-        if (uncompress(*window_bytes, &unpacked_size, packed_bytes, entry->packed_size) != Z_OK || unpacked_size != entry->unpacked_size) {
-            free(packed_bytes);
-            free(*window_bytes);
-            *window_bytes = NULL;
-            return false;
-        }
-        free(packed_bytes);
-        *window_size = entry->unpacked_size;
-    } else {
-        *window_bytes = packed_bytes;
-        *window_size = entry->packed_size;
-    }
-    return true;
-}
-
 static bool configure_chunk_view(Movie *movie, int chunk_index)
 {
     const ChunkIndexEntry *entry = movie->chunk_index + chunk_index;
@@ -1623,38 +1293,38 @@ static bool configure_chunk_view(Movie *movie, int chunk_index)
         size_t local_offset = (size_t) entry->frame_table_offset;
         size_t header_size;
         uint32_t payload_size;
-        if (!movie->window_bytes || local_offset + 4 > movie->window_size) {
+        if (!movie->chunk_storage || local_offset + 4 > movie->chunk_storage_size) {
             return false;
         }
-        payload_size = read_le32(movie->window_bytes + local_offset);
+        payload_size = read_le32(movie->chunk_storage + local_offset);
         header_size = 4 + ((size_t) entry->frame_count * sizeof(uint32_t));
-        if (local_offset + header_size + payload_size > movie->window_size) {
+        if (local_offset + header_size + payload_size > movie->chunk_storage_size) {
             return false;
         }
         movie->frame_offsets = (uint32_t *) calloc((size_t) entry->frame_count, sizeof(uint32_t));
         if (!movie->frame_offsets) {
             return false;
         }
-        memcpy(movie->frame_offsets, movie->window_bytes + local_offset + 4, (size_t) entry->frame_count * sizeof(uint32_t));
-        movie->chunk_bytes = movie->window_bytes + local_offset + header_size;
+        memcpy(movie->frame_offsets, movie->chunk_storage + local_offset + 4, (size_t) entry->frame_count * sizeof(uint32_t));
+        movie->chunk_bytes = movie->chunk_storage + local_offset + header_size;
         movie->chunk_size = payload_size;
         return true;
     }
 
-    if (!movie->window_bytes) {
+    if (!movie->chunk_storage) {
         return false;
     }
     movie->frame_offsets = (uint32_t *) calloc((size_t) entry->frame_count, sizeof(uint32_t));
     if (!movie->frame_offsets) {
         return false;
     }
-    if (!load_frame_offsets(movie, entry, movie->window_bytes, movie->window_size, movie->frame_offsets)) {
+    if (!load_frame_offsets(movie, entry, movie->chunk_storage, movie->chunk_storage_size, movie->frame_offsets)) {
         free(movie->frame_offsets);
         movie->frame_offsets = NULL;
         return false;
     }
-    movie->chunk_bytes = movie->window_bytes;
-    movie->chunk_size = movie->window_size;
+    movie->chunk_bytes = movie->chunk_storage;
+    movie->chunk_size = movie->chunk_storage_size;
     return true;
 }
 
@@ -1663,52 +1333,17 @@ static void clear_prefetched_chunk(PrefetchedChunk *chunk)
     if (!chunk) {
         return;
     }
-    free(chunk->packed_bytes);
-    chunk->packed_bytes = NULL;
-    chunk->packed_buffer_size = 0;
-    free(chunk->window_bytes);
-    chunk->window_bytes = NULL;
-    chunk->window_buffer_size = 0;
-    chunk->offset = 0;
-    chunk->packed_size = 0;
-    chunk->unpacked_size = 0;
-    chunk->first_chunk = -1;
-    chunk->last_chunk = -1;
-    chunk->ready = false;
-}
-
-static bool chunk_uses_same_window(const ChunkIndexEntry *entry, uint32_t offset, uint32_t packed_size, uint32_t unpacked_size)
-{
-    return entry->offset == offset && entry->packed_size == packed_size && entry->unpacked_size == unpacked_size;
-}
-
-static void window_range_for_chunk(const Movie *movie, int chunk_index, int *first_chunk, int *last_chunk)
-{
-    const ChunkIndexEntry *entry = movie->chunk_index + chunk_index;
-    int first = chunk_index;
-    int last = chunk_index;
-    while (first > 0 && chunk_uses_same_window(movie->chunk_index + (first - 1), entry->offset, entry->packed_size, entry->unpacked_size)) {
-        first--;
-    }
-    while ((uint32_t) (last + 1) < movie->header.chunk_count &&
-        chunk_uses_same_window(movie->chunk_index + (last + 1), entry->offset, entry->packed_size, entry->unpacked_size)) {
-        last++;
-    }
-    *first_chunk = first;
-    *last_chunk = last;
+    free(chunk->chunk_storage);
+    chunk->chunk_storage = NULL;
+    chunk->chunk_storage_size = 0;
+    chunk->chunk_index = -1;
 }
 
 static PrefetchedChunk *find_prefetched_chunk(Movie *movie, int chunk_index)
 {
     int index;
-    const ChunkIndexEntry *entry = movie->chunk_index + chunk_index;
-    for (index = 0; index < PREFETCH_WINDOW_COUNT; ++index) {
-        if (movie->prefetched[index].ready &&
-            chunk_index >= movie->prefetched[index].first_chunk &&
-            chunk_index <= movie->prefetched[index].last_chunk &&
-            movie->prefetched[index].offset == entry->offset &&
-            movie->prefetched[index].packed_size == entry->packed_size &&
-            movie->prefetched[index].unpacked_size == entry->unpacked_size) {
+    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+        if (movie->prefetched[index].chunk_index == chunk_index) {
             return &movie->prefetched[index];
         }
     }
@@ -1718,9 +1353,9 @@ static PrefetchedChunk *find_prefetched_chunk(Movie *movie, int chunk_index)
 static bool load_chunk(Movie *movie, int chunk_index)
 {
     const ChunkIndexEntry *entry;
+    uint8_t *packed_bytes = NULL;
+    uLongf unpacked_size;
     PrefetchedChunk *prefetched;
-    int first_chunk;
-    int last_chunk;
     if (chunk_index < 0 || (uint32_t) chunk_index >= movie->header.chunk_count) {
         return false;
     }
@@ -1729,57 +1364,14 @@ static bool load_chunk(Movie *movie, int chunk_index)
     }
 
     entry = movie->chunk_index + chunk_index;
-    window_range_for_chunk(movie, chunk_index, &first_chunk, &last_chunk);
-    if (movie->window_bytes &&
-        chunk_uses_same_window(entry, movie->loaded_window_offset, movie->loaded_window_packed_size, movie->loaded_window_unpacked_size)) {
-        if (!configure_chunk_view(movie, chunk_index)) {
-            return false;
-        }
-        movie->loaded_chunk = chunk_index;
-        movie->decoded_local_frame = -1;
-        return true;
-    }
-    if (loader_claim_window(movie, chunk_index)) {
-        if (!configure_chunk_view(movie, chunk_index)) {
-            return false;
-        }
-        movie->loaded_chunk = chunk_index;
-        movie->decoded_local_frame = -1;
-        return true;
-    }
     prefetched = find_prefetched_chunk(movie, chunk_index);
     if (prefetched) {
-        free(movie->frame_offsets);
-        free(movie->window_bytes);
-        if (prefetched->window_bytes) {
-            movie->window_bytes = prefetched->window_bytes;
-            movie->window_size = prefetched->window_buffer_size;
-            prefetched->window_bytes = NULL;
-            prefetched->window_buffer_size = 0;
-        } else {
-            movie->window_bytes = (uint8_t *) malloc(prefetched->unpacked_size);
-            if (!movie->window_bytes) {
-                return false;
-            }
-            movie->window_size = prefetched->unpacked_size;
-            if (prefetched->packed_size != prefetched->unpacked_size) {
-                uLongf unpacked_size = prefetched->unpacked_size;
-                if (uncompress(movie->window_bytes, &unpacked_size, prefetched->packed_bytes, prefetched->packed_size) != Z_OK ||
-                    unpacked_size != prefetched->unpacked_size) {
-                    free(movie->window_bytes);
-                    movie->window_bytes = NULL;
-                    return false;
-                }
-            } else {
-                memcpy(movie->window_bytes, prefetched->packed_bytes, prefetched->packed_size);
-            }
-        }
-        movie->loaded_window_offset = prefetched->offset;
-        movie->loaded_window_packed_size = prefetched->packed_size;
-        movie->loaded_window_unpacked_size = prefetched->unpacked_size;
-        movie->loaded_window_first_chunk = prefetched->first_chunk;
-        movie->loaded_window_last_chunk = prefetched->last_chunk;
-        clear_prefetched_chunk(prefetched);
+        free(movie->chunk_storage);
+        movie->chunk_storage = prefetched->chunk_storage;
+        movie->chunk_storage_size = prefetched->chunk_storage_size;
+        prefetched->chunk_storage = NULL;
+        prefetched->chunk_storage_size = 0;
+        prefetched->chunk_index = -1;
         if (!configure_chunk_view(movie, chunk_index)) {
             return false;
         }
@@ -1788,18 +1380,40 @@ static bool load_chunk(Movie *movie, int chunk_index)
         return true;
     }
 
-    free(movie->frame_offsets);
-    movie->frame_offsets = NULL;
-    free(movie->window_bytes);
-    movie->window_bytes = NULL;
-    if (!read_window_bytes(movie->file, entry, &movie->window_bytes, &movie->window_size)) {
+    free(movie->chunk_storage);
+    movie->chunk_storage = NULL;
+    movie->chunk_storage_size = 0;
+    packed_bytes = (uint8_t *) malloc(entry->packed_size);
+    if (!packed_bytes) {
         return false;
     }
-    movie->loaded_window_offset = entry->offset;
-    movie->loaded_window_packed_size = entry->packed_size;
-    movie->loaded_window_unpacked_size = entry->unpacked_size;
-    movie->loaded_window_first_chunk = first_chunk;
-    movie->loaded_window_last_chunk = last_chunk;
+    if (fseek(movie->file, (long) entry->offset, SEEK_SET) != 0) {
+        free(packed_bytes);
+        return false;
+    }
+    if (fread(packed_bytes, 1, entry->packed_size, movie->file) != entry->packed_size) {
+        free(packed_bytes);
+        return false;
+    }
+    if (entry->packed_size != entry->unpacked_size) {
+        movie->chunk_storage = (uint8_t *) malloc(entry->unpacked_size);
+        if (!movie->chunk_storage) {
+            free(packed_bytes);
+            return false;
+        }
+        unpacked_size = entry->unpacked_size;
+        if (uncompress(movie->chunk_storage, &unpacked_size, packed_bytes, entry->packed_size) != Z_OK || unpacked_size != entry->unpacked_size) {
+            free(packed_bytes);
+            free(movie->chunk_storage);
+            movie->chunk_storage = NULL;
+            return false;
+        }
+        free(packed_bytes);
+        movie->chunk_storage_size = entry->unpacked_size;
+    } else {
+        movie->chunk_storage = packed_bytes;
+        movie->chunk_storage_size = entry->packed_size;
+    }
     if (!configure_chunk_view(movie, chunk_index)) {
         return false;
     }
@@ -1811,116 +1425,93 @@ static bool load_chunk(Movie *movie, int chunk_index)
 static bool prefetch_chunk(Movie *movie, int chunk_index)
 {
     const ChunkIndexEntry *entry;
+    uint8_t *bytes;
+    uint8_t *packed_bytes;
+    size_t chunk_storage_size;
+    uLongf unpacked_size;
     PrefetchedChunk *slot = NULL;
-    uint8_t *window_bytes = NULL;
-    size_t window_size = 0;
     int index;
-    int first_chunk;
-    int last_chunk;
     if (chunk_index < 0 || (uint32_t) chunk_index >= movie->header.chunk_count) {
         return false;
     }
-    entry = movie->chunk_index + chunk_index;
-    window_range_for_chunk(movie, chunk_index, &first_chunk, &last_chunk);
-    if ((movie->window_bytes &&
-            chunk_uses_same_window(entry, movie->loaded_window_offset, movie->loaded_window_packed_size, movie->loaded_window_unpacked_size)) ||
-        loader_matches_slot(entry, chunk_index) ||
-        find_prefetched_chunk(movie, chunk_index)) {
+    if (movie->loaded_chunk == chunk_index || find_prefetched_chunk(movie, chunk_index)) {
         return true;
     }
-    if (loader_request_window(entry, first_chunk, last_chunk)) {
-        return true;
-    }
-    for (index = 0; index < PREFETCH_WINDOW_COUNT; ++index) {
-        if (!movie->prefetched[index].ready) {
+    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+        if (movie->prefetched[index].chunk_index < 0) {
             slot = &movie->prefetched[index];
             break;
         }
     }
     if (!slot) {
         slot = &movie->prefetched[0];
-        for (index = 1; index < PREFETCH_WINDOW_COUNT; ++index) {
-            if (movie->prefetched[index].last_chunk < slot->last_chunk) {
+        for (index = 1; index < PREFETCH_CHUNK_COUNT; ++index) {
+            if (movie->prefetched[index].chunk_index < slot->chunk_index) {
                 slot = &movie->prefetched[index];
             }
         }
         clear_prefetched_chunk(slot);
     }
-    if (!read_window_bytes(movie->file, entry, &window_bytes, &window_size)) {
+    entry = movie->chunk_index + chunk_index;
+    packed_bytes = (uint8_t *) malloc(entry->packed_size);
+    if (!packed_bytes) {
         return false;
     }
-    slot->packed_buffer_size = entry->packed_size;
-    slot->window_bytes = window_bytes;
-    slot->window_buffer_size = window_size;
-    slot->offset = entry->offset;
-    slot->packed_size = entry->packed_size;
-    slot->unpacked_size = entry->unpacked_size;
-    slot->first_chunk = first_chunk;
-    slot->last_chunk = last_chunk;
-    slot->ready = true;
+    if (fseek(movie->file, (long) entry->offset, SEEK_SET) != 0) {
+        free(packed_bytes);
+        return false;
+    }
+    if (fread(packed_bytes, 1, entry->packed_size, movie->file) != entry->packed_size) {
+        free(packed_bytes);
+        return false;
+    }
+    if (entry->packed_size != entry->unpacked_size) {
+        bytes = (uint8_t *) malloc(entry->unpacked_size);
+        if (!bytes) {
+            free(packed_bytes);
+            return false;
+        }
+        unpacked_size = entry->unpacked_size;
+        if (uncompress(bytes, &unpacked_size, packed_bytes, entry->packed_size) != Z_OK || unpacked_size != entry->unpacked_size) {
+            free(packed_bytes);
+            free(bytes);
+            return false;
+        }
+        free(packed_bytes);
+        chunk_storage_size = entry->unpacked_size;
+    } else {
+        bytes = packed_bytes;
+        chunk_storage_size = entry->packed_size;
+    }
+    slot->chunk_storage = bytes;
+    slot->chunk_storage_size = chunk_storage_size;
+    slot->chunk_index = chunk_index;
     return true;
 }
 
-static int collect_future_window_starts(const Movie *movie, int current_chunk, int *starts, int max_count)
+static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks)
 {
-    int next_chunk = current_chunk + 1;
-    int count = 0;
-
-    if (!movie || !starts || max_count <= 0) {
-        return 0;
-    }
-
-    if (movie->loaded_window_last_chunk >= next_chunk) {
-        next_chunk = movie->loaded_window_last_chunk + 1;
-    }
-
-    while (next_chunk >= 0 && (uint32_t) next_chunk < movie->header.chunk_count && count < max_count) {
-        int first_chunk = -1;
-        int last_chunk = -1;
-        window_range_for_chunk(movie, next_chunk, &first_chunk, &last_chunk);
-        starts[count++] = first_chunk;
-        next_chunk = last_chunk + 1;
-    }
-
-    return count;
-}
-
-static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_windows)
-{
-    int desired_starts[PREFETCH_WINDOW_COUNT];
-    int desired_count;
     int index;
     int loaded = 0;
-
-    if (max_new_windows <= 0) {
-        return;
-    }
-
-    desired_count = collect_future_window_starts(movie, current_chunk, desired_starts, PREFETCH_WINDOW_COUNT);
-    for (index = 0; index < PREFETCH_WINDOW_COUNT; ++index) {
-        if (movie->prefetched[index].ready) {
-            int desired_index;
-            bool keep = false;
-            for (desired_index = 0; desired_index < desired_count; ++desired_index) {
-                if (movie->prefetched[index].first_chunk == desired_starts[desired_index]) {
-                    keep = true;
-                    break;
-                }
-            }
-            if (!keep) {
-                clear_prefetched_chunk(&movie->prefetched[index]);
-            }
+    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+        int wanted_min = current_chunk + 1;
+        int wanted_max = current_chunk + PREFETCH_CHUNK_COUNT;
+        if (movie->prefetched[index].chunk_index >= 0 &&
+            (movie->prefetched[index].chunk_index < wanted_min || movie->prefetched[index].chunk_index > wanted_max)) {
+            clear_prefetched_chunk(&movie->prefetched[index]);
         }
     }
-
-    if (desired_count <= 0) {
-        return;
-    }
-
-    for (index = 0; index < desired_count && loaded < max_new_windows; ++index) {
-        if (!find_prefetched_chunk(movie, desired_starts[index])) {
-            if (prefetch_chunk(movie, desired_starts[index])) {
-                loaded++;
+    for (index = 1; index <= PREFETCH_CHUNK_COUNT; ++index) {
+        int wanted_chunk = current_chunk + index;
+        if ((uint32_t) wanted_chunk < movie->header.chunk_count &&
+            movie->loaded_chunk != wanted_chunk &&
+            !find_prefetched_chunk(movie, wanted_chunk)) {
+            if (!prefetch_chunk(movie, wanted_chunk)) {
+                break;
+            }
+            loaded++;
+            if (loaded >= max_new_chunks) {
+                break;
             }
         }
     }
@@ -1929,7 +1520,7 @@ static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_windows)
 static int prefetch_budget_for_state(bool paused, uint32_t spare_ms)
 {
     if (paused) {
-        return PREFETCH_WINDOW_COUNT;
+        return PREFETCH_CHUNK_COUNT;
     }
     if (spare_ms > 10) {
         return 1;
@@ -2085,9 +1676,8 @@ static bool load_movie(const char *path, Movie *movie)
     movie->loaded_chunk = -1;
     {
         int prefetch_index;
-        for (prefetch_index = 0; prefetch_index < PREFETCH_WINDOW_COUNT; ++prefetch_index) {
-            movie->prefetched[prefetch_index].first_chunk = -1;
-            movie->prefetched[prefetch_index].last_chunk = -1;
+        for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
+            movie->prefetched[prefetch_index].chunk_index = -1;
         }
     }
     movie->decoded_local_frame = -1;
@@ -2159,7 +1749,6 @@ static bool load_movie(const char *path, Movie *movie)
     if (!decode_to_frame(movie, 0)) {
         return false;
     }
-    loader_set_movie_path(path);
     init_prefetch(movie);
     return true;
 }
@@ -2604,31 +2193,17 @@ static void draw_progress(
     snprintf(hint_text, sizeof(hint_text), "CLICK SEEK  L/R +/-5s  TAB STEP  / MODE  +/- SUB");
     SDL_FillRect(screen, &overlay, SDL_MapRGB(screen->format, 0, 0, 0));
     SDL_FillRect(screen, &bar_back, SDL_MapRGB(screen->format, 52, 52, 68));
-    for (index = 0; index < PREFETCH_WINDOW_COUNT; ++index) {
-        if (movie->prefetched[index].ready && movie->prefetched[index].first_chunk >= 0) {
-            const ChunkIndexEntry *first_entry = movie->chunk_index + movie->prefetched[index].first_chunk;
-            const ChunkIndexEntry *last_entry = movie->chunk_index + movie->prefetched[index].last_chunk;
+    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+        if (movie->prefetched[index].chunk_index >= 0) {
+            const ChunkIndexEntry *entry = movie->chunk_index + movie->prefetched[index].chunk_index;
             SDL_Rect prefetch_rect = bar_back;
-            uint32_t last_frame = last_entry->first_frame + last_entry->frame_count;
-            prefetch_rect.x = bar_back.x + (int) (((uint64_t) bar_back.w * first_entry->first_frame) / movie->header.frame_count);
-            prefetch_rect.w = (Uint16) (((uint64_t) bar_back.w * (last_frame - first_entry->first_frame)) / movie->header.frame_count);
+            prefetch_rect.x = bar_back.x + (int) (((uint64_t) bar_back.w * entry->first_frame) / movie->header.frame_count);
+            prefetch_rect.w = (Uint16) (((uint64_t) bar_back.w * entry->frame_count) / movie->header.frame_count);
             if (prefetch_rect.w <= 0) {
                 prefetch_rect.w = 1;
             }
             SDL_FillRect(screen, &prefetch_rect, SDL_MapRGB(screen->format, 104, 104, 116));
         }
-    }
-    if (g_loader.state == LOADER_REQUESTED || g_loader.state == LOADER_LOADING || g_loader.state == LOADER_READY) {
-        const ChunkIndexEntry *first_entry = movie->chunk_index + g_loader.request_first_chunk;
-        const ChunkIndexEntry *last_entry = movie->chunk_index + g_loader.request_last_chunk;
-        SDL_Rect prefetch_rect = bar_back;
-        uint32_t last_frame = last_entry->first_frame + last_entry->frame_count;
-        prefetch_rect.x = bar_back.x + (int) (((uint64_t) bar_back.w * first_entry->first_frame) / movie->header.frame_count);
-        prefetch_rect.w = (Uint16) (((uint64_t) bar_back.w * (last_frame - first_entry->first_frame)) / movie->header.frame_count);
-        if (prefetch_rect.w <= 0) {
-            prefetch_rect.w = 1;
-        }
-        SDL_FillRect(screen, &prefetch_rect, SDL_MapRGB(screen->format, 88, 88, 104));
     }
     if (duration_ms > 0) {
         bar_front.w = (Uint16) (((uint64_t) bar_back.w * current_ms) / duration_ms);
@@ -2808,7 +2383,6 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     Movie movie;
     ClockState playback_clock_state;
     bool playback_clock_active = false;
-    bool loader_active = false;
     bool prev_enter = false;
     bool prev_left = false;
     bool prev_right = false;
@@ -2830,9 +2404,6 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     PointerState pointer;
 
     if (!load_movie(path, &movie)) {
-        if (loader_active) {
-            loader_shutdown();
-        }
         if (playback_clock_active) {
             clock_state_restore(&playback_clock_state);
         }
@@ -2843,11 +2414,6 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         clock_state_init(&playback_clock_state);
         clock_state_apply_boost(&playback_clock_state);
         playback_clock_active = true;
-    }
-    if (ENABLE_ASYNC_LOADER) {
-        loader_init();
-        loader_active = true;
-        loader_set_movie_path(path);
     }
     pointer_init(&pointer);
     frame_ms = movie_frame_interval_ms(&movie);
@@ -2981,9 +2547,6 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     }
 
     destroy_movie(&movie);
-    if (loader_active) {
-        loader_shutdown();
-    }
     if (playback_clock_active) {
         clock_state_restore(&playback_clock_state);
     }

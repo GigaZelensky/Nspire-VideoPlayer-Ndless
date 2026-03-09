@@ -1154,7 +1154,6 @@ def encode(args: argparse.Namespace) -> EncodeStats:
 
     chunk_index: list[tuple[int, int, int, int, int, int]] = []
     current_chunk_frames: list[np.ndarray] = []
-    pending_window_records: list[tuple[int, int, bytes, list[int]]] = []
     frame_count = 0
     chunk_count = 0
     keyframes = 0
@@ -1165,43 +1164,10 @@ def encode(args: argparse.Namespace) -> EncodeStats:
     literal_blocks = 0
     start_time = time.time()
     previous_chunk_last_frame: np.ndarray | None = None
-    window_chunk_count = max(1, args.window_chunks)
-
-    def build_window_blob(records: list[tuple[int, int, bytes, list[int]]]) -> tuple[bytes, list[tuple[int, int, int]]]:
-        window_blob = bytearray()
-        local_entries: list[tuple[int, int, int]] = []
-        for first_frame, frame_len, chunk_blob, frame_offsets in records:
-            local_offset = len(window_blob)
-            local_entries.append((first_frame, frame_len, local_offset))
-            window_blob += struct.pack("<I", len(chunk_blob))
-            for frame_offset in frame_offsets:
-                window_blob += struct.pack("<I", frame_offset)
-            window_blob += chunk_blob
-            while len(window_blob) % 4:
-                window_blob.append(0)
-        return bytes(window_blob), local_entries
-
-    def estimate_total_size_bytes() -> int:
-        if not pending_window_records:
-            return output_handle.tell()
-        window_blob, _ = build_window_blob(pending_window_records)
-        return output_handle.tell() + len(compress_chunk_payload(window_blob, args.zlib_level))
-
-    def flush_window() -> None:
-        nonlocal pending_window_records
-        if not pending_window_records:
-            return
-        window_blob, local_entries = build_window_blob(pending_window_records)
-        stored_window_blob = compress_chunk_payload(window_blob, args.zlib_level)
-        window_offset = output_handle.tell()
-        output_handle.write(stored_window_blob)
-        for first_frame, frame_len, local_offset in local_entries:
-            chunk_index.append((window_offset, len(stored_window_blob), len(window_blob), first_frame, frame_len, local_offset))
-        pending_window_records = []
 
     def flush_chunk() -> None:
         nonlocal chunk_count, keyframes, predicted, repeated, block_updates, motion_copies, literal_blocks
-        nonlocal current_chunk_frames, previous_chunk_last_frame, pending_window_records
+        nonlocal current_chunk_frames, previous_chunk_last_frame
         nonlocal budget_bank
         if not current_chunk_frames:
             return
@@ -1257,10 +1223,18 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             frame_index_base=first_frame,
             initial_previous_raw_frame=previous_chunk_last_frame,
         )
-        pending_window_records.append((first_frame, len(current_chunk_frames), chunk_blob, frame_offsets))
-        if len(pending_window_records) >= window_chunk_count:
-            flush_window()
-        total_size_bytes = estimate_total_size_bytes()
+        stored_chunk_blob = bytearray()
+        stored_chunk_blob += struct.pack("<I", len(chunk_blob))
+        for frame_offset in frame_offsets:
+            stored_chunk_blob += struct.pack("<I", frame_offset)
+        stored_chunk_blob += chunk_blob
+        while len(stored_chunk_blob) % 4:
+            stored_chunk_blob.append(0)
+        stored_blob = compress_chunk_payload(bytes(stored_chunk_blob), args.zlib_level)
+        offset = output_handle.tell()
+        output_handle.write(stored_blob)
+        chunk_index.append((offset, len(stored_blob), len(stored_chunk_blob), first_frame, len(current_chunk_frames), 0))
+        total_size_bytes = output_handle.tell()
         chunk_count += 1
         keyframes += chunk_keyframes
         predicted += chunk_predicted
@@ -1269,7 +1243,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         motion_copies += chunk_motion
         literal_blocks += chunk_literal
         if average_chunk_budget > 0:
-            budget_bank += average_chunk_budget - len(chunk_blob)
+            budget_bank += average_chunk_budget - len(stored_blob)
         elapsed = time.time() - start_time
         progress = min(100.0, (frame_count / expected_frames) * 100.0) if expected_frames else 0.0
         fps_done = frame_count / elapsed if elapsed > 0 else 0.0
@@ -1277,7 +1251,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         eta = (eta_frames / fps_done) if fps_done > 0 and eta_frames else 0.0
         log(
                 f"Chunk {chunk_count:03d}: {progress:5.1f}% | ETA {format_duration_hms(eta)} | "
-                f"frames {first_frame}-{frame_count - 1} | size {len(chunk_blob) / 1024:.1f} KiB | "
+                f"frames {first_frame}-{frame_count - 1} | size {len(stored_blob) / 1024:.1f} KiB | "
                 f"total size {total_size_bytes / (1024 * 1024):.2f} MiB | "
                 f"I={chunk_keyframes} P={chunk_predicted - chunk_repeated} N={chunk_repeated} M={chunk_motion} L={chunk_literal}"
                 f" | C={chunk_complexity:.3f}"
@@ -1295,7 +1269,6 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             flush_chunk()
 
     flush_chunk()
-    flush_window()
 
     index_offset = output_handle.tell()
     for entry in chunk_index:
@@ -1376,7 +1349,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--posterize-bits", type=int, default=0, help="Optional 1-7 bit posterization per RGB channel before encoding")
     parser.add_argument("--zlib-level", type=int, default=9, help="Chunk compression level (0-9)")
     parser.add_argument("--max-chunk-kib", type=int, default=0, help="Soft cap per compressed chunk; retries oversized chunks with more aggressive delta settings")
-    parser.add_argument("--window-chunks", type=int, default=1, help="Number of coded chunks to group into one compressed storage window")
     parser.add_argument("--target-size-mib", type=float, default=0.0, help="Approximate total output size target; smooths chunk budgets across the whole encode")
     parser.add_argument("--start", type=float, default=0.0, help="Optional clip start offset in seconds")
     parser.add_argument("--duration", type=float, help="Optional clip duration in seconds")

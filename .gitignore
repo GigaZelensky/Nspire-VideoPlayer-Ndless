@@ -8,3 +8,6 @@ movies/
 *.nvp
 *.json
 *.srt
+__pycache__/
+*.pyc
+PLAN.md
