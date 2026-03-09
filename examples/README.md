@@ -6,3 +6,11 @@ Current examples in the working tree include:
 
 - a packaged player binary
 - a short example movie encode
+
+Licensing note:
+
+- the packaged player binary follows the repository software license
+- the sample movie encode is not covered by the repository software license
+  and remains subject to the rights in its original media and subtitle sources
+- the included Family Guy intro sample is provided only for research,
+  educational, and non-commercial testing purposes

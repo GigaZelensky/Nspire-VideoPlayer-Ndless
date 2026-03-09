@@ -16,3 +16,5 @@ PLAN.md
 !examples/README.md
 !examples/*.tns
 !examples/*.nvp.tns
+!examples/screenshots/
+!examples/screenshots/*.png

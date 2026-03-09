@@ -3171,7 +3171,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     SDL_Rect accent = {14, 36, 288, 2};
     SDL_Rect footer = {14, 182, 288, 12};
     const char *close_text = "CAT close";
-    int y = 38;
+    int y = 36;
 
     SDL_FillRect(screen, &shadow, SDL_MapRGB(screen->format, 0, 0, 0));
     SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 8, 10, 14));
@@ -3183,27 +3183,29 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     nSDL_DrawString(screen, fonts->white, panel.x + panel.w - 10 - nSDL_GetStringWidth(fonts->white, close_text), panel.y + 6, "%s", close_text);
 
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "ENTER", "Play or pause");
-    y += 12;
+    y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "CLICK", "Toggle or seek bar");
-    y += 12;
+    y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "L / R", "Seek -/+5s");
-    y += 12;
+    y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "TAB", "Step one frame");
-    y += 12;
+    y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "/", "Scale mode");
-    y += 12;
+    y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "{ / }", "Playback speed");
-    y += 12;
+    y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "^", "Subtitle position");
-    y += 12;
+    y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "+ / -", "Subtitle size");
-    y += 12;
+    y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "F", "Cycle subtitle font");
-    y += 12;
+    y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "M", "Memory overlay");
-    y += 12;
+    y += 11;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "S", "Save BMP screenshot");
+    y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "TOUCHPAD", "Move cursor / show UI");
-    y += 12;
+    y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "ESC", "Close menu or exit");
 
     nSDL_DrawString(screen, fonts->white, panel.x + 10, panel.y + panel.h - 10, "CAT closes help. ESC exits movie.");
@@ -3391,6 +3393,52 @@ static void strip_filename(char *path)
     }
 }
 
+static bool save_screenshot_bitmap(SDL_Surface *screen, const char *movie_path, char *saved_path, size_t saved_path_size)
+{
+    char directory[MAX_PATH_LEN];
+    int index;
+
+    if (saved_path && saved_path_size > 0) {
+        saved_path[0] = '\0';
+    }
+    if (!screen) {
+        return false;
+    }
+
+    if (movie_path && movie_path[0] != '\0') {
+        snprintf(directory, sizeof(directory), "%s", movie_path);
+        strip_filename(directory);
+    } else {
+        snprintf(directory, sizeof(directory), ".");
+    }
+
+    for (index = 1; index <= 9999; ++index) {
+        char candidate[MAX_PATH_LEN];
+        FILE *existing;
+        int candidate_len = snprintf(candidate, sizeof(candidate), "%s/ndvideo-shot-%04d.bmp", directory, index);
+
+        if (candidate_len < 0 || (size_t) candidate_len >= sizeof(candidate)) {
+            return false;
+        }
+        existing = fopen(candidate, "rb");
+        if (existing) {
+            fclose(existing);
+            continue;
+        }
+        if (SDL_SaveBMP(screen, candidate) == 0) {
+            if (saved_path && saved_path_size > 0) {
+                snprintf(saved_path, saved_path_size, "%s", candidate);
+            }
+            debug_tracef("screenshot saved path=%s", candidate);
+            return true;
+        }
+        debug_tracef("screenshot save fail path=%s", candidate);
+        return false;
+    }
+
+    return false;
+}
+
 static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *directory, char *selected_path, size_t selected_size)
 {
     bool prev_up = false;
@@ -3479,6 +3527,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     bool prev_gthan = false;
     bool prev_f = false;
     bool prev_m = false;
+    bool prev_s = false;
     bool prev_plus = false;
     bool prev_minus = false;
     bool paused = false;
@@ -3514,6 +3563,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     pointer_init(&pointer);
     prev_tab = isKeyPressed(KEY_NSPIRE_TAB);
     prev_m = isKeyPressed(KEY_NSPIRE_M);
+    prev_s = isKeyPressed(KEY_NSPIRE_S);
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
     playback_anchor_ticks = monotonic_clock_now_ticks();
     playback_anchor_frame = movie.current_frame;
@@ -3543,7 +3593,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         bool speed_up_edge = rp_edge || gthan_edge;
         bool subtitle_font_edge = key_pressed_edge(KEY_NSPIRE_F, &prev_f);
         bool memory_overlay_edge = key_pressed_edge(KEY_NSPIRE_M, &prev_m);
+        bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool click_edge = key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click);
+        bool take_screenshot = false;
 
         if (pointer.moved || pointer_click) {
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
@@ -3553,6 +3605,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             pointer_click = true;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             show_ui = true;
+        }
+        if (screenshot_edge) {
+            take_screenshot = true;
         }
         if (cat_edge) {
             if (help_menu_open) {
@@ -3601,6 +3656,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 subtitle_placement,
                 &pointer
             );
+            if (take_screenshot) {
+                save_screenshot_bitmap(screen, path, NULL, 0);
+            }
             prefetch_tick(&movie, true, 1000);
             msleep(16);
             continue;
@@ -3739,6 +3797,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             subtitle_placement,
             &pointer
         );
+        if (take_screenshot) {
+            save_screenshot_bitmap(screen, path, NULL, 0);
+        }
         if (paused || frame_interval_ticks == 0) {
             prefetch_tick(&movie, true, 1000);
             msleep(16);

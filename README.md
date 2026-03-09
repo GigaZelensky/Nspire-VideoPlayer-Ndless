@@ -9,6 +9,12 @@ This project keeps the player and the movie data separate:
 
 The player has been tested on the **TI-Nspire CX II-T**.
 
+## Screenshots
+
+| Subtitle playback | UI overlay | Dialogue scene |
+| --- | --- | --- |
+| ![Subtitle playback](./examples/screenshots/subtitles.png) | ![Playback UI overlay](./examples/screenshots/ui-overlay.png) | ![Dialogue scene](./examples/screenshots/dialogue.png) |
+
 ## Features
 
 - Native C/Ndless runtime, no ScriptApp resource packing and no giant embedded movie `.tns` payloads
@@ -82,6 +88,7 @@ These are built-in `nSDL` fonts. They are still bitmap fonts, not anti-aliased v
 - [`src/initfini.c`](./src/initfini.c): startup / shutdown glue
 - [`tools/encode_ndless_video.py`](./tools/encode_ndless_video.py): PC-side encoder
 - [`tools/pack_zehn.py`](./tools/pack_zehn.py): Zehn packer used by the build
+- [`examples/screenshots`](./examples/screenshots): README screenshot assets
 - [`examples`](./examples): sample packaged files, including a short example movie
 - [`Makefile`](./Makefile): player build entry point
 
@@ -204,3 +211,14 @@ Run `python tools/encode_ndless_video.py --help` for the full CLI.
 5. Pick a movie from the file picker and play it locally from calculator storage.
 
 No PC connection is needed during playback. The PC is only used for preprocessing source video into the `.nvp` container.
+
+## License
+
+Unless noted otherwise, the software in this repository is licensed under the
+GNU General Public License, version 3. See [`LICENSE`](./LICENSE).
+
+The bundled sample movie encode in [`examples`](./examples) is sample content
+for testing and is not covered by the software license. The included Family
+Guy intro sample is provided only for research, educational, and
+non-commercial testing purposes, and it remains subject to the rights in its
+underlying media and subtitle sources.
