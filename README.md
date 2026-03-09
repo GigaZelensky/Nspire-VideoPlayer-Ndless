@@ -82,6 +82,7 @@ These are built-in `nSDL` fonts. They are still bitmap fonts, not anti-aliased v
 - [`src/initfini.c`](./src/initfini.c): startup / shutdown glue
 - [`tools/encode_ndless_video.py`](./tools/encode_ndless_video.py): PC-side encoder
 - [`tools/pack_zehn.py`](./tools/pack_zehn.py): Zehn packer used by the build
+- [`examples`](./examples): sample packaged files, including a short example movie
 - [`Makefile`](./Makefile): player build entry point
 
 ## Build
@@ -119,7 +120,7 @@ The current build is packaged with:
 
 ## Encoder
 
-The encoder turns a normal video file into a streamed `.nvp` movie container for the player.
+The encoder turns a normal video file into a streamed `.nvp` movie container for the player and writes it with a `.nvp.tns` filename by default.
 
 ### Python Requirements
 
@@ -149,20 +150,30 @@ The encoder uses:
 ### Basic Encode Example
 
 ```powershell
-python .\tools\encode_ndless_video.py "C:\path\to\video.mp4" --output ".\dist\video.nvp"
+python .\tools\encode_ndless_video.py "C:\path\to\video.mp4" --output ".\dist\video.nvp.tns"
 ```
 
 ### Encode With Embedded Subtitles
 
 ```powershell
-python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --output ".\dist\video.nvp"
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --output ".\dist\video.nvp.tns"
 ```
 
 ### Preserve Source Framerate
 
 ```powershell
-python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --fps source --output ".\dist\video.nvp"
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --fps source --output ".\dist\video.nvp.tns"
 ```
+
+### Recommended Full-Episode Settings
+
+This is the best quality-to-file-size balance I found for a full Family Guy episode on the CX II-T:
+
+```powershell
+python .\tools\encode_ndless_video.py "C:\path\to\episode.mkv" --subtitle embedded --output ".\dist\episode.nvp.tns" --fps 16 --max-width 320 --max-height 180 --chunk-frames 72 --block-size 16 --keyframe-interval 144 --change-ratio 0.08 --keyframe-block-ratio 0.75 --motion-search-radius 10 --motion-search-step 2 --motion-error-ratio 0.12 --posterize-bits 4 --zlib-level 9
+```
+
+There is also a ready-made short example encode in [`examples`](./examples) for quick testing without encoding a full episode first.
 
 ### Useful Encoder Options
 
@@ -187,10 +198,9 @@ Run `python tools/encode_ndless_video.py --help` for the full CLI.
 ## Install On Calculator
 
 1. Build `ndvideo.tns`.
-2. Encode a movie into a `.nvp` file.
+2. Encode a movie into a `.nvp.tns` file.
 3. Copy `ndvideo.tns` and one or more movie files to the same calculator directory.
-4. If TI's transfer software refuses a raw `.nvp`, rename or copy it as `.nvp.tns` before transfer.
-5. Launch `ndvideo.tns` through Ndless.
-6. Pick a movie from the file picker and play it locally from calculator storage.
+4. Launch `ndvideo.tns` through Ndless.
+5. Pick a movie from the file picker and play it locally from calculator storage.
 
 No PC connection is needed during playback. The PC is only used for preprocessing source video into the `.nvp` container.
