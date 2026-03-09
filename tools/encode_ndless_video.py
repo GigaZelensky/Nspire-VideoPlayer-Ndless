@@ -88,6 +88,19 @@ def format_duration_hms(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
+def normalize_output_path(output_arg: str) -> Path:
+    path = Path(output_arg).resolve()
+    lower_name = path.name.lower()
+
+    if lower_name.endswith(".nvp.tns"):
+        return path
+    if lower_name.endswith(".nvp"):
+        return path.with_name(path.name + ".tns")
+    if lower_name.endswith(".tns"):
+        return path.with_name(path.name[:-4] + ".nvp.tns")
+    return path.with_name(path.name + ".nvp.tns")
+
+
 def sanitize_subtitle_text(text: str) -> str:
     text = unicodedata.normalize("NFKD", text)
     text = text.encode("ascii", "ignore").decode("ascii")
@@ -864,7 +877,7 @@ def write_header(
 
 def encode(args: argparse.Namespace) -> EncodeStats:
     input_path = Path(args.input).resolve()
-    output_path = Path(args.output).resolve()
+    output_path = normalize_output_path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path = output_path.with_suffix(".json")
 
@@ -1061,7 +1074,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", help="Input video file")
-    parser.add_argument("--output", required=True, help="Output .nvp file")
+    parser.add_argument("--output", required=True, help="Output .nvp.tns file")
     parser.add_argument("--subtitle", help="Optional .srt path or 'embedded'")
     parser.add_argument("--fps", default="12", help="Target framerate or 'source'")
     parser.add_argument("--max-width", type=int, default=SCREEN_W, help="Fit width")

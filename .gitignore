@@ -12,3 +12,7 @@ movies/
 __pycache__/
 *.pyc
 PLAN.md
+!examples/
+!examples/README.md
+!examples/*.tns
+!examples/*.nvp.tns
