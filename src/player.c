@@ -29,16 +29,11 @@
 #define PREFETCH_FILE_BLOCK_SIZE 4096U
 #define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
 #define PREFETCH_PAUSED_SLICE_MS 12U
-#define SP804_FAST_TIMER2_LOAD_ADDR 0x90010020U
-#define SP804_FAST_TIMER2_VALUE_ADDR 0x90010024U
-#define SP804_FAST_TIMER2_CONTROL_ADDR 0x90010028U
-#define SP804_FAST_TIMER2_INTCLR_ADDR 0x9001002CU
-#define SP804_FAST_TIMER2_BGLOAD_ADDR 0x90010038U
-#define SP804_FAST_TIMER_SPEED_ADDR 0x90010080U
-#define SP804_TIMER_SPEED_32KHZ 0x02U
-#define SP804_TIMER_CONTROL_ENABLE 0x80U
-#define SP804_TIMER_CONTROL_PERIODIC 0x40U
-#define SP804_TIMER_CONTROL_32BIT 0x02U
+#define MONOTONIC_TIMER_VALUE_ADDR 0x900C0004U
+#define MONOTONIC_TIMER_CONTROL_ADDR 0x900C0008U
+#define MONOTONIC_TIMER_CLOCK_SOURCE_ADDR 0x900C0080U
+#define MONOTONIC_TIMER_CLOCK_SOURCE_32768HZ 0x0AU
+#define MONOTONIC_TIMER_CONTROL_ENABLE_32BIT 0x82U
 #define MONOTONIC_TIMER_MAX_DELTA_TICKS (TIMER_TICKS_PER_SEC * 10U)
 
 #pragma pack(push, 1)
@@ -176,6 +171,7 @@ typedef struct {
 typedef struct {
     bool initialized;
     bool using_hw_timer;
+    uint32_t ticks_per_second;
     volatile unsigned *load_reg;
     volatile unsigned *value_reg;
     volatile unsigned *control_reg;
@@ -305,40 +301,40 @@ static bool monotonic_clock_try_init_hw_timer(void)
         return false;
     }
 
-    g_clock.load_reg = (volatile unsigned *) SP804_FAST_TIMER2_LOAD_ADDR;
-    g_clock.value_reg = (volatile unsigned *) SP804_FAST_TIMER2_VALUE_ADDR;
-    g_clock.control_reg = (volatile unsigned *) SP804_FAST_TIMER2_CONTROL_ADDR;
-    g_clock.int_clear_reg = (volatile unsigned *) SP804_FAST_TIMER2_INTCLR_ADDR;
-    g_clock.bgload_reg = (volatile unsigned *) SP804_FAST_TIMER2_BGLOAD_ADDR;
-    g_clock.speed_reg = (volatile unsigned *) SP804_FAST_TIMER_SPEED_ADDR;
-    g_clock.original_load = *g_clock.load_reg;
+    g_clock.value_reg = (volatile unsigned *) MONOTONIC_TIMER_VALUE_ADDR;
+    g_clock.control_reg = (volatile unsigned *) MONOTONIC_TIMER_CONTROL_ADDR;
+    g_clock.speed_reg = (volatile unsigned *) MONOTONIC_TIMER_CLOCK_SOURCE_ADDR;
     g_clock.original_control = *g_clock.control_reg;
-    g_clock.original_bgload = *g_clock.bgload_reg;
     g_clock.original_speed = *g_clock.speed_reg;
 
     *g_clock.control_reg = 0;
-    *g_clock.int_clear_reg = 1;
-    *g_clock.speed_reg = SP804_TIMER_SPEED_32KHZ;
-    *g_clock.load_reg = 0xFFFFFFFFU;
-    *g_clock.bgload_reg = 0xFFFFFFFFU;
-    *g_clock.control_reg = SP804_TIMER_CONTROL_ENABLE
-        | SP804_TIMER_CONTROL_PERIODIC
-        | SP804_TIMER_CONTROL_32BIT;
+    *g_clock.speed_reg = MONOTONIC_TIMER_CLOCK_SOURCE_32768HZ;
+    *g_clock.control_reg = MONOTONIC_TIMER_CONTROL_ENABLE_32BIT;
 
     g_clock.last_value = (uint32_t) *g_clock.value_reg;
-    g_clock.using_hw_timer = ((*g_clock.speed_reg & SP804_TIMER_SPEED_32KHZ) == SP804_TIMER_SPEED_32KHZ);
-    return g_clock.using_hw_timer;
+    g_clock.using_hw_timer = true;
+    return true;
 }
 
 static void monotonic_clock_init(void)
 {
     memset(&g_clock, 0, sizeof(g_clock));
     g_clock.initialized = true;
+    g_clock.ticks_per_second = TIMER_TICKS_PER_SEC;
     monotonic_clock_try_init_hw_timer();
+}
+
+static uint32_t monotonic_clock_ticks_per_second(void)
+{
+    if (g_clock.ticks_per_second) {
+        return g_clock.ticks_per_second;
+    }
+    return TIMER_TICKS_PER_SEC;
 }
 
 static uint64_t monotonic_clock_now_ticks(void)
 {
+    uint32_t ticks_per_second = monotonic_clock_ticks_per_second();
     uint64_t sdl_ticks;
     if (!g_clock.initialized) {
         return 0;
@@ -348,7 +344,7 @@ static uint64_t monotonic_clock_now_ticks(void)
         uint32_t elapsed = g_clock.last_value - current_value;
         if (elapsed > MONOTONIC_TIMER_MAX_DELTA_TICKS) {
             g_clock.using_hw_timer = false;
-            sdl_ticks = (((uint64_t) SDL_GetTicks()) * TIMER_TICKS_PER_SEC) / 1000ULL;
+            sdl_ticks = (((uint64_t) SDL_GetTicks()) * ticks_per_second) / 1000ULL;
             if (sdl_ticks > g_clock.elapsed_ticks) {
                 g_clock.elapsed_ticks = sdl_ticks;
             }
@@ -358,7 +354,7 @@ static uint64_t monotonic_clock_now_ticks(void)
         g_clock.last_value = current_value;
         return g_clock.elapsed_ticks;
     }
-    sdl_ticks = (((uint64_t) SDL_GetTicks()) * TIMER_TICKS_PER_SEC) / 1000ULL;
+    sdl_ticks = (((uint64_t) SDL_GetTicks()) * ticks_per_second) / 1000ULL;
     if (sdl_ticks > g_clock.elapsed_ticks) {
         g_clock.elapsed_ticks = sdl_ticks;
     }
@@ -367,7 +363,7 @@ static uint64_t monotonic_clock_now_ticks(void)
 
 static uint32_t monotonic_clock_ticks_to_ms(uint64_t ticks)
 {
-    return (uint32_t) ((ticks * 1000ULL) / TIMER_TICKS_PER_SEC);
+    return (uint32_t) ((ticks * 1000ULL) / monotonic_clock_ticks_per_second());
 }
 
 static uint32_t monotonic_clock_now_ms(void)
@@ -379,9 +375,6 @@ static void monotonic_clock_shutdown(void)
 {
     if (g_clock.control_reg) {
         *g_clock.control_reg = 0;
-        *g_clock.int_clear_reg = 1;
-        *g_clock.load_reg = g_clock.original_load;
-        *g_clock.bgload_reg = g_clock.original_bgload;
         if (g_clock.speed_reg) {
             *g_clock.speed_reg = g_clock.original_speed;
         }
@@ -463,7 +456,7 @@ static uint64_t movie_frame_interval_ticks(const Movie *movie)
     if (!movie->header.fps_num) {
         return 0;
     }
-    return (((uint64_t) TIMER_TICKS_PER_SEC) * movie->header.fps_den) / movie->header.fps_num;
+    return (((uint64_t) monotonic_clock_ticks_per_second()) * movie->header.fps_den) / movie->header.fps_num;
 }
 
 static const PlaybackRate *playback_rate_for_index(size_t rate_index)
@@ -487,7 +480,7 @@ static uint64_t movie_frame_time_scaled_ticks(const Movie *movie, uint32_t frame
     if (!movie->header.fps_num || !rate || !rate->numerator) {
         return 0;
     }
-    return (((uint64_t) frame_index) * TIMER_TICKS_PER_SEC * movie->header.fps_den * rate->denominator)
+    return (((uint64_t) frame_index) * monotonic_clock_ticks_per_second() * movie->header.fps_den * rate->denominator)
         / (((uint64_t) movie->header.fps_num) * rate->numerator);
 }
 
@@ -505,7 +498,7 @@ static uint32_t movie_frames_from_scaled_ticks(const Movie *movie, uint64_t tota
         return 0;
     }
     return (uint32_t) ((total_ticks * movie->header.fps_num * rate->numerator)
-        / (((uint64_t) TIMER_TICKS_PER_SEC) * movie->header.fps_den * rate->denominator));
+        / (((uint64_t) monotonic_clock_ticks_per_second()) * movie->header.fps_den * rate->denominator));
 }
 
 static uint32_t movie_duration_ms(const Movie *movie)
