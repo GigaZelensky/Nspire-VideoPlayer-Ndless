@@ -2,9 +2,6 @@
 #include <libndls.h>
 #include <os.h>
 #include <SDL/SDL.h>
-#include <SDL/SDL_ttf.h>
-
-#include "overclock.h"
 
 #include <ctype.h>
 #include <stdbool.h>
@@ -16,7 +13,7 @@
 
 #define SCREEN_W 320
 #define SCREEN_H 240
-#define UI_BAR_H 40
+#define UI_BAR_H 28
 #define SEEK_STEP_MS 5000
 #define PICKER_MAX_FILES 128
 #define PICKER_VISIBLE_ROWS 9
@@ -29,12 +26,9 @@
 #define POINTER_UI_TIMEOUT_MS 1800U
 #define POINTER_GAIN_NUM 5
 #define POINTER_GAIN_DEN 4
-#define ENABLE_STARTUP_OVERCLOCK 0
 #define PREFETCH_FILE_BLOCK_SIZE 4096U
 #define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
 #define PREFETCH_PAUSED_SLICE_MS 12U
-#define SUBTITLE_TTF_PATH "subtitles.ttf"
-#define SUBTITLE_FONT_COUNT 4
 
 #pragma pack(push, 1)
 typedef struct {
@@ -90,7 +84,8 @@ typedef struct {
 typedef struct {
     nSDL_Font *white;
     nSDL_Font *outline;
-    TTF_Font *subtitle_fonts[SUBTITLE_FONT_COUNT];
+    nSDL_Font *subtitle_white;
+    nSDL_Font *subtitle_outline;
 } Fonts;
 
 typedef enum {
@@ -99,6 +94,14 @@ typedef enum {
     SCALE_STRETCH = 2,
     SCALE_NATIVE = 3,
 } ScaleMode;
+
+typedef enum {
+    SUBTITLE_POS_BAR_BOTTOM = 0,
+    SUBTITLE_POS_VIDEO_BOTTOM,
+    SUBTITLE_POS_VIDEO_TOP,
+    SUBTITLE_POS_BAR_TOP,
+    SUBTITLE_POS_COUNT,
+} SubtitlePlacement;
 
 typedef struct {
     touchpad_info_t *info;
@@ -151,10 +154,6 @@ typedef struct {
     int decoded_local_frame;
     uint32_t current_frame;
     SDL_Surface *frame_surface;
-    const char *current_subtitle_text;
-    SDL_Surface *cached_subtitle_surface;
-    int cached_subtitle_size;
-    int cached_subtitle_max_width;
 } Movie;
 
 typedef struct {
@@ -380,20 +379,6 @@ static void free_movie_files(MovieFile *files, size_t count)
     free(files);
 }
 
-static void clear_subtitle_cache(Movie *movie)
-{
-    if (!movie) {
-        return;
-    }
-    if (movie->cached_subtitle_surface) {
-        SDL_FreeSurface(movie->cached_subtitle_surface);
-    }
-    movie->cached_subtitle_surface = NULL;
-    movie->current_subtitle_text = NULL;
-    movie->cached_subtitle_size = -1;
-    movie->cached_subtitle_max_width = -1;
-}
-
 static void destroy_movie(Movie *movie)
 {
     uint32_t index;
@@ -419,7 +404,6 @@ static void destroy_movie(Movie *movie)
     free(movie->block_scratch);
     free(movie->chunk_storage);
     free(movie->frame_offsets);
-    clear_subtitle_cache(movie);
     for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
         clear_prefetched_chunk(&movie->prefetched[prefetch_index]);
     }
@@ -431,49 +415,39 @@ static void destroy_movie(Movie *movie)
     movie->decoded_local_frame = -1;
 }
 
-static int subtitle_point_size(int subtitle_size)
-{
-    static const int point_sizes[SUBTITLE_FONT_COUNT] = {14, 18, 22, 26};
-
-    subtitle_size = clamp_int(subtitle_size, 0, SUBTITLE_FONT_COUNT - 1);
-    return point_sizes[subtitle_size];
-}
-
 static bool init_fonts(Fonts *fonts)
 {
-    int index;
-
     memset(fonts, 0, sizeof(*fonts));
     fonts->white = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 255, 255, 255);
     fonts->outline = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 0, 0, 0);
-    if (!fonts->white || !fonts->outline) {
+    fonts->subtitle_white = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 255, 255, 255);
+    fonts->subtitle_outline = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 0, 0, 0);
+    if (fonts->subtitle_white) {
+        nSDL_SetFontSpacing(fonts->subtitle_white, 0, 0);
+    }
+    if (fonts->subtitle_outline) {
+        nSDL_SetFontSpacing(fonts->subtitle_outline, 0, 0);
+    }
+    if (!fonts->white || !fonts->outline || !fonts->subtitle_white || !fonts->subtitle_outline) {
         free_fonts(fonts);
         return false;
-    }
-    for (index = 0; index < SUBTITLE_FONT_COUNT; ++index) {
-        fonts->subtitle_fonts[index] = TTF_OpenFont(SUBTITLE_TTF_PATH, subtitle_point_size(index));
-        if (!fonts->subtitle_fonts[index]) {
-            free_fonts(fonts);
-            return false;
-        }
     }
     return true;
 }
 
 static void free_fonts(Fonts *fonts)
 {
-    int index;
-
     if (fonts->white) {
         nSDL_FreeFont(fonts->white);
     }
     if (fonts->outline) {
         nSDL_FreeFont(fonts->outline);
     }
-    for (index = 0; index < SUBTITLE_FONT_COUNT; ++index) {
-        if (fonts->subtitle_fonts[index]) {
-            TTF_CloseFont(fonts->subtitle_fonts[index]);
-        }
+    if (fonts->subtitle_white) {
+        nSDL_FreeFont(fonts->subtitle_white);
+    }
+    if (fonts->subtitle_outline) {
+        nSDL_FreeFont(fonts->subtitle_outline);
     }
     memset(fonts, 0, sizeof(*fonts));
 }
@@ -1932,8 +1906,6 @@ static bool load_movie(const char *path, Movie *movie)
     uint32_t chunk_index_read;
     memset(movie, 0, sizeof(*movie));
     movie->loaded_chunk = -1;
-    movie->cached_subtitle_size = -1;
-    movie->cached_subtitle_max_width = -1;
     {
         int prefetch_index;
         for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
@@ -2084,29 +2056,16 @@ static const char *active_subtitle(const Movie *movie, uint32_t now_ms)
     return NULL;
 }
 
-static TTF_Font *subtitle_font_for_size(const Fonts *fonts, int subtitle_size)
+static void draw_outlined_text(SDL_Surface *surface, nSDL_Font *white_font, nSDL_Font *outline_font, int x, int y, const char *text)
 {
-    if (!fonts) {
-        return NULL;
-    }
-    subtitle_size = clamp_int(subtitle_size, 0, SUBTITLE_FONT_COUNT - 1);
-    return fonts->subtitle_fonts[subtitle_size];
+    nSDL_DrawString(surface, outline_font, x - 1, y, text);
+    nSDL_DrawString(surface, outline_font, x + 1, y, text);
+    nSDL_DrawString(surface, outline_font, x, y - 1, text);
+    nSDL_DrawString(surface, outline_font, x, y + 1, text);
+    nSDL_DrawString(surface, white_font, x, y, text);
 }
 
-static int subtitle_text_width(TTF_Font *font, const char *text)
-{
-    int width = 0;
-
-    if (!font || !text || !*text) {
-        return 0;
-    }
-    if (TTF_SizeUTF8(font, text, &width, NULL) != 0) {
-        return 0;
-    }
-    return width;
-}
-
-static int wrap_subtitle_ttf(TTF_Font *font, const char *text, int max_width, char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN])
+static int wrap_subtitle(nSDL_Font *font, const char *text, int max_width, char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN])
 {
     char current[MAX_SUBTITLE_LINE_LEN];
     size_t pos = 0;
@@ -2115,9 +2074,9 @@ static int wrap_subtitle_ttf(TTF_Font *font, const char *text, int max_width, ch
     if (!font || !text || max_width <= 0) {
         return 0;
     }
+
     current[0] = '\0';
     memset(lines, 0, sizeof(char) * MAX_SUBTITLE_LINES * MAX_SUBTITLE_LINE_LEN);
-
     while (text[pos] != '\0' && line_count < MAX_SUBTITLE_LINES) {
         char word[64];
         size_t word_len = 0;
@@ -2145,7 +2104,6 @@ static int wrap_subtitle_ttf(TTF_Font *font, const char *text, int max_width, ch
         } else {
             char candidate[MAX_SUBTITLE_LINE_LEN];
             size_t current_len = strlen(current);
-
             if (current_len + 1 + word_len >= sizeof(candidate)) {
                 strncpy(lines[line_count], current, MAX_SUBTITLE_LINE_LEN - 1);
                 line_count++;
@@ -2157,7 +2115,7 @@ static int wrap_subtitle_ttf(TTF_Font *font, const char *text, int max_width, ch
                 memcpy(candidate, current, current_len);
                 candidate[current_len] = ' ';
                 memcpy(candidate + current_len + 1, word, word_len + 1);
-                if (subtitle_text_width(font, candidate) > max_width) {
+                if (nSDL_GetStringWidth(font, candidate) > max_width) {
                     strncpy(lines[line_count], current, MAX_SUBTITLE_LINE_LEN - 1);
                     line_count++;
                     if (line_count >= MAX_SUBTITLE_LINES) {
@@ -2177,152 +2135,248 @@ static int wrap_subtitle_ttf(TTF_Font *font, const char *text, int max_width, ch
     return line_count;
 }
 
-static SDL_Surface *create_rgba_surface(int width, int height)
+static int subtitle_scale_num(int subtitle_size)
 {
-    Uint32 rmask;
-    Uint32 gmask;
-    Uint32 bmask;
-    Uint32 amask;
-
-    if (width <= 0 || height <= 0) {
-        return NULL;
-    }
-#if SDL_BYTEORDER == SDL_BIG_ENDIAN
-    rmask = 0xFF000000U;
-    gmask = 0x00FF0000U;
-    bmask = 0x0000FF00U;
-    amask = 0x000000FFU;
-#else
-    rmask = 0x000000FFU;
-    gmask = 0x0000FF00U;
-    bmask = 0x00FF0000U;
-    amask = 0xFF000000U;
-#endif
-    return SDL_CreateRGBSurface(SDL_SWSURFACE, width, height, 32, rmask, gmask, bmask, amask);
+    static const int numerators[4] = {1, 4, 5, 2};
+    subtitle_size = clamp_int(subtitle_size, 0, 3);
+    return numerators[subtitle_size];
 }
 
-static void blit_surface_at(SDL_Surface *dst, SDL_Surface *src, int x, int y)
+static int subtitle_scale_den(int subtitle_size)
 {
-    SDL_Rect rect;
+    static const int denominators[4] = {1, 3, 3, 1};
+    subtitle_size = clamp_int(subtitle_size, 0, 3);
+    return denominators[subtitle_size];
+}
 
-    if (!dst || !src) {
+static void subtitle_fonts_for_size(const Fonts *fonts, int subtitle_size, nSDL_Font **white_font, nSDL_Font **outline_font)
+{
+    (void) subtitle_size;
+    *white_font = fonts->subtitle_white;
+    *outline_font = fonts->subtitle_outline;
+}
+
+static void draw_scaled_outlined_text(
+    SDL_Surface *screen,
+    nSDL_Font *white_font,
+    nSDL_Font *outline_font,
+    int x,
+    int y,
+    const char *text,
+    int scale_num,
+    int scale_den
+)
+{
+    int text_w = nSDL_GetStringWidth(white_font, text);
+    int text_h = nSDL_GetStringHeight(white_font, text);
+    SDL_Surface *text_surface;
+    Uint32 key;
+    int dst_w;
+    int dst_h;
+    int dst_x;
+    int dst_y;
+    Uint16 key16;
+    Uint16 *src_pixels;
+    Uint16 *dst_pixels;
+    int src_pitch;
+    int dst_pitch;
+    if (scale_num <= 0 || scale_den <= 0) {
         return;
     }
-    rect.x = (Sint16) x;
-    rect.y = (Sint16) y;
-    rect.w = 0;
-    rect.h = 0;
-    SDL_BlitSurface(src, NULL, dst, &rect);
+    if (scale_num == scale_den) {
+        draw_outlined_text(screen, white_font, outline_font, x, y, text);
+        return;
+    }
+    text_surface = SDL_CreateRGBSurface(
+        SDL_SWSURFACE,
+        text_w + 4,
+        text_h + 4,
+        screen->format->BitsPerPixel,
+        screen->format->Rmask,
+        screen->format->Gmask,
+        screen->format->Bmask,
+        screen->format->Amask
+    );
+    if (!text_surface) {
+        draw_outlined_text(screen, white_font, outline_font, x, y, text);
+        return;
+    }
+    key = SDL_MapRGB(text_surface->format, 255, 0, 255);
+    SDL_FillRect(text_surface, NULL, key);
+    draw_outlined_text(text_surface, white_font, outline_font, 2, 2, text);
+    dst_w = (text_surface->w * scale_num) / scale_den;
+    dst_h = (text_surface->h * scale_num) / scale_den;
+    if (dst_w <= 0 || dst_h <= 0 || screen->format->BitsPerPixel != 16 || text_surface->format->BitsPerPixel != 16) {
+        SDL_FreeSurface(text_surface);
+        draw_outlined_text(screen, white_font, outline_font, x, y, text);
+        return;
+    }
+    if (SDL_MUSTLOCK(text_surface)) {
+        SDL_LockSurface(text_surface);
+    }
+    if (SDL_MUSTLOCK(screen)) {
+        SDL_LockSurface(screen);
+    }
+    key16 = (Uint16) key;
+    src_pixels = (Uint16 *) text_surface->pixels;
+    dst_pixels = (Uint16 *) screen->pixels;
+    src_pitch = text_surface->pitch / 2;
+    dst_pitch = screen->pitch / 2;
+    for (dst_y = 0; dst_y < dst_h; ++dst_y) {
+        int src_y;
+        int draw_y = y + dst_y;
+        if (draw_y < 0 || draw_y >= screen->h) {
+            continue;
+        }
+        if (dst_h > 1 && text_surface->h > 1) {
+            src_y = (dst_y * (text_surface->h - 1) + ((dst_h - 1) / 2)) / (dst_h - 1);
+        } else {
+            src_y = 0;
+        }
+        for (dst_x = 0; dst_x < dst_w; ++dst_x) {
+            int src_x;
+            Uint16 sample;
+            int draw_x = x + dst_x;
+            if (draw_x < 0 || draw_x >= screen->w) {
+                continue;
+            }
+            if (dst_w > 1 && text_surface->w > 1) {
+                src_x = (dst_x * (text_surface->w - 1) + ((dst_w - 1) / 2)) / (dst_w - 1);
+            } else {
+                src_x = 0;
+            }
+            sample = src_pixels[src_y * src_pitch + src_x];
+            if (sample != key16) {
+                dst_pixels[draw_y * dst_pitch + draw_x] = sample;
+            }
+        }
+    }
+    if (SDL_MUSTLOCK(screen)) {
+        SDL_UnlockSurface(screen);
+    }
+    if (SDL_MUSTLOCK(text_surface)) {
+        SDL_UnlockSurface(text_surface);
+    }
+    SDL_FreeSurface(text_surface);
 }
 
-static void update_subtitle_cache(Movie *movie, const Fonts *fonts, const char *text, int subtitle_size, int max_width)
+static void draw_subtitle(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    const SDL_Rect *video_rect,
+    const char *text,
+    bool overlay_visible,
+    int subtitle_size,
+    SubtitlePlacement placement
+)
 {
-    TTF_Font *font;
     char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN];
-    SDL_Surface *white_surfaces[MAX_SUBTITLE_LINES] = {0};
-    SDL_Surface *outline_surfaces[MAX_SUBTITLE_LINES] = {0};
-    SDL_Surface *combined = NULL;
-    SDL_Surface *optimized = NULL;
-    SDL_Color white = {255, 255, 255, 0};
-    SDL_Color black = {0, 0, 0, 0};
-    int line_widths[MAX_SUBTITLE_LINES] = {0};
-    int line_heights[MAX_SUBTITLE_LINES] = {0};
-    int subtitle_w = 0;
-    int subtitle_h = 0;
     int line_count;
-    int index;
-    int y = 2;
-    const int line_spacing = 2;
-
-    if (!movie) {
+    int line_index;
+    int base_x;
+    int base_y;
+    int area_width;
+    int max_width;
+    nSDL_Font *white_font;
+    nSDL_Font *outline_font;
+    int scale_num;
+    int scale_den;
+    int line_height;
+    int total_height;
+    int area_top;
+    int area_bottom;
+    int area_height;
+    if (!text || !*text) {
         return;
     }
-    subtitle_size = clamp_int(subtitle_size, 0, SUBTITLE_FONT_COUNT - 1);
-    if (movie->cached_subtitle_surface &&
-        movie->current_subtitle_text == text &&
-        movie->cached_subtitle_size == subtitle_size &&
-        movie->cached_subtitle_max_width == max_width) {
+    if (subtitle_size < 0) {
         return;
     }
-
-    clear_subtitle_cache(movie);
-    if (!text || !*text || max_width <= 0) {
+    subtitle_size = clamp_int(subtitle_size, 0, 3);
+    subtitle_fonts_for_size(fonts, subtitle_size, &white_font, &outline_font);
+    scale_num = subtitle_scale_num(subtitle_size);
+    scale_den = subtitle_scale_den(subtitle_size);
+    line_height = nSDL_GetStringHeight(white_font, "Ag");
+    if (line_height < 10) {
+        line_height = 10;
+    }
+    line_height = (line_height * scale_num) / scale_den;
+    if (line_height < 10) {
+        line_height = 10;
+    }
+    if (placement == SUBTITLE_POS_BAR_BOTTOM || placement == SUBTITLE_POS_BAR_TOP) {
+        base_x = 0;
+        area_width = SCREEN_W;
+    } else {
+        base_x = video_rect->x;
+        area_width = video_rect->w;
+    }
+    max_width = area_width - 12;
+    if (max_width <= 0) {
         return;
     }
-
-    font = subtitle_font_for_size(fonts, subtitle_size);
-    if (!font) {
-        return;
-    }
-
-    line_count = wrap_subtitle_ttf(font, text, max_width, lines);
+    line_count = wrap_subtitle(white_font, text, (max_width * scale_den) / scale_num, lines);
     if (line_count <= 0) {
         return;
     }
-
-    for (index = 0; index < line_count; ++index) {
-        white_surfaces[index] = TTF_RenderUTF8_Blended(font, lines[index], white);
-        outline_surfaces[index] = TTF_RenderUTF8_Blended(font, lines[index], black);
-        if (!white_surfaces[index] || !outline_surfaces[index]) {
-            goto cleanup;
-        }
-        line_widths[index] = white_surfaces[index]->w;
-        line_heights[index] = white_surfaces[index]->h;
-        if (line_widths[index] > subtitle_w) {
-            subtitle_w = line_widths[index];
-        }
-        subtitle_h += line_heights[index];
-        if (index + 1 < line_count) {
-            subtitle_h += line_spacing;
-        }
+    total_height = line_count * line_height;
+    if (line_count > 1) {
+        total_height += (line_count - 1) * 2;
     }
-
-    combined = create_rgba_surface(subtitle_w + 4, subtitle_h + 4);
-    if (!combined) {
-        goto cleanup;
+    switch (placement) {
+        case SUBTITLE_POS_BAR_BOTTOM:
+            area_top = video_rect->y + video_rect->h + 2;
+            area_bottom = (overlay_visible ? (SCREEN_H - UI_BAR_H) : SCREEN_H) - 2;
+            area_height = area_bottom - area_top;
+            if (area_height >= total_height) {
+                base_y = area_top + (area_height - total_height) / 2;
+            } else {
+                base_y = area_bottom - total_height;
+                if (base_y < 2) {
+                    base_y = 2;
+                }
+            }
+            break;
+        case SUBTITLE_POS_VIDEO_TOP:
+            base_y = video_rect->y + 4;
+            break;
+        case SUBTITLE_POS_BAR_TOP:
+            area_top = 2;
+            area_bottom = video_rect->y - 2;
+            area_height = area_bottom - area_top;
+            if (area_height >= total_height) {
+                base_y = area_top + (area_height - total_height) / 2;
+            } else {
+                base_y = 4;
+            }
+            break;
+        case SUBTITLE_POS_VIDEO_BOTTOM:
+        default:
+            base_y = (video_rect->y + video_rect->h - 8) - total_height;
+            if (base_y < video_rect->y + 4) {
+                base_y = video_rect->y + 4;
+            }
+            break;
     }
-    SDL_FillRect(combined, NULL, SDL_MapRGBA(combined->format, 0, 0, 0, 0));
-
-    for (index = 0; index < line_count; ++index) {
-        int x = 2 + (subtitle_w - line_widths[index]) / 2;
-
-        blit_surface_at(combined, outline_surfaces[index], x - 1, y - 1);
-        blit_surface_at(combined, outline_surfaces[index], x + 1, y - 1);
-        blit_surface_at(combined, outline_surfaces[index], x - 1, y + 1);
-        blit_surface_at(combined, outline_surfaces[index], x + 1, y + 1);
-        blit_surface_at(combined, white_surfaces[index], x, y);
-        y += line_heights[index] + line_spacing;
-    }
-
-    optimized = SDL_DisplayFormatAlpha(combined);
-    if (optimized) {
-        SDL_FreeSurface(combined);
-        combined = optimized;
-    }
-
-    movie->cached_subtitle_surface = combined;
-    movie->current_subtitle_text = text;
-    movie->cached_subtitle_size = subtitle_size;
-    movie->cached_subtitle_max_width = max_width;
-    combined = NULL;
-
-cleanup:
-    if (combined) {
-        SDL_FreeSurface(combined);
-    }
-    for (index = 0; index < MAX_SUBTITLE_LINES; ++index) {
-        if (white_surfaces[index]) {
-            SDL_FreeSurface(white_surfaces[index]);
-        }
-        if (outline_surfaces[index]) {
-            SDL_FreeSurface(outline_surfaces[index]);
-        }
+    for (line_index = 0; line_index < line_count; ++line_index) {
+        int width = (nSDL_GetStringWidth(white_font, lines[line_index]) * scale_num) / scale_den;
+        int x = base_x + (area_width - width) / 2;
+        draw_scaled_outlined_text(
+            screen,
+            white_font,
+            outline_font,
+            x,
+            base_y + (line_index * (line_height + 2)),
+            lines[line_index],
+            scale_num,
+            scale_den
+        );
     }
 }
 
 static SDL_Rect progress_bar_rect(void)
 {
-    SDL_Rect rect = {16, SCREEN_H - 14, SCREEN_W - 32, 6};
+    SDL_Rect rect = {14, SCREEN_H - 11, SCREEN_W - 28, 5};
     return rect;
 }
 
@@ -2408,6 +2462,37 @@ static const char *scale_mode_text(ScaleMode scale_mode)
     return "FIT";
 }
 
+static const char *subtitle_size_text(int subtitle_size)
+{
+    switch (subtitle_size) {
+        case 3:
+            return "XL";
+        case 2:
+            return "LARGE";
+        case 1:
+            return "MEDIUM";
+        case 0:
+            return "SMALL";
+        default:
+            return "HIDDEN";
+    }
+}
+
+static const char *subtitle_placement_text(SubtitlePlacement placement)
+{
+    switch (placement) {
+        case SUBTITLE_POS_VIDEO_BOTTOM:
+            return "BOTTOM VIDEO";
+        case SUBTITLE_POS_VIDEO_TOP:
+            return "TOP VIDEO";
+        case SUBTITLE_POS_BAR_TOP:
+            return "TOP BAR";
+        case SUBTITLE_POS_BAR_BOTTOM:
+        default:
+            return "BOTTOM BAR";
+    }
+}
+
 static void draw_mode_badge(SDL_Surface *screen, const Fonts *fonts, ScaleMode scale_mode)
 {
     const char *label = scale_mode_text(scale_mode);
@@ -2417,14 +2502,110 @@ static void draw_mode_badge(SDL_Surface *screen, const Fonts *fonts, ScaleMode s
     nSDL_DrawString(screen, fonts->white, badge.x + 5, badge.y + 4, label);
 }
 
+static void draw_playback_badge(SDL_Surface *screen, bool paused)
+{
+    Uint32 background = SDL_MapRGB(screen->format, 18, 18, 24);
+    Uint32 inner = SDL_MapRGB(screen->format, 8, 10, 14);
+    Uint32 foreground = SDL_MapRGB(screen->format, 255, 255, 255);
+    SDL_Rect outer = {8, 8, 22, 22};
+    SDL_Rect fill = {9, 9, 20, 20};
+
+    SDL_FillRect(screen, &outer, background);
+    SDL_FillRect(screen, &fill, inner);
+    if (paused) {
+        SDL_Rect left_bar = {14, 13, 3, 10};
+        SDL_Rect right_bar = {21, 13, 3, 10};
+        SDL_FillRect(screen, &left_bar, foreground);
+        SDL_FillRect(screen, &right_bar, foreground);
+    } else {
+        int column;
+        for (column = 0; column < 8; ++column) {
+            int height = 1 + ((7 - column) * 10) / 7;
+            SDL_Rect slice = {
+                (Sint16) (14 + column),
+                (Sint16) (18 - (height / 2)),
+                1,
+                (Uint16) height
+            };
+            SDL_FillRect(screen, &slice, foreground);
+        }
+    }
+}
+
+static void draw_help_row(SDL_Surface *screen, const Fonts *fonts, int x, int y, int panel_w, const char *shortcut, const char *description)
+{
+    SDL_Rect row_rect = {(Sint16) x, (Sint16) (y - 2), (Uint16) panel_w, 13};
+    SDL_Rect key_rect = {(Sint16) x, (Sint16) (y - 2), 72, 13};
+
+    SDL_FillRect(screen, &row_rect, SDL_MapRGB(screen->format, 10, 14, 20));
+    SDL_FillRect(screen, &key_rect, SDL_MapRGB(screen->format, 18, 24, 34));
+    nSDL_DrawString(screen, fonts->white, x + 6, y, shortcut);
+    nSDL_DrawString(screen, fonts->white, x + 80, y, description);
+}
+
+static void draw_help_menu(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    ScaleMode scale_mode,
+    int subtitle_size,
+    SubtitlePlacement subtitle_placement
+)
+{
+    SDL_Rect shadow = {18, 18, 288, 180};
+    SDL_Rect panel = {14, 14, 288, 180};
+    SDL_Rect header = {14, 14, 288, 22};
+    SDL_Rect accent = {14, 36, 288, 2};
+    SDL_Rect footer = {14, 182, 288, 12};
+    char status[80];
+    const char *close_text = "CAT close";
+    int y = 52;
+
+    SDL_FillRect(screen, &shadow, SDL_MapRGB(screen->format, 0, 0, 0));
+    SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 8, 10, 14));
+    SDL_FillRect(screen, &header, SDL_MapRGB(screen->format, 12, 18, 28));
+    SDL_FillRect(screen, &accent, SDL_MapRGB(screen->format, 32, 182, 255));
+    SDL_FillRect(screen, &footer, SDL_MapRGB(screen->format, 12, 18, 28));
+
+    nSDL_DrawString(screen, fonts->white, panel.x + 10, panel.y + 6, "Playback Controls");
+    nSDL_DrawString(screen, fonts->white, panel.x + panel.w - 10 - nSDL_GetStringWidth(fonts->white, close_text), panel.y + 6, close_text);
+
+    snprintf(
+        status,
+        sizeof(status),
+        "%s  |  %s  |  %s",
+        scale_mode_text(scale_mode),
+        subtitle_size_text(subtitle_size),
+        subtitle_placement_text(subtitle_placement)
+    );
+    nSDL_DrawString(screen, fonts->white, panel.x + 10, panel.y + 24, status);
+
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "ENTER", "Play or pause");
+    y += 14;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "CLICK", "Toggle or seek bar");
+    y += 14;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "L / R", "Seek -/+5s");
+    y += 14;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "TAB", "Step one frame");
+    y += 14;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "/", "Scale mode");
+    y += 14;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "^", "Subtitle position");
+    y += 14;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "+ / -", "Subtitle size");
+    y += 14;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "TOUCHPAD", "Move cursor / show UI");
+    y += 14;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "ESC", "Close menu or exit");
+
+    nSDL_DrawString(screen, fonts->white, panel.x + 10, panel.y + panel.h - 10, "CAT closes help. ESC exits movie.");
+}
 
 static void draw_progress(
     SDL_Surface *screen,
     const Fonts *fonts,
     const Movie *movie,
     uint32_t current_ms,
-    const PointerState *pointer,
-    const ClockState *clock_state
+    const PointerState *pointer
 )
 {
     SDL_Rect overlay = {0, SCREEN_H - UI_BAR_H, SCREEN_W, UI_BAR_H};
@@ -2434,10 +2615,9 @@ static void draw_progress(
     char current_text[24];
     char total_text[24];
     char left_text[56];
-    char clock_text[24];
-    char hint_text[80];
+    char remaining_text[24];
+    char right_text[32];
     uint32_t duration_ms = movie_duration_ms(movie);
-    snprintf(hint_text, sizeof(hint_text), "CLICK SEEK  L/R +/-5s  TAB STEP  / MODE  +/- SUB");
     SDL_FillRect(screen, &overlay, SDL_MapRGB(screen->format, 0, 0, 0));
     SDL_FillRect(screen, &bar_back, SDL_MapRGB(screen->format, 52, 52, 68));
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
@@ -2462,24 +2642,16 @@ static void draw_progress(
     }
     format_clock(current_ms, current_text, sizeof(current_text));
     format_clock(duration_ms, total_text, sizeof(total_text));
+    format_clock(duration_ms > current_ms ? (duration_ms - current_ms) : 0, remaining_text, sizeof(remaining_text));
     snprintf(left_text, sizeof(left_text), "%s / %s", current_text, total_text);
-    nSDL_DrawString(screen, fonts->white, 12, SCREEN_H - UI_BAR_H + 6, left_text);
-    if (clock_state) {
-        snprintf(clock_text, sizeof(clock_text), "%s", clock_state_label(clock_state));
-        nSDL_DrawString(
-            screen,
-            fonts->white,
-            SCREEN_W - nSDL_GetStringWidth(fonts->white, clock_text) - 12,
-            SCREEN_H - UI_BAR_H + 6,
-            clock_text
-        );
-    }
+    snprintf(right_text, sizeof(right_text), "-%s", remaining_text);
+    nSDL_DrawString(screen, fonts->white, 12, SCREEN_H - UI_BAR_H + 7, left_text);
     nSDL_DrawString(
         screen,
         fonts->white,
-        (SCREEN_W - nSDL_GetStringWidth(fonts->white, hint_text)) / 2,
-        SCREEN_H - UI_BAR_H + 18,
-        hint_text
+        SCREEN_W - 12 - nSDL_GetStringWidth(fonts->white, right_text),
+        SCREEN_H - UI_BAR_H + 7,
+        right_text
     );
 }
 
@@ -2489,17 +2661,18 @@ static void render_movie(
     Movie *movie,
     bool paused,
     bool show_ui,
+    bool help_menu_open,
     ScaleMode scale_mode,
     int subtitle_size,
-    const PointerState *pointer,
-    const ClockState *clock_state
+    SubtitlePlacement subtitle_placement,
+    const PointerState *pointer
 )
 {
     SDL_Rect src;
     SDL_Rect dst;
     uint32_t current_ms = movie_frame_time_ms(movie, movie->current_frame);
     const char *subtitle = active_subtitle(movie, current_ms);
-    int max_subtitle_width;
+
     compute_video_rects(movie, scale_mode, &src, &dst);
     SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
     if (src.w == movie->header.video_width && src.h == movie->header.video_height &&
@@ -2508,37 +2681,19 @@ static void render_movie(
     } else {
         SDL_SoftStretch(movie->frame_surface, &src, screen, &dst);
     }
-    max_subtitle_width = dst.w > 12 ? (dst.w - 12) : dst.w;
-    update_subtitle_cache(movie, fonts, subtitle, subtitle_size, max_subtitle_width);
-    if (movie->cached_subtitle_surface) {
-        SDL_Rect subtitle_rect;
-        int bottom_limit = show_ui ? (SCREEN_H - UI_BAR_H - 8) : (dst.y + dst.h - 8);
-        int max_x = screen->w - movie->cached_subtitle_surface->w;
-
-        subtitle_rect.x = (Sint16) (dst.x + (dst.w - movie->cached_subtitle_surface->w) / 2);
-        subtitle_rect.y = (Sint16) (bottom_limit - movie->cached_subtitle_surface->h);
-        subtitle_rect.w = 0;
-        subtitle_rect.h = 0;
-        if (max_x < 0) {
-            max_x = 0;
-        }
-        if (subtitle_rect.x < 0) {
-            subtitle_rect.x = 0;
-        }
-        if (subtitle_rect.x > max_x) {
-            subtitle_rect.x = (Sint16) max_x;
-        }
-        if (subtitle_rect.y < dst.y + 4) {
-            subtitle_rect.y = (Sint16) (dst.y + 4);
-        }
-        SDL_BlitSurface(movie->cached_subtitle_surface, NULL, screen, &subtitle_rect);
-    }
+    draw_subtitle(screen, fonts, &dst, subtitle, show_ui, subtitle_size, subtitle_placement);
     if (show_ui) {
-        draw_mode_badge(screen, fonts, scale_mode);
-        draw_progress(screen, fonts, movie, current_ms, pointer, clock_state);
-        if (pointer && pointer->visible) {
+        if (!help_menu_open) {
+            draw_playback_badge(screen, paused);
+            draw_mode_badge(screen, fonts, scale_mode);
+        }
+        draw_progress(screen, fonts, movie, current_ms, pointer);
+        if (!help_menu_open && pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
+    }
+    if (help_menu_open) {
+        draw_help_menu(screen, fonts, scale_mode, subtitle_size, subtitle_placement);
     }
     SDL_Flip(screen);
 }
@@ -2673,15 +2828,16 @@ static void seek_to_ratio(Movie *movie, uint32_t numerator, uint32_t denominator
 static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
 {
     Movie movie;
-    ClockState playback_clock_state;
-    bool playback_clock_active = false;
     bool prev_enter = false;
     bool prev_left = false;
     bool prev_right = false;
     bool prev_tab = false;
     bool prev_esc = false;
     bool prev_click = false;
+    bool prev_cat = false;
     bool prev_divide = false;
+    bool prev_exp = false;
+    bool prev_tenx = false;
     bool prev_plus = false;
     bool prev_minus = false;
     bool paused = false;
@@ -2692,20 +2848,15 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     uint32_t ui_visible_until;
     int result = 0;
     ScaleMode scale_mode = SCALE_FIT;
-    int subtitle_size = 2;
+    int subtitle_size = 0;
+    SubtitlePlacement subtitle_placement = SUBTITLE_POS_BAR_BOTTOM;
     PointerState pointer;
+    bool help_menu_open = false;
+    bool help_resume_playback = false;
 
     if (!load_movie(path, &movie)) {
-        if (playback_clock_active) {
-            clock_state_restore(&playback_clock_state);
-        }
         show_msgbox("ND Video Player", "Failed to open movie file.");
         return -1;
-    }
-    clock_state_init(&playback_clock_state);
-    playback_clock_active = true;
-    if (ENABLE_STARTUP_OVERCLOCK) {
-        clock_state_apply_boost(&playback_clock_state);
     }
     pointer_init(&pointer);
     frame_ms = movie_frame_interval_ms(&movie);
@@ -2720,12 +2871,14 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     while (1) {
         bool pointer_click = pointer_update(&pointer);
         uint32_t now_ms = monotonic_clock_now_ms();
-        bool show_ui = paused || (now_ms <= ui_visible_until);
+        bool show_ui = help_menu_open || paused || (now_ms <= ui_visible_until);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
         bool tab_edge = key_pressed_edge(KEY_NSPIRE_TAB, &prev_tab);
+        bool cat_edge = key_pressed_edge(KEY_NSPIRE_CAT, &prev_cat);
         bool divide_edge = key_pressed_edge(KEY_NSPIRE_DIVIDE, &prev_divide);
+        bool exp_edge = key_pressed_edge(KEY_NSPIRE_EXP, &prev_exp);
+        bool tenx_edge = key_pressed_edge(KEY_NSPIRE_TENX, &prev_tenx);
         bool click_edge = key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click);
-        bool overclock_toggle = divide_edge && isKeyPressed(KEY_NSPIRE_TAB);
 
         if (pointer.moved || pointer_click) {
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
@@ -2736,8 +2889,52 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             show_ui = true;
         }
+        if (cat_edge) {
+            if (help_menu_open) {
+                help_menu_open = false;
+                if (help_resume_playback) {
+                    paused = false;
+                }
+                help_resume_playback = false;
+            } else {
+                help_menu_open = true;
+                help_resume_playback = !paused;
+                paused = true;
+            }
+            reset_playback_timeline(&movie, now_ms, &playback_anchor_ms, &playback_anchor_frame, &next_frame_due);
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+            show_ui = true;
+        }
         if (key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc)) {
-            break;
+            if (help_menu_open) {
+                help_menu_open = false;
+                if (help_resume_playback) {
+                    paused = false;
+                }
+                help_resume_playback = false;
+                reset_playback_timeline(&movie, now_ms, &playback_anchor_ms, &playback_anchor_frame, &next_frame_due);
+                ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+                show_ui = true;
+            } else {
+                break;
+            }
+        }
+        if (help_menu_open) {
+            render_movie(
+                screen,
+                fonts,
+                &movie,
+                paused,
+                true,
+                true,
+                scale_mode,
+                subtitle_size,
+                subtitle_placement,
+                &pointer
+            );
+            prefetch_tick(&movie, true, 1000);
+            msleep(16);
+            continue;
         }
         if (enter_edge) {
             if (movie.current_frame + 1 >= movie.header.frame_count) {
@@ -2762,26 +2959,22 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (divide_edge) {
-            if (overclock_toggle) {
-                if (playback_clock_state.cx2_applied) {
-                    clock_state_restore(&playback_clock_state);
-                } else {
-                    clock_state_apply_boost(&playback_clock_state);
-                }
-            } else {
-                scale_mode = (ScaleMode) ((scale_mode + 1) % 4);
-            }
+            scale_mode = (ScaleMode) ((scale_mode + 1) % 4);
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (exp_edge || tenx_edge) {
+            subtitle_placement = (SubtitlePlacement) ((subtitle_placement + 1) % SUBTITLE_POS_COUNT);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (key_pressed_edge(KEY_NSPIRE_PLUS, &prev_plus) && subtitle_size < 3) {
             subtitle_size++;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
-        if (key_pressed_edge(KEY_NSPIRE_MINUS, &prev_minus) && subtitle_size > 0) {
+        if (key_pressed_edge(KEY_NSPIRE_MINUS, &prev_minus) && subtitle_size > -1) {
             subtitle_size--;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
-        if (paused && tab_edge && !overclock_toggle && movie.current_frame + 1 < movie.header.frame_count) {
+        if (paused && tab_edge && movie.current_frame + 1 < movie.header.frame_count) {
             if (!decode_to_frame(&movie, movie.current_frame + 1)) {
                 show_msgbox("ND Video Player", "Movie decode failed.");
                 result = -1;
@@ -2792,8 +2985,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         }
         if (pointer_click) {
             SDL_Rect bar = progress_bar_rect();
-            if (show_ui && pointer.x >= bar.x && pointer.x < bar.x + bar.w && pointer.y >= bar.y - 3 && pointer.y <= bar.y + (int) bar.h + 3) {
-                seek_to_ratio(&movie, (uint32_t) (pointer.x - bar.x), (uint32_t) bar.w);
+            if (show_ui && pointer.y >= SCREEN_H - UI_BAR_H && pointer.y < SCREEN_H) {
+                int seek_x = clamp_int(pointer.x, bar.x, bar.x + bar.w);
+                seek_to_ratio(&movie, (uint32_t) (seek_x - bar.x), (uint32_t) bar.w);
                 reset_playback_timeline(&movie, now_ms, &playback_anchor_ms, &playback_anchor_frame, &next_frame_due);
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             } else {
@@ -2839,10 +3033,11 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             &movie,
             paused,
             show_ui,
+            false,
             scale_mode,
             subtitle_size,
-            &pointer,
-            playback_clock_active ? &playback_clock_state : NULL
+            subtitle_placement,
+            &pointer
         );
         if (paused || frame_ms == 0) {
             prefetch_tick(&movie, true, 1000);
@@ -2860,9 +3055,6 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     }
 
     destroy_movie(&movie);
-    if (playback_clock_active) {
-        clock_state_restore(&playback_clock_state);
-    }
     return result;
 }
 
@@ -2893,15 +3085,8 @@ int main(int argc, char **argv)
         monotonic_clock_shutdown();
         return 1;
     }
-    if (TTF_Init() != 0) {
-        show_msgbox("ND Video Player", "Failed to initialize SDL_ttf.");
-        SDL_Quit();
-        monotonic_clock_shutdown();
-        return 1;
-    }
     if (!init_fonts(&fonts)) {
-        show_msgbox("ND Video Player", "Failed to load fonts or subtitles.ttf.");
-        TTF_Quit();
+        show_msgbox("ND Video Player", "Failed to load fonts.");
         SDL_Quit();
         monotonic_clock_shutdown();
         return 1;
@@ -2928,7 +3113,6 @@ int main(int argc, char **argv)
     }
 
     free_fonts(&fonts);
-    TTF_Quit();
     SDL_Quit();
     monotonic_clock_shutdown();
     return result == 0 ? 0 : 1;
