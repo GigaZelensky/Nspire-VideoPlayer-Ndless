@@ -173,6 +173,7 @@ typedef struct {
     SubtitleCue *subtitles;
     uint16_t *framebuffer;
     uint16_t *previous_framebuffer;
+    uint16_t *anchor_framebuffer;
     uint16_t *block_scratch;
     uint8_t *chunk_storage;
     size_t chunk_storage_size;
@@ -182,6 +183,7 @@ typedef struct {
     int loaded_chunk;
     PrefetchedChunk prefetched[PREFETCH_CHUNK_COUNT];
     int decoded_local_frame;
+    bool anchor_valid;
     uint32_t current_frame;
     SDL_Surface *frame_surface;
 } Movie;
@@ -791,6 +793,7 @@ static void destroy_movie(Movie *movie)
     free(movie->chunk_index);
     free(movie->framebuffer);
     free(movie->previous_framebuffer);
+    free(movie->anchor_framebuffer);
     free(movie->block_scratch);
     free(movie->chunk_storage);
     free(movie->frame_offsets);
@@ -803,6 +806,7 @@ static void destroy_movie(Movie *movie)
         movie->prefetched[prefetch_index].chunk_index = -1;
     }
     movie->decoded_local_frame = -1;
+    movie->anchor_valid = false;
 }
 
 static bool init_fonts(Fonts *fonts)
@@ -862,7 +866,7 @@ static void free_fonts(Fonts *fonts)
     memset(fonts, 0, sizeof(*fonts));
 }
 
-static bool rle16_decode(const uint8_t *src, size_t src_size, uint16_t *dst, size_t dst_words)
+static bool rle16_decode_legacy(const uint8_t *src, size_t src_size, uint16_t *dst, size_t dst_words)
 {
     size_t src_pos = 0;
     size_t dst_pos = 0;
@@ -891,6 +895,102 @@ static bool rle16_decode(const uint8_t *src, size_t src_size, uint16_t *dst, siz
         }
     }
     return src_pos == src_size && dst_pos == dst_words;
+}
+
+static bool rle16_decode_v6(const uint8_t *src, size_t src_size, uint16_t *dst, size_t dst_words)
+{
+    size_t src_pos = 0;
+    size_t dst_pos = 0;
+
+    while (src_pos < src_size && dst_pos < dst_words) {
+        uint8_t token = src[src_pos++];
+        if (token == 0xFF) {
+            uint8_t palette_size;
+            uint16_t run_length;
+            uint16_t palette[16];
+            uint8_t bits_per_index;
+            size_t packed_bytes;
+            size_t palette_index;
+            size_t packed_pos = 0;
+            uint32_t bit_buffer = 0;
+            unsigned int bit_count = 0;
+
+            if (src_pos + 3 > src_size) {
+                return false;
+            }
+            palette_size = src[src_pos++];
+            run_length = read_le16(src + src_pos);
+            src_pos += 2;
+            if (palette_size < 2 || palette_size > 16 || dst_pos + run_length > dst_words) {
+                return false;
+            }
+            if (src_pos + ((size_t) palette_size * 2) > src_size) {
+                return false;
+            }
+            for (palette_index = 0; palette_index < palette_size; ++palette_index) {
+                palette[palette_index] = read_le16(src + src_pos);
+                src_pos += 2;
+            }
+            bits_per_index = palette_size <= 2 ? 1 : (palette_size <= 4 ? 2 : 4);
+            packed_bytes = (((size_t) run_length * bits_per_index) + 7U) / 8U;
+            if (src_pos + packed_bytes > src_size) {
+                return false;
+            }
+            for (palette_index = 0; palette_index < run_length; ++palette_index) {
+                uint8_t palette_entry;
+                while (bit_count < bits_per_index) {
+                    if (packed_pos >= packed_bytes) {
+                        return false;
+                    }
+                    bit_buffer |= ((uint32_t) src[src_pos + packed_pos]) << bit_count;
+                    packed_pos++;
+                    bit_count += 8;
+                }
+                palette_entry = (uint8_t) (bit_buffer & ((1U << bits_per_index) - 1U));
+                bit_buffer >>= bits_per_index;
+                bit_count -= bits_per_index;
+                if (palette_entry >= palette_size) {
+                    return false;
+                }
+                dst[dst_pos++] = palette[palette_entry];
+            }
+            src_pos += packed_bytes;
+            continue;
+        }
+
+        {
+            size_t run_length = (token & 0x7F) + 1;
+            if (token & 0x80) {
+                uint16_t value;
+                size_t index;
+                if (src_pos + 2 > src_size || dst_pos + run_length > dst_words) {
+                    return false;
+                }
+                value = read_le16(src + src_pos);
+                src_pos += 2;
+                for (index = 0; index < run_length; ++index) {
+                    dst[dst_pos++] = value;
+                }
+            } else {
+                size_t literal_bytes = run_length * 2;
+                if (src_pos + literal_bytes > src_size || dst_pos + run_length > dst_words) {
+                    return false;
+                }
+                memcpy(dst + dst_pos, src + src_pos, literal_bytes);
+                src_pos += literal_bytes;
+                dst_pos += run_length;
+            }
+        }
+    }
+    return src_pos == src_size && dst_pos == dst_words;
+}
+
+static bool rle16_decode_movie(const Movie *movie, const uint8_t *src, size_t src_size, uint16_t *dst, size_t dst_words)
+{
+    if (movie && movie->header.version >= 6) {
+        return rle16_decode_v6(src, src_size, dst, dst_words);
+    }
+    return rle16_decode_legacy(src, src_size, dst, dst_words);
 }
 
 static bool block_region_for_id(
@@ -970,7 +1070,7 @@ static bool apply_block_region(
 )
 {
     uint16_t row;
-    if (!rle16_decode(payload, payload_size, movie->block_scratch, (size_t) block_w * block_h)) {
+    if (!rle16_decode_movie(movie, payload, payload_size, movie->block_scratch, (size_t) block_w * block_h)) {
         return false;
     }
     for (row = 0; row < block_h; ++row) {
@@ -1043,7 +1143,7 @@ static bool apply_row_span(Movie *movie, uint16_t *target, const uint8_t *payloa
     if (row >= movie->header.video_height || x >= movie->header.video_width || x + span_length > movie->header.video_width) {
         return false;
     }
-    if (!rle16_decode(payload, payload_size, movie->block_scratch, span_length)) {
+    if (!rle16_decode_movie(movie, payload, payload_size, movie->block_scratch, span_length)) {
         return false;
     }
     memcpy(
@@ -1322,6 +1422,7 @@ static bool decode_frame_record(Movie *movie, const uint8_t *frame_data, size_t 
     }
     if (*cursor == 'I') {
         uint32_t payload_size;
+        bool ok;
         cursor++;
         remaining--;
         if (remaining < 4) {
@@ -1333,12 +1434,18 @@ static bool decode_frame_record(Movie *movie, const uint8_t *frame_data, size_t 
         if (payload_size > remaining) {
             return false;
         }
-        return rle16_decode(
+        ok = rle16_decode_movie(
+            movie,
             cursor,
             payload_size,
             movie->framebuffer,
             frame_words
         );
+        if (ok) {
+            memcpy(movie->anchor_framebuffer, movie->framebuffer, frame_words * sizeof(uint16_t));
+            movie->anchor_valid = true;
+        }
+        return ok;
     }
     if (*cursor == 'D') {
         uint16_t row_count;
@@ -1418,6 +1525,21 @@ static bool decode_frame_record(Movie *movie, const uint8_t *frame_data, size_t 
         cursor += 2;
         remaining -= 2;
         if (!decode_motion_records(movie, &cursor, &remaining, record_count, movie->previous_framebuffer)) {
+            return false;
+        }
+        return true;
+    }
+    if (*cursor == 'R') {
+        uint16_t record_count;
+        cursor++;
+        remaining--;
+        if (remaining < 2 || !movie->anchor_valid) {
+            return false;
+        }
+        record_count = read_le16(cursor);
+        cursor += 2;
+        remaining -= 2;
+        if (!decode_motion_records(movie, &cursor, &remaining, record_count, movie->anchor_framebuffer)) {
             return false;
         }
         return true;
@@ -1536,6 +1658,84 @@ static bool build_frame_offsets(
                 remaining -= payload_size;
             }
         } else if (*cursor == 'M') {
+            uint16_t record_count;
+            uint16_t record_index;
+            cursor++;
+            remaining--;
+            if (remaining < 2) {
+                return false;
+            }
+            record_count = read_le16(cursor);
+            cursor += 2;
+            remaining -= 2;
+            for (record_index = 0; record_index < record_count; ++record_index) {
+                uint8_t mode;
+                if (remaining < 3) {
+                    return false;
+                }
+                mode = cursor[0];
+                cursor += 3;
+                remaining -= 3;
+                if (mode == 1) {
+                    if (remaining < 2) {
+                        return false;
+                    }
+                    cursor += 2;
+                    remaining -= 2;
+                } else if (mode == 2) {
+                    uint8_t sub_count;
+                    uint8_t sub_index;
+                    if (remaining < 1) {
+                        return false;
+                    }
+                    sub_count = cursor[0];
+                    cursor++;
+                    remaining--;
+                    for (sub_index = 0; sub_index < sub_count; ++sub_index) {
+                        uint8_t sub_mode;
+                        if (remaining < 2) {
+                            return false;
+                        }
+                        sub_mode = cursor[1];
+                        cursor += 2;
+                        remaining -= 2;
+                        if (sub_mode == 1) {
+                            if (remaining < 2) {
+                                return false;
+                            }
+                            cursor += 2;
+                            remaining -= 2;
+                        } else {
+                            uint16_t payload_size;
+                            if (remaining < 2) {
+                                return false;
+                            }
+                            payload_size = read_le16(cursor);
+                            cursor += 2;
+                            remaining -= 2;
+                            if (payload_size > remaining) {
+                                return false;
+                            }
+                            cursor += payload_size;
+                            remaining -= payload_size;
+                        }
+                    }
+                } else {
+                    uint16_t payload_size;
+                    if (remaining < 2) {
+                        return false;
+                    }
+                    payload_size = read_le16(cursor);
+                    cursor += 2;
+                    remaining -= 2;
+                    if (payload_size > remaining) {
+                        return false;
+                    }
+                    cursor += payload_size;
+                    remaining -= payload_size;
+                }
+            }
+        } else if (*cursor == 'R') {
             uint16_t record_count;
             uint16_t record_index;
             cursor++;
@@ -2076,6 +2276,7 @@ retry:
     }
     movie->loaded_chunk = chunk_index;
     movie->decoded_local_frame = -1;
+    movie->anchor_valid = false;
     debug_tracef(
         "load chunk=%d sync packed=%lu unpacked=%lu prefetched=%lu",
         chunk_index,
@@ -2134,6 +2335,7 @@ static bool load_chunk(Movie *movie, int chunk_index)
         }
         movie->loaded_chunk = chunk_index;
         movie->decoded_local_frame = -1;
+        movie->anchor_valid = false;
         debug_tracef(
             "load chunk=%d prefetched packed=%lu unpacked=%lu prefetched=%lu",
             chunk_index,
@@ -2373,6 +2575,7 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
     }
     if (movie->decoded_local_frame > (int) local_index) {
         movie->decoded_local_frame = -1;
+        movie->anchor_valid = false;
     }
     for (replay_index = (uint32_t) (movie->decoded_local_frame + 1); replay_index <= local_index; ++replay_index) {
         size_t start = movie->frame_offsets[replay_index];
@@ -2462,7 +2665,7 @@ static bool load_movie(const char *path, Movie *movie)
     if (memcmp(movie->header.magic, "NVP1", 4) != 0) {
         return false;
     }
-    if (movie->header.version < 2 || movie->header.version > 5) {
+    if (movie->header.version < 2 || movie->header.version > 6) {
         return false;
     }
     movie->chunk_index = (ChunkIndexEntry *) calloc(movie->header.chunk_count, sizeof(ChunkIndexEntry));
@@ -2497,12 +2700,13 @@ static bool load_movie(const char *path, Movie *movie)
     framebuffer_words = (size_t) movie->header.video_width * movie->header.video_height;
     movie->framebuffer = (uint16_t *) calloc(framebuffer_words, sizeof(uint16_t));
     movie->previous_framebuffer = (uint16_t *) calloc(framebuffer_words, sizeof(uint16_t));
+    movie->anchor_framebuffer = (uint16_t *) calloc(framebuffer_words, sizeof(uint16_t));
     movie->block_scratch = (uint16_t *) malloc(
         (size_t) ((movie->header.video_width > (movie->header.block_size * movie->header.block_size))
             ? movie->header.video_width
             : (movie->header.block_size * movie->header.block_size)) * sizeof(uint16_t)
     );
-    if (!movie->framebuffer || !movie->previous_framebuffer || !movie->block_scratch) {
+    if (!movie->framebuffer || !movie->previous_framebuffer || !movie->anchor_framebuffer || !movie->block_scratch) {
         return false;
     }
     movie->frame_surface = SDL_CreateRGBSurfaceFrom(
