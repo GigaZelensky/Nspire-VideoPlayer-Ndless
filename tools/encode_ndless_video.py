@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import math
 import re
@@ -35,6 +36,9 @@ MOTION_VISUAL_ERROR_DIVISOR = 96
 ROW_DIFF_GAP_LIMIT = 3
 ROW_DIFF_FULL_ROW_RATIO = 0.34
 ROW_DIFF_MAX_RUNS_PER_ROW = 24
+SUBTITLE_LINE_BREAK_RE = re.compile(r"(?i)<br\s*/?>|\\N|\\n")
+SUBTITLE_TAG_RE = re.compile(r"(?s)<[^>]+>")
+SUBTITLE_ASS_OVERRIDE_RE = re.compile(r"\{\\[^}]*\}")
 
 
 @dataclass(slots=True)
@@ -101,10 +105,26 @@ def normalize_output_path(output_arg: str) -> Path:
     return path.with_name(path.name + ".nvp.tns")
 
 
+def repair_mojibake(text: str) -> str:
+    if not any(marker in text for marker in ("Ã", "â", "€", "™", "œ", "ž")):
+        return text
+    try:
+        repaired = text.encode("latin-1").decode("utf-8")
+    except UnicodeError:
+        return text
+    return repaired if "\ufffd" not in repaired else text
+
+
 def sanitize_subtitle_text(text: str) -> str:
+    text = html.unescape(text)
+    text = repair_mojibake(text)
     text = unicodedata.normalize("NFKD", text)
+    text = SUBTITLE_LINE_BREAK_RE.sub("\n", text)
+    text = SUBTITLE_ASS_OVERRIDE_RE.sub("", text)
+    text = SUBTITLE_TAG_RE.sub("", text)
     text = text.encode("ascii", "ignore").decode("ascii")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
