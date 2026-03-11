@@ -37,6 +37,7 @@
 #define PREFETCH_ACTIVE_H264_MIN_SPARE_MS 12U
 #define PREFETCH_ACTIVE_H264_SLICE_MS 1U
 #define H264_FRAME_RING_COUNT 4
+#define H264_FRAME_RING_ALIGNMENT 32U
 #define H264_PREFETCH_ACTIVE_MIN_SPARE_MS 14U
 #define MONOTONIC_TIMER_VALUE_ADDR 0x900C0004U
 #define MONOTONIC_TIMER_CONTROL_ADDR 0x900C0008U
@@ -201,6 +202,7 @@ typedef struct {
 
 typedef struct {
     uint8_t *data;
+    uint8_t *allocation;
     uint32_t frame_index;
     bool valid;
 } H264FrameSlot;
@@ -976,7 +978,7 @@ static void destroy_movie(Movie *movie)
         h264bsdFree(movie->h264_decoder);
     }
     for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_COUNT; ++h264_ring_index) {
-        free(movie->h264_frame_ring[h264_ring_index].data);
+        free(movie->h264_frame_ring[h264_ring_index].allocation);
     }
     for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
         clear_prefetched_chunk(&movie->prefetched[prefetch_index]);
@@ -1100,6 +1102,65 @@ static uint8_t h264_clip_byte(int32_t value)
     }
     return g_h264_color_tables.clip[table_index];
 }
+
+static uint8_t *alloc_aligned_bytes(size_t size, size_t alignment, uint8_t **allocation)
+{
+    uintptr_t raw_address;
+    uintptr_t aligned_address;
+    uint8_t *raw;
+
+    if (allocation) {
+        *allocation = NULL;
+    }
+    if (size == 0 || alignment < sizeof(void *) || (alignment & (alignment - 1U)) != 0U) {
+        return NULL;
+    }
+
+    raw = (uint8_t *) malloc(size + alignment - 1U);
+    if (!raw) {
+        return NULL;
+    }
+
+    raw_address = (uintptr_t) raw;
+    aligned_address = (raw_address + alignment - 1U) & ~((uintptr_t) alignment - 1U);
+    if (allocation) {
+        *allocation = raw;
+    }
+    return (uint8_t *) aligned_address;
+}
+
+#if defined(__arm__) && !defined(__thumb__)
+static inline int32_t armv5te_smulbb(int32_t lhs, int32_t rhs)
+{
+    int32_t result;
+    __asm__ volatile ("smulbb %0, %1, %2" : "=r" (result) : "r" (lhs), "r" (rhs));
+    return result;
+}
+
+static inline int32_t armv5te_smlabb(int32_t acc, int32_t lhs, int32_t rhs)
+{
+    int32_t result;
+    __asm__ volatile ("smlabb %0, %1, %2, %3" : "=r" (result) : "r" (lhs), "r" (rhs), "r" (acc));
+    return result;
+}
+
+static inline void h264_compute_chroma_terms(uint8_t u_sample, uint8_t v_sample, int32_t *red, int32_t *green, int32_t *blue)
+{
+    const int32_t u = (int32_t) u_sample - 128;
+    const int32_t v = (int32_t) v_sample - 128;
+
+    *red = armv5te_smulbb(v, 409);
+    *green = armv5te_smlabb(armv5te_smulbb(u, -100), v, -208);
+    *blue = armv5te_smulbb(u, 516);
+}
+#else
+static inline void h264_compute_chroma_terms(uint8_t u_sample, uint8_t v_sample, int32_t *red, int32_t *green, int32_t *blue)
+{
+    *red = g_h264_color_tables.v_to_red[v_sample];
+    *green = g_h264_color_tables.u_to_green[u_sample] + g_h264_color_tables.v_to_green[v_sample];
+    *blue = g_h264_color_tables.u_to_blue[u_sample];
+}
+#endif
 
 static size_t h264_cropped_frame_bytes(const Movie *movie)
 {
@@ -1282,21 +1343,6 @@ static bool refresh_h264_picture_params(Movie *movie)
     return true;
 }
 
-static inline uint16_t h264_rgb565_pixel(
-    uint8_t y_sample,
-    int32_t chroma_red,
-    int32_t chroma_green,
-    int32_t chroma_blue
-)
-{
-    uint8_t red = h264_clip_byte((g_h264_color_tables.y_base[y_sample] + chroma_red) >> 8);
-    uint8_t green = h264_clip_byte((g_h264_color_tables.y_base[y_sample] + chroma_green) >> 8);
-    uint8_t blue = h264_clip_byte((g_h264_color_tables.y_base[y_sample] + chroma_blue) >> 8);
-    return (uint16_t) (g_h264_color_tables.red565[red]
-        | g_h264_color_tables.green565[green]
-        | g_h264_color_tables.blue565[blue]);
-}
-
 static inline uint32_t h264_pack_rgb565_pair(uint16_t left_pixel, uint16_t right_pixel)
 {
     return ((uint32_t) right_pixel << 16) | left_pixel;
@@ -1304,13 +1350,17 @@ static inline uint32_t h264_pack_rgb565_pair(uint16_t left_pixel, uint16_t right
 
 static bool blit_h264_planes_to_framebuffer(
     Movie *movie,
-    const uint8_t *y_plane,
-    const uint8_t *u_plane,
-    const uint8_t *v_plane,
+    const uint8_t *restrict y_plane,
+    const uint8_t *restrict u_plane,
+    const uint8_t *restrict v_plane,
     size_t luma_stride,
     size_t chroma_stride
 )
 {
+    const int32_t *restrict y_base = g_h264_color_tables.y_base;
+    const uint16_t *restrict red565 = g_h264_color_tables.red565;
+    const uint16_t *restrict green565 = g_h264_color_tables.green565;
+    const uint16_t *restrict blue565 = g_h264_color_tables.blue565;
     size_t y;
 
     if (!movie || !y_plane || !u_plane || !v_plane || !movie->framebuffer || !movie->h264_headers_ready) {
@@ -1329,9 +1379,13 @@ static bool blit_h264_planes_to_framebuffer(
         for (x = 0; x < movie->h264_crop_width; x += 2U) {
             const uint8_t u = u_row[x / 2U];
             const uint8_t v = v_row[x / 2U];
-            const int32_t chroma_red = g_h264_color_tables.v_to_red[v];
-            const int32_t chroma_green = g_h264_color_tables.u_to_green[u] + g_h264_color_tables.v_to_green[v];
-            const int32_t chroma_blue = g_h264_color_tables.u_to_blue[u];
+            int32_t chroma_red;
+            int32_t chroma_green;
+            int32_t chroma_blue;
+            int32_t luma;
+            uint8_t red;
+            uint8_t green;
+            uint8_t blue;
 
 #if defined(__GNUC__)
             if ((x & 15U) == 0U) {
@@ -1342,14 +1396,37 @@ static bool blit_h264_planes_to_framebuffer(
             }
 #endif
 
+            h264_compute_chroma_terms(u, v, &chroma_red, &chroma_green, &chroma_blue);
+
+            luma = y_base[y_row0[x]];
+            red = h264_clip_byte((luma + chroma_red) >> 8);
+            green = h264_clip_byte((luma + chroma_green) >> 8);
+            blue = h264_clip_byte((luma + chroma_blue) >> 8);
             dst_row0[x / 2U] = h264_pack_rgb565_pair(
-                h264_rgb565_pixel(y_row0[x], chroma_red, chroma_green, chroma_blue),
-                h264_rgb565_pixel(y_row0[x + 1U], chroma_red, chroma_green, chroma_blue)
+                (uint16_t) (red565[red] | green565[green] | blue565[blue]),
+                0
             );
+
+            luma = y_base[y_row0[x + 1U]];
+            red = h264_clip_byte((luma + chroma_red) >> 8);
+            green = h264_clip_byte((luma + chroma_green) >> 8);
+            blue = h264_clip_byte((luma + chroma_blue) >> 8);
+            dst_row0[x / 2U] |= (uint32_t) ((uint16_t) (red565[red] | green565[green] | blue565[blue])) << 16;
+
+            luma = y_base[y_row1[x]];
+            red = h264_clip_byte((luma + chroma_red) >> 8);
+            green = h264_clip_byte((luma + chroma_green) >> 8);
+            blue = h264_clip_byte((luma + chroma_blue) >> 8);
             dst_row1[x / 2U] = h264_pack_rgb565_pair(
-                h264_rgb565_pixel(y_row1[x], chroma_red, chroma_green, chroma_blue),
-                h264_rgb565_pixel(y_row1[x + 1U], chroma_red, chroma_green, chroma_blue)
+                (uint16_t) (red565[red] | green565[green] | blue565[blue]),
+                0
             );
+
+            luma = y_base[y_row1[x + 1U]];
+            red = h264_clip_byte((luma + chroma_red) >> 8);
+            green = h264_clip_byte((luma + chroma_green) >> 8);
+            blue = h264_clip_byte((luma + chroma_blue) >> 8);
+            dst_row1[x / 2U] |= (uint32_t) ((uint16_t) (red565[red] | green565[green] | blue565[blue])) << 16;
         }
     }
 
@@ -3521,12 +3598,17 @@ static bool load_movie(const char *path, Movie *movie)
         movie->h264_frame_bytes = h264_cropped_frame_bytes(movie);
         clear_h264_frame_ring(movie);
         for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_COUNT; ++h264_ring_index) {
-            movie->h264_frame_ring[h264_ring_index].data = (uint8_t *) malloc(movie->h264_frame_bytes);
+            movie->h264_frame_ring[h264_ring_index].data = alloc_aligned_bytes(
+                movie->h264_frame_bytes,
+                H264_FRAME_RING_ALIGNMENT,
+                &movie->h264_frame_ring[h264_ring_index].allocation
+            );
             if (!movie->h264_frame_ring[h264_ring_index].data) {
                 debug_failf(
-                    "open failed: h264 frame ring alloc slot=%d bytes=%lu",
+                    "open failed: h264 frame ring alloc slot=%d bytes=%lu align=%u",
                     h264_ring_index,
-                    (unsigned long) movie->h264_frame_bytes
+                    (unsigned long) movie->h264_frame_bytes,
+                    (unsigned) H264_FRAME_RING_ALIGNMENT
                 );
                 return false;
             }

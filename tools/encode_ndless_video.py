@@ -578,19 +578,20 @@ def h264_stream_profile_options(chunk_frames: int, stream_profile: str) -> tuple
         "slices=1",
         "force-cfr=1",
         "weightp=0",
+        "no-deblock=1",
+        "partitions=none",
+        "me=dia",
+        "subme=0",
+        "no-8x8dct=1",
     ]
 
     if stream_profile == "fast":
         tune = "fastdecode"
         extra_params = [
-            "no-deblock=1",
-            "partitions=none",
             "aq-mode=0",
             "mbtree=0",
             "rc-lookahead=0",
             "sync-lookahead=0",
-            "me=dia",
-            "subme=0",
             "trellis=0",
         ]
     elif stream_profile == "balanced":
@@ -600,8 +601,6 @@ def h264_stream_profile_options(chunk_frames: int, stream_profile: str) -> tuple
             "mbtree=1",
             "rc-lookahead=12",
             "sync-lookahead=12",
-            "me=hex",
-            "subme=2",
             "trellis=0",
         ]
     elif stream_profile == "quality":
@@ -611,19 +610,15 @@ def h264_stream_profile_options(chunk_frames: int, stream_profile: str) -> tuple
             "mbtree=1",
             "rc-lookahead=20",
             "sync-lookahead=20",
-            "me=hex",
-            "subme=6",
             "trellis=1",
         ]
     elif stream_profile == "intra":
         tune = None
         extra_params = [
-            "no-deblock=1",
             "aq-mode=1",
             "mbtree=0",
             "rc-lookahead=0",
             "sync-lookahead=0",
-            "subme=4",
             "trellis=1",
         ]
     else:
