@@ -11,6 +11,7 @@ movies/
 *.srt
 __pycache__/
 *.pyc
+src/h264bsd/
 PLAN.md
 !examples/
 !examples/README.md

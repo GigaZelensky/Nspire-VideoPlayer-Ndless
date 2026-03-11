@@ -6,39 +6,39 @@ from __future__ import annotations
 import argparse
 import html
 import json
-import math
 import re
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterator
 
 import imageio_ffmpeg
-import numpy as np
-from PIL import Image
 
 
 MAGIC = b"NVP1"
-VERSION = 8
+VERSION = 9
 SCREEN_W = 320
 SCREEN_H = 240
 HEADER_STRUCT = struct.Struct("<4sHHHHHHHHHHHHIIIII")
 CHUNK_INDEX_STRUCT = struct.Struct("<IIIIII")
-MOTION_ERROR_WEIGHT = 8
-COLOR_ERROR_WEIGHT = 6
-GREEN_ERROR_WEIGHT = 4
-MOTION_VISUAL_ERROR_DIVISOR = 96
-ROW_DIFF_GAP_LIMIT = 3
-ROW_DIFF_FULL_ROW_RATIO = 0.34
-ROW_DIFF_MAX_RUNS_PER_ROW = 24
+START_CODE_RE = re.compile(rb"\x00\x00(?:\x00)?\x01")
 SUBTITLE_LINE_BREAK_RE = re.compile(r"(?i)<br\s*/?>|\\N|\\n")
 SUBTITLE_TAG_RE = re.compile(r"(?s)<[^>]+>")
 SUBTITLE_ASS_OVERRIDE_RE = re.compile(r"\{\\[^}]*\}")
+
+NAL_IDR = 5
+NAL_SEI = 6
+NAL_SPS = 7
+NAL_PPS = 8
+NAL_AUD = 9
+VCL_NAL_TYPES = {1, NAL_IDR}
+CHUNK_BOUNDARY_NAL_TYPES = {NAL_SPS, NAL_PPS, NAL_IDR}
+STREAM_PROFILES = ("fast", "balanced", "quality", "intra")
 
 
 @dataclass(slots=True)
@@ -73,12 +73,8 @@ class EncodeStats:
     fps: float
     frame_count: int
     chunk_count: int
-    keyframes: int
-    predicted_frames: int
-    repeated_frames: int
-    block_updates: int
-    motion_copies: int
-    literal_blocks: int
+    idr_chunks: int
+    raw_h264_bytes: int
     bytes_written: int
     average_bytes_per_frame: float
 
@@ -91,6 +87,23 @@ class VideoProbe:
     display_height: int
     fps: float
     duration: float
+
+
+@dataclass(slots=True)
+class NalUnit:
+    nal_type: int
+    data: bytes
+
+
+@dataclass(slots=True)
+class AccessUnit:
+    nal_units: list[NalUnit]
+
+    def contains_type(self, nal_type: int) -> bool:
+        return any(unit.nal_type == nal_type for unit in self.nal_units)
+
+    def bytes(self) -> bytes:
+        return b"".join(unit.data for unit in self.nal_units)
 
 
 def log(message: str, *, quiet: bool = False) -> None:
@@ -120,7 +133,7 @@ def normalize_output_path(output_arg: str) -> Path:
 
 
 def repair_mojibake(text: str) -> str:
-    if not any(marker in text for marker in ("Ã", "â", "€", "™", "œ", "ž")):
+    if not any(marker in text for marker in ("Ãƒ", "Ã¢", "â‚¬", "â„¢", "Å“", "Å¾")):
         return text
     try:
         repaired = text.encode("latin-1").decode("utf-8")
@@ -178,23 +191,6 @@ def parse_srt(path: Path) -> list[SubtitleCue]:
         if text:
             cues.append(SubtitleCue(start_ms=start_ms, end_ms=end_ms, text=text))
     return cues
-
-
-def extract_embedded_subtitles(input_path: Path, output_path: Path) -> Path:
-    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    command = [
-        ffmpeg,
-        "-y",
-        "-i",
-        str(input_path),
-        "-map",
-        "0:s:0",
-        str(output_path),
-    ]
-    completed = subprocess.run(command, capture_output=True, text=True)
-    if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.strip() or "ffmpeg subtitle extraction failed")
-    return output_path
 
 
 def ffprobe_path() -> Path | None:
@@ -317,7 +313,12 @@ def extract_embedded_subtitle_track(input_path: Path, output_path: Path, track_i
     return output_path
 
 
-def load_subtitle_tracks(input_path: Path, output_path: Path, subtitle_arg: str | None, selected_tracks: list[int] | None) -> list[SubtitleTrack]:
+def load_subtitle_tracks(
+    input_path: Path,
+    output_path: Path,
+    subtitle_arg: str | None,
+    selected_tracks: list[int] | None,
+) -> list[SubtitleTrack]:
     if not subtitle_arg:
         return []
 
@@ -363,16 +364,96 @@ def load_subtitle_tracks(input_path: Path, output_path: Path, subtitle_arg: str 
     return subtitle_tracks
 
 
+def force_even(value: int, maximum: int) -> int:
+    value = max(2, min(value, maximum))
+    if value % 2 == 0:
+        return value
+    if value + 1 <= maximum:
+        return value + 1
+    return value - 1
+
+
 def fit_dimensions(source_width: int, source_height: int, max_width: int, max_height: int) -> tuple[int, int, int, int]:
     scale = min(max_width / source_width, max_height / source_height)
-    width = max(1, int(round(source_width * scale)))
-    height = max(1, int(round(source_height * scale)))
+    width = force_even(int(round(source_width * scale)), max_width)
+    height = force_even(int(round(source_height * scale)), max_height)
     x = (max_width - width) // 2
     y = (max_height - height) // 2
     return width, height, x, y
 
 
+def parse_fraction(value: str | None) -> float:
+    if not value or value in {"0", "0/0"}:
+        return 0.0
+    if "/" in value:
+        numerator_text, denominator_text = value.split("/", 1)
+        numerator = float(numerator_text or 0)
+        denominator = float(denominator_text or 0)
+        if denominator == 0:
+            return 0.0
+        return numerator / denominator
+    return float(value)
+
+
 def probe_video(input_path: Path) -> VideoProbe:
+    ffprobe = ffprobe_path()
+    if ffprobe is not None:
+        completed = subprocess.run(
+            [
+                str(ffprobe),
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,r_frame_rate:"
+                "format=duration",
+                "-of",
+                "json",
+                str(input_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode == 0:
+            try:
+                payload = json.loads(completed.stdout or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            streams = payload.get("streams", [])
+            if streams and isinstance(streams[0], dict):
+                stream = streams[0]
+                width = int(stream.get("width") or 0)
+                height = int(stream.get("height") or 0)
+                display_width = width
+                display_height = height
+                dar = stream.get("display_aspect_ratio")
+                sar = stream.get("sample_aspect_ratio")
+                if isinstance(dar, str) and ":" in dar and height > 0:
+                    dar_n_text, dar_d_text = dar.split(":", 1)
+                    dar_n = int(dar_n_text or 0)
+                    dar_d = int(dar_d_text or 0)
+                    if dar_n > 0 and dar_d > 0:
+                        display_width = max(1, int(round(height * dar_n / dar_d)))
+                elif isinstance(sar, str) and ":" in sar and width > 0:
+                    sar_n_text, sar_d_text = sar.split(":", 1)
+                    sar_n = int(sar_n_text or 0)
+                    sar_d = int(sar_d_text or 0)
+                    if sar_n > 0 and sar_d > 0:
+                        display_width = max(1, int(round(width * sar_n / sar_d)))
+                fps = parse_fraction(stream.get("avg_frame_rate") or stream.get("r_frame_rate"))
+                duration_text = payload.get("format", {}).get("duration")
+                duration = float(duration_text) if duration_text else 0.0
+                if width > 0 and height > 0 and fps > 0:
+                    return VideoProbe(
+                        storage_width=width,
+                        storage_height=height,
+                        display_width=display_width,
+                        display_height=display_height,
+                        fps=fps,
+                        duration=duration,
+                    )
+
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     completed = subprocess.run(
         [ffmpeg, "-hide_banner", "-i", str(input_path)],
@@ -399,7 +480,7 @@ def probe_video(input_path: Path) -> VideoProbe:
         if " Video:" not in line:
             continue
         size_match = re.search(
-            r"(?P<w>\d+)x(?P<h>\d+)(?:\s*\[SAR\s*(?P<sar_n>\d+):(?P<sar_d>\d+)\s*DAR\s*(?P<dar_n>\d+):(?P<dar_d>\d+)\])?",
+            r"(?P<w>\d{2,5})x(?P<h>\d{2,5})(?:\s*\[SAR\s*(?P<sar_n>\d+):(?P<sar_d>\d+)\s*DAR\s*(?P<dar_n>\d+):(?P<dar_d>\d+)\])?",
             line,
         )
         fps_match = re.search(r"(?P<fps>\d+(?:\.\d+)?)\s*fps", line)
@@ -433,598 +514,6 @@ def probe_video(input_path: Path) -> VideoProbe:
     )
 
 
-def iter_video_frames(
-    input_path: Path,
-    *,
-    width: int,
-    height: int,
-    fps: float,
-    start: float = 0.0,
-    duration: float | None = None,
-) -> Iterator[dict | np.ndarray]:
-    input_params: list[str] = []
-    if start > 0:
-        input_params += ["-ss", f"{start:.3f}"]
-    if duration is not None:
-        input_params += ["-t", f"{duration:.3f}"]
-    generator = imageio_ffmpeg.read_frames(
-        str(input_path),
-        pix_fmt="rgb24",
-        input_params=input_params,
-        output_params=["-vf", f"fps={fps},scale=trunc(ih*dar/2)*2:ih,setsar=1,scale={width}:{height}:flags=lanczos"],
-    )
-    metadata = next(generator)
-    yield metadata  # type: ignore[misc]
-    for frame_bytes in generator:
-        yield np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3))
-
-
-def image_to_rgb565_words(frame: np.ndarray) -> np.ndarray:
-    image = np.asarray(Image.fromarray(frame, mode="RGB"), dtype=np.uint8)
-    red = (image[:, :, 0].astype(np.uint16) >> 3) << 11
-    green = (image[:, :, 1].astype(np.uint16) >> 2) << 5
-    blue = image[:, :, 2].astype(np.uint16) >> 3
-    return (red | green | blue).astype("<u2")
-
-
-def preprocess_frame(frame: np.ndarray, posterize_bits: int) -> np.ndarray:
-    if posterize_bits <= 0 or posterize_bits >= 8:
-        return frame
-    levels = (1 << posterize_bits) - 1
-    image = frame.astype(np.uint16)
-    quantized = ((image * levels + 127) // 255)
-    restored = (quantized * 255 + (levels // 2)) // levels
-    return restored.astype(np.uint8)
-
-
-def rgb565_block_metrics(current_block: np.ndarray, reference_block: np.ndarray) -> tuple[int, int, float]:
-    current_words = np.asarray(current_block, dtype=np.uint16)
-    reference_words = np.asarray(reference_block, dtype=np.uint16)
-    current_red = ((current_words >> 11) & 0x1F).astype(np.int16)
-    current_green = ((current_words >> 5) & 0x3F).astype(np.int16)
-    current_blue = (current_words & 0x1F).astype(np.int16)
-    reference_red = ((reference_words >> 11) & 0x1F).astype(np.int16)
-    reference_green = ((reference_words >> 5) & 0x3F).astype(np.int16)
-    reference_blue = (reference_words & 0x1F).astype(np.int16)
-    red_diff = np.abs(current_red - reference_red)
-    green_diff = np.abs(current_green - reference_green)
-    blue_diff = np.abs(current_blue - reference_blue)
-    changed_pixels = int(np.count_nonzero((red_diff + blue_diff + (green_diff // 2)) > 1))
-    colorfulness = float(
-        np.mean(
-            np.maximum.reduce([current_red, current_green // 2, current_blue])
-            - np.minimum.reduce([current_red, current_green // 2, current_blue])
-        )
-    ) / 31.0
-    weighted_error = int(
-        np.sum(red_diff * COLOR_ERROR_WEIGHT)
-        + np.sum(green_diff * GREEN_ERROR_WEIGHT)
-        + np.sum(blue_diff * COLOR_ERROR_WEIGHT)
-    )
-    return changed_pixels, weighted_error, colorfulness
-
-
-def motion_penalty_from_error(changed_pixels: int, weighted_error: int, colorfulness: float) -> int:
-    chroma_scale = 0.20 + min(1.0, max(0.0, colorfulness)) * 0.60
-    visual_penalty = int((weighted_error * chroma_scale) // MOTION_VISUAL_ERROR_DIVISOR)
-    return max(changed_pixels * MOTION_ERROR_WEIGHT, visual_penalty)
-
-
-def rle16_encode(words: np.ndarray) -> bytes:
-    flat = np.asarray(words, dtype="<u2").reshape(-1)
-    output = bytearray()
-    index = 0
-    total = flat.size
-
-    while index < total:
-        repeat_len = 1
-        value = flat[index]
-        while index + repeat_len < total and flat[index + repeat_len] == value and repeat_len < 128:
-            repeat_len += 1
-        if repeat_len >= 3:
-            output.append(0x80 | (repeat_len - 1))
-            output += struct.pack("<H", int(value))
-            index += repeat_len
-            continue
-
-        literal_start = index
-        literal_len = 0
-        while index < total and literal_len < 128:
-            repeat_len = 1
-            value = flat[index]
-            while index + repeat_len < total and flat[index + repeat_len] == value and repeat_len < 128:
-                repeat_len += 1
-            if repeat_len >= 3 and literal_len > 0:
-                break
-            literal_len += 1
-            index += 1
-        output.append(literal_len - 1)
-        output += flat[literal_start:literal_start + literal_len].tobytes()
-
-    return bytes(output)
-
-
-def build_row_runs(mask: np.ndarray, *, gap_limit: int, full_row_ratio: float) -> list[tuple[int, int]]:
-    changed = np.flatnonzero(mask)
-    if changed.size == 0:
-        return []
-    if changed.size >= int(mask.size * full_row_ratio):
-        return [(0, int(mask.size))]
-
-    runs: list[tuple[int, int]] = []
-    start = int(changed[0])
-    end = start + 1
-
-    for index in changed[1:]:
-        column = int(index)
-        if column <= end + gap_limit:
-            end = column + 1
-            continue
-        runs.append((start, end))
-        start = column
-        end = column + 1
-    runs.append((start, end))
-
-    if len(runs) > ROW_DIFF_MAX_RUNS_PER_ROW:
-        return [(0, int(mask.size))]
-    return runs
-
-
-def encode_row_diff_records(
-    current_frame: np.ndarray,
-    reference_frame: np.ndarray,
-    *,
-    gap_limit: int,
-    full_row_ratio: float,
-) -> tuple[bytes, int, int, int]:
-    row_records: list[bytes] = []
-    changed_rows = 0
-    span_count = 0
-    changed_pixels = 0
-
-    for row_index in range(current_frame.shape[0]):
-        current_row = current_frame[row_index]
-        reference_row = reference_frame[row_index]
-        mask = current_row != reference_row
-        if not np.any(mask):
-            continue
-        runs = build_row_runs(mask, gap_limit=gap_limit, full_row_ratio=full_row_ratio)
-        if not runs:
-            continue
-        row_blob = bytearray()
-        row_blob += struct.pack("<BH", row_index, len(runs))
-        changed_rows += 1
-        span_count += len(runs)
-        for x0, x1 in runs:
-            payload = rle16_encode(current_row[x0:x1])
-            row_blob += struct.pack("<HHH", x0, x1 - x0, len(payload))
-            row_blob += payload
-            changed_pixels += x1 - x0
-        row_records.append(bytes(row_blob))
-
-    return struct.pack("<H", changed_rows) + b"".join(row_records), changed_rows, span_count, changed_pixels
-
-
-def find_motion_vector(
-    current_frame: np.ndarray,
-    previous_frame: np.ndarray,
-    *,
-    x0: int,
-    y0: int,
-    x1: int,
-    y1: int,
-    search_radius: int,
-    search_step: int,
-    error_ratio: float,
-) -> tuple[int, int, int] | None:
-    block = current_frame[y0:y1, x0:x1]
-    block_h, block_w = block.shape
-    best_dx = 0
-    best_dy = 0
-    best_error = block.size + 1
-    max_error = int(block.size * error_ratio)
-
-    if search_radius <= 0:
-        return None
-
-    for dy in range(-search_radius, search_radius + 1, search_step):
-        src_y = y0 + dy
-        if src_y < 0 or src_y + block_h > previous_frame.shape[0]:
-            continue
-        for dx in range(-search_radius, search_radius + 1, search_step):
-            src_x = x0 + dx
-            if (dx == 0 and dy == 0) or src_x < 0 or src_x + block_w > previous_frame.shape[1]:
-                continue
-            candidate = previous_frame[src_y:src_y + block_h, src_x:src_x + block_w]
-            error = int(np.count_nonzero(block != candidate))
-            if error < best_error:
-                best_error = error
-                best_dx = dx
-                best_dy = dy
-                if error == 0:
-                    return best_dx, best_dy, 0
-    if best_error <= max_error:
-        return best_dx, best_dy, best_error
-    return None
-
-
-def find_global_motion_vector(
-    current_frame: np.ndarray,
-    previous_frame: np.ndarray,
-    *,
-    search_radius: int,
-    search_step: int,
-) -> tuple[int, int] | None:
-    if search_radius <= 0:
-        return None
-    sample_step = 4
-    sample_search_radius = max(1, search_radius // sample_step)
-    sample_search_step = max(1, search_step // sample_step) if search_step > 1 else 1
-    current_sample = current_frame[::sample_step, ::sample_step].astype(np.int32)
-    previous_sample = previous_frame[::sample_step, ::sample_step].astype(np.int32)
-    sample_h, sample_w = current_sample.shape
-    baseline_error = float(np.count_nonzero(current_sample != previous_sample))
-    best_dx = 0
-    best_dy = 0
-    best_error = baseline_error
-
-    for dy in range(-sample_search_radius, sample_search_radius + 1, sample_search_step):
-        if dy == 0:
-            dest_y0 = 0
-            src_y0 = 0
-            overlap_h = sample_h
-        elif dy > 0:
-            dest_y0 = 0
-            src_y0 = dy
-            overlap_h = sample_h - dy
-        else:
-            dest_y0 = -dy
-            src_y0 = 0
-            overlap_h = sample_h + dy
-        if overlap_h < 8:
-            continue
-        for dx in range(-sample_search_radius, sample_search_radius + 1, sample_search_step):
-            if dx == 0 and dy == 0:
-                continue
-            if dx == 0:
-                dest_x0 = 0
-                src_x0 = 0
-                overlap_w = sample_w
-            elif dx > 0:
-                dest_x0 = 0
-                src_x0 = dx
-                overlap_w = sample_w - dx
-            else:
-                dest_x0 = -dx
-                src_x0 = 0
-                overlap_w = sample_w + dx
-            if overlap_w < 8:
-                continue
-            current_view = current_sample[dest_y0:dest_y0 + overlap_h, dest_x0:dest_x0 + overlap_w]
-            previous_view = previous_sample[src_y0:src_y0 + overlap_h, src_x0:src_x0 + overlap_w]
-            error = float(np.count_nonzero(current_view != previous_view))
-            if error < best_error:
-                best_error = error
-                best_dx = dx
-                best_dy = dy
-
-    if best_dx == 0 and best_dy == 0:
-        return None
-    if baseline_error <= 0:
-        return None
-    if best_error >= baseline_error * 0.86:
-        return None
-    return best_dx * sample_step, best_dy * sample_step
-
-
-def apply_global_motion_reference(previous_frame: np.ndarray, dx: int, dy: int) -> np.ndarray:
-    frame_h, frame_w = previous_frame.shape
-    shifted = previous_frame.copy()
-    if dy == 0:
-        dest_y0 = 0
-        src_y0 = 0
-        overlap_h = frame_h
-    elif dy > 0:
-        dest_y0 = 0
-        src_y0 = dy
-        overlap_h = frame_h - dy
-    else:
-        dest_y0 = -dy
-        src_y0 = 0
-        overlap_h = frame_h + dy
-    if dx == 0:
-        dest_x0 = 0
-        src_x0 = 0
-        overlap_w = frame_w
-    elif dx > 0:
-        dest_x0 = 0
-        src_x0 = dx
-        overlap_w = frame_w - dx
-    else:
-        dest_x0 = -dx
-        src_x0 = 0
-        overlap_w = frame_w + dx
-    if overlap_h > 0 and overlap_w > 0:
-        shifted[dest_y0:dest_y0 + overlap_h, dest_x0:dest_x0 + overlap_w] = previous_frame[
-            src_y0:src_y0 + overlap_h,
-            src_x0:src_x0 + overlap_w,
-        ]
-    return shifted
-
-
-def split_block_regions(x0: int, y0: int, x1: int, y1: int) -> list[tuple[int, int, int, int, int]]:
-    block_w = x1 - x0
-    block_h = y1 - y0
-    if block_w < 2 or block_h < 2:
-        return []
-    left_w = (block_w + 1) // 2
-    right_w = block_w - left_w
-    top_h = (block_h + 1) // 2
-    bottom_h = block_h - top_h
-    regions: list[tuple[int, int, int, int, int]] = []
-    if left_w > 0 and top_h > 0:
-        regions.append((0, x0, y0, x0 + left_w, y0 + top_h))
-    if right_w > 0 and top_h > 0:
-        regions.append((1, x0 + left_w, y0, x1, y0 + top_h))
-    if left_w > 0 and bottom_h > 0:
-        regions.append((2, x0, y0 + top_h, x0 + left_w, y1))
-    if right_w > 0 and bottom_h > 0:
-        regions.append((3, x0 + left_w, y0 + top_h, x1, y1))
-    return regions
-
-
-def encode_split_block(
-    current_frame: np.ndarray,
-    previous_frame: np.ndarray,
-    *,
-    bx: int,
-    by: int,
-    x0: int,
-    y0: int,
-    x1: int,
-    y1: int,
-    change_ratio: float,
-    motion_search_radius: int,
-    motion_search_step: int,
-    motion_error_ratio: float,
-) -> tuple[bytes, int, int, int] | None:
-    records: list[bytes] = []
-    changed_parts = 0
-    motion_copies = 0
-    literal_blocks = 0
-    total_penalty = 0
-    split_change_ratio = max(change_ratio * 0.65, 0.0)
-    split_error_ratio = max(motion_error_ratio * 0.5, 0.0)
-    split_search_radius = max(2, motion_search_radius // 2)
-
-    for quarter_index, sx0, sy0, sx1, sy1 in split_block_regions(x0, y0, x1, y1):
-        current_block = current_frame[sy0:sy1, sx0:sx1]
-        previous_block = previous_frame[sy0:sy1, sx0:sx1]
-        changed_pixels, _, block_colorfulness = rgb565_block_metrics(current_block, previous_block)
-        if changed_pixels <= int(current_block.size * split_change_ratio):
-            continue
-        motion = find_motion_vector(
-            current_frame,
-            previous_frame,
-            x0=sx0,
-            y0=sy0,
-            x1=sx1,
-            y1=sy1,
-            search_radius=split_search_radius,
-            search_step=motion_search_step,
-            error_ratio=split_error_ratio,
-        )
-        if motion is not None:
-            motion_block = previous_frame[sy0 + motion[1]:sy1 + motion[1], sx0 + motion[0]:sx1 + motion[0]]
-            motion_changed_pixels, motion_weighted_error, _ = rgb565_block_metrics(current_block, motion_block)
-            records.append(struct.pack("<BBbb", quarter_index, 1, motion[0], motion[1]))
-            motion_copies += 1
-            total_penalty += motion_penalty_from_error(motion_changed_pixels, motion_weighted_error, block_colorfulness)
-        else:
-            payload = rle16_encode(current_block)
-            records.append(struct.pack("<BBH", quarter_index, 0, len(payload)) + payload)
-            literal_blocks += 1
-        changed_parts += 1
-
-    if changed_parts == 0:
-        return None
-    return struct.pack("<BBBB", 2, bx, by, changed_parts) + b"".join(records), motion_copies, literal_blocks, total_penalty
-
-
-def encode_motion_records(
-    current_frame: np.ndarray,
-    reference_frame: np.ndarray,
-    *,
-    frame_width: int,
-    frame_height: int,
-    block_size: int,
-    change_ratio: float,
-    motion_search_radius: int,
-    motion_search_step: int,
-    motion_error_ratio: float,
-) -> tuple[bytes, int, int, int]:
-    grid_w = math.ceil(frame_width / block_size)
-    grid_h = math.ceil(frame_height / block_size)
-    record_bytes: list[bytes] = []
-    changed_blocks = 0
-    motion_copies_local = 0
-    literal_blocks_local = 0
-
-    for by in range(grid_h):
-        for bx in range(grid_w):
-            x0 = bx * block_size
-            y0 = by * block_size
-            x1 = min(x0 + block_size, frame_width)
-            y1 = min(y0 + block_size, frame_height)
-            current_block = current_frame[y0:y1, x0:x1]
-            reference_block = reference_frame[y0:y1, x0:x1]
-            changed_pixels, _, block_colorfulness = rgb565_block_metrics(current_block, reference_block)
-            if changed_pixels <= int(current_block.size * change_ratio):
-                continue
-            motion = find_motion_vector(
-                current_frame,
-                reference_frame,
-                x0=x0,
-                y0=y0,
-                x1=x1,
-                y1=y1,
-                search_radius=motion_search_radius,
-                search_step=motion_search_step,
-                error_ratio=motion_error_ratio,
-            )
-            payload = rle16_encode(current_block)
-            literal_record = struct.pack("<BBBH", 0, bx, by, len(payload)) + payload
-            best_record = literal_record
-            best_score = len(literal_record)
-            best_motion_copies = 0
-            best_literal_blocks = 1
-
-            if motion is not None:
-                motion_block = reference_frame[y0 + motion[1]:y1 + motion[1], x0 + motion[0]:x1 + motion[0]]
-                motion_changed_pixels, motion_weighted_error, _ = rgb565_block_metrics(current_block, motion_block)
-                motion_record = struct.pack("<BBBbb", 1, bx, by, motion[0], motion[1])
-                motion_score = len(motion_record) + motion_penalty_from_error(
-                    motion_changed_pixels,
-                    motion_weighted_error,
-                    block_colorfulness,
-                )
-                if motion_score < best_score or (motion_score == best_score and len(motion_record) < len(best_record)):
-                    best_record = motion_record
-                    best_score = motion_score
-                    best_motion_copies = 1
-                    best_literal_blocks = 0
-
-            split_result = encode_split_block(
-                current_frame,
-                reference_frame,
-                bx=bx,
-                by=by,
-                x0=x0,
-                y0=y0,
-                x1=x1,
-                y1=y1,
-                change_ratio=change_ratio,
-                motion_search_radius=motion_search_radius,
-                motion_search_step=motion_search_step,
-                motion_error_ratio=motion_error_ratio,
-            )
-            if split_result is not None:
-                split_record, split_motion_copies, split_literal_count, split_penalty = split_result
-                split_score = len(split_record) + split_penalty
-                if split_score < best_score or (split_score == best_score and len(split_record) < len(best_record)):
-                    best_record = split_record
-                    best_score = split_score
-                    best_motion_copies = split_motion_copies
-                    best_literal_blocks = split_literal_count
-
-            record_bytes.append(best_record)
-            motion_copies_local += best_motion_copies
-            literal_blocks_local += best_literal_blocks
-            changed_blocks += 1
-
-    return b"".join(record_bytes), changed_blocks, motion_copies_local, literal_blocks_local
-
-
-def iter_chunks(items: list[np.ndarray], size: int) -> Iterator[list[np.ndarray]]:
-    for start in range(0, len(items), size):
-        yield items[start:start + size]
-
-
-def encode_chunk(
-    frames: list[np.ndarray],
-    *,
-    block_size: int,
-    keyframe_interval: int,
-    change_ratio: float,
-    keyframe_block_ratio: float,
-    motion_search_radius: int,
-    motion_search_step: int,
-    motion_error_ratio: float,
-    frame_index_base: int = 0,
-    initial_previous_frame: np.ndarray | None = None,
-) -> tuple[bytes, list[int], int, int, int, int, int, int]:
-    frame_height, frame_width = frames[0].shape
-    previous_frame: np.ndarray | None = None if initial_previous_frame is None else initial_previous_frame.copy()
-    encoded = bytearray()
-    frame_offsets: list[int] = []
-    keyframes = 0
-    predicted = 0
-    repeated = 0
-    block_updates = 0
-    motion_copies = 0
-    literal_blocks = 0
-
-    for local_index, frame_words in enumerate(frames):
-        frame_offsets.append(len(encoded))
-        full_payload = rle16_encode(frame_words)
-        force_keyframe = previous_frame is None or ((frame_index_base + local_index) % keyframe_interval == 0)
-
-        if not force_keyframe and previous_frame is not None:
-            best_inter_blob: bytes | None = None
-            best_changed_rows = 0
-            best_global_shifts = 0
-            best_literal_spans = 0
-
-            gap_limit = max(1, min(6, int(round(motion_error_ratio * 32.0)) or 1))
-            full_row_ratio = min(0.80, max(0.18, change_ratio * 4.0))
-
-            predicted_payload, changed_rows, literal_spans_local, _ = encode_row_diff_records(
-                frame_words,
-                previous_frame,
-                gap_limit=gap_limit,
-                full_row_ratio=full_row_ratio,
-            )
-            if changed_rows == 0:
-                best_inter_blob = b"N"
-                best_changed_rows = 0
-                best_global_shifts = 0
-                best_literal_spans = 0
-            elif len(predicted_payload) + 1 < len(full_payload):
-                best_inter_blob = b"D" + predicted_payload
-                best_changed_rows = changed_rows
-                best_global_shifts = 0
-                best_literal_spans = literal_spans_local
-
-            global_motion = find_global_motion_vector(
-                frame_words,
-                previous_frame,
-                search_radius=motion_search_radius,
-                search_step=motion_search_step,
-            )
-            if global_motion is not None:
-                shifted_reference = apply_global_motion_reference(previous_frame, global_motion[0], global_motion[1])
-                global_payload, global_changed_rows, global_literal_spans, _ = encode_row_diff_records(
-                    frame_words,
-                    shifted_reference,
-                    gap_limit=max(1, gap_limit - 1),
-                    full_row_ratio=min(0.90, full_row_ratio + 0.10),
-                )
-                global_blob = b"H" + struct.pack("<bb", global_motion[0], global_motion[1]) + global_payload
-                if len(global_blob) + 1 < len(full_payload) and (
-                    best_inter_blob is None or len(global_blob) < len(best_inter_blob)
-                ):
-                    best_inter_blob = global_blob
-                    best_changed_rows = global_changed_rows
-                    best_global_shifts = 1
-                    best_literal_spans = global_literal_spans
-
-            if best_inter_blob is not None:
-                encoded += best_inter_blob
-                predicted += 1
-                repeated += 1 if best_inter_blob == b"N" else 0
-                block_updates += best_changed_rows
-                motion_copies += best_global_shifts
-                literal_blocks += best_literal_spans
-                previous_frame = frame_words.copy()
-                continue
-
-        encoded += b"I" + struct.pack("<I", len(full_payload)) + full_payload
-        keyframes += 1
-        previous_frame = frame_words.copy()
-
-    return bytes(encoded), frame_offsets, keyframes, predicted, repeated, block_updates, motion_copies, literal_blocks
-
-
 def compress_chunk_payload(chunk_blob: bytes, zlib_level: int) -> bytes:
     compressed_blob = zlib.compress(chunk_blob, level=zlib_level)
     if len(compressed_blob) + 16 < len(chunk_blob):
@@ -1042,7 +531,6 @@ def write_header(
     video_width: int,
     video_height: int,
     fps: float,
-    block_size: int,
     chunk_frames: int,
     frame_count: int,
     chunk_count: int,
@@ -1064,7 +552,7 @@ def write_header(
             video_height,
             int(round(fps * 1000)),
             1000,
-            block_size,
+            0,
             chunk_frames,
             frame_count,
             chunk_count,
@@ -1073,6 +561,309 @@ def write_header(
             subtitle_offset,
         )
     )
+
+
+def format_fps_value(fps: float) -> str:
+    return f"{fps:.6f}".rstrip("0").rstrip(".")
+
+
+def h264_stream_profile_options(chunk_frames: int, stream_profile: str) -> tuple[str | None, str, list[str]]:
+    keyint = 1 if stream_profile == "intra" else chunk_frames
+    base_params = [
+        f"keyint={keyint}",
+        f"min-keyint={keyint}",
+        "scenecut=0",
+        "repeat-headers=1",
+        "aud=1",
+        "bframes=0",
+        "ref=1",
+        "cabac=0",
+        "slices=1",
+        "force-cfr=1",
+        "weightp=0",
+    ]
+
+    if stream_profile == "fast":
+        tune = "fastdecode"
+        extra_params = [
+            "no-deblock=1",
+            "partitions=none",
+            "aq-mode=0",
+            "mbtree=0",
+            "rc-lookahead=0",
+            "sync-lookahead=0",
+            "me=dia",
+            "subme=0",
+            "trellis=0",
+        ]
+    elif stream_profile == "balanced":
+        tune = None
+        extra_params = [
+            "aq-mode=1",
+            "mbtree=1",
+            "rc-lookahead=12",
+            "sync-lookahead=12",
+            "me=hex",
+            "subme=2",
+            "trellis=0",
+        ]
+    elif stream_profile == "quality":
+        tune = None
+        extra_params = [
+            "aq-mode=1",
+            "mbtree=1",
+            "rc-lookahead=20",
+            "sync-lookahead=20",
+            "me=hex",
+            "subme=6",
+            "trellis=1",
+        ]
+    elif stream_profile == "intra":
+        tune = None
+        extra_params = [
+            "no-deblock=1",
+            "aq-mode=1",
+            "mbtree=0",
+            "rc-lookahead=0",
+            "sync-lookahead=0",
+            "subme=4",
+            "trellis=1",
+        ]
+    else:
+        raise ValueError(f"Unsupported stream profile: {stream_profile}")
+
+    return tune, ":".join(base_params + extra_params), ["filter_units=remove_types=6"]
+
+
+def build_ffmpeg_command(
+    *,
+    input_path: Path,
+    output_path: Path,
+    width: int,
+    height: int,
+    fps: float,
+    chunk_frames: int,
+    crf: int,
+    preset: str,
+    level: str,
+    stream_profile: str,
+    start: float,
+    duration: float | None,
+) -> list[str]:
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    vf = f"fps={format_fps_value(fps)},scale={width}:{height}:flags=lanczos,setsar=1"
+    tune, x264_params, bitstream_filters = h264_stream_profile_options(chunk_frames, stream_profile)
+    command = [ffmpeg, "-y"]
+    if start > 0:
+        command += ["-ss", f"{start:.3f}"]
+    command += ["-i", str(input_path)]
+    if duration is not None:
+        command += ["-t", f"{duration:.3f}"]
+    command += [
+        "-vf",
+        vf,
+        "-r",
+        format_fps_value(fps),
+        "-an",
+        "-sn",
+        "-dn",
+        "-threads",
+        "1",
+        "-c:v",
+        "libx264",
+        "-preset",
+        preset,
+    ]
+    if tune:
+        command += ["-tune", tune]
+    command += [
+        "-profile:v",
+        "baseline",
+        "-level:v",
+        level,
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        str(chunk_frames),
+        "-keyint_min",
+        str(chunk_frames),
+        "-sc_threshold",
+        "0",
+        "-bf",
+        "0",
+        "-refs",
+        "1",
+        "-force_key_frames",
+        f"expr:gte(n,n_forced*{chunk_frames})",
+        "-x264-params",
+        x264_params,
+    ]
+    for bitstream_filter in bitstream_filters:
+        command += ["-bsf:v", bitstream_filter]
+    command += [
+        "-crf",
+        str(crf),
+        "-f",
+        "h264",
+        str(output_path),
+    ]
+    return command
+
+
+def encode_h264_bitstream(
+    *,
+    input_path: Path,
+    width: int,
+    height: int,
+    fps: float,
+    chunk_frames: int,
+    crf: int,
+    preset: str,
+    level: str,
+    stream_profile: str,
+    start: float,
+    duration: float | None,
+) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="nvp-h264-") as temp_dir:
+        bitstream_path = Path(temp_dir) / "video.264"
+        command = build_ffmpeg_command(
+            input_path=input_path,
+            output_path=bitstream_path,
+            width=width,
+            height=height,
+            fps=fps,
+            chunk_frames=chunk_frames,
+            crf=crf,
+            preset=preset,
+            level=level,
+            stream_profile=stream_profile,
+            start=start,
+            duration=duration,
+        )
+        completed = subprocess.run(command, capture_output=True, text=True)
+        if completed.returncode != 0:
+            raise RuntimeError(completed.stderr.strip() or "ffmpeg H.264 encoding failed")
+        return bitstream_path.read_bytes()
+
+
+def parse_annex_b_nalus(bitstream: bytes) -> list[NalUnit]:
+    matches = list(START_CODE_RE.finditer(bitstream))
+    if not matches:
+        raise RuntimeError("FFmpeg did not produce an Annex B H.264 bitstream.")
+
+    nal_units: list[NalUnit] = []
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(bitstream)
+        if match.end() >= end:
+            continue
+        nal_units.append(NalUnit(
+            nal_type=bitstream[match.end()] & 0x1F,
+            data=bitstream[start:end],
+        ))
+
+    if not nal_units:
+        raise RuntimeError("No H.264 NAL units were found in the encoded bitstream.")
+    return nal_units
+
+
+def group_nals_into_access_units(nal_units: list[NalUnit]) -> list[AccessUnit]:
+    access_units: list[AccessUnit] = []
+    current: list[NalUnit] = []
+    current_has_vcl = False
+
+    for unit in nal_units:
+        if unit.nal_type == NAL_AUD and current:
+            if current_has_vcl:
+                access_units.append(AccessUnit(nal_units=current))
+            current = []
+            current_has_vcl = False
+        elif current and current_has_vcl and unit.nal_type in {NAL_AUD, NAL_SPS, NAL_PPS, NAL_SEI}:
+            access_units.append(AccessUnit(nal_units=current))
+            current = []
+            current_has_vcl = False
+
+        current.append(unit)
+        if unit.nal_type in VCL_NAL_TYPES:
+            current_has_vcl = True
+
+    if current and current_has_vcl:
+        access_units.append(AccessUnit(nal_units=current))
+
+    if not access_units:
+        raise RuntimeError("No decodable H.264 access units were found in the bitstream.")
+    return access_units
+
+
+def access_unit_starts_chunk(unit: AccessUnit) -> bool:
+    return any(nal.nal_type in CHUNK_BOUNDARY_NAL_TYPES for nal in unit.nal_units)
+
+
+def chunk_has_independent_start(unit: AccessUnit) -> bool:
+    return unit.contains_type(NAL_IDR) and unit.contains_type(NAL_SPS) and unit.contains_type(NAL_PPS)
+
+
+def group_access_units_into_chunks(access_units: list[AccessUnit], chunk_frames: int, stream_profile: str) -> list[list[AccessUnit]]:
+    chunks: list[list[AccessUnit]] = []
+    current: list[AccessUnit] = []
+
+    for unit in access_units:
+        if current and (
+            (stream_profile == "intra" and len(current) >= chunk_frames)
+            or (stream_profile != "intra" and access_unit_starts_chunk(unit))
+        ):
+            chunks.append(current)
+            current = []
+        current.append(unit)
+
+    if current:
+        chunks.append(current)
+
+    if not chunks:
+        raise RuntimeError("The H.264 bitstream did not produce any `.nvp` chunks.")
+
+    for index, chunk in enumerate(chunks):
+        if not chunk:
+            raise RuntimeError("Encountered an empty chunk while grouping H.264 access units.")
+        if not chunk_has_independent_start(chunk[0]):
+            raise RuntimeError(
+                f"Chunk {index} does not start with SPS/PPS/IDR. "
+                "Check the FFmpeg keyframe and repeat-headers settings."
+            )
+        if index + 1 < len(chunks) and len(chunk) != chunk_frames:
+            raise RuntimeError(
+                f"Chunk {index} has {len(chunk)} frames, expected {chunk_frames}. "
+                "FFmpeg did not honor the requested fixed IDR cadence."
+            )
+        if len(chunk) > chunk_frames:
+            raise RuntimeError(
+                f"Chunk {index} has {len(chunk)} frames, which exceeds chunk_frames={chunk_frames}."
+            )
+
+    return chunks
+
+
+def build_access_unit_payload(unit: AccessUnit, *, keep_parameter_sets: bool) -> bytes:
+    payload = bytearray()
+    for nal in unit.nal_units:
+        if nal.nal_type == NAL_AUD:
+            continue
+        if not keep_parameter_sets and nal.nal_type in {NAL_SPS, NAL_PPS, NAL_SEI}:
+            continue
+        payload.extend(nal.data)
+    return bytes(payload)
+
+
+def build_chunk_blob(access_units: list[AccessUnit], stream_profile: str) -> tuple[bytes, list[int]]:
+    payload = bytearray()
+    frame_offsets: list[int] = []
+    for index, unit in enumerate(access_units):
+        frame_offsets.append(len(payload))
+        payload.extend(build_access_unit_payload(
+            unit,
+            keep_parameter_sets=(index == 0 or stream_profile != "intra"),
+        ))
+    return bytes(payload), frame_offsets
 
 
 def encode(args: argparse.Namespace) -> EncodeStats:
@@ -1086,125 +877,95 @@ def encode(args: argparse.Namespace) -> EncodeStats:
     if subtitle_tracks and args.subtitle == "embedded":
         log(f"Embedding {len(subtitle_tracks)} subtitle track(s).", quiet=args.quiet)
 
-    probe = iter_video_frames(input_path, width=16, height=16, fps=1.0)
-    metadata = next(probe)
-    if hasattr(probe, "close"):
-        probe.close()
     video_probe = probe_video(input_path)
-    source_width = video_probe.display_width or metadata["source_size"][0]
-    source_height = video_probe.display_height or metadata["source_size"][1]
-    duration = video_probe.duration or metadata.get("duration", 0.0) or 0.0
+    source_width = video_probe.display_width or video_probe.storage_width
+    source_height = video_probe.display_height or video_probe.storage_height
+    if source_width <= 0 or source_height <= 0:
+        raise RuntimeError("Failed to determine input video dimensions.")
+
     fps = video_probe.fps if isinstance(args.fps, str) and args.fps.lower() == "source" else float(args.fps)
     if fps <= 0:
         raise RuntimeError("Target fps must be greater than zero.")
+
     target_width, target_height, video_x, video_y = fit_dimensions(
         source_width,
         source_height,
         args.max_width,
         args.max_height,
     )
-    expected_frames = int(round((args.duration or duration) * fps)) if duration else 0
 
     log(
         f"Encoding {input_path.name} -> {target_width}x{target_height} @ {fps:.3f}fps "
-        f"(source {video_probe.storage_width}x{video_probe.storage_height}, display {source_width}x{source_height})",
+        f"(source {video_probe.storage_width}x{video_probe.storage_height}, display {source_width}x{source_height}, profile {args.stream_profile})",
         quiet=args.quiet,
     )
 
-    frame_stream = iter_video_frames(
-        input_path,
+    start_time = time.time()
+    bitstream = encode_h264_bitstream(
+        input_path=input_path,
         width=target_width,
         height=target_height,
         fps=fps,
+        chunk_frames=args.chunk_frames,
+        crf=args.crf,
+        preset=args.preset,
+        level=args.level,
+        stream_profile=args.stream_profile,
         start=args.start,
         duration=args.duration,
     )
-    next(frame_stream)
+    log(
+        f"FFmpeg produced {len(bitstream) / 1024:.1f} KiB of Annex B H.264 in {time.time() - start_time:.1f}s.",
+        quiet=args.quiet,
+    )
+
+    nal_units = parse_annex_b_nalus(bitstream)
+    access_units = group_nals_into_access_units(nal_units)
+    chunks = group_access_units_into_chunks(access_units, args.chunk_frames, args.stream_profile)
+
+    if not access_units:
+        raise RuntimeError("No frames were found in the encoded H.264 bitstream.")
 
     output_handle = output_path.open("wb")
     output_handle.write(b"\0" * HEADER_STRUCT.size)
 
     chunk_index: list[tuple[int, int, int, int, int, int]] = []
-    current_chunk_frames: list[np.ndarray] = []
-    frame_count = 0
-    chunk_count = 0
-    keyframes = 0
-    predicted = 0
-    repeated = 0
-    block_updates = 0
-    motion_copies = 0
-    literal_blocks = 0
-    start_time = time.time()
-    previous_chunk_last_frame: np.ndarray | None = None
-
-    def flush_chunk() -> None:
-        nonlocal chunk_count, keyframes, predicted, repeated, block_updates, motion_copies, literal_blocks
-        nonlocal current_chunk_frames, previous_chunk_last_frame
-        if not current_chunk_frames:
-            return
-        first_frame = frame_count - len(current_chunk_frames)
-        prepared_frames = [
-            image_to_rgb565_words(preprocess_frame(frame, args.posterize_bits))
-            for frame in current_chunk_frames
-        ]
-        initial_previous_frame = None
-        if previous_chunk_last_frame is not None:
-            initial_previous_frame = image_to_rgb565_words(
-                preprocess_frame(previous_chunk_last_frame, args.posterize_bits)
-            )
-        chunk_blob, frame_offsets, chunk_keyframes, chunk_predicted, chunk_repeated, chunk_blocks, chunk_motion, chunk_literal = encode_chunk(
-            prepared_frames,
-            block_size=args.block_size,
-            keyframe_interval=args.keyframe_interval,
-            change_ratio=args.change_ratio,
-            keyframe_block_ratio=args.keyframe_block_ratio,
-            motion_search_radius=args.motion_search_radius,
-            motion_search_step=args.motion_search_step,
-            motion_error_ratio=args.motion_error_ratio,
-            frame_index_base=first_frame,
-            initial_previous_frame=initial_previous_frame,
-        )
+    frame_cursor = 0
+    for chunk_number, access_unit_chunk in enumerate(chunks, start=1):
+        chunk_payload, frame_offsets = build_chunk_blob(access_unit_chunk, args.stream_profile)
         stored_chunk_blob = bytearray()
-        stored_chunk_blob += struct.pack("<I", len(chunk_blob))
+        stored_chunk_blob += struct.pack("<I", len(chunk_payload))
         for frame_offset in frame_offsets:
             stored_chunk_blob += struct.pack("<I", frame_offset)
-        stored_chunk_blob += chunk_blob
+        stored_chunk_blob += chunk_payload
         while len(stored_chunk_blob) % 4:
             stored_chunk_blob.append(0)
+
         stored_blob = compress_chunk_payload(bytes(stored_chunk_blob), args.zlib_level)
         offset = output_handle.tell()
         output_handle.write(stored_blob)
-        chunk_index.append((offset, len(stored_blob), len(stored_chunk_blob), first_frame, len(current_chunk_frames), 0))
-        total_size_bytes = output_handle.tell()
-        chunk_count += 1
-        keyframes += chunk_keyframes
-        predicted += chunk_predicted
-        repeated += chunk_repeated
-        block_updates += chunk_blocks
-        motion_copies += chunk_motion
-        literal_blocks += chunk_literal
+        chunk_index.append((
+            offset,
+            len(stored_blob),
+            len(stored_chunk_blob),
+            frame_cursor,
+            len(access_unit_chunk),
+            0,
+        ))
+
         elapsed = time.time() - start_time
-        progress = min(100.0, (frame_count / expected_frames) * 100.0) if expected_frames else 0.0
-        fps_done = frame_count / elapsed if elapsed > 0 else 0.0
-        eta_frames = max(0, expected_frames - frame_count) if expected_frames else 0
-        eta = (eta_frames / fps_done) if fps_done > 0 and eta_frames else 0.0
+        fps_done = frame_cursor / elapsed if elapsed > 0 else 0.0
+        frame_end = frame_cursor + len(access_unit_chunk) - 1
+        progress = (chunk_number / len(chunks)) * 100.0
+        eta_chunks = len(chunks) - chunk_number
+        eta = (eta_chunks * args.chunk_frames / fps_done) if fps_done > 0 and eta_chunks > 0 else 0.0
         log(
-            f"Chunk {chunk_count:03d}: {progress:5.1f}% | ETA {format_duration_hms(eta)} | "
-            f"frames {first_frame}-{frame_count - 1} | size {len(stored_blob) / 1024:.1f} KiB | "
-            f"total size {total_size_bytes / (1024 * 1024):.2f} MiB | "
-            f"I={chunk_keyframes} P={chunk_predicted - chunk_repeated} N={chunk_repeated} M={chunk_motion} L={chunk_literal}",
+            f"Chunk {chunk_number:03d}: {progress:5.1f}% | ETA {format_duration_hms(eta)} | "
+            f"frames {frame_cursor}-{frame_end} | size {len(stored_blob) / 1024:.1f} KiB | "
+            f"total size {output_handle.tell() / (1024 * 1024):.2f} MiB",
             quiet=args.quiet,
         )
-        previous_chunk_last_frame = current_chunk_frames[-1].copy()
-        current_chunk_frames = []
-
-    for frame in frame_stream:
-        current_chunk_frames.append(frame.copy())
-        frame_count += 1
-        if len(current_chunk_frames) >= args.chunk_frames:
-            flush_chunk()
-
-    flush_chunk()
+        frame_cursor += len(access_unit_chunk)
 
     index_offset = output_handle.tell()
     for entry in chunk_index:
@@ -1232,10 +993,9 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         video_width=target_width,
         video_height=target_height,
         fps=fps,
-        block_size=args.block_size,
         chunk_frames=args.chunk_frames,
-        frame_count=frame_count,
-        chunk_count=chunk_count,
+        frame_count=len(access_units),
+        chunk_count=len(chunks),
         subtitle_count=subtitle_count,
         index_offset=index_offset,
         subtitle_offset=subtitle_offset,
@@ -1251,23 +1011,17 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         video_x=video_x,
         video_y=video_y,
         fps=fps,
-        frame_count=frame_count,
-        chunk_count=chunk_count,
-        keyframes=keyframes,
-        predicted_frames=predicted,
-        repeated_frames=repeated,
-        block_updates=block_updates,
-        motion_copies=motion_copies,
-        literal_blocks=literal_blocks,
+        frame_count=len(access_units),
+        chunk_count=len(chunks),
+        idr_chunks=len(chunks),
+        raw_h264_bytes=len(bitstream),
         bytes_written=bytes_written,
-        average_bytes_per_frame=bytes_written / frame_count,
+        average_bytes_per_frame=bytes_written / len(access_units),
     )
     stats_path.write_text(json.dumps(asdict(stats), indent=2), encoding="utf-8")
     log(
         f"Wrote {output_path.name}: {bytes_written / (1024 * 1024):.2f} MiB | "
-        f"{frame_count} frames | {chunk_count} chunks | "
-        f"{keyframes} I / {predicted - repeated} P / {repeated} N | "
-        f"{block_updates} changed blocks | {motion_copies} motion copies | {literal_blocks} literal blocks",
+        f"{len(access_units)} frames | {len(chunks)} chunks | raw H.264 {len(bitstream) / 1024:.1f} KiB",
         quiet=args.quiet,
     )
     return stats
@@ -1282,15 +1036,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--fps", default="12", help="Target framerate or 'source'")
     parser.add_argument("--max-width", type=int, default=SCREEN_W, help="Fit width")
     parser.add_argument("--max-height", type=int, default=SCREEN_H, help="Fit height")
-    parser.add_argument("--block-size", type=int, default=16, help="Delta block size")
-    parser.add_argument("--chunk-frames", type=int, default=24, help="Frames per streamed chunk")
-    parser.add_argument("--keyframe-interval", type=int, default=48, help="Force a keyframe every N local frames")
-    parser.add_argument("--change-ratio", type=float, default=0.05, help="Changed-pixel ratio per block to keep the block")
-    parser.add_argument("--keyframe-block-ratio", type=float, default=0.42, help="Promote to keyframe if this fraction of blocks changed")
-    parser.add_argument("--motion-search-radius", type=int, default=6, help="Pixel radius to search for block motion reuse")
-    parser.add_argument("--motion-search-step", type=int, default=2, help="Pixel step when searching motion vectors")
-    parser.add_argument("--motion-error-ratio", type=float, default=0.08, help="Allowed differing-pixel ratio for motion copied blocks")
-    parser.add_argument("--posterize-bits", type=int, default=0, help="Optional 1-7 bit posterization per RGB channel before encoding")
+    parser.add_argument("--chunk-frames", type=int, default=24, help="Frames per streamed chunk and forced IDR interval")
+    parser.add_argument("--crf", type=int, default=24, help="libx264 CRF quality target")
+    parser.add_argument("--preset", default="slow", help="libx264 preset")
+    parser.add_argument("--level", default="1.3", help="Target H.264 level")
+    parser.add_argument("--stream-profile", choices=STREAM_PROFILES, default="fast", help="Decoder-complexity profile: fast is smoothest, balanced/quality trade more CPU for better image quality")
     parser.add_argument("--zlib-level", type=int, default=9, help="Chunk compression level (0-9)")
     parser.add_argument("--start", type=float, default=0.0, help="Optional clip start offset in seconds")
     parser.add_argument("--duration", type=float, help="Optional clip duration in seconds")
