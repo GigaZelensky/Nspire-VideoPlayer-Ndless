@@ -24,7 +24,7 @@ from PIL import Image
 
 
 MAGIC = b"NVP1"
-VERSION = 5
+VERSION = 8
 SCREEN_W = 320
 SCREEN_H = 240
 HEADER_STRUCT = struct.Struct("<4sHHHHHHHHHHHHIIIII")
@@ -46,6 +46,20 @@ class SubtitleCue:
     start_ms: int
     end_ms: int
     text: str
+
+
+@dataclass(slots=True)
+class SubtitleTrack:
+    name: str
+    cues: list[SubtitleCue]
+
+
+@dataclass(slots=True)
+class EmbeddedSubtitleTrackInfo:
+    ordinal: int
+    name: str
+    codec_name: str
+    text_supported: bool
 
 
 @dataclass(slots=True)
@@ -181,6 +195,172 @@ def extract_embedded_subtitles(input_path: Path, output_path: Path) -> Path:
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or "ffmpeg subtitle extraction failed")
     return output_path
+
+
+def ffprobe_path() -> Path | None:
+    ffmpeg_path = Path(imageio_ffmpeg.get_ffmpeg_exe())
+    candidate_names = ["ffprobe.exe", "ffprobe"]
+    for name in candidate_names:
+        candidate = ffmpeg_path.with_name(name)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def subtitle_track_display_name(ordinal: int, language: str | None, title: str | None) -> str:
+    parts: list[str] = []
+    if language and language.lower() not in {"und", "unknown"}:
+        parts.append(language.upper())
+    if title:
+        parts.append(title.strip())
+    if not parts:
+        return f"Subtitle {ordinal + 1}"
+    return " - ".join(part for part in parts if part)
+
+
+def is_text_subtitle_codec(codec_name: str | None) -> bool:
+    codec = (codec_name or "").strip().lower()
+    if not codec:
+        return False
+    return codec not in {
+        "hdmv_pgs_subtitle",
+        "pgssub",
+        "dvd_subtitle",
+        "dvb_subtitle",
+        "xsub",
+    }
+
+
+def probe_embedded_subtitle_tracks(input_path: Path) -> list[EmbeddedSubtitleTrackInfo]:
+    ffprobe = ffprobe_path()
+    if ffprobe is not None:
+        completed = subprocess.run(
+            [
+                str(ffprobe),
+                "-v",
+                "error",
+                "-select_streams",
+                "s",
+                "-show_entries",
+                "stream=index,codec_name:stream_tags=language,title",
+                "-of",
+                "json",
+                str(input_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode == 0:
+            try:
+                payload = json.loads(completed.stdout or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            streams = payload.get("streams", [])
+            tracks: list[EmbeddedSubtitleTrackInfo] = []
+            for ordinal, stream in enumerate(streams):
+                tags = stream.get("tags", {}) if isinstance(stream, dict) else {}
+                codec_name = stream.get("codec_name") if isinstance(stream, dict) else None
+                tracks.append(EmbeddedSubtitleTrackInfo(
+                    ordinal=ordinal,
+                    name=subtitle_track_display_name(
+                        ordinal,
+                        tags.get("language") if isinstance(tags, dict) else None,
+                        tags.get("title") if isinstance(tags, dict) else None,
+                    ),
+                    codec_name=(codec_name or "unknown"),
+                    text_supported=is_text_subtitle_codec(codec_name),
+                ))
+            if tracks:
+                return tracks
+
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    completed = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", str(input_path)],
+        capture_output=True,
+        text=True,
+    )
+    tracks = []
+    subtitle_ordinal = 0
+    for line in completed.stderr.splitlines():
+        if " Subtitle:" not in line:
+            continue
+        language_match = re.search(r"Stream #\d+:\d+(?:\(([^)]+)\))?: Subtitle:", line)
+        language = language_match.group(1) if language_match else None
+        title_match = re.search(r"title\s*:\s*(.+)$", line, re.IGNORECASE)
+        title = title_match.group(1).strip() if title_match else None
+        codec_match = re.search(r"Subtitle:\s*([a-zA-Z0-9_]+)", line)
+        codec_name = codec_match.group(1).lower() if codec_match else "unknown"
+        tracks.append(EmbeddedSubtitleTrackInfo(
+            ordinal=subtitle_ordinal,
+            name=subtitle_track_display_name(subtitle_ordinal, language, title),
+            codec_name=codec_name,
+            text_supported=is_text_subtitle_codec(codec_name),
+        ))
+        subtitle_ordinal += 1
+    return tracks
+
+
+def extract_embedded_subtitle_track(input_path: Path, output_path: Path, track_index: int) -> Path:
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(input_path),
+        "-map",
+        f"0:s:{track_index}",
+        str(output_path),
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or f"ffmpeg subtitle extraction failed for track {track_index}")
+    return output_path
+
+
+def load_subtitle_tracks(input_path: Path, output_path: Path, subtitle_arg: str | None, selected_tracks: list[int] | None) -> list[SubtitleTrack]:
+    if not subtitle_arg:
+        return []
+
+    if subtitle_arg != "embedded":
+        cues = parse_srt(Path(subtitle_arg))
+        if not cues:
+            return []
+        return [SubtitleTrack(name=Path(subtitle_arg).stem or "Subtitles", cues=cues)]
+
+    available_tracks = probe_embedded_subtitle_tracks(input_path)
+    if not available_tracks:
+        raise RuntimeError("No embedded subtitle tracks were found.")
+
+    if selected_tracks:
+        wanted_tracks = list(dict.fromkeys(selected_tracks))
+    else:
+        wanted_tracks = [track.ordinal for track in available_tracks if track.text_supported]
+        if not wanted_tracks:
+            raise RuntimeError("No supported text embedded subtitle tracks were found.")
+    track_info_map = {track.ordinal: track for track in available_tracks}
+    subtitle_tracks: list[SubtitleTrack] = []
+
+    for track_index in wanted_tracks:
+        track_info = track_info_map.get(track_index)
+        if track_info is None:
+            raise RuntimeError(f"Embedded subtitle track {track_index} is not available.")
+        if not track_info.text_supported:
+            raise RuntimeError(
+                f"Embedded subtitle track {track_index} ({track_info.name}) uses unsupported bitmap codec "
+                f"'{track_info.codec_name}'. Select a text subtitle track instead."
+            )
+        extracted = output_path.parent / f"{output_path.stem}.track{track_index}.srt"
+        try:
+            extract_embedded_subtitle_track(input_path, extracted, track_index)
+            cues = parse_srt(extracted)
+            if cues:
+                subtitle_tracks.append(SubtitleTrack(name=track_info.name, cues=cues))
+        finally:
+            try:
+                extracted.unlink()
+            except FileNotFoundError:
+                pass
+    return subtitle_tracks
 
 
 def fit_dimensions(source_width: int, source_height: int, max_width: int, max_height: int) -> tuple[int, int, int, int]:
@@ -901,15 +1081,10 @@ def encode(args: argparse.Namespace) -> EncodeStats:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path = output_path.with_suffix(".json")
 
-    subtitle_cues: list[SubtitleCue] = []
-    if args.subtitle:
-        if args.subtitle == "embedded":
-            extracted = output_path.with_suffix(".srt")
-            log("Extracting embedded subtitles...", quiet=args.quiet)
-            extract_embedded_subtitles(input_path, extracted)
-            subtitle_cues = parse_srt(extracted)
-        else:
-            subtitle_cues = parse_srt(Path(args.subtitle))
+    subtitle_tracks = load_subtitle_tracks(input_path, output_path, args.subtitle, args.subtitle_track)
+    subtitle_count = sum(len(track.cues) for track in subtitle_tracks)
+    if subtitle_tracks and args.subtitle == "embedded":
+        log(f"Embedding {len(subtitle_tracks)} subtitle track(s).", quiet=args.quiet)
 
     probe = iter_video_frames(input_path, width=16, height=16, fps=1.0)
     metadata = next(probe)
@@ -1036,10 +1211,17 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         output_handle.write(CHUNK_INDEX_STRUCT.pack(*entry))
 
     subtitle_offset = output_handle.tell()
-    for cue in subtitle_cues:
-        encoded = sanitize_subtitle_text(cue.text).encode("ascii", "replace")
-        output_handle.write(struct.pack("<IIH", cue.start_ms, cue.end_ms, len(encoded)))
-        output_handle.write(encoded)
+    if subtitle_tracks:
+        output_handle.write(struct.pack("<H", len(subtitle_tracks)))
+        for track in subtitle_tracks:
+            encoded_name = sanitize_subtitle_text(track.name).encode("ascii", "replace")
+            output_handle.write(struct.pack("<HI", len(encoded_name), len(track.cues)))
+            output_handle.write(encoded_name)
+        for track in subtitle_tracks:
+            for cue in track.cues:
+                encoded = sanitize_subtitle_text(cue.text).encode("ascii", "replace")
+                output_handle.write(struct.pack("<IIH", cue.start_ms, cue.end_ms, len(encoded)))
+                output_handle.write(encoded)
 
     write_header(
         output_handle,
@@ -1054,7 +1236,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         chunk_frames=args.chunk_frames,
         frame_count=frame_count,
         chunk_count=chunk_count,
-        subtitle_count=len(subtitle_cues),
+        subtitle_count=subtitle_count,
         index_offset=index_offset,
         subtitle_offset=subtitle_offset,
     )
@@ -1096,6 +1278,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("input", help="Input video file")
     parser.add_argument("--output", required=True, help="Output .nvp.tns file")
     parser.add_argument("--subtitle", help="Optional .srt path or 'embedded'")
+    parser.add_argument("--subtitle-track", dest="subtitle_track", action="append", type=int, help="Embedded subtitle track index to include; repeat to keep multiple tracks")
     parser.add_argument("--fps", default="12", help="Target framerate or 'source'")
     parser.add_argument("--max-width", type=int, default=SCREEN_W, help="Fit width")
     parser.add_argument("--max-height", type=int, default=SCREEN_H, help="Fit height")

@@ -39,6 +39,11 @@
 #define MONOTONIC_TIMER_MAX_DELTA_TICKS (TIMER_TICKS_PER_SEC * 10U)
 #define DEBUG_RING_SIZE 64
 #define DEBUG_LINE_LEN 128
+#define HISTORY_FILE_NAME "ndhistory.ts.tns"
+#define HISTORY_MAX_ENTRIES 5
+#define RESUME_MIN_MS 5000U
+#define RESUME_CLEAR_TAIL_MS 3000U
+#define STATUS_OVERLAY_MS 1200U
 
 #pragma pack(push, 1)
 typedef struct {
@@ -88,8 +93,26 @@ typedef struct {
 
 typedef struct {
     char *name;
+    uint32_t cue_start;
+    uint32_t cue_count;
+} SubtitleTrack;
+
+typedef struct {
+    char *name;
     char *path;
+    uint32_t resume_frame;
+    bool has_resume;
 } MovieFile;
+
+typedef struct {
+    char *path;
+    uint32_t frame;
+} HistoryEntry;
+
+typedef struct {
+    HistoryEntry entries[HISTORY_MAX_ENTRIES];
+    size_t count;
+} HistoryStore;
 
 typedef struct {
     nSDL_Font *white;
@@ -171,6 +194,9 @@ typedef struct {
     MovieHeader header;
     ChunkIndexEntry *chunk_index;
     SubtitleCue *subtitles;
+    SubtitleTrack *subtitle_tracks;
+    uint16_t subtitle_track_count;
+    uint16_t selected_subtitle_track;
     uint16_t *framebuffer;
     uint16_t *previous_framebuffer;
     uint16_t *block_scratch;
@@ -247,6 +273,9 @@ static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk);
 static void prefetch_do_work(Movie *movie, int current_chunk, uint32_t deadline_ms);
 static void free_fonts(Fonts *fonts);
 static uint32_t monotonic_clock_now_ms(void);
+static void history_path_for_directory(const char *directory, char *history_path, size_t history_path_size);
+static bool load_history_store_from_path(const char *history_path, HistoryStore *history);
+static int history_find_entry_index(const HistoryStore *history, const char *movie_path);
 
 static void debug_tracef(const char *fmt, ...)
 {
@@ -769,6 +798,19 @@ static void free_movie_files(MovieFile *files, size_t count)
     free(files);
 }
 
+static void free_history_store(HistoryStore *history)
+{
+    size_t index;
+    if (!history) {
+        return;
+    }
+    for (index = 0; index < history->count && index < HISTORY_MAX_ENTRIES; ++index) {
+        free(history->entries[index].path);
+        history->entries[index].path = NULL;
+    }
+    history->count = 0;
+}
+
 static void destroy_movie(Movie *movie)
 {
     uint32_t index;
@@ -787,7 +829,13 @@ static void destroy_movie(Movie *movie)
             free(movie->subtitles[index].text);
         }
     }
+    if (movie->subtitle_tracks) {
+        for (index = 0; index < movie->subtitle_track_count; ++index) {
+            free(movie->subtitle_tracks[index].name);
+        }
+    }
     free(movie->subtitles);
+    free(movie->subtitle_tracks);
     free(movie->chunk_index);
     free(movie->framebuffer);
     free(movie->previous_framebuffer);
@@ -1190,7 +1238,6 @@ static bool apply_global_motion_frame(Movie *movie, uint16_t *target, const uint
     }
     return true;
 }
-
 static bool decode_motion_records(
     Movie *movie,
     const uint8_t **cursor_ptr,
@@ -2398,44 +2445,146 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
     return true;
 }
 
-static SubtitleCue *load_subtitles(FILE *file, const MovieHeader *header)
+static bool load_subtitles(
+    FILE *file,
+    const MovieHeader *header,
+    SubtitleCue **out_cues,
+    SubtitleTrack **out_tracks,
+    uint16_t *out_track_count
+)
 {
     SubtitleCue *cues = NULL;
-    uint32_t index;
+    SubtitleTrack *tracks = NULL;
+    uint32_t cue_index = 0;
+    uint32_t track_index = 0;
+
+    *out_cues = NULL;
+    *out_tracks = NULL;
+    *out_track_count = 0;
     if (!header->subtitle_count) {
-        return NULL;
+        return true;
     }
+
     cues = (SubtitleCue *) calloc(header->subtitle_count, sizeof(SubtitleCue));
     if (!cues) {
-        return NULL;
+        return false;
     }
     if (fseek(file, (long) header->subtitle_offset, SEEK_SET) != 0) {
         free(cues);
-        return NULL;
+        return false;
     }
-    for (index = 0; index < header->subtitle_count; ++index) {
+
+    if (header->version >= 8) {
+        uint8_t track_count_bytes[2];
+        uint32_t cue_cursor = 0;
+        if (fread(track_count_bytes, 1, sizeof(track_count_bytes), file) != sizeof(track_count_bytes)) {
+            free(cues);
+            return false;
+        }
+        *out_track_count = read_le16(track_count_bytes);
+        if (*out_track_count == 0) {
+            free(cues);
+            return true;
+        }
+        tracks = (SubtitleTrack *) calloc(*out_track_count, sizeof(SubtitleTrack));
+        if (!tracks) {
+            free(cues);
+            return false;
+        }
+        for (track_index = 0; track_index < *out_track_count; ++track_index) {
+            uint8_t meta[6];
+            uint16_t name_len;
+            if (fread(meta, 1, sizeof(meta), file) != sizeof(meta)) {
+                free(cues);
+                free(tracks);
+                return false;
+            }
+            name_len = read_le16(meta);
+            tracks[track_index].cue_start = cue_cursor;
+            tracks[track_index].cue_count = read_le32(meta + 2);
+            if (cue_cursor + tracks[track_index].cue_count > header->subtitle_count) {
+                free(cues);
+                free(tracks);
+                return false;
+            }
+            tracks[track_index].name = (char *) malloc(name_len + 1);
+            if (!tracks[track_index].name) {
+                free(cues);
+                free(tracks);
+                return false;
+            }
+            if (fread(tracks[track_index].name, 1, name_len, file) != name_len) {
+                free(cues);
+                free(tracks[track_index].name);
+                free(tracks);
+                return false;
+            }
+            tracks[track_index].name[name_len] = '\0';
+            cue_cursor += tracks[track_index].cue_count;
+        }
+        if (cue_cursor != header->subtitle_count) {
+            free(cues);
+            for (track_index = 0; track_index < *out_track_count; ++track_index) {
+                free(tracks[track_index].name);
+            }
+            free(tracks);
+            return false;
+        }
+    } else {
+        tracks = (SubtitleTrack *) calloc(1, sizeof(SubtitleTrack));
+        if (!tracks) {
+            free(cues);
+            return false;
+        }
+        tracks[0].name = dup_string("Subtitles");
+        if (!tracks[0].name) {
+            free(cues);
+            free(tracks);
+            return false;
+        }
+        tracks[0].cue_start = 0;
+        tracks[0].cue_count = header->subtitle_count;
+        *out_track_count = 1;
+    }
+
+    for (cue_index = 0; cue_index < header->subtitle_count; ++cue_index) {
         uint8_t meta[10];
         uint16_t text_len;
         if (fread(meta, 1, sizeof(meta), file) != sizeof(meta)) {
-            free(cues);
-            return NULL;
+            goto fail;
         }
-        cues[index].start_ms = read_le32(meta);
-        cues[index].end_ms = read_le32(meta + 4);
+        cues[cue_index].start_ms = read_le32(meta);
+        cues[cue_index].end_ms = read_le32(meta + 4);
         text_len = read_le16(meta + 8);
-        cues[index].text = (char *) malloc(text_len + 1);
-        if (!cues[index].text) {
-            free(cues);
-            return NULL;
+        cues[cue_index].text = (char *) malloc(text_len + 1);
+        if (!cues[cue_index].text) {
+            goto fail;
         }
-        if (fread(cues[index].text, 1, text_len, file) != text_len) {
-            free(cues[index].text);
-            free(cues);
-            return NULL;
+        if (fread(cues[cue_index].text, 1, text_len, file) != text_len) {
+            goto fail;
         }
-        cues[index].text[text_len] = '\0';
+        cues[cue_index].text[text_len] = '\0';
     }
-    return cues;
+
+    *out_cues = cues;
+    *out_tracks = tracks;
+    return true;
+
+fail:
+    if (cues) {
+        for (cue_index = 0; cue_index < header->subtitle_count; ++cue_index) {
+            free(cues[cue_index].text);
+        }
+    }
+    if (tracks) {
+        for (track_index = 0; track_index < *out_track_count; ++track_index) {
+            free(tracks[track_index].name);
+        }
+    }
+    free(cues);
+    free(tracks);
+    *out_track_count = 0;
+    return false;
 }
 
 static bool load_movie(const char *path, Movie *movie)
@@ -2462,7 +2611,7 @@ static bool load_movie(const char *path, Movie *movie)
     if (memcmp(movie->header.magic, "NVP1", 4) != 0) {
         return false;
     }
-    if (movie->header.version < 2 || movie->header.version > 5) {
+    if (movie->header.version < 2 || movie->header.version > 9) {
         return false;
     }
     movie->chunk_index = (ChunkIndexEntry *) calloc(movie->header.chunk_count, sizeof(ChunkIndexEntry));
@@ -2490,8 +2639,7 @@ static bool load_movie(const char *path, Movie *movie)
             movie->chunk_index[chunk_index_read].frame_table_offset = 0;
         }
     }
-    movie->subtitles = load_subtitles(movie->file, &movie->header);
-    if (movie->header.subtitle_count && !movie->subtitles) {
+    if (!load_subtitles(movie->file, &movie->header, &movie->subtitles, &movie->subtitle_tracks, &movie->subtitle_track_count)) {
         return false;
     }
     framebuffer_words = (size_t) movie->header.video_width * movie->header.video_height;
@@ -2543,6 +2691,9 @@ static MovieFile *scan_movies(const char *directory, size_t *out_count)
     DIR *dir = opendir(directory);
     struct dirent *entry;
     MovieFile *files;
+    char history_path[MAX_PATH_LEN];
+    HistoryStore history;
+    bool have_history = false;
     size_t count = 0;
     if (!dir) {
         *out_count = 0;
@@ -2554,9 +2705,12 @@ static MovieFile *scan_movies(const char *directory, size_t *out_count)
         *out_count = 0;
         return NULL;
     }
+    history_path_for_directory(directory, history_path, sizeof(history_path));
+    have_history = load_history_store_from_path(history_path, &history);
     while ((entry = readdir(dir)) && count < PICKER_MAX_FILES) {
         char joined[MAX_PATH_LEN];
         int joined_len;
+        size_t history_index;
         if (entry->d_name[0] == '.') {
             continue;
         }
@@ -2571,13 +2725,28 @@ static MovieFile *scan_movies(const char *directory, size_t *out_count)
         files[count].path = dup_string(joined);
         if (!files[count].name || !files[count].path) {
             closedir(dir);
+            if (have_history) {
+                free_history_store(&history);
+            }
             free_movie_files(files, count + 1);
             *out_count = 0;
             return NULL;
         }
+        if (have_history) {
+            for (history_index = 0; history_index < history.count; ++history_index) {
+                if (strcmp(history.entries[history_index].path, files[count].path) == 0) {
+                    files[count].has_resume = true;
+                    files[count].resume_frame = history.entries[history_index].frame;
+                    break;
+                }
+            }
+        }
         count++;
     }
     closedir(dir);
+    if (have_history) {
+        free_history_store(&history);
+    }
     qsort(files, count, sizeof(MovieFile), compare_movie_files);
     *out_count = count;
     return files;
@@ -2586,12 +2755,30 @@ static MovieFile *scan_movies(const char *directory, size_t *out_count)
 static const char *active_subtitle(const Movie *movie, uint32_t now_ms)
 {
     uint32_t index;
-    for (index = 0; index < movie->header.subtitle_count; ++index) {
+    uint32_t start_index = 0;
+    uint32_t end_index = movie->header.subtitle_count;
+
+    if (movie->subtitle_track_count > 0 && movie->selected_subtitle_track < movie->subtitle_track_count) {
+        start_index = movie->subtitle_tracks[movie->selected_subtitle_track].cue_start;
+        end_index = start_index + movie->subtitle_tracks[movie->selected_subtitle_track].cue_count;
+    }
+    for (index = start_index; index < end_index; ++index) {
         if (now_ms >= movie->subtitles[index].start_ms && now_ms <= movie->subtitles[index].end_ms) {
             return movie->subtitles[index].text;
         }
     }
     return NULL;
+}
+
+static const char *active_subtitle_track_name(const Movie *movie)
+{
+    if (!movie || movie->subtitle_track_count == 0 || movie->selected_subtitle_track >= movie->subtitle_track_count) {
+        return "No subtitles";
+    }
+    if (!movie->subtitle_tracks[movie->selected_subtitle_track].name || movie->subtitle_tracks[movie->selected_subtitle_track].name[0] == '\0') {
+        return "Subtitles";
+    }
+    return movie->subtitle_tracks[movie->selected_subtitle_track].name;
 }
 
 static void draw_outlined_text(SDL_Surface *surface, nSDL_Font *white_font, nSDL_Font *outline_font, int x, int y, const char *text)
@@ -3089,14 +3276,21 @@ static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect,
         SDL_FillRect(screen, &left_bar, foreground);
         SDL_FillRect(screen, &right_bar, foreground);
     } else {
+        int triangle_width = 9;
+        int triangle_half_height = 6;
+        int triangle_left = fill.x + ((fill.w - triangle_width) / 2);
+        int triangle_center_y = fill.y + ((fill.h - 1) / 2);
+        int triangle_denominator = triangle_width - 1;
         int column;
-        for (column = 0; column < 8; ++column) {
-            int height = 1 + ((7 - column) * 10) / 7;
+
+        for (column = 0; column < triangle_width; ++column) {
+            int remaining = triangle_denominator - column;
+            int half_height = (triangle_half_height * remaining + (triangle_denominator / 2)) / triangle_denominator;
             SDL_Rect slice = {
-                (Sint16) (14 + column),
-                (Sint16) ((y + 10) - (height / 2)),
+                (Sint16) (triangle_left + column),
+                (Sint16) (triangle_center_y - half_height),
                 1,
-                (Uint16) height
+                (Uint16) (half_height * 2 + 1)
             };
             SDL_FillRect(screen, &slice, foreground);
         }
@@ -3154,30 +3348,23 @@ static void draw_memory_badge(
 
 static void draw_help_row(SDL_Surface *screen, const Fonts *fonts, int x, int y, int panel_w, const char *shortcut, const char *description)
 {
-    SDL_Rect row_rect = {(Sint16) x, (Sint16) (y - 2), (Uint16) panel_w, 13};
-    SDL_Rect key_rect = {(Sint16) x, (Sint16) (y - 2), 72, 13};
-
-    SDL_FillRect(screen, &row_rect, SDL_MapRGB(screen->format, 10, 14, 20));
-    SDL_FillRect(screen, &key_rect, SDL_MapRGB(screen->format, 18, 24, 34));
     nSDL_DrawString(screen, fonts->white, x + 6, y, "%s", shortcut);
     nSDL_DrawString(screen, fonts->white, x + 80, y, "%s", description);
 }
 
 static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
 {
-    SDL_Rect shadow = {18, 18, 288, 180};
-    SDL_Rect panel = {14, 14, 288, 180};
-    SDL_Rect header = {14, 14, 288, 22};
-    SDL_Rect accent = {14, 36, 288, 2};
-    SDL_Rect footer = {14, 182, 288, 12};
+    SDL_Rect border = {15, 11, 282, 190};
+    SDL_Rect panel = {16, 12, 280, 188};
+    SDL_Rect header = {16, 12, 280, 24};
+    SDL_Rect accent = {16, 36, 280, 2};
     const char *close_text = "CAT close";
-    int y = 36;
+    int y = 48;
 
-    SDL_FillRect(screen, &shadow, SDL_MapRGB(screen->format, 0, 0, 0));
+    SDL_FillRect(screen, &border, SDL_MapRGB(screen->format, 0, 0, 0));
     SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 8, 10, 14));
     SDL_FillRect(screen, &header, SDL_MapRGB(screen->format, 12, 18, 28));
     SDL_FillRect(screen, &accent, SDL_MapRGB(screen->format, 32, 182, 255));
-    SDL_FillRect(screen, &footer, SDL_MapRGB(screen->format, 12, 18, 28));
 
     nSDL_DrawString(screen, fonts->white, panel.x + 10, panel.y + 6, "Playback Controls");
     nSDL_DrawString(screen, fonts->white, panel.x + panel.w - 10 - nSDL_GetStringWidth(fonts->white, close_text), panel.y + 6, "%s", close_text);
@@ -3200,6 +3387,8 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "F", "Cycle subtitle font");
     y += 11;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "T", "Switch subtitle track");
+    y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "M", "Memory overlay");
     y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "S", "Save BMP screenshot");
@@ -3207,8 +3396,6 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "TOUCHPAD", "Move cursor / show UI");
     y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "ESC", "Close menu or exit");
-
-    nSDL_DrawString(screen, fonts->white, panel.x + 10, panel.y + panel.h - 10, "CAT closes help. ESC exits movie.");
 }
 
 static void draw_progress(
@@ -3281,6 +3468,7 @@ static void render_movie(
     bool subtitle_font_overlay_visible,
     int subtitle_size,
     SubtitlePlacement subtitle_placement,
+    const char *status_overlay_text,
     const PointerState *pointer
 )
 {
@@ -3320,6 +3508,9 @@ static void render_movie(
                 draw_playback_badge(screen, &dst, paused);
             }
             memory_right_limit = draw_status_badges(screen, fonts, &dst, scale_mode, playback_rate);
+            if (status_overlay_text && status_overlay_text[0] != '\0') {
+                draw_left_text_badge(screen, fonts, playback_badge_visible ? 36 : 8, top_overlay_y_for_rect(&dst, 16), status_overlay_text);
+            }
         }
         draw_progress(screen, fonts, movie, current_ms, pointer);
         if (!help_menu_open && pointer && pointer->visible) {
@@ -3335,7 +3526,51 @@ static void render_movie(
     SDL_Flip(screen);
 }
 
-static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *files, size_t count, size_t selected)
+static int picker_row_index_at(size_t count, size_t selected, int y)
+{
+    size_t start_index;
+    size_t end_index;
+    size_t index;
+    int row_y = 52;
+
+    if (count == 0) {
+        return -1;
+    }
+    start_index = selected > (PICKER_VISIBLE_ROWS / 2) ? selected - (PICKER_VISIBLE_ROWS / 2) : 0;
+    if (start_index + PICKER_VISIBLE_ROWS > count) {
+        start_index = count > PICKER_VISIBLE_ROWS ? count - PICKER_VISIBLE_ROWS : 0;
+    }
+    end_index = start_index + PICKER_VISIBLE_ROWS;
+    if (end_index > count) {
+        end_index = count;
+    }
+    for (index = start_index; index < end_index && row_y < SCREEN_H - 20; ++index) {
+        if (y >= row_y - 4 && y < row_y + 14) {
+            return (int) index;
+        }
+        row_y += 20;
+    }
+    return -1;
+}
+
+static void draw_loading_overlay(SDL_Surface *screen, const Fonts *fonts, const char *label, int phase)
+{
+    SDL_Rect shadow = {92, 88, 136, 46};
+    SDL_Rect panel = {88, 84, 136, 46};
+    SDL_Rect accent = {88, 84, 136, 2};
+    char spinner[8];
+    int dot_count = (phase % 3) + 1;
+
+    memset(spinner, '.', (size_t) dot_count);
+    spinner[dot_count] = '\0';
+    SDL_FillRect(screen, &shadow, SDL_MapRGB(screen->format, 0, 0, 0));
+    SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 10, 14, 20));
+    SDL_FillRect(screen, &accent, SDL_MapRGB(screen->format, 32, 182, 255));
+    nSDL_DrawString(screen, fonts->white, panel.x + 12, panel.y + 12, "%s", label ? label : "Loading");
+    nSDL_DrawString(screen, fonts->white, panel.x + panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), panel.y + 12, "%s", spinner);
+}
+
+static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *files, size_t count, size_t selected, const PointerState *pointer, const char *loading_label, int loading_phase)
 {
     size_t start_index;
     size_t end_index;
@@ -3348,6 +3583,9 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
     nSDL_DrawString(screen, fonts->white, 10, 24, "ENTER open   UP/DOWN choose   ESC exit");
     if (count == 0) {
         nSDL_DrawString(screen, fonts->white, 10, 54, "No .nvp or .nvp.tns files found");
+        if (pointer && pointer->visible) {
+            draw_cursor(screen, pointer->x, pointer->y);
+        }
         SDL_Flip(screen);
         return;
     }
@@ -3361,6 +3599,7 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
     }
     for (index = start_index; index < end_index && y < SCREEN_H - 20; ++index) {
         SDL_Rect row = {8, (Sint16) (y - 4), SCREEN_W - 16, 18};
+        const char *resume_label = files[index].has_resume ? "RESUME" : NULL;
         if (index == selected) {
             SDL_Rect accent = {8, (Sint16) (y - 4), 4, 18};
             SDL_FillRect(screen, &row, SDL_MapRGB(screen->format, 26, 118, 180));
@@ -3370,12 +3609,21 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
             SDL_FillRect(screen, &row, SDL_MapRGB(screen->format, 16, 20, 28));
             nSDL_DrawString(screen, fonts->white, 12, y, "%s", files[index].name);
         }
+        if (resume_label) {
+            draw_text_badge(screen, fonts, SCREEN_W - 16, y - 3, resume_label);
+        }
         y += 20;
     }
     {
         char footer[32];
         snprintf(footer, sizeof(footer), "%lu file(s)", (unsigned long) count);
         nSDL_DrawString(screen, fonts->white, SCREEN_W - 10 - nSDL_GetStringWidth(fonts->white, footer), SCREEN_H - 16, "%s", footer);
+    }
+    if (loading_label) {
+        draw_loading_overlay(screen, fonts, loading_label, loading_phase);
+    }
+    if (pointer && pointer->visible) {
+        draw_cursor(screen, pointer->x, pointer->y);
     }
     SDL_Flip(screen);
 }
@@ -3391,6 +3639,182 @@ static void strip_filename(char *path)
     } else {
         strcpy(path, ".");
     }
+}
+
+static void history_path_for_directory(const char *directory, char *history_path, size_t history_path_size)
+{
+    if (!history_path || history_path_size == 0) {
+        return;
+    }
+    snprintf(history_path, history_path_size, "%s/%s", directory && directory[0] != '\0' ? directory : ".", HISTORY_FILE_NAME);
+}
+
+static void history_path_for_movie(const char *movie_path, char *history_path, size_t history_path_size)
+{
+    char directory[MAX_PATH_LEN];
+
+    if (!history_path || history_path_size == 0) {
+        return;
+    }
+    if (movie_path && movie_path[0] != '\0') {
+        snprintf(directory, sizeof(directory), "%s", movie_path);
+        strip_filename(directory);
+    } else {
+        snprintf(directory, sizeof(directory), ".");
+    }
+    history_path_for_directory(directory, history_path, history_path_size);
+}
+
+static bool load_history_store_from_path(const char *history_path, HistoryStore *history)
+{
+    FILE *file;
+    char line[MAX_PATH_LEN + 64];
+
+    memset(history, 0, sizeof(*history));
+    file = fopen(history_path, "rb");
+    if (!file) {
+        return true;
+    }
+    if (!fgets(line, sizeof(line), file) || strncmp(line, "NDVH1", 5) != 0) {
+        fclose(file);
+        return false;
+    }
+    while (history->count < HISTORY_MAX_ENTRIES && fgets(line, sizeof(line), file)) {
+        char *separator = strchr(line, '\t');
+        char *path;
+        if (!separator) {
+            continue;
+        }
+        *separator = '\0';
+        path = separator + 1;
+        path[strcspn(path, "\r\n")] = '\0';
+        if (path[0] == '\0') {
+            continue;
+        }
+        history->entries[history->count].frame = (uint32_t) strtoul(line, NULL, 10);
+        history->entries[history->count].path = dup_string(path);
+        if (!history->entries[history->count].path) {
+            fclose(file);
+            free_history_store(history);
+            return false;
+        }
+        history->count++;
+    }
+    fclose(file);
+    return true;
+}
+
+static bool load_history_store(const char *movie_path, HistoryStore *history)
+{
+    char history_path[MAX_PATH_LEN];
+    history_path_for_movie(movie_path, history_path, sizeof(history_path));
+    return load_history_store_from_path(history_path, history);
+}
+
+static bool save_history_store(const char *movie_path, const HistoryStore *history)
+{
+    char history_path[MAX_PATH_LEN];
+    FILE *file;
+    size_t index;
+
+    history_path_for_movie(movie_path, history_path, sizeof(history_path));
+    file = fopen(history_path, "wb");
+    if (!file) {
+        return false;
+    }
+    fputs("NDVH1\n", file);
+    for (index = 0; index < history->count && index < HISTORY_MAX_ENTRIES; ++index) {
+        fprintf(file, "%lu\t%s\n", (unsigned long) history->entries[index].frame, history->entries[index].path);
+    }
+    fclose(file);
+    return true;
+}
+
+static int history_find_entry_index(const HistoryStore *history, const char *movie_path)
+{
+    size_t index;
+    for (index = 0; index < history->count; ++index) {
+        if (history->entries[index].path && strcmp(history->entries[index].path, movie_path) == 0) {
+            return (int) index;
+        }
+    }
+    return -1;
+}
+
+static void history_remove_entry(HistoryStore *history, const char *movie_path)
+{
+    int found_index = history_find_entry_index(history, movie_path);
+    size_t index;
+    if (found_index < 0) {
+        return;
+    }
+    free(history->entries[found_index].path);
+    for (index = (size_t) found_index; index + 1 < history->count; ++index) {
+        history->entries[index] = history->entries[index + 1];
+    }
+    memset(&history->entries[history->count - 1], 0, sizeof(history->entries[history->count - 1]));
+    history->count--;
+}
+
+static void history_upsert_entry(HistoryStore *history, const char *movie_path, uint32_t frame)
+{
+    HistoryEntry entry;
+    size_t index;
+
+    history_remove_entry(history, movie_path);
+    entry.path = dup_string(movie_path);
+    entry.frame = frame;
+    if (!entry.path) {
+        return;
+    }
+    if (history->count == HISTORY_MAX_ENTRIES) {
+        free(history->entries[HISTORY_MAX_ENTRIES - 1].path);
+        history->count--;
+    }
+    for (index = history->count; index > 0; --index) {
+        history->entries[index] = history->entries[index - 1];
+    }
+    history->entries[0] = entry;
+    history->count++;
+}
+
+static bool history_resume_frame_for_movie(const char *movie_path, uint32_t *out_frame)
+{
+    HistoryStore history;
+    int found_index;
+    if (!load_history_store(movie_path, &history)) {
+        return false;
+    }
+    found_index = history_find_entry_index(&history, movie_path);
+    if (found_index >= 0) {
+        *out_frame = history.entries[found_index].frame;
+        free_history_store(&history);
+        return true;
+    }
+    free_history_store(&history);
+    return false;
+}
+
+static bool should_save_history_position(const Movie *movie)
+{
+    uint32_t now_ms = movie_frame_time_ms(movie, movie->current_frame);
+    uint32_t duration_ms = movie_duration_ms(movie);
+    return now_ms >= RESUME_MIN_MS && (duration_ms == 0 || now_ms + RESUME_CLEAR_TAIL_MS < duration_ms);
+}
+
+static void save_history_position_for_movie(const char *movie_path, const Movie *movie)
+{
+    HistoryStore history;
+    if (!load_history_store(movie_path, &history)) {
+        return;
+    }
+    if (should_save_history_position(movie)) {
+        history_upsert_entry(&history, movie_path, movie->current_frame);
+    } else {
+        history_remove_entry(&history, movie_path);
+    }
+    save_history_store(movie_path, &history);
+    free_history_store(&history);
 }
 
 static bool save_screenshot_bitmap(SDL_Surface *screen, const char *movie_path, char *saved_path, size_t saved_path_size)
@@ -3445,20 +3869,44 @@ static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *direc
     bool prev_down = false;
     bool prev_enter = false;
     bool prev_esc = false;
+    PointerState pointer;
     MovieFile *files;
     size_t count = 0;
     size_t selected = 0;
 
     files = scan_movies(directory, &count);
+    pointer_init(&pointer);
     while (1) {
-        render_picker(screen, fonts, files, count, selected);
+        bool pointer_click = pointer_update(&pointer);
+        int hovered_index = pointer.visible ? picker_row_index_at(count, selected, pointer.y) : -1;
+
+        if (hovered_index >= 0) {
+            selected = (size_t) hovered_index;
+        }
+        render_picker(screen, fonts, files, count, selected, &pointer, NULL, 0);
         if (key_pressed_edge(KEY_NSPIRE_UP, &prev_up) && selected > 0) {
             selected--;
         }
         if (key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) && selected + 1 < count) {
             selected++;
         }
+        if (pointer_click && hovered_index >= 0 && (size_t) hovered_index < count) {
+            int phase;
+            for (phase = 0; phase < 6; ++phase) {
+                render_picker(screen, fonts, files, count, selected, &pointer, "Loading", phase);
+                msleep(30);
+            }
+            strncpy(selected_path, files[hovered_index].path, selected_size - 1);
+            selected_path[selected_size - 1] = '\0';
+            free_movie_files(files, count);
+            return 0;
+        }
         if (key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) && count > 0) {
+            int phase;
+            for (phase = 0; phase < 6; ++phase) {
+                render_picker(screen, fonts, files, count, selected, &pointer, "Loading", phase);
+                msleep(30);
+            }
             strncpy(selected_path, files[selected].path, selected_size - 1);
             selected_path[selected_size - 1] = '\0';
             free_movie_files(files, count);
@@ -3508,6 +3956,135 @@ static void seek_to_ratio(Movie *movie, uint32_t numerator, uint32_t denominator
     decode_to_frame(movie, target_frame);
 }
 
+static void draw_prompt_button(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *button, const char *label, bool selected)
+{
+    Uint32 background = selected
+        ? SDL_MapRGB(screen->format, 26, 118, 180)
+        : SDL_MapRGB(screen->format, 18, 24, 34);
+    Uint32 accent = selected
+        ? SDL_MapRGB(screen->format, 32, 182, 255)
+        : SDL_MapRGB(screen->format, 52, 62, 78);
+    SDL_Rect left_accent = {button->x, button->y, 4, button->h};
+
+    SDL_FillRect(screen, (SDL_Rect *) button, background);
+    SDL_FillRect(screen, &left_accent, accent);
+    nSDL_DrawString(
+        screen,
+        fonts->white,
+        button->x + (button->w - nSDL_GetStringWidth(fonts->white, label)) / 2,
+        button->y + 6,
+        "%s",
+        label
+    );
+}
+
+static int prompt_resume_position(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    Movie *movie,
+    const char *path,
+    uint32_t resume_frame
+)
+{
+    bool prev_left = false;
+    bool prev_right = false;
+    bool prev_enter = false;
+    bool prev_esc = false;
+    bool prev_click = false;
+    PointerState pointer;
+    SDL_Rect shadow = {34, 24, 252, 192};
+    SDL_Rect panel = {28, 18, 252, 192};
+    SDL_Rect header = {28, 18, 252, 26};
+    SDL_Rect accent = {28, 44, 252, 2};
+    SDL_Rect preview = {74, 56, 160, 90};
+    SDL_Rect preview_border = {72, 54, 164, 94};
+    SDL_Rect continue_button = {46, 162, 90, 22};
+    SDL_Rect restart_button = {172, 162, 90, 22};
+    char time_label[64];
+    char time_value[24];
+    char title[96];
+    const char *filename = path;
+    char *display_name = NULL;
+    int selected_button = 0;
+    uint32_t preview_ms;
+
+    if (resume_frame >= movie->header.frame_count) {
+        resume_frame = movie->header.frame_count ? (movie->header.frame_count - 1) : 0;
+    }
+    if (!decode_to_frame(movie, resume_frame)) {
+        return 0;
+    }
+    preview_ms = movie_frame_time_ms(movie, movie->current_frame);
+    format_clock(preview_ms, time_value, sizeof(time_value));
+    snprintf(time_label, sizeof(time_label), "Resume from %s", time_value);
+    if (strrchr(path, '/')) {
+        filename = strrchr(path, '/') + 1;
+    } else if (strrchr(path, '\\')) {
+        filename = strrchr(path, '\\') + 1;
+    }
+    display_name = display_name_for_movie(filename);
+    snprintf(title, sizeof(title), "%s", display_name ? display_name : filename);
+    pointer_init(&pointer);
+
+    while (1) {
+        bool pointer_click = pointer_update(&pointer);
+
+        SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
+        SDL_FillRect(screen, &shadow, SDL_MapRGB(screen->format, 0, 0, 0));
+        SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 8, 10, 14));
+        SDL_FillRect(screen, &header, SDL_MapRGB(screen->format, 12, 18, 28));
+        SDL_FillRect(screen, &accent, SDL_MapRGB(screen->format, 32, 182, 255));
+        SDL_FillRect(screen, &preview_border, SDL_MapRGB(screen->format, 0, 0, 0));
+        SDL_SoftStretch(movie->frame_surface, NULL, screen, &preview);
+        nSDL_DrawString(screen, fonts->white, panel.x + 12, panel.y + 8, "Continue Watching?");
+        nSDL_DrawString(screen, fonts->white, panel.x + 12, panel.y + 28, "%s", title);
+        nSDL_DrawString(screen, fonts->white, panel.x + 12, panel.y + 44, "%s", time_label);
+        draw_prompt_button(screen, fonts, &continue_button, "CONTINUE", selected_button == 0);
+        draw_prompt_button(screen, fonts, &restart_button, "START OVER", selected_button == 1);
+        if (pointer.visible) {
+            draw_cursor(screen, pointer.x, pointer.y);
+        }
+        SDL_Flip(screen);
+
+        if (pointer.visible) {
+            if (pointer.x >= continue_button.x && pointer.x < continue_button.x + continue_button.w &&
+                pointer.y >= continue_button.y && pointer.y < continue_button.y + continue_button.h) {
+                selected_button = 0;
+            } else if (pointer.x >= restart_button.x && pointer.x < restart_button.x + restart_button.w &&
+                pointer.y >= restart_button.y && pointer.y < restart_button.y + restart_button.h) {
+                selected_button = 1;
+            }
+        }
+        if (key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right)) {
+            selected_button = 1 - selected_button;
+        }
+        if (key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click)) {
+            pointer_click = true;
+        }
+        if (pointer_click) {
+            if (pointer.x >= continue_button.x && pointer.x < continue_button.x + continue_button.w &&
+                pointer.y >= continue_button.y && pointer.y < continue_button.y + continue_button.h) {
+                free(display_name);
+                return 1;
+            }
+            if (pointer.x >= restart_button.x && pointer.x < restart_button.x + restart_button.w &&
+                pointer.y >= restart_button.y && pointer.y < restart_button.y + restart_button.h) {
+                free(display_name);
+                return 0;
+            }
+        }
+        if (key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter)) {
+            free(display_name);
+            return selected_button == 0 ? 1 : 0;
+        }
+        if (key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc)) {
+            free(display_name);
+            return -1;
+        }
+        msleep(16);
+    }
+}
+
 static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
 {
     Movie movie;
@@ -3526,6 +4103,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     bool prev_lthan = false;
     bool prev_gthan = false;
     bool prev_f = false;
+    bool prev_t = false;
     bool prev_m = false;
     bool prev_s = false;
     bool prev_plus = false;
@@ -3544,12 +4122,25 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     MemoryOverlayMode memory_overlay_mode = MEMORY_OVERLAY_OFF;
     int subtitle_size = 0;
     SubtitlePlacement subtitle_placement = SUBTITLE_POS_BAR_BOTTOM;
+    char status_overlay_text[64] = {0};
+    uint32_t status_overlay_until = 0;
     PointerState pointer;
     bool help_menu_open = false;
     bool help_resume_playback = false;
+    uint32_t resume_frame = 0;
+    uint32_t last_history_saved_ms = 0;
 
     g_debug_ring_count = 0;
     g_debug_ring_next = 0;
+    {
+        int phase;
+        for (phase = 0; phase < 4; ++phase) {
+            SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 8, 10, 14));
+            draw_loading_overlay(screen, fonts, "Loading", phase);
+            SDL_Flip(screen);
+            msleep(24);
+        }
+    }
     if (!load_movie(path, &movie)) {
         show_msgbox("ND Video Player", "Failed to open movie file.");
         return -1;
@@ -3560,8 +4151,22 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         (unsigned long) movie.header.frame_count,
         (unsigned long) movie.header.chunk_count
     );
+    if (history_resume_frame_for_movie(path, &resume_frame) && resume_frame < movie.header.frame_count) {
+        int resume_choice = prompt_resume_position(screen, fonts, &movie, path, resume_frame);
+        if (resume_choice < 0) {
+            destroy_movie(&movie);
+            return 0;
+        }
+        if (resume_choice == 0) {
+            decode_to_frame(&movie, 0);
+        } else {
+            snprintf(status_overlay_text, sizeof(status_overlay_text), "RESUMED");
+            status_overlay_until = monotonic_clock_now_ms() + STATUS_OVERLAY_MS;
+        }
+    }
     pointer_init(&pointer);
     prev_tab = isKeyPressed(KEY_NSPIRE_TAB);
+    prev_t = isKeyPressed(KEY_NSPIRE_T);
     prev_m = isKeyPressed(KEY_NSPIRE_M);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
@@ -3569,6 +4174,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     playback_anchor_frame = movie.current_frame;
     next_frame_due_ticks = playback_anchor_ticks + movie_frame_time_scaled_ticks(&movie, 1, playback_rate_for_index(playback_rate_index));
     ui_visible_until = monotonic_clock_ticks_to_ms(playback_anchor_ticks) + POINTER_UI_TIMEOUT_MS;
+    last_history_saved_ms = movie_frame_time_ms(&movie, movie.current_frame);
     {
         prefetch_tick(&movie, true, 1000);
     }
@@ -3592,6 +4198,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         bool speed_down_edge = lp_edge || lthan_edge;
         bool speed_up_edge = rp_edge || gthan_edge;
         bool subtitle_font_edge = key_pressed_edge(KEY_NSPIRE_F, &prev_f);
+        bool subtitle_track_edge = key_pressed_edge(KEY_NSPIRE_T, &prev_t);
         bool memory_overlay_edge = key_pressed_edge(KEY_NSPIRE_M, &prev_m);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool click_edge = key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click);
@@ -3654,6 +4261,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 false,
                 subtitle_size,
                 subtitle_placement,
+                (now_ms <= status_overlay_until) ? status_overlay_text : NULL,
                 &pointer
             );
             if (take_screenshot) {
@@ -3718,6 +4326,21 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             subtitle_font_overlay_until = now_ms + SUBTITLE_FONT_OVERLAY_MS;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
+        if (subtitle_track_edge) {
+            if (movie.subtitle_track_count > 1) {
+                movie.selected_subtitle_track = (uint16_t) ((movie.selected_subtitle_track + 1) % movie.subtitle_track_count);
+            } else {
+                movie.selected_subtitle_track = 0;
+            }
+            snprintf(
+                status_overlay_text,
+                sizeof(status_overlay_text),
+                "SUB %.22s",
+                active_subtitle_track_name(&movie)
+            );
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
         if (memory_overlay_edge) {
             memory_overlay_mode = (memory_overlay_mode == MEMORY_OVERLAY_OFF)
                 ? MEMORY_OVERLAY_ALWAYS
@@ -3753,6 +4376,13 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 }
                 reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+            }
+        }
+        {
+            uint32_t history_ms = movie_frame_time_ms(&movie, movie.current_frame);
+            if (history_ms + 1000U < last_history_saved_ms || history_ms >= last_history_saved_ms + 15000U) {
+                save_history_position_for_movie(path, &movie);
+                last_history_saved_ms = history_ms;
             }
         }
         if (!paused && frame_interval_ticks > 0) {
@@ -3795,6 +4425,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             now_ms <= subtitle_font_overlay_until,
             subtitle_size,
             subtitle_placement,
+            (now_ms <= status_overlay_until) ? status_overlay_text : NULL,
             &pointer
         );
         if (take_screenshot) {
@@ -3820,6 +4451,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         }
     }
 
+    save_history_position_for_movie(path, &movie);
     destroy_movie(&movie);
     return result;
 }
