@@ -36,6 +36,8 @@
 #define PREFETCH_PAUSED_SLICE_MS 12U
 #define PREFETCH_ACTIVE_H264_MIN_SPARE_MS 12U
 #define PREFETCH_ACTIVE_H264_SLICE_MS 1U
+#define H264_FRAME_RING_COUNT 4
+#define H264_PREFETCH_ACTIVE_MIN_SPARE_MS 14U
 #define MONOTONIC_TIMER_VALUE_ADDR 0x900C0004U
 #define MONOTONIC_TIMER_CONTROL_ADDR 0x900C0008U
 #define MONOTONIC_TIMER_CLOCK_SOURCE_ADDR 0x900C0080U
@@ -198,6 +200,12 @@ typedef struct {
 } PrefetchedChunk;
 
 typedef struct {
+    uint8_t *data;
+    uint32_t frame_index;
+    bool valid;
+} H264FrameSlot;
+
+typedef struct {
     FILE *file;
     MovieHeader header;
     ChunkIndexEntry *chunk_index;
@@ -228,6 +236,8 @@ typedef struct {
     bool h264_headers_ready;
     bool h264_decoder_initialized;
     bool h264_chunk_dirty;
+    size_t h264_frame_bytes;
+    H264FrameSlot h264_frame_ring[H264_FRAME_RING_COUNT];
 } Movie;
 
 typedef struct {
@@ -299,11 +309,14 @@ static const char *g_subtitle_font_names[] = {
 #define SUBTITLE_FONT_OVERLAY_MS 1200U
 
 static bool decode_to_frame(Movie *movie, uint32_t frame_index);
+static bool decode_h264_frame(Movie *movie, uint32_t frame_index, bool blit_output, bool store_prefetched);
 static bool prefetch_chunk(Movie *movie, int chunk_index);
 static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks);
 static void clear_prefetched_chunk(PrefetchedChunk *chunk);
 static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk);
 static void prefetch_do_work(Movie *movie, int current_chunk, uint32_t deadline_ms);
+static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms);
+static int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index);
 static void free_fonts(Fonts *fonts);
 static uint32_t monotonic_clock_now_ms(void);
 static void history_path_for_directory(const char *directory, char *history_path, size_t history_path_size);
@@ -779,6 +792,14 @@ static MemoryStats query_memory_stats(const Movie *movie)
     if (movie->previous_framebuffer) {
         stats.used_bytes += framebuffer_words * sizeof(uint16_t);
     }
+    if (movie->h264_frame_bytes > 0) {
+        int h264_index;
+        for (h264_index = 0; h264_index < H264_FRAME_RING_COUNT; ++h264_index) {
+            if (movie->h264_frame_ring[h264_index].data) {
+                stats.used_bytes += movie->h264_frame_bytes;
+            }
+        }
+    }
 
     block_scratch_words = (size_t) ((movie->header.video_width > (movie->header.block_size * movie->header.block_size))
         ? movie->header.video_width
@@ -920,6 +941,7 @@ static void destroy_movie(Movie *movie)
 {
     uint32_t index;
     int prefetch_index;
+    int h264_ring_index;
     if (!movie) {
         return;
     }
@@ -953,6 +975,9 @@ static void destroy_movie(Movie *movie)
         }
         h264bsdFree(movie->h264_decoder);
     }
+    for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_COUNT; ++h264_ring_index) {
+        free(movie->h264_frame_ring[h264_ring_index].data);
+    }
     for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
         clear_prefetched_chunk(&movie->prefetched[prefetch_index]);
     }
@@ -960,6 +985,9 @@ static void destroy_movie(Movie *movie)
     movie->loaded_chunk = -1;
     for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
         movie->prefetched[prefetch_index].chunk_index = -1;
+    }
+    for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_COUNT; ++h264_ring_index) {
+        movie->h264_frame_ring[h264_ring_index].frame_index = UINT32_MAX;
     }
     movie->decoded_local_frame = -1;
 }
@@ -1073,6 +1101,121 @@ static uint8_t h264_clip_byte(int32_t value)
     return g_h264_color_tables.clip[table_index];
 }
 
+static size_t h264_cropped_frame_bytes(const Movie *movie)
+{
+    size_t luma_size;
+    size_t chroma_size;
+
+    if (!movie) {
+        return 0;
+    }
+
+    luma_size = (size_t) movie->header.video_width * movie->header.video_height;
+    chroma_size = ((size_t) movie->header.video_width / 2U) * ((size_t) movie->header.video_height / 2U);
+    return luma_size + (chroma_size * 2U);
+}
+
+static void clear_h264_frame_ring(Movie *movie)
+{
+    int index;
+
+    if (!movie) {
+        return;
+    }
+
+    for (index = 0; index < H264_FRAME_RING_COUNT; ++index) {
+        movie->h264_frame_ring[index].frame_index = UINT32_MAX;
+        movie->h264_frame_ring[index].valid = false;
+    }
+}
+
+static void discard_h264_frame_ring_before(Movie *movie, uint32_t first_frame_to_keep)
+{
+    int index;
+
+    if (!movie) {
+        return;
+    }
+
+    for (index = 0; index < H264_FRAME_RING_COUNT; ++index) {
+        if (movie->h264_frame_ring[index].valid &&
+            movie->h264_frame_ring[index].frame_index < first_frame_to_keep) {
+            movie->h264_frame_ring[index].frame_index = UINT32_MAX;
+            movie->h264_frame_ring[index].valid = false;
+        }
+    }
+}
+
+static size_t h264_frame_ring_ready_count(const Movie *movie)
+{
+    size_t count = 0;
+    int index;
+
+    if (!movie) {
+        return 0;
+    }
+
+    for (index = 0; index < H264_FRAME_RING_COUNT; ++index) {
+        if (movie->h264_frame_ring[index].valid &&
+            movie->h264_frame_ring[index].frame_index > movie->current_frame) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static H264FrameSlot *find_h264_frame_slot(Movie *movie, uint32_t frame_index)
+{
+    int index;
+
+    if (!movie) {
+        return NULL;
+    }
+
+    for (index = 0; index < H264_FRAME_RING_COUNT; ++index) {
+        if (movie->h264_frame_ring[index].valid &&
+            movie->h264_frame_ring[index].frame_index == frame_index) {
+            return &movie->h264_frame_ring[index];
+        }
+    }
+    return NULL;
+}
+
+static H264FrameSlot *reserve_h264_frame_slot(Movie *movie, uint32_t frame_index)
+{
+    int index;
+
+    if (!movie) {
+        return NULL;
+    }
+
+    for (index = 0; index < H264_FRAME_RING_COUNT; ++index) {
+        if (movie->h264_frame_ring[index].valid &&
+            movie->h264_frame_ring[index].frame_index == frame_index) {
+            return &movie->h264_frame_ring[index];
+        }
+    }
+
+    for (index = 0; index < H264_FRAME_RING_COUNT; ++index) {
+        if (!movie->h264_frame_ring[index].valid) {
+            movie->h264_frame_ring[index].frame_index = frame_index;
+            return &movie->h264_frame_ring[index];
+        }
+    }
+
+    return NULL;
+}
+
+static int64_t h264_decoded_global_frame(const Movie *movie)
+{
+    if (!movie || !movie->chunk_index || movie->loaded_chunk < 0 ||
+        (uint32_t) movie->loaded_chunk >= movie->header.chunk_count ||
+        movie->decoded_local_frame < 0) {
+        return -1;
+    }
+    return (int64_t) movie->chunk_index[movie->loaded_chunk].first_frame + movie->decoded_local_frame;
+}
+
 static bool reset_h264_decoder(Movie *movie)
 {
     if (!movie || !movie->h264_decoder) {
@@ -1139,16 +1282,149 @@ static bool refresh_h264_picture_params(Movie *movie)
     return true;
 }
 
-static bool blit_h264_picture(Movie *movie, const uint8_t *picture)
+static inline uint16_t h264_rgb565_pixel(
+    uint8_t y_sample,
+    int32_t chroma_red,
+    int32_t chroma_green,
+    int32_t chroma_blue
+)
 {
-    const uint8_t *y_plane;
-    const uint8_t *u_plane;
-    const uint8_t *v_plane;
+    uint8_t red = h264_clip_byte((g_h264_color_tables.y_base[y_sample] + chroma_red) >> 8);
+    uint8_t green = h264_clip_byte((g_h264_color_tables.y_base[y_sample] + chroma_green) >> 8);
+    uint8_t blue = h264_clip_byte((g_h264_color_tables.y_base[y_sample] + chroma_blue) >> 8);
+    return (uint16_t) (g_h264_color_tables.red565[red]
+        | g_h264_color_tables.green565[green]
+        | g_h264_color_tables.blue565[blue]);
+}
+
+static inline uint32_t h264_pack_rgb565_pair(uint16_t left_pixel, uint16_t right_pixel)
+{
+    return ((uint32_t) right_pixel << 16) | left_pixel;
+}
+
+static bool blit_h264_planes_to_framebuffer(
+    Movie *movie,
+    const uint8_t *y_plane,
+    const uint8_t *u_plane,
+    const uint8_t *v_plane,
+    size_t luma_stride,
+    size_t chroma_stride
+)
+{
+    size_t y;
+
+    if (!movie || !y_plane || !u_plane || !v_plane || !movie->framebuffer || !movie->h264_headers_ready) {
+        return false;
+    }
+
+    for (y = 0; y < movie->h264_crop_height; y += 2U) {
+        const uint8_t *y_row0 = y_plane + ((size_t) y * luma_stride);
+        const uint8_t *y_row1 = y_row0 + luma_stride;
+        const uint8_t *u_row = u_plane + ((size_t) (y / 2U) * chroma_stride);
+        const uint8_t *v_row = v_plane + ((size_t) (y / 2U) * chroma_stride);
+        uint32_t *dst_row0 = (uint32_t *) (void *) (movie->framebuffer + ((size_t) y * movie->header.video_width));
+        uint32_t *dst_row1 = (uint32_t *) (void *) (movie->framebuffer + ((size_t) (y + 1U) * movie->header.video_width));
+        size_t x;
+
+        for (x = 0; x < movie->h264_crop_width; x += 2U) {
+            const uint8_t u = u_row[x / 2U];
+            const uint8_t v = v_row[x / 2U];
+            const int32_t chroma_red = g_h264_color_tables.v_to_red[v];
+            const int32_t chroma_green = g_h264_color_tables.u_to_green[u] + g_h264_color_tables.v_to_green[v];
+            const int32_t chroma_blue = g_h264_color_tables.u_to_blue[u];
+
+#if defined(__GNUC__)
+            if ((x & 15U) == 0U) {
+                __builtin_prefetch(y_row0 + x + 32U, 0, 0);
+                __builtin_prefetch(y_row1 + x + 32U, 0, 0);
+                __builtin_prefetch(u_row + (x / 2U) + 16U, 0, 0);
+                __builtin_prefetch(v_row + (x / 2U) + 16U, 0, 0);
+            }
+#endif
+
+            dst_row0[x / 2U] = h264_pack_rgb565_pair(
+                h264_rgb565_pixel(y_row0[x], chroma_red, chroma_green, chroma_blue),
+                h264_rgb565_pixel(y_row0[x + 1U], chroma_red, chroma_green, chroma_blue)
+            );
+            dst_row1[x / 2U] = h264_pack_rgb565_pair(
+                h264_rgb565_pixel(y_row1[x], chroma_red, chroma_green, chroma_blue),
+                h264_rgb565_pixel(y_row1[x + 1U], chroma_red, chroma_green, chroma_blue)
+            );
+        }
+    }
+
+    return true;
+}
+
+static bool copy_h264_picture_to_slot(Movie *movie, H264FrameSlot *slot, const uint8_t *picture)
+{
     const size_t luma_stride = movie->h264_full_width;
     const size_t chroma_stride = luma_stride / 2U;
     const size_t luma_plane_size = luma_stride * movie->h264_full_height;
     const size_t chroma_plane_size = chroma_stride * (movie->h264_full_height / 2U);
-    uint32_t y;
+    const uint8_t *src_y;
+    const uint8_t *src_u;
+    const uint8_t *src_v;
+    uint8_t *dst_y;
+    uint8_t *dst_u;
+    uint8_t *dst_v;
+    size_t row;
+    size_t chroma_height;
+    size_t dst_luma_stride;
+    size_t dst_chroma_stride;
+
+    if (!movie || !slot || !slot->data || !picture || !movie->h264_headers_ready) {
+        return false;
+    }
+
+    dst_luma_stride = movie->header.video_width;
+    dst_chroma_stride = dst_luma_stride / 2U;
+    chroma_height = movie->header.video_height / 2U;
+    dst_y = slot->data;
+    dst_u = dst_y + ((size_t) movie->header.video_width * movie->header.video_height);
+    dst_v = dst_u + (dst_chroma_stride * chroma_height);
+
+    src_y = picture + ((size_t) movie->h264_crop_top * luma_stride) + movie->h264_crop_left;
+    src_u = picture + luma_plane_size
+        + ((size_t) (movie->h264_crop_top / 2U) * chroma_stride)
+        + (movie->h264_crop_left / 2U);
+    src_v = picture + luma_plane_size + chroma_plane_size
+        + ((size_t) (movie->h264_crop_top / 2U) * chroma_stride)
+        + (movie->h264_crop_left / 2U);
+
+    for (row = 0; row < movie->header.video_height; ++row) {
+        memcpy(
+            dst_y + (row * dst_luma_stride),
+            src_y + (row * luma_stride),
+            dst_luma_stride
+        );
+    }
+    for (row = 0; row < chroma_height; ++row) {
+        memcpy(
+            dst_u + (row * dst_chroma_stride),
+            src_u + (row * chroma_stride),
+            dst_chroma_stride
+        );
+        memcpy(
+            dst_v + (row * dst_chroma_stride),
+            src_v + (row * chroma_stride),
+            dst_chroma_stride
+        );
+    }
+
+    slot->valid = true;
+    return true;
+}
+
+static bool blit_h264_picture(Movie *movie, const uint8_t *picture)
+{
+    const size_t luma_stride = movie->h264_full_width;
+    const size_t chroma_stride = luma_stride / 2U;
+    const size_t luma_plane_size = luma_stride * movie->h264_full_height;
+    const size_t chroma_plane_size = chroma_stride * (movie->h264_full_height / 2U);
+    const uint8_t *y_plane;
+    const uint8_t *u_plane;
+    const uint8_t *v_plane;
 
     if (!movie || !picture || !movie->framebuffer || !movie->h264_headers_ready) {
         return false;
@@ -1162,59 +1438,36 @@ static bool blit_h264_picture(Movie *movie, const uint8_t *picture)
         + ((size_t) (movie->h264_crop_top / 2U) * chroma_stride)
         + (movie->h264_crop_left / 2U);
 
-    for (y = 0; y < movie->h264_crop_height; y += 2U) {
-        const uint8_t *y_row0 = y_plane + ((size_t) y * luma_stride);
-        const uint8_t *y_row1 = y_row0 + luma_stride;
-        const uint8_t *u_row = u_plane + ((size_t) (y / 2U) * chroma_stride);
-        const uint8_t *v_row = v_plane + ((size_t) (y / 2U) * chroma_stride);
-        uint16_t *dst_row0 = movie->framebuffer + ((size_t) y * movie->header.video_width);
-        uint16_t *dst_row1 = dst_row0 + movie->header.video_width;
-        uint32_t x;
-
-        for (x = 0; x < movie->h264_crop_width; x += 2U) {
-            const uint8_t u = u_row[x / 2U];
-            const uint8_t v = v_row[x / 2U];
-            const int32_t chroma_red = g_h264_color_tables.v_to_red[v];
-            const int32_t chroma_green = g_h264_color_tables.u_to_green[u] + g_h264_color_tables.v_to_green[v];
-            const int32_t chroma_blue = g_h264_color_tables.u_to_blue[u];
-            uint8_t red;
-            uint8_t green;
-            uint8_t blue;
-
-            red = h264_clip_byte((g_h264_color_tables.y_base[y_row0[x]] + chroma_red) >> 8);
-            green = h264_clip_byte((g_h264_color_tables.y_base[y_row0[x]] + chroma_green) >> 8);
-            blue = h264_clip_byte((g_h264_color_tables.y_base[y_row0[x]] + chroma_blue) >> 8);
-            dst_row0[x] = (uint16_t) (g_h264_color_tables.red565[red]
-                | g_h264_color_tables.green565[green]
-                | g_h264_color_tables.blue565[blue]);
-
-            red = h264_clip_byte((g_h264_color_tables.y_base[y_row0[x + 1U]] + chroma_red) >> 8);
-            green = h264_clip_byte((g_h264_color_tables.y_base[y_row0[x + 1U]] + chroma_green) >> 8);
-            blue = h264_clip_byte((g_h264_color_tables.y_base[y_row0[x + 1U]] + chroma_blue) >> 8);
-            dst_row0[x + 1U] = (uint16_t) (g_h264_color_tables.red565[red]
-                | g_h264_color_tables.green565[green]
-                | g_h264_color_tables.blue565[blue]);
-
-            red = h264_clip_byte((g_h264_color_tables.y_base[y_row1[x]] + chroma_red) >> 8);
-            green = h264_clip_byte((g_h264_color_tables.y_base[y_row1[x]] + chroma_green) >> 8);
-            blue = h264_clip_byte((g_h264_color_tables.y_base[y_row1[x]] + chroma_blue) >> 8);
-            dst_row1[x] = (uint16_t) (g_h264_color_tables.red565[red]
-                | g_h264_color_tables.green565[green]
-                | g_h264_color_tables.blue565[blue]);
-
-            red = h264_clip_byte((g_h264_color_tables.y_base[y_row1[x + 1U]] + chroma_red) >> 8);
-            green = h264_clip_byte((g_h264_color_tables.y_base[y_row1[x + 1U]] + chroma_green) >> 8);
-            blue = h264_clip_byte((g_h264_color_tables.y_base[y_row1[x + 1U]] + chroma_blue) >> 8);
-            dst_row1[x + 1U] = (uint16_t) (g_h264_color_tables.red565[red]
-                | g_h264_color_tables.green565[green]
-                | g_h264_color_tables.blue565[blue]);
-        }
-    }
-
-    return true;
+    return blit_h264_planes_to_framebuffer(movie, y_plane, u_plane, v_plane, luma_stride, chroma_stride);
 }
 
-static bool decode_h264_access_unit(Movie *movie, uint8_t *frame_data, size_t frame_size)
+static bool blit_h264_frame_slot(Movie *movie, const H264FrameSlot *slot)
+{
+    const size_t luma_plane_size = (size_t) movie->header.video_width * movie->header.video_height;
+    const size_t chroma_plane_size = ((size_t) movie->header.video_width / 2U) * ((size_t) movie->header.video_height / 2U);
+
+    if (!movie || !slot || !slot->valid || !slot->data) {
+        return false;
+    }
+
+    return blit_h264_planes_to_framebuffer(
+        movie,
+        slot->data,
+        slot->data + luma_plane_size,
+        slot->data + luma_plane_size + chroma_plane_size,
+        movie->header.video_width,
+        movie->header.video_width / 2U
+    );
+}
+
+static bool decode_h264_access_unit(
+    Movie *movie,
+    uint8_t *frame_data,
+    size_t frame_size,
+    uint32_t frame_index,
+    bool blit_output,
+    bool store_prefetched
+)
 {
     size_t consumed = 0;
     bool picture_ready = false;
@@ -1245,7 +1498,18 @@ static bool decode_h264_access_unit(Movie *movie, uint8_t *frame_data, size_t fr
             if (!movie->h264_headers_ready && !refresh_h264_picture_params(movie)) {
                 return false;
             }
-            if (!blit_h264_picture(movie, picture)) {
+            if (store_prefetched) {
+                H264FrameSlot *slot = reserve_h264_frame_slot(movie, frame_index);
+                if (!slot) {
+                    debug_tracef("h264 frame ring full frame=%lu", (unsigned long) frame_index);
+                    return false;
+                }
+                if (!copy_h264_picture_to_slot(movie, slot, picture)) {
+                    debug_failf("h264 frame ring copy failed");
+                    return false;
+                }
+            }
+            if (blit_output && !blit_h264_picture(movie, picture)) {
                 debug_failf("h264 blit failed");
                 return false;
             }
@@ -2739,6 +3003,54 @@ static int prefetch_target_chunk(const Movie *movie)
     return movie->loaded_chunk;
 }
 
+static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms)
+{
+    size_t target_ready_count;
+
+    if (!movie || !movie_uses_h264(movie) || movie->header.frame_count == 0) {
+        return;
+    }
+
+    discard_h264_frame_ring_before(movie, movie->current_frame + 1U);
+    target_ready_count = paused ? H264_FRAME_RING_COUNT : h264_frame_ring_ready_count(movie) + 1U;
+    if (target_ready_count > H264_FRAME_RING_COUNT) {
+        target_ready_count = H264_FRAME_RING_COUNT;
+    }
+    if (!paused && spare_ms < H264_PREFETCH_ACTIVE_MIN_SPARE_MS) {
+        return;
+    }
+
+    while (h264_frame_ring_ready_count(movie) < target_ready_count) {
+        int64_t decoded_frame = h264_decoded_global_frame(movie);
+        uint32_t next_frame = (decoded_frame >= (int64_t) movie->current_frame)
+            ? ((uint32_t) decoded_frame + 1U)
+            : (movie->current_frame + 1U);
+        int next_chunk;
+        PrefetchedChunk *prefetched;
+
+        if (next_frame >= movie->header.frame_count) {
+            break;
+        }
+        next_chunk = movie_chunk_for_frame(movie, next_frame);
+        if (next_chunk < 0) {
+            break;
+        }
+        if (!paused && movie->loaded_chunk != next_chunk) {
+            prefetched = find_prefetched_chunk(movie, next_chunk);
+            if (!prefetched || prefetched->state != PREFETCH_READY) {
+                break;
+            }
+        }
+        if (!decode_h264_frame(movie, next_frame, false, true)) {
+            debug_tracef("h264 predecode fail frame=%lu", (unsigned long) next_frame);
+            break;
+        }
+        if (!paused) {
+            break;
+        }
+    }
+}
+
 static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
 {
     uint32_t time_slice_ms = paused && spare_ms > PREFETCH_PAUSED_SLICE_MS ? PREFETCH_PAUSED_SLICE_MS : spare_ms;
@@ -2751,6 +3063,9 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
         uint32_t deadline_ms = monotonic_clock_now_ms() + time_slice_ms;
         prefetch_ahead(movie, current_chunk, budget);
         prefetch_do_work(movie, current_chunk, deadline_ms);
+    }
+    if (movie_uses_h264(movie)) {
+        prefetch_h264_frames(movie, paused, spare_ms);
     }
 }
  
@@ -2779,10 +3094,75 @@ static int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index)
     return -1;
 }
 
+static bool decode_h264_frame(Movie *movie, uint32_t frame_index, bool blit_output, bool store_prefetched)
+{
+    int chunk_index = movie_chunk_for_frame(movie, frame_index);
+    const ChunkIndexEntry *entry;
+    uint32_t local_index;
+    uint32_t replay_index;
+
+    if (chunk_index < 0) {
+        debug_failf("decode frame=%lu invalid h264 chunk", (unsigned long) frame_index);
+        return false;
+    }
+    if (!load_chunk(movie, chunk_index)) {
+        debug_tracef("decode frame=%lu load h264 chunk=%d fail", (unsigned long) frame_index, chunk_index);
+        return false;
+    }
+
+    entry = movie->chunk_index + chunk_index;
+    local_index = frame_index - entry->first_frame;
+    if (movie->decoded_local_frame > (int) local_index) {
+        if (movie->h264_chunk_dirty) {
+            if (!load_chunk_from_file(movie, chunk_index, true)) {
+                debug_failf("h264 chunk reload failed chunk=%d for replay", chunk_index);
+                return false;
+            }
+            entry = movie->chunk_index + chunk_index;
+            local_index = frame_index - entry->first_frame;
+        } else if (!reset_h264_decoder(movie)) {
+            return false;
+        }
+        movie->decoded_local_frame = -1;
+    }
+
+    for (replay_index = (uint32_t) (movie->decoded_local_frame + 1); replay_index <= local_index; ++replay_index) {
+        size_t start = movie->frame_offsets[replay_index];
+        size_t end = (replay_index + 1 < entry->frame_count)
+            ? movie->frame_offsets[replay_index + 1]
+            : movie->chunk_size;
+        uint32_t decoded_frame_index = entry->first_frame + replay_index;
+
+        movie->h264_chunk_dirty = true;
+        if (!decode_h264_access_unit(
+                movie,
+                movie->chunk_bytes + start,
+                end - start,
+                decoded_frame_index,
+                blit_output && decoded_frame_index == frame_index,
+                store_prefetched && decoded_frame_index == frame_index)) {
+            debug_tracef(
+                "h264 frame decode fail frame=%lu chunk=%d local=%lu start=%lu end=%lu size=%lu",
+                (unsigned long) decoded_frame_index,
+                chunk_index,
+                (unsigned long) replay_index,
+                (unsigned long) start,
+                (unsigned long) end,
+                (unsigned long) (end - start)
+            );
+            return false;
+        }
+        movie->decoded_local_frame = (int) replay_index;
+    }
+
+    return true;
+}
+
 static bool decode_to_frame(Movie *movie, uint32_t frame_index)
 {
     int chunk_index = movie_chunk_for_frame(movie, frame_index);
     const ChunkIndexEntry *entry;
+    H264FrameSlot *prefetched_frame = NULL;
     uint32_t local_index;
     uint32_t replay_index;
     bool have_contiguous_seed = false;
@@ -2790,6 +3170,21 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
     if (chunk_index < 0) {
         debug_failf("decode frame=%lu invalid chunk", (unsigned long) frame_index);
         return false;
+    }
+    if (movie_uses_h264(movie) && frame_index > movie->current_frame) {
+        prefetched_frame = find_h264_frame_slot(movie, frame_index);
+        if (prefetched_frame) {
+            if (!blit_h264_frame_slot(movie, prefetched_frame)) {
+                debug_failf("h264 frame ring blit failed frame=%lu", (unsigned long) frame_index);
+                return false;
+            }
+            movie->current_frame = frame_index;
+            discard_h264_frame_ring_before(movie, frame_index + 1U);
+            return true;
+        }
+    }
+    if (movie_uses_h264(movie) && frame_index < movie->current_frame) {
+        clear_h264_frame_ring(movie);
     }
     if (!load_chunk(movie, chunk_index)) {
         debug_tracef("decode frame=%lu load chunk=%d fail", (unsigned long) frame_index, chunk_index);
@@ -2827,19 +3222,15 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
             local_index = frame_index - entry->first_frame;
         }
     }
-    if (movie->decoded_local_frame > (int) local_index) {
-        if (movie_uses_h264(movie)) {
-            if (movie->h264_chunk_dirty) {
-                if (!load_chunk_from_file(movie, chunk_index, true)) {
-                    debug_failf("h264 chunk reload failed chunk=%d for replay", chunk_index);
-                    return false;
-                }
-                entry = movie->chunk_index + chunk_index;
-                local_index = frame_index - entry->first_frame;
-            } else if (!reset_h264_decoder(movie)) {
-                return false;
-            }
+    if (movie_uses_h264(movie)) {
+        if (!decode_h264_frame(movie, frame_index, true, false)) {
+            return false;
         }
+        movie->current_frame = frame_index;
+        discard_h264_frame_ring_before(movie, frame_index + 1U);
+        return true;
+    }
+    if (movie->decoded_local_frame > (int) local_index) {
         movie->decoded_local_frame = -1;
     }
     for (replay_index = (uint32_t) (movie->decoded_local_frame + 1); replay_index <= local_index; ++replay_index) {
@@ -2847,22 +3238,7 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
         size_t end = (replay_index + 1 < entry->frame_count)
             ? movie->frame_offsets[replay_index + 1]
             : movie->chunk_size;
-        if (movie_uses_h264(movie)) {
-            size_t access_unit_size = end - start;
-            movie->h264_chunk_dirty = true;
-            if (!decode_h264_access_unit(movie, movie->chunk_bytes + start, access_unit_size)) {
-                debug_tracef(
-                    "h264 frame decode fail frame=%lu chunk=%d local=%lu start=%lu end=%lu size=%lu",
-                    (unsigned long) (entry->first_frame + replay_index),
-                    chunk_index,
-                    (unsigned long) replay_index,
-                    (unsigned long) start,
-                    (unsigned long) end,
-                    (unsigned long) (end - start)
-                );
-                return false;
-            }
-        } else if (!legacy_decode_frame_record(movie, movie->chunk_bytes + start, end - start)) {
+        if (!legacy_decode_frame_record(movie, movie->chunk_bytes + start, end - start)) {
             debug_failf(
                 "frame decode fail frame=%lu chunk=%d local=%lu tag=%c start=%lu end=%lu size=%lu",
                 (unsigned long) (entry->first_frame + replay_index),
@@ -3062,9 +3438,13 @@ static bool load_movie(const char *path, Movie *movie)
     memset(movie, 0, sizeof(*movie));
     movie->loaded_chunk = -1;
     {
+        int h264_ring_index;
         int prefetch_index;
         for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
             movie->prefetched[prefetch_index].chunk_index = -1;
+        }
+        for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_COUNT; ++h264_ring_index) {
+            movie->h264_frame_ring[h264_ring_index].frame_index = UINT32_MAX;
         }
     }
     movie->decoded_local_frame = -1;
@@ -3132,10 +3512,24 @@ static bool load_movie(const char *path, Movie *movie)
     framebuffer_words = (size_t) movie->header.video_width * movie->header.video_height;
     movie->framebuffer = (uint16_t *) calloc(framebuffer_words, sizeof(uint16_t));
     if (movie_uses_h264(movie)) {
+        int h264_ring_index;
         init_h264_color_tables();
         movie->h264_decoder = h264bsdAlloc();
         if (movie->h264_decoder) {
             memset(movie->h264_decoder, 0, sizeof(*movie->h264_decoder));
+        }
+        movie->h264_frame_bytes = h264_cropped_frame_bytes(movie);
+        clear_h264_frame_ring(movie);
+        for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_COUNT; ++h264_ring_index) {
+            movie->h264_frame_ring[h264_ring_index].data = (uint8_t *) malloc(movie->h264_frame_bytes);
+            if (!movie->h264_frame_ring[h264_ring_index].data) {
+                debug_failf(
+                    "open failed: h264 frame ring alloc slot=%d bytes=%lu",
+                    h264_ring_index,
+                    (unsigned long) movie->h264_frame_bytes
+                );
+                return false;
+            }
         }
         if (!movie->framebuffer || !movie->h264_decoder || !reset_h264_decoder(movie)) {
             if (!movie->framebuffer) {
@@ -3965,6 +4359,42 @@ static void draw_progress(
     );
 }
 
+static bool blit_rgb565_direct(SDL_Surface *screen, const Movie *movie, const SDL_Rect *dst)
+{
+    const uint8_t *src_row;
+    uint8_t *dst_row;
+    int row;
+    bool locked = false;
+
+    if (!screen || !movie || !dst || !movie->framebuffer || !screen->pixels ||
+        screen->format->BitsPerPixel != 16 ||
+        screen->format->Rmask != 0xF800 ||
+        screen->format->Gmask != 0x07E0 ||
+        screen->format->Bmask != 0x001F) {
+        return false;
+    }
+
+    if (SDL_MUSTLOCK(screen)) {
+        if (SDL_LockSurface(screen) != 0) {
+            return false;
+        }
+        locked = true;
+    }
+
+    src_row = (const uint8_t *) movie->framebuffer;
+    dst_row = (uint8_t *) screen->pixels + ((size_t) dst->y * screen->pitch) + ((size_t) dst->x * 2U);
+    for (row = 0; row < movie->header.video_height; ++row) {
+        memcpy(dst_row, src_row, (size_t) movie->header.video_width * 2U);
+        src_row += (size_t) movie->header.video_width * 2U;
+        dst_row += screen->pitch;
+    }
+
+    if (locked) {
+        SDL_UnlockSurface(screen);
+    }
+    return true;
+}
+
 static void render_movie(
     SDL_Surface *screen,
     const Fonts *fonts,
@@ -3995,7 +4425,9 @@ static void render_movie(
     SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
     if (src.w == movie->header.video_width && src.h == movie->header.video_height &&
         dst.w == movie->header.video_width && dst.h == movie->header.video_height) {
-        SDL_BlitSurface(movie->frame_surface, NULL, screen, &dst);
+        if (!blit_rgb565_direct(screen, movie, &dst)) {
+            SDL_BlitSurface(movie->frame_surface, NULL, screen, &dst);
+        }
     } else {
         SDL_SoftStretch(movie->frame_surface, &src, screen, &dst);
     }

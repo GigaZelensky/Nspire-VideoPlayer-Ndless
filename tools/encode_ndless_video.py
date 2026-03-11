@@ -13,7 +13,6 @@ import sys
 import tempfile
 import time
 import unicodedata
-import zlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -515,9 +514,7 @@ def probe_video(input_path: Path) -> VideoProbe:
 
 
 def compress_chunk_payload(chunk_blob: bytes, zlib_level: int) -> bytes:
-    compressed_blob = zlib.compress(chunk_blob, level=zlib_level)
-    if len(compressed_blob) + 16 < len(chunk_blob):
-        return compressed_blob
+    del zlib_level
     return chunk_blob
 
 
@@ -1041,7 +1038,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--preset", default="slow", help="libx264 preset")
     parser.add_argument("--level", default="1.3", help="Target H.264 level")
     parser.add_argument("--stream-profile", choices=STREAM_PROFILES, default="fast", help="Decoder-complexity profile: fast is smoothest, balanced/quality trade more CPU for better image quality")
-    parser.add_argument("--zlib-level", type=int, default=9, help="Chunk compression level (0-9)")
+    parser.add_argument("--zlib-level", type=int, default=9, help="Ignored for H.264 output; chunks are stored raw")
     parser.add_argument("--start", type=float, default=0.0, help="Optional clip start offset in seconds")
     parser.add_argument("--duration", type=float, help="Optional clip duration in seconds")
     parser.add_argument("--quiet", action="store_true", help="Silence progress logging")
