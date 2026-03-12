@@ -38,15 +38,19 @@
 #define PREFETCH_PAUSED_SLICE_MS 12U
 #define PREFETCH_ACTIVE_H264_MIN_SPARE_MS 12U
 #define PREFETCH_ACTIVE_H264_SLICE_MS 2U
-#define H264_FRAME_RING_MAX_COUNT 96
+#define H264_FRAME_RING_MAX_COUNT 160
 #define H264_FRAME_RING_ALIGNMENT 32U
 #define H264_FRAME_RING_BUDGET_BYTES (12U * 1024U * 1024U)
 #define H264_PREFETCH_ACTIVE_MIN_SPARE_MS 14U
 #define H264_PREFETCH_ACTIVE_GUARD_MS 2U
-#define H264_PREFETCH_MIN_READY_FRAMES 8U
-#define H264_PREFETCH_LOOKAHEAD_FRAMES 96U
+#define H264_PREFETCH_MIN_READY_FRAMES 10U
+#define H264_PREFETCH_LOOKAHEAD_FRAMES 128U
 #define H264_PREFETCH_HEAVY_FRAME_BYTES 8192U
 #define H264_PREFETCH_VERY_HEAVY_FRAME_BYTES 12288U
+#define H264_PREFETCH_AVG_MIN_FRAME_BYTES 2048U
+#define H264_PREFETCH_ABOVE_AVG_NUMERATOR 9U
+#define H264_PREFETCH_ABOVE_AVG_DENOMINATOR 8U
+#define H264_PREFETCH_NEAR_WINDOW_FRAMES 24U
 #define MONOTONIC_TIMER_VALUE_ADDR 0x900C0004U
 #define MONOTONIC_TIMER_CONTROL_ADDR 0x900C0008U
 #define MONOTONIC_TIMER_CLOCK_SOURCE_ADDR 0x900C0080U
@@ -1512,6 +1516,31 @@ static uint32_t h264_frame_size_from_chunk_storage(const Movie *movie, const Chu
     return end - start;
 }
 
+static uint32_t estimate_h264_chunk_average_frame_bytes(const Movie *movie, const ChunkIndexEntry *entry)
+{
+    size_t payload_bytes;
+
+    if (!movie || !entry || entry->frame_count == 0) {
+        return 0;
+    }
+
+    payload_bytes = entry->unpacked_size;
+    if (movie->header.version >= 4) {
+        size_t header_bytes = 4U + ((size_t) entry->frame_count * sizeof(uint32_t));
+        if (payload_bytes > header_bytes) {
+            payload_bytes -= header_bytes;
+        } else {
+            payload_bytes = 0;
+        }
+    }
+
+    if (payload_bytes == 0) {
+        return 0;
+    }
+
+    return (uint32_t) ((payload_bytes + entry->frame_count - 1U) / entry->frame_count);
+}
+
 static uint32_t estimate_h264_frame_bytes(const Movie *movie, uint32_t frame_index)
 {
     int chunk_index;
@@ -1540,7 +1569,7 @@ static uint32_t estimate_h264_frame_bytes(const Movie *movie, uint32_t frame_ind
         return h264_frame_size_from_chunk_storage(movie, entry, prefetched->chunk_storage, prefetched->chunk_storage_size, local_index);
     }
 
-    return 0;
+    return estimate_h264_chunk_average_frame_bytes(movie, entry);
 }
 
 static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spare_ms)
@@ -1548,6 +1577,11 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
     size_t capacity;
     size_t target;
     size_t heavy_target = 0;
+    size_t proximity_bonus = 0;
+    uint64_t total_frame_bytes = 0;
+    uint32_t sampled_frames = 0;
+    uint32_t average_frame_bytes;
+    uint32_t above_average_threshold;
     uint32_t heavy_hits = 0;
     uint32_t frame_index;
     uint32_t limit;
@@ -1572,11 +1606,37 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
     }
 
     for (frame_index = movie->current_frame + 1U; frame_index < limit; ++frame_index) {
+        uint32_t frame_bytes = estimate_h264_frame_bytes(movie, frame_index);
+        if (frame_bytes > 0) {
+            total_frame_bytes += frame_bytes;
+            sampled_frames++;
+        }
+    }
+
+    if (sampled_frames > 0) {
+        average_frame_bytes = (uint32_t) ((total_frame_bytes + (sampled_frames / 2U)) / sampled_frames);
+    } else {
+        average_frame_bytes = H264_PREFETCH_HEAVY_FRAME_BYTES;
+    }
+    if (average_frame_bytes < H264_PREFETCH_AVG_MIN_FRAME_BYTES) {
+        average_frame_bytes = H264_PREFETCH_AVG_MIN_FRAME_BYTES;
+    }
+
+    above_average_threshold =
+        (average_frame_bytes * H264_PREFETCH_ABOVE_AVG_NUMERATOR) / H264_PREFETCH_ABOVE_AVG_DENOMINATOR;
+    if (above_average_threshold < average_frame_bytes + 256U) {
+        above_average_threshold = average_frame_bytes + 256U;
+    }
+
+    for (frame_index = movie->current_frame + 1U; frame_index < limit; ++frame_index) {
         size_t distance = (size_t) (frame_index - movie->current_frame);
         uint32_t frame_bytes = estimate_h264_frame_bytes(movie, frame_index);
-        if (frame_bytes >= H264_PREFETCH_HEAVY_FRAME_BYTES) {
+        if (frame_bytes >= above_average_threshold) {
             heavy_target = distance;
             heavy_hits++;
+            if (distance <= H264_PREFETCH_NEAR_WINDOW_FRAMES) {
+                proximity_bonus++;
+            }
             if (frame_bytes >= H264_PREFETCH_VERY_HEAVY_FRAME_BYTES || heavy_hits >= 4U) {
                 break;
             }
@@ -1592,6 +1652,7 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
     if (spare_ms >= 32U) {
         target += 8U;
     }
+    target += proximity_bonus;
     if (heavy_target > target) {
         target = heavy_target;
     }
@@ -3495,7 +3556,7 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
         time_slice_ms = PREFETCH_ACTIVE_H264_SLICE_MS;
     }
     if (movie_uses_h264(movie)) {
-        try_grow_h264_frame_ring(movie, paused ? 8U : (spare_ms >= 24U ? 2U : 1U));
+        try_grow_h264_frame_ring(movie, paused ? 8U : (spare_ms >= 24U ? 3U : (spare_ms >= 18U ? 2U : 1U)));
         prefetch_h264_frames(movie, paused, spare_ms, deadline_ms);
     }
     if (current_chunk >= 0 && budget > 0 && time_slice_ms > 0) {
