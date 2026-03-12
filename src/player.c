@@ -35,10 +35,18 @@
 #define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
 #define PREFETCH_PAUSED_SLICE_MS 12U
 #define PREFETCH_ACTIVE_H264_MIN_SPARE_MS 12U
-#define PREFETCH_ACTIVE_H264_SLICE_MS 1U
-#define H264_FRAME_RING_COUNT 4
+#define PREFETCH_ACTIVE_H264_SLICE_MS 2U
+#define H264_FRAME_RING_MAX_COUNT 256
 #define H264_FRAME_RING_ALIGNMENT 32U
+#define H264_FRAME_RING_BUDGET_BYTES (20U * 1024U * 1024U)
 #define H264_PREFETCH_ACTIVE_MIN_SPARE_MS 14U
+#define H264_PREFETCH_ACTIVE_GUARD_MS 2U
+#define H264_PREFETCH_MIN_READY_FRAMES 10U
+#define H264_PREFETCH_LOOKAHEAD_FRAMES 160U
+#define H264_PREFETCH_HEAVY_FRAME_BYTES 8192U
+#define H264_PREFETCH_VERY_HEAVY_FRAME_BYTES 12288U
+#define H264_PREFETCH_HEAVY_WINDOW_BYTES 24576U
+#define H264_PREFETCH_VERY_HEAVY_WINDOW_BYTES 36864U
 #define MONOTONIC_TIMER_VALUE_ADDR 0x900C0004U
 #define MONOTONIC_TIMER_CONTROL_ADDR 0x900C0008U
 #define MONOTONIC_TIMER_CLOCK_SOURCE_ADDR 0x900C0080U
@@ -239,7 +247,8 @@ typedef struct {
     bool h264_decoder_initialized;
     bool h264_chunk_dirty;
     size_t h264_frame_bytes;
-    H264FrameSlot h264_frame_ring[H264_FRAME_RING_COUNT];
+    size_t h264_frame_ring_capacity;
+    H264FrameSlot h264_frame_ring[H264_FRAME_RING_MAX_COUNT];
 } Movie;
 
 typedef struct {
@@ -317,8 +326,9 @@ static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks);
 static void clear_prefetched_chunk(PrefetchedChunk *chunk);
 static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk);
 static void prefetch_do_work(Movie *movie, int current_chunk, uint32_t deadline_ms);
-static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms);
+static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, uint32_t deadline_ms);
 static int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index);
+static size_t active_h264_frame_ring_capacity(const Movie *movie);
 static void free_fonts(Fonts *fonts);
 static uint32_t monotonic_clock_now_ms(void);
 static void history_path_for_directory(const char *directory, char *history_path, size_t history_path_size);
@@ -773,6 +783,8 @@ static MemoryStats query_memory_stats(const Movie *movie)
     MemoryStats stats;
     size_t framebuffer_words;
     size_t block_scratch_words;
+    size_t chunk_prefetch_bytes = 0;
+    size_t h264_ring_bytes = 0;
     int index;
 
     memset(&stats, 0, sizeof(stats));
@@ -796,9 +808,10 @@ static MemoryStats query_memory_stats(const Movie *movie)
     }
     if (movie->h264_frame_bytes > 0) {
         int h264_index;
-        for (h264_index = 0; h264_index < H264_FRAME_RING_COUNT; ++h264_index) {
+        for (h264_index = 0; h264_index < (int) active_h264_frame_ring_capacity(movie); ++h264_index) {
             if (movie->h264_frame_ring[h264_index].data) {
                 stats.used_bytes += movie->h264_frame_bytes;
+                h264_ring_bytes += movie->h264_frame_bytes;
             }
         }
     }
@@ -818,12 +831,13 @@ static MemoryStats query_memory_stats(const Movie *movie)
 
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
         if (movie->prefetched[index].chunk_index >= 0 && movie->prefetched[index].chunk_storage) {
-            stats.prefetched_bytes += movie->prefetched[index].chunk_storage_size;
+            chunk_prefetch_bytes += movie->prefetched[index].chunk_storage_size;
         }
     }
 
-    stats.used_bytes += stats.prefetched_bytes;
-    stats.total_bytes = PREFETCH_MAX_TOTAL_BYTES;
+    stats.prefetched_bytes = chunk_prefetch_bytes + h264_ring_bytes;
+    stats.used_bytes += chunk_prefetch_bytes;
+    stats.total_bytes = PREFETCH_MAX_TOTAL_BYTES + h264_ring_bytes;
     stats.free_bytes = stats.total_bytes > stats.prefetched_bytes
         ? (stats.total_bytes - stats.prefetched_bytes)
         : 0;
@@ -977,7 +991,7 @@ static void destroy_movie(Movie *movie)
         }
         h264bsdFree(movie->h264_decoder);
     }
-    for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_COUNT; ++h264_ring_index) {
+    for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_MAX_COUNT; ++h264_ring_index) {
         free(movie->h264_frame_ring[h264_ring_index].allocation);
     }
     for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
@@ -988,7 +1002,7 @@ static void destroy_movie(Movie *movie)
     for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
         movie->prefetched[prefetch_index].chunk_index = -1;
     }
-    for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_COUNT; ++h264_ring_index) {
+    for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_MAX_COUNT; ++h264_ring_index) {
         movie->h264_frame_ring[h264_ring_index].frame_index = UINT32_MAX;
     }
     movie->decoded_local_frame = -1;
@@ -1176,15 +1190,23 @@ static size_t h264_cropped_frame_bytes(const Movie *movie)
     return luma_size + (chroma_size * 2U);
 }
 
+static size_t active_h264_frame_ring_capacity(const Movie *movie)
+{
+    if (!movie || movie->h264_frame_ring_capacity > H264_FRAME_RING_MAX_COUNT) {
+        return 0;
+    }
+    return movie->h264_frame_ring_capacity;
+}
+
 static void clear_h264_frame_ring(Movie *movie)
 {
-    int index;
+    size_t index;
 
     if (!movie) {
         return;
     }
 
-    for (index = 0; index < H264_FRAME_RING_COUNT; ++index) {
+    for (index = 0; index < active_h264_frame_ring_capacity(movie); ++index) {
         movie->h264_frame_ring[index].frame_index = UINT32_MAX;
         movie->h264_frame_ring[index].valid = false;
     }
@@ -1192,13 +1214,13 @@ static void clear_h264_frame_ring(Movie *movie)
 
 static void discard_h264_frame_ring_before(Movie *movie, uint32_t first_frame_to_keep)
 {
-    int index;
+    size_t index;
 
     if (!movie) {
         return;
     }
 
-    for (index = 0; index < H264_FRAME_RING_COUNT; ++index) {
+    for (index = 0; index < active_h264_frame_ring_capacity(movie); ++index) {
         if (movie->h264_frame_ring[index].valid &&
             movie->h264_frame_ring[index].frame_index < first_frame_to_keep) {
             movie->h264_frame_ring[index].frame_index = UINT32_MAX;
@@ -1210,13 +1232,13 @@ static void discard_h264_frame_ring_before(Movie *movie, uint32_t first_frame_to
 static size_t h264_frame_ring_ready_count(const Movie *movie)
 {
     size_t count = 0;
-    int index;
+    size_t index;
 
     if (!movie) {
         return 0;
     }
 
-    for (index = 0; index < H264_FRAME_RING_COUNT; ++index) {
+    for (index = 0; index < active_h264_frame_ring_capacity(movie); ++index) {
         if (movie->h264_frame_ring[index].valid &&
             movie->h264_frame_ring[index].frame_index > movie->current_frame) {
             count++;
@@ -1227,13 +1249,13 @@ static size_t h264_frame_ring_ready_count(const Movie *movie)
 
 static H264FrameSlot *find_h264_frame_slot(Movie *movie, uint32_t frame_index)
 {
-    int index;
+    size_t index;
 
     if (!movie) {
         return NULL;
     }
 
-    for (index = 0; index < H264_FRAME_RING_COUNT; ++index) {
+    for (index = 0; index < active_h264_frame_ring_capacity(movie); ++index) {
         if (movie->h264_frame_ring[index].valid &&
             movie->h264_frame_ring[index].frame_index == frame_index) {
             return &movie->h264_frame_ring[index];
@@ -1244,27 +1266,196 @@ static H264FrameSlot *find_h264_frame_slot(Movie *movie, uint32_t frame_index)
 
 static H264FrameSlot *reserve_h264_frame_slot(Movie *movie, uint32_t frame_index)
 {
-    int index;
+    size_t index;
 
     if (!movie) {
         return NULL;
     }
 
-    for (index = 0; index < H264_FRAME_RING_COUNT; ++index) {
+    for (index = 0; index < active_h264_frame_ring_capacity(movie); ++index) {
         if (movie->h264_frame_ring[index].valid &&
             movie->h264_frame_ring[index].frame_index == frame_index) {
             return &movie->h264_frame_ring[index];
         }
     }
 
-    for (index = 0; index < H264_FRAME_RING_COUNT; ++index) {
-        if (!movie->h264_frame_ring[index].valid) {
+    for (index = 0; index < active_h264_frame_ring_capacity(movie); ++index) {
+        if (movie->h264_frame_ring[index].data && !movie->h264_frame_ring[index].valid) {
             movie->h264_frame_ring[index].frame_index = frame_index;
             return &movie->h264_frame_ring[index];
         }
     }
 
     return NULL;
+}
+
+static const PrefetchedChunk *find_prefetched_chunk_const(const Movie *movie, int chunk_index)
+{
+    int index;
+
+    if (!movie) {
+        return NULL;
+    }
+
+    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+        if (movie->prefetched[index].chunk_index == chunk_index) {
+            return &movie->prefetched[index];
+        }
+    }
+    return NULL;
+}
+
+static uint32_t h264_frame_size_from_offsets(const uint32_t *frame_offsets, uint32_t frame_count, size_t chunk_size, uint32_t local_index)
+{
+    size_t start;
+    size_t end;
+
+    if (!frame_offsets || local_index >= frame_count) {
+        return 0;
+    }
+
+    start = frame_offsets[local_index];
+    end = (local_index + 1U < frame_count) ? frame_offsets[local_index + 1U] : chunk_size;
+    if (end < start || end > chunk_size) {
+        return 0;
+    }
+    return (uint32_t) (end - start);
+}
+
+static uint32_t h264_frame_size_from_chunk_storage(const Movie *movie, const ChunkIndexEntry *entry, const uint8_t *chunk_storage, size_t chunk_storage_size, uint32_t local_index)
+{
+    size_t local_offset;
+    size_t table_size;
+    size_t header_size;
+    uint32_t payload_size;
+    uint32_t start;
+    uint32_t end;
+
+    if (!movie || !entry || !chunk_storage || local_index >= entry->frame_count) {
+        return 0;
+    }
+
+    if (movie->header.version < 4) {
+        return 0;
+    }
+
+    local_offset = (size_t) entry->frame_table_offset;
+    table_size = (size_t) entry->frame_count * sizeof(uint32_t);
+    header_size = 4U + table_size;
+    if (local_offset + header_size > chunk_storage_size) {
+        return 0;
+    }
+
+    payload_size = read_le32(chunk_storage + local_offset);
+    if (local_offset + header_size + payload_size > chunk_storage_size) {
+        return 0;
+    }
+
+    start = read_le32(chunk_storage + local_offset + 4U + ((size_t) local_index * sizeof(uint32_t)));
+    end = (local_index + 1U < entry->frame_count)
+        ? read_le32(chunk_storage + local_offset + 4U + ((size_t) (local_index + 1U) * sizeof(uint32_t)))
+        : payload_size;
+    if (end < start || end > payload_size) {
+        return 0;
+    }
+    return end - start;
+}
+
+static uint32_t estimate_h264_frame_bytes(const Movie *movie, uint32_t frame_index)
+{
+    int chunk_index;
+    const ChunkIndexEntry *entry;
+    uint32_t local_index;
+    const PrefetchedChunk *prefetched;
+
+    if (!movie || !movie_uses_h264(movie) || frame_index >= movie->header.frame_count) {
+        return 0;
+    }
+
+    chunk_index = movie_chunk_for_frame(movie, frame_index);
+    if (chunk_index < 0) {
+        return 0;
+    }
+
+    entry = movie->chunk_index + chunk_index;
+    local_index = frame_index - entry->first_frame;
+
+    if (movie->loaded_chunk == chunk_index && movie->frame_offsets && movie->chunk_bytes) {
+        return h264_frame_size_from_offsets(movie->frame_offsets, entry->frame_count, movie->chunk_size, local_index);
+    }
+
+    prefetched = find_prefetched_chunk_const(movie, chunk_index);
+    if (prefetched && prefetched->state == PREFETCH_READY && prefetched->chunk_storage) {
+        return h264_frame_size_from_chunk_storage(movie, entry, prefetched->chunk_storage, prefetched->chunk_storage_size, local_index);
+    }
+
+    return 0;
+}
+
+static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spare_ms)
+{
+    size_t capacity;
+    size_t target;
+    size_t heavy_target = 0;
+    uint32_t heavy_hits = 0;
+    uint32_t frame_index;
+    uint32_t limit;
+
+    if (!movie || movie->current_frame + 1U >= movie->header.frame_count) {
+        return 0;
+    }
+
+    capacity = active_h264_frame_ring_capacity(movie);
+    if (capacity == 0) {
+        return 0;
+    }
+
+    target = H264_PREFETCH_MIN_READY_FRAMES;
+    if (target > capacity) {
+        target = capacity;
+    }
+
+    limit = movie->current_frame + H264_PREFETCH_LOOKAHEAD_FRAMES + 1U;
+    if (limit > movie->header.frame_count) {
+        limit = movie->header.frame_count;
+    }
+
+    for (frame_index = movie->current_frame + 1U; frame_index < limit; ++frame_index) {
+        size_t distance = (size_t) (frame_index - movie->current_frame);
+        uint32_t frame_bytes = estimate_h264_frame_bytes(movie, frame_index);
+        if (frame_bytes >= H264_PREFETCH_HEAVY_FRAME_BYTES) {
+            heavy_target = distance;
+            heavy_hits++;
+            if (frame_bytes >= H264_PREFETCH_VERY_HEAVY_FRAME_BYTES || heavy_hits >= 3U) {
+                break;
+            }
+        }
+    }
+
+    if (spare_ms >= 18U) {
+        target += 2U;
+    }
+    if (spare_ms >= 24U) {
+        target += 4U;
+    }
+    if (spare_ms >= 32U) {
+        target += 8U;
+    }
+    if (heavy_target > target) {
+        target = heavy_target;
+    }
+    if (target > capacity) {
+        target = capacity;
+    }
+    return target;
+}
+
+static bool h264_prefetch_deadline_reached(uint32_t deadline_ms)
+{
+    if (deadline_ms == 0) {
+        return false;
+    }
+    return (int32_t) ((monotonic_clock_now_ms() + H264_PREFETCH_ACTIVE_GUARD_MS) - deadline_ms) >= 0;
 }
 
 static int64_t h264_decoded_global_frame(const Movie *movie)
@@ -3060,6 +3251,9 @@ static int prefetch_budget_for_state(const Movie *movie, bool paused, uint32_t s
     if (movie_uses_h264(movie) && spare_ms < PREFETCH_ACTIVE_H264_MIN_SPARE_MS) {
         return 0;
     }
+    if (spare_ms >= 24U) {
+        return 2;
+    }
     if (spare_ms > 0) {
         return 1;
     }
@@ -3080,19 +3274,16 @@ static int prefetch_target_chunk(const Movie *movie)
     return movie->loaded_chunk;
 }
 
-static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms)
+static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, uint32_t deadline_ms)
 {
     size_t target_ready_count;
 
-    if (!movie || !movie_uses_h264(movie) || movie->header.frame_count == 0) {
+    if (!movie || !movie_uses_h264(movie) || movie->header.frame_count == 0 || active_h264_frame_ring_capacity(movie) == 0) {
         return;
     }
 
     discard_h264_frame_ring_before(movie, movie->current_frame + 1U);
-    target_ready_count = paused ? H264_FRAME_RING_COUNT : h264_frame_ring_ready_count(movie) + 1U;
-    if (target_ready_count > H264_FRAME_RING_COUNT) {
-        target_ready_count = H264_FRAME_RING_COUNT;
-    }
+    target_ready_count = paused ? active_h264_frame_ring_capacity(movie) : h264_prefetch_target_ready_count(movie, spare_ms);
     if (!paused && spare_ms < H264_PREFETCH_ACTIVE_MIN_SPARE_MS) {
         return;
     }
@@ -3112,6 +3303,9 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms)
         if (next_chunk < 0) {
             break;
         }
+        if (!paused && h264_prefetch_deadline_reached(deadline_ms)) {
+            break;
+        }
         if (!paused && movie->loaded_chunk != next_chunk) {
             prefetched = find_prefetched_chunk(movie, next_chunk);
             if (!prefetched || prefetched->state != PREFETCH_READY) {
@@ -3122,7 +3316,7 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms)
             debug_tracef("h264 predecode fail frame=%lu", (unsigned long) next_frame);
             break;
         }
-        if (!paused) {
+        if (!paused && h264_prefetch_deadline_reached(deadline_ms)) {
             break;
         }
     }
@@ -3131,18 +3325,24 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms)
 static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
 {
     uint32_t time_slice_ms = paused && spare_ms > PREFETCH_PAUSED_SLICE_MS ? PREFETCH_PAUSED_SLICE_MS : spare_ms;
+    uint32_t deadline_ms = spare_ms > 0 ? (monotonic_clock_now_ms() + spare_ms) : 0;
     int current_chunk = prefetch_target_chunk(movie);
     int budget = prefetch_budget_for_state(movie, paused, spare_ms);
     if (!paused && movie_uses_h264(movie) && time_slice_ms > PREFETCH_ACTIVE_H264_SLICE_MS) {
         time_slice_ms = PREFETCH_ACTIVE_H264_SLICE_MS;
     }
-    if (current_chunk >= 0 && budget > 0 && time_slice_ms > 0) {
-        uint32_t deadline_ms = monotonic_clock_now_ms() + time_slice_ms;
-        prefetch_ahead(movie, current_chunk, budget);
-        prefetch_do_work(movie, current_chunk, deadline_ms);
-    }
     if (movie_uses_h264(movie)) {
-        prefetch_h264_frames(movie, paused, spare_ms);
+        prefetch_h264_frames(movie, paused, spare_ms, deadline_ms);
+    }
+    if (current_chunk >= 0 && budget > 0 && time_slice_ms > 0) {
+        uint32_t io_deadline_ms = monotonic_clock_now_ms() + time_slice_ms;
+        if (!io_deadline_ms || !prefetch_deadline_reached(io_deadline_ms)) {
+            prefetch_ahead(movie, current_chunk, budget);
+            prefetch_do_work(movie, current_chunk, io_deadline_ms);
+        }
+    }
+    if (movie_uses_h264(movie) && (!deadline_ms || !h264_prefetch_deadline_reached(deadline_ms))) {
+        prefetch_h264_frames(movie, paused, spare_ms, deadline_ms);
     }
 }
  
@@ -3520,7 +3720,7 @@ static bool load_movie(const char *path, Movie *movie)
         for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
             movie->prefetched[prefetch_index].chunk_index = -1;
         }
-        for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_COUNT; ++h264_ring_index) {
+        for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_MAX_COUNT; ++h264_ring_index) {
             movie->h264_frame_ring[h264_ring_index].frame_index = UINT32_MAX;
         }
     }
@@ -3589,29 +3789,45 @@ static bool load_movie(const char *path, Movie *movie)
     framebuffer_words = (size_t) movie->header.video_width * movie->header.video_height;
     movie->framebuffer = (uint16_t *) calloc(framebuffer_words, sizeof(uint16_t));
     if (movie_uses_h264(movie)) {
-        int h264_ring_index;
+        size_t ring_budget_count;
+        size_t h264_ring_index;
         init_h264_color_tables();
         movie->h264_decoder = h264bsdAlloc();
         if (movie->h264_decoder) {
             memset(movie->h264_decoder, 0, sizeof(*movie->h264_decoder));
         }
         movie->h264_frame_bytes = h264_cropped_frame_bytes(movie);
-        clear_h264_frame_ring(movie);
-        for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_COUNT; ++h264_ring_index) {
+        movie->h264_frame_ring_capacity = 0;
+        ring_budget_count = movie->h264_frame_bytes > 0
+            ? (H264_FRAME_RING_BUDGET_BYTES / movie->h264_frame_bytes)
+            : 0;
+        if (ring_budget_count == 0) {
+            ring_budget_count = 1;
+        }
+        if (ring_budget_count > H264_FRAME_RING_MAX_COUNT) {
+            ring_budget_count = H264_FRAME_RING_MAX_COUNT;
+        }
+        for (h264_ring_index = 0; h264_ring_index < ring_budget_count; ++h264_ring_index) {
             movie->h264_frame_ring[h264_ring_index].data = alloc_aligned_bytes(
                 movie->h264_frame_bytes,
                 H264_FRAME_RING_ALIGNMENT,
                 &movie->h264_frame_ring[h264_ring_index].allocation
             );
             if (!movie->h264_frame_ring[h264_ring_index].data) {
-                debug_failf(
-                    "open failed: h264 frame ring alloc slot=%d bytes=%lu align=%u",
-                    h264_ring_index,
-                    (unsigned long) movie->h264_frame_bytes,
-                    (unsigned) H264_FRAME_RING_ALIGNMENT
-                );
-                return false;
+                break;
             }
+            movie->h264_frame_ring[h264_ring_index].frame_index = UINT32_MAX;
+            movie->h264_frame_ring_capacity++;
+        }
+        clear_h264_frame_ring(movie);
+        if (movie->h264_frame_ring_capacity == 0) {
+            debug_failf(
+                "open failed: h264 frame ring alloc bytes=%lu align=%u budget=%lu",
+                (unsigned long) movie->h264_frame_bytes,
+                (unsigned) H264_FRAME_RING_ALIGNMENT,
+                (unsigned long) H264_FRAME_RING_BUDGET_BYTES
+            );
+            return false;
         }
         if (!movie->framebuffer || !movie->h264_decoder || !reset_h264_decoder(movie)) {
             if (!movie->framebuffer) {
@@ -3621,6 +3837,12 @@ static bool load_movie(const char *path, Movie *movie)
             }
             return false;
         }
+        debug_tracef(
+            "open h264 ring slots=%lu frame_bytes=%lu budget=%lu",
+            (unsigned long) movie->h264_frame_ring_capacity,
+            (unsigned long) movie->h264_frame_bytes,
+            (unsigned long) H264_FRAME_RING_BUDGET_BYTES
+        );
     } else {
         movie->previous_framebuffer = (uint16_t *) calloc(framebuffer_words, sizeof(uint16_t));
         movie->block_scratch = (uint16_t *) malloc(
@@ -4313,8 +4535,8 @@ static void draw_memory_badge(
     format_memory_compact(stats.prefetched_bytes, prefetched_text, sizeof(prefetched_text));
     format_memory_compact(stats.total_bytes, total_text, sizeof(total_text));
     format_memory_compact(stats.free_bytes, free_text, sizeof(free_text));
-    snprintf(label_full, sizeof(label_full), "RAM %s P%s/%s %u%% F%s", app_text, prefetched_text, total_text, stats.percent_used, free_text);
-    snprintf(label_medium, sizeof(label_medium), "RAM %s P%s %u%%", app_text, prefetched_text, stats.percent_used);
+    snprintf(label_full, sizeof(label_full), "RAM %s C%s/%s %u%% F%s", app_text, prefetched_text, total_text, stats.percent_used, free_text);
+    snprintf(label_medium, sizeof(label_medium), "RAM %s C%s %u%%", app_text, prefetched_text, stats.percent_used);
     snprintf(label_short, sizeof(label_short), "RAM %s %u%%", app_text, stats.percent_used);
 
     left_x = playback_badge_visible ? 36 : 8;
