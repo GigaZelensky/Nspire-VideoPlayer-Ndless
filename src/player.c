@@ -342,6 +342,8 @@ static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk);
 static void prefetch_do_work(Movie *movie, int current_chunk, uint32_t deadline_ms);
 static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, uint32_t deadline_ms);
 static int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index);
+static bool next_chunk_needs_prefetch(const Movie *movie, int current_chunk);
+static uint32_t next_chunk_prefetch_guard_frames(const Movie *movie, int current_chunk);
 static size_t active_h264_frame_ring_capacity(const Movie *movie);
 static void discard_h264_frame_ring_before(Movie *movie, uint32_t first_frame_to_keep);
 static void free_fonts(Fonts *fonts);
@@ -1649,6 +1651,7 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
     size_t target;
     size_t heavy_target = 0;
     size_t proximity_bonus = 0;
+    size_t boundary_target = 0;
     uint64_t total_frame_bytes = 0;
     uint32_t sampled_frames = 0;
     uint32_t average_frame_bytes;
@@ -1656,6 +1659,7 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
     uint32_t heavy_hits = 0;
     uint32_t frame_index;
     uint32_t limit;
+    int current_chunk;
 
     if (!movie || movie->current_frame + 1U >= movie->header.frame_count) {
         return 0;
@@ -1714,6 +1718,19 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
         }
     }
 
+    current_chunk = movie_chunk_for_frame(movie, movie->current_frame);
+    if (current_chunk >= 0 &&
+        !next_chunk_needs_prefetch(movie, current_chunk) &&
+        (uint32_t) (current_chunk + 1) < movie->header.chunk_count) {
+        const ChunkIndexEntry *next_entry = movie->chunk_index + current_chunk + 1;
+        uint32_t frames_until_next_chunk = next_entry->first_frame - movie->current_frame;
+        uint32_t guard_frames = next_chunk_prefetch_guard_frames(movie, current_chunk);
+        if (frames_until_next_chunk <= guard_frames) {
+            size_t next_chunk_bonus = next_entry->frame_count > 4U ? 4U : next_entry->frame_count;
+            boundary_target = (size_t) frames_until_next_chunk + next_chunk_bonus;
+        }
+    }
+
     if (spare_ms >= 18U) {
         target += 2U;
     }
@@ -1726,6 +1743,9 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
     target += proximity_bonus;
     if (heavy_target > target) {
         target = heavy_target;
+    }
+    if (boundary_target > target) {
+        target = boundary_target;
     }
     if (target > capacity) {
         target = capacity;
@@ -3681,10 +3701,32 @@ static bool next_chunk_needs_prefetch(const Movie *movie, int current_chunk)
     return true;
 }
 
+static uint32_t next_chunk_prefetch_guard_frames(const Movie *movie, int current_chunk)
+{
+    const ChunkIndexEntry *entry;
+    uint32_t guard_frames = H264_PREFETCH_NEXT_CHUNK_GUARD_FRAMES;
+    int next_chunk = current_chunk + 1;
+
+    if (!movie || current_chunk < 0 || (uint32_t) next_chunk >= movie->header.chunk_count) {
+        return guard_frames;
+    }
+
+    entry = movie->chunk_index + next_chunk;
+    if (entry->unpacked_size >= 768U * 1024U) {
+        guard_frames += 16U;
+    } else if (entry->unpacked_size >= 512U * 1024U) {
+        guard_frames += 8U;
+    } else if (entry->unpacked_size >= 256U * 1024U) {
+        guard_frames += 4U;
+    }
+    return guard_frames;
+}
+
 static bool should_prioritize_next_chunk_io(const Movie *movie, int current_chunk)
 {
     const ChunkIndexEntry *entry;
     uint32_t frames_remaining;
+    uint32_t guard_frames;
 
     if (!movie || current_chunk < 0 || (uint32_t) current_chunk >= movie->header.chunk_count) {
         return false;
@@ -3694,12 +3736,13 @@ static bool should_prioritize_next_chunk_io(const Movie *movie, int current_chun
     }
 
     entry = movie->chunk_index + current_chunk;
+    guard_frames = next_chunk_prefetch_guard_frames(movie, current_chunk);
     if (movie->current_frame < entry->first_frame) {
         return true;
     }
 
     frames_remaining = (entry->first_frame + entry->frame_count) - movie->current_frame;
-    return frames_remaining <= H264_PREFETCH_NEXT_CHUNK_GUARD_FRAMES;
+    return frames_remaining <= guard_frames;
 }
 
 static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, uint32_t deadline_ms)
