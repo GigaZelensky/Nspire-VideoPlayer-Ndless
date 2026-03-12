@@ -34,6 +34,7 @@
 #define POINTER_GAIN_NUM 5
 #define POINTER_GAIN_DEN 4
 #define PREFETCH_FILE_BLOCK_SIZE 32768U
+#define PREFETCH_ACTIVE_FILE_BLOCK_SIZE 8192U
 #define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
 #define PREFETCH_PAUSED_SLICE_MS 12U
 #define PREFETCH_ACTIVE_H264_MIN_SPARE_MS 12U
@@ -51,6 +52,12 @@
 #define H264_PREFETCH_ABOVE_AVG_NUMERATOR 9U
 #define H264_PREFETCH_ABOVE_AVG_DENOMINATOR 8U
 #define H264_PREFETCH_NEAR_WINDOW_FRAMES 24U
+#define H264_PREFETCH_NEXT_CHUNK_GUARD_FRAMES 12U
+#define H264_PREFETCH_IO_PRIORITY_SLICE_MS 4U
+#define H264_PREFETCH_DECODE_GUARD_DEFAULT_MS 24U
+#define H264_PREFETCH_DECODE_GUARD_MIN_MS 18U
+#define H264_PREFETCH_DECODE_GUARD_MAX_MS 40U
+#define FRAME_PACING_SPIN_MS 2U
 #define MONOTONIC_TIMER_VALUE_ADDR 0x900C0004U
 #define MONOTONIC_TIMER_CONTROL_ADDR 0x900C0008U
 #define MONOTONIC_TIMER_CLOCK_SOURCE_ADDR 0x900C0080U
@@ -250,6 +257,8 @@ typedef struct {
     bool h264_headers_ready;
     bool h264_decoder_initialized;
     bool h264_chunk_dirty;
+    uint16_t h264_prefetch_decode_avg_ms;
+    uint16_t h264_prefetch_decode_peak_ms;
     size_t h264_frame_bytes;
     size_t h264_frame_ring_capacity;
     H264FrameSlot h264_frame_ring[H264_FRAME_RING_MAX_COUNT];
@@ -931,6 +940,73 @@ static void reset_playback_timeline(const Movie *movie, const PlaybackRate *play
     *anchor_ticks = now_ticks;
     *anchor_frame = movie->current_frame;
     *next_frame_due_ticks = now_ticks + movie_frame_time_scaled_ticks(movie, 1, playback_rate);
+}
+
+static void record_h264_prefetch_decode_time(Movie *movie, uint32_t elapsed_ms)
+{
+    uint32_t average_ms;
+    uint32_t peak_ms;
+
+    if (!movie) {
+        return;
+    }
+    if (elapsed_ms == 0) {
+        elapsed_ms = 1;
+    }
+
+    average_ms = movie->h264_prefetch_decode_avg_ms;
+    if (average_ms == 0) {
+        average_ms = elapsed_ms;
+    } else {
+        average_ms = ((average_ms * 7U) + elapsed_ms + 4U) / 8U;
+    }
+
+    peak_ms = movie->h264_prefetch_decode_peak_ms;
+    if (elapsed_ms >= peak_ms) {
+        peak_ms = elapsed_ms;
+    } else if (peak_ms > average_ms) {
+        peak_ms--;
+    } else {
+        peak_ms = average_ms;
+    }
+
+    if (average_ms > H264_PREFETCH_DECODE_GUARD_MAX_MS) {
+        average_ms = H264_PREFETCH_DECODE_GUARD_MAX_MS;
+    }
+    if (peak_ms > H264_PREFETCH_DECODE_GUARD_MAX_MS) {
+        peak_ms = H264_PREFETCH_DECODE_GUARD_MAX_MS;
+    }
+
+    movie->h264_prefetch_decode_avg_ms = (uint16_t) average_ms;
+    movie->h264_prefetch_decode_peak_ms = (uint16_t) peak_ms;
+}
+
+static uint32_t h264_prefetch_decode_guard_ms(const Movie *movie)
+{
+    uint32_t average_ms = movie && movie->h264_prefetch_decode_avg_ms
+        ? movie->h264_prefetch_decode_avg_ms
+        : H264_PREFETCH_DECODE_GUARD_DEFAULT_MS;
+    uint32_t peak_ms = movie && movie->h264_prefetch_decode_peak_ms
+        ? movie->h264_prefetch_decode_peak_ms
+        : average_ms;
+    uint32_t guard_ms = average_ms + 4U;
+
+    if (peak_ms > guard_ms) {
+        guard_ms = peak_ms;
+    }
+    if (guard_ms < H264_PREFETCH_DECODE_GUARD_MIN_MS) {
+        guard_ms = H264_PREFETCH_DECODE_GUARD_MIN_MS;
+    }
+    if (guard_ms > H264_PREFETCH_DECODE_GUARD_MAX_MS) {
+        guard_ms = H264_PREFETCH_DECODE_GUARD_MAX_MS;
+    }
+    return guard_ms;
+}
+
+static void wait_until_ticks_precise(uint64_t target_ticks)
+{
+    while ((int64_t) (target_ticks - monotonic_clock_now_ticks()) > 0) {
+    }
 }
 
 static void free_movie_files(MovieFile *files, size_t count)
@@ -3087,11 +3163,12 @@ static PrefetchedChunk *find_prefetch_work_chunk(Movie *movie, int current_chunk
     return best;
 }
 
-static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk)
+static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respect_deadline)
 {
     const ChunkIndexEntry *entry;
     size_t remaining;
     size_t read_size;
+    size_t block_size;
     uint8_t *read_target;
 
     if (!movie || !chunk || chunk->chunk_index < 0) {
@@ -3114,7 +3191,8 @@ static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk)
         return true;
     }
 
-    read_size = remaining > PREFETCH_FILE_BLOCK_SIZE ? PREFETCH_FILE_BLOCK_SIZE : remaining;
+    block_size = respect_deadline ? PREFETCH_ACTIVE_FILE_BLOCK_SIZE : PREFETCH_FILE_BLOCK_SIZE;
+    read_size = remaining > block_size ? block_size : remaining;
     read_target = entry->packed_size == entry->unpacked_size
         ? (chunk->chunk_storage + chunk->read_offset)
         : chunk->input_buffer;
@@ -3213,7 +3291,7 @@ static bool prefetch_process_chunk(Movie *movie, PrefetchedChunk *chunk, uint32_
 {
     while (chunk && chunk->state != PREFETCH_READY) {
         if (chunk->state == PREFETCH_READING) {
-            if (!prefetch_read_step(movie, chunk)) {
+            if (!prefetch_read_step(movie, chunk, respect_deadline)) {
                 return false;
             }
         } else if (chunk->state == PREFETCH_INFLATING) {
@@ -3563,9 +3641,17 @@ static int prefetch_budget_for_state(const Movie *movie, bool paused, uint32_t s
  
 static int prefetch_target_chunk(const Movie *movie)
 {
+    int current_chunk;
+
     if (!movie) {
         return -1;
     }
+
+    current_chunk = movie_chunk_for_frame(movie, movie->current_frame);
+    if (current_chunk >= 0) {
+        return current_chunk;
+    }
+
     if (movie->loaded_chunk < 0) {
         return -1;
     }
@@ -3575,9 +3661,51 @@ static int prefetch_target_chunk(const Movie *movie)
     return movie->loaded_chunk;
 }
 
+static bool next_chunk_needs_prefetch(const Movie *movie, int current_chunk)
+{
+    int index;
+    int next_chunk = current_chunk + 1;
+
+    if (!movie || current_chunk < 0 || (uint32_t) next_chunk >= movie->header.chunk_count) {
+        return false;
+    }
+    if (movie->loaded_chunk == next_chunk) {
+        return false;
+    }
+    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+        const PrefetchedChunk *prefetched = &movie->prefetched[index];
+        if (prefetched->chunk_index == next_chunk) {
+            return prefetched->state != PREFETCH_READY;
+        }
+    }
+    return true;
+}
+
+static bool should_prioritize_next_chunk_io(const Movie *movie, int current_chunk)
+{
+    const ChunkIndexEntry *entry;
+    uint32_t frames_remaining;
+
+    if (!movie || current_chunk < 0 || (uint32_t) current_chunk >= movie->header.chunk_count) {
+        return false;
+    }
+    if (!next_chunk_needs_prefetch(movie, current_chunk)) {
+        return false;
+    }
+
+    entry = movie->chunk_index + current_chunk;
+    if (movie->current_frame < entry->first_frame) {
+        return true;
+    }
+
+    frames_remaining = (entry->first_frame + entry->frame_count) - movie->current_frame;
+    return frames_remaining <= H264_PREFETCH_NEXT_CHUNK_GUARD_FRAMES;
+}
+
 static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, uint32_t deadline_ms)
 {
     size_t target_ready_count;
+    uint32_t decode_guard_ms;
 
     if (!movie || !movie_uses_h264(movie) || movie->header.frame_count == 0 || active_h264_frame_ring_capacity(movie) == 0) {
         return;
@@ -3588,6 +3716,7 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
     if (!paused && spare_ms < H264_PREFETCH_ACTIVE_MIN_SPARE_MS) {
         return;
     }
+    decode_guard_ms = h264_prefetch_decode_guard_ms(movie);
 
     while (h264_frame_ring_ready_count(movie) < target_ready_count) {
         int64_t decoded_frame = h264_decoded_global_frame(movie);
@@ -3596,6 +3725,8 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
             : (movie->current_frame + 1U);
         int next_chunk;
         PrefetchedChunk *prefetched;
+        uint32_t decode_start_ms;
+        uint32_t decode_elapsed_ms;
 
         if (next_frame >= movie->header.frame_count) {
             break;
@@ -3603,6 +3734,12 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
         next_chunk = movie_chunk_for_frame(movie, next_frame);
         if (next_chunk < 0) {
             break;
+        }
+        if (!paused && deadline_ms != 0) {
+            uint32_t now_ms = monotonic_clock_now_ms();
+            if ((int32_t) ((now_ms + decode_guard_ms) - deadline_ms) >= 0) {
+                break;
+            }
         }
         if (!paused && h264_prefetch_deadline_reached(deadline_ms)) {
             break;
@@ -3613,10 +3750,13 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
                 break;
             }
         }
+        decode_start_ms = monotonic_clock_now_ms();
         if (!decode_h264_frame(movie, next_frame, false, true)) {
             debug_tracef("h264 predecode fail frame=%lu", (unsigned long) next_frame);
             break;
         }
+        decode_elapsed_ms = monotonic_clock_now_ms() - decode_start_ms;
+        record_h264_prefetch_decode_time(movie, decode_elapsed_ms);
         if (!paused && h264_prefetch_deadline_reached(deadline_ms)) {
             break;
         }
@@ -3629,10 +3769,26 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
     uint32_t deadline_ms = spare_ms > 0 ? (monotonic_clock_now_ms() + spare_ms) : 0;
     int current_chunk = prefetch_target_chunk(movie);
     int budget = prefetch_budget_for_state(movie, paused, spare_ms);
-    if (!paused && movie_uses_h264(movie) && time_slice_ms > PREFETCH_ACTIVE_H264_SLICE_MS) {
+    bool prioritize_io = false;
+
+    if (!paused && movie_uses_h264(movie) && current_chunk >= 0) {
+        prioritize_io = should_prioritize_next_chunk_io(movie, current_chunk);
+        if (prioritize_io) {
+            if (budget < 1) {
+                budget = 1;
+            }
+            if (time_slice_ms < H264_PREFETCH_IO_PRIORITY_SLICE_MS && spare_ms > 0) {
+                time_slice_ms = spare_ms < H264_PREFETCH_IO_PRIORITY_SLICE_MS
+                    ? spare_ms
+                    : H264_PREFETCH_IO_PRIORITY_SLICE_MS;
+            }
+        }
+    }
+
+    if (!paused && movie_uses_h264(movie) && !prioritize_io && time_slice_ms > PREFETCH_ACTIVE_H264_SLICE_MS) {
         time_slice_ms = PREFETCH_ACTIVE_H264_SLICE_MS;
     }
-    if (movie_uses_h264(movie)) {
+    if (movie_uses_h264(movie) && !prioritize_io) {
         try_grow_h264_frame_ring(movie, paused ? 8U : (spare_ms >= 24U ? 3U : (spare_ms >= 18U ? 2U : 1U)));
         prefetch_h264_frames(movie, paused, spare_ms, deadline_ms);
     }
@@ -3644,6 +3800,7 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
         }
     }
     if (movie_uses_h264(movie) && (!deadline_ms || !h264_prefetch_deadline_reached(deadline_ms))) {
+        try_grow_h264_frame_ring(movie, paused ? 8U : (spare_ms >= 24U ? 3U : (spare_ms >= 18U ? 2U : 1U)));
         prefetch_h264_frames(movie, paused, spare_ms, deadline_ms);
     }
 }
@@ -5961,15 +6118,26 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             uint64_t after_render_ticks = monotonic_clock_now_ticks();
             uint64_t spare_ticks = next_frame_due_ticks > after_render_ticks ? (next_frame_due_ticks - after_render_ticks) : 0;
             uint32_t spare_ms = monotonic_clock_ticks_to_ms(spare_ticks);
+            uint64_t wait_target_ticks = next_frame_due_ticks;
             prefetch_tick(&movie, false, spare_ms);
             after_render_ticks = monotonic_clock_now_ticks();
             spare_ticks = next_frame_due_ticks > after_render_ticks ? (next_frame_due_ticks - after_render_ticks) : 0;
-            uint32_t wait_ms = monotonic_clock_ticks_to_ms(spare_ticks);
-            if (wait_ms > 8) {
-                wait_ms = 8;
-            }
-            if (wait_ms > 0) {
-                msleep(wait_ms);
+            if (spare_ticks > 0) {
+                uint64_t max_wait_ticks = (((uint64_t) monotonic_clock_ticks_per_second()) * 8U) / 1000U;
+                uint32_t wait_ms = monotonic_clock_ticks_to_ms(spare_ticks);
+                if (spare_ticks > max_wait_ticks) {
+                    wait_target_ticks = after_render_ticks + max_wait_ticks;
+                }
+                wait_ms = monotonic_clock_ticks_to_ms(wait_target_ticks - after_render_ticks);
+                if (wait_ms > 8U) {
+                    wait_ms = 8U;
+                }
+                if (wait_ms > FRAME_PACING_SPIN_MS) {
+                    msleep(wait_ms - FRAME_PACING_SPIN_MS);
+                }
+                if (wait_ms > 0) {
+                    wait_until_ticks_precise(wait_target_ticks);
+                }
             }
         }
     }
