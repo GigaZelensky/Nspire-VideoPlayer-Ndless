@@ -83,6 +83,51 @@ extern const u8 h264bsdClip[];
 
 #ifndef H264DEC_OMXDL
 
+static __inline i32 H264SixTapRaw(i32 p0, i32 p1, i32 p2, i32 p3, i32 p4, i32 p5)
+{
+    i32 acc = p0 + p5;
+
+#if defined(__arm__) && !defined(__thumb__)
+    i32 mid = p2 + p3;
+    i32 edge = p1 + p4;
+    i32 twenty = 20;
+    i32 minus_five = -5;
+
+    __asm__ volatile("smlabb %0, %1, %2, %0" : "+r" (acc) : "r" (mid), "r" (twenty));
+    __asm__ volatile("smlabb %0, %1, %2, %0" : "+r" (acc) : "r" (edge), "r" (minus_five));
+#else
+    acc += 20 * (p2 + p3);
+    acc -= 5 * (p1 + p4);
+#endif
+
+    return acc;
+}
+
+static __inline i32 H264SixTapHalf(i32 p0, i32 p1, i32 p2, i32 p3, i32 p4, i32 p5)
+{
+    return 16 + H264SixTapRaw(p0, p1, p2, p3, p4, p5);
+}
+
+static __inline u32 H264PackFourBytes(u8 p0, u8 p1, u8 p2, u8 p3)
+{
+    return (u32) p0 | ((u32) p1 << 8) | ((u32) p2 << 16) | ((u32) p3 << 24);
+}
+
+static __inline void H264StoreFourBytes(u8 *dst, u8 p0, u8 p1, u8 p2, u8 p3)
+{
+    if (((u32) dst & 0x3U) == 0U)
+    {
+        *((u32 *) dst) = H264PackFourBytes(p0, p1, p2, p3);
+    }
+    else
+    {
+        dst[0] = p0;
+        dst[1] = p1;
+        dst[2] = p2;
+        dst[3] = p3;
+    }
+}
+
 /*------------------------------------------------------------------------------
 
     Function: h264bsdInterpolateChromaHor
@@ -498,15 +543,14 @@ void h264bsdInterpolateVerHalf(
   u32 partHeight)
 {
     u32 p1[21*21/4+1];
-    u32 i, j;
-    i32 tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7;
-    u8 *ptrC, *ptrV;
+    u32 x, y;
     const u8 *clp = h264bsdClip + 512;
 
     /* Code */
 
     ASSERT(ref);
     ASSERT(mb);
+    ASSERT((partWidth & 0x3U) == 0U);
 
     if ((x0 < 0) || ((u32)x0+partWidth > width) ||
         (y0 < 0) || ((u32)y0+partHeight+5 > height))
@@ -522,73 +566,24 @@ void h264bsdInterpolateVerHalf(
 
     ref += (u32)y0 * width + (u32)x0;
 
-    ptrC = ref + width;
-    ptrV = ptrC + 5*width;
-
-    /* 4 pixels per iteration, interpolate using 5 vertical samples */
-    for (i = (partHeight >> 2); i; i--)
+    for (y = 0; y < partHeight; ++y)
     {
-        /* h1 = (16 + A + 16(G+M) + 4(G+M) - 4(C+R) - (C+R) + T) >> 5 */
-        for (j = partWidth; j; j--)
+        const u8 *row0 = ref + (y * width);
+        const u8 *row1 = row0 + width;
+        const u8 *row2 = row1 + width;
+        const u8 *row3 = row2 + width;
+        const u8 *row4 = row3 + width;
+        const u8 *row5 = row4 + width;
+        u8 *dst = mb + (y * 16U);
+
+        for (x = 0; x < partWidth; x += 4U)
         {
-            tmp4 = ptrV[-(i32)width*2];
-            tmp5 = ptrV[-(i32)width];
-            tmp1 = ptrV[width];
-            tmp2 = ptrV[width*2];
-            tmp6 = *ptrV++;
-
-            tmp7 = tmp4 + tmp1;
-            tmp2 -= (tmp7 << 2);
-            tmp2 -= tmp7;
-            tmp2 += 16;
-            tmp7 = tmp5 + tmp6;
-            tmp3 = ptrC[width*2];
-            tmp2 += (tmp7 << 4);
-            tmp2 += (tmp7 << 2);
-            tmp2 += tmp3;
-            tmp2 = clp[tmp2>>5];
-            tmp1 += 16;
-            mb[48] = (u8)tmp2;
-
-            tmp7 = tmp3 + tmp6;
-            tmp1 -= (tmp7 << 2);
-            tmp1 -= tmp7;
-            tmp7 = tmp4 + tmp5;
-            tmp2 = ptrC[width];
-            tmp1 += (tmp7 << 4);
-            tmp1 += (tmp7 << 2);
-            tmp1 += tmp2;
-            tmp1 = clp[tmp1>>5];
-            tmp6 += 16;
-            mb[32] = (u8)tmp1;
-
-            tmp7 = tmp2 + tmp5;
-            tmp6 -= (tmp7 << 2);
-            tmp6 -= tmp7;
-            tmp7 = tmp4 + tmp3;
-            tmp1 = *ptrC;
-            tmp6 += (tmp7 << 4);
-            tmp6 += (tmp7 << 2);
-            tmp6 += tmp1;
-            tmp6 = clp[tmp6>>5];
-            tmp5 += 16;
-            mb[16] = (u8)tmp6;
-
-            tmp1 += tmp4;
-            tmp5 -= (tmp1 << 2);
-            tmp5 -= tmp1;
-            tmp3 += tmp2;
-            tmp6 = ptrC[-(i32)width];
-            tmp5 += (tmp3 << 4);
-            tmp5 += (tmp3 << 2);
-            tmp5 += tmp6;
-            tmp5 = clp[tmp5>>5];
-            *mb++ = (u8)tmp5;
-            ptrC++;
+            u8 p0 = clp[H264SixTapHalf(row0[x], row1[x], row2[x], row3[x], row4[x], row5[x]) >> 5];
+            u8 p1 = clp[H264SixTapHalf(row0[x + 1U], row1[x + 1U], row2[x + 1U], row3[x + 1U], row4[x + 1U], row5[x + 1U]) >> 5];
+            u8 p2 = clp[H264SixTapHalf(row0[x + 2U], row1[x + 2U], row2[x + 2U], row3[x + 2U], row4[x + 2U], row5[x + 2U]) >> 5];
+            u8 p3 = clp[H264SixTapHalf(row0[x + 3U], row1[x + 3U], row2[x + 3U], row3[x + 3U], row4[x + 3U], row5[x + 3U]) >> 5];
+            H264StoreFourBytes(dst + x, p0, p1, p2, p3);
         }
-        ptrC += 4*width - partWidth;
-        ptrV += 4*width - partWidth;
-        mb += 4*16 - partWidth;
     }
 
 }
@@ -750,9 +745,7 @@ void h264bsdInterpolateHorHalf(
   u32 partHeight)
 {
     u32 p1[21*21/4+1];
-    u8 *ptrJ;
     u32 x, y;
-    i32 tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7;
     const u8 *clp = h264bsdClip + 512;
 
     /* Code */
@@ -776,76 +769,19 @@ void h264bsdInterpolateHorHalf(
 
     ref += (u32)y0 * width + (u32)x0;
 
-    ptrJ = ref + 5;
-
-    for (y = partHeight; y; y--)
+    for (y = 0; y < partHeight; ++y)
     {
-        tmp6 = *(ptrJ - 5);
-        tmp5 = *(ptrJ - 4);
-        tmp4 = *(ptrJ - 3);
-        tmp3 = *(ptrJ - 2);
-        tmp2 = *(ptrJ - 1);
+        const u8 *src = ref + (y * width);
+        u8 *dst = mb + (y * 16U);
 
-        /* calculate 4 pels per iteration */
-        for (x = (partWidth >> 2); x; x--)
+        for (x = 0; x < partWidth; x += 4U)
         {
-            /* First pixel */
-            tmp6 += 16;
-            tmp7 = tmp3 + tmp4;
-            tmp6 += (tmp7 << 4);
-            tmp6 += (tmp7 << 2);
-            tmp7 = tmp2 + tmp5;
-            tmp1 = *ptrJ++;
-            tmp6 -= (tmp7 << 2);
-            tmp6 -= tmp7;
-            tmp6 += tmp1;
-            tmp6 = clp[tmp6>>5];
-            /* Second pixel */
-            tmp5 += 16;
-            tmp7 = tmp2 + tmp3;
-            *mb++ = (u8)tmp6;
-            tmp5 += (tmp7 << 4);
-            tmp5 += (tmp7 << 2);
-            tmp7 = tmp1 + tmp4;
-            tmp6 = *ptrJ++;
-            tmp5 -= (tmp7 << 2);
-            tmp5 -= tmp7;
-            tmp5 += tmp6;
-            tmp5 = clp[tmp5>>5];
-            /* Third pixel */
-            tmp4 += 16;
-            tmp7 = tmp1 + tmp2;
-            *mb++ = (u8)tmp5;
-            tmp4 += (tmp7 << 4);
-            tmp4 += (tmp7 << 2);
-            tmp7 = tmp6 + tmp3;
-            tmp5 = *ptrJ++;
-            tmp4 -= (tmp7 << 2);
-            tmp4 -= tmp7;
-            tmp4 += tmp5;
-            tmp4 = clp[tmp4>>5];
-            /* Fourth pixel */
-            tmp3 += 16;
-            tmp7 = tmp6 + tmp1;
-            *mb++ = (u8)tmp4;
-            tmp3 += (tmp7 << 4);
-            tmp3 += (tmp7 << 2);
-            tmp7 = tmp5 + tmp2;
-            tmp4 = *ptrJ++;
-            tmp3 -= (tmp7 << 2);
-            tmp3 -= tmp7;
-            tmp3 += tmp4;
-            tmp3 = clp[tmp3>>5];
-            tmp7 = tmp4;
-            tmp4 = tmp6;
-            tmp6 = tmp2;
-            tmp2 = tmp7;
-            *mb++ = (u8)tmp3;
-            tmp3 = tmp5;
-            tmp5 = tmp1;
+            u8 p0 = clp[H264SixTapHalf(src[x], src[x + 1U], src[x + 2U], src[x + 3U], src[x + 4U], src[x + 5U]) >> 5];
+            u8 p1 = clp[H264SixTapHalf(src[x + 1U], src[x + 2U], src[x + 3U], src[x + 4U], src[x + 5U], src[x + 6U]) >> 5];
+            u8 p2 = clp[H264SixTapHalf(src[x + 2U], src[x + 3U], src[x + 4U], src[x + 5U], src[x + 6U], src[x + 7U]) >> 5];
+            u8 p3 = clp[H264SixTapHalf(src[x + 3U], src[x + 4U], src[x + 5U], src[x + 6U], src[x + 7U], src[x + 8U]) >> 5];
+            H264StoreFourBytes(dst + x, p0, p1, p2, p3);
         }
-        ptrJ += width - partWidth;
-        mb += 16 - partWidth;
     }
 
 }
@@ -1218,10 +1154,8 @@ void h264bsdInterpolateMidHalf(
 {
     u32 p1[21*21/4+1];
     u32 x, y;
-    i32 tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7;
-    i32 *ptrC, *ptrV, *b1;
-    u8  *ptrJ;
-    i32 table[21*16];
+    i32 *table_ptr;
+    i32 table[21 * 16];
     const u8 *clp = h264bsdClip + 512;
 
     /* Code */
@@ -1243,140 +1177,37 @@ void h264bsdInterpolateMidHalf(
 
     ref += (u32)y0 * width + (u32)x0;
 
-    b1 = table;
-    ptrJ = ref + 5;
-
-    /* First step: calculate intermediate values for
-     * horizontal interpolation */
-    for (y = partHeight + 5; y; y--)
+    table_ptr = table;
+    for (y = 0; y < partHeight + 5U; ++y)
     {
-        tmp6 = *(ptrJ - 5);
-        tmp5 = *(ptrJ - 4);
-        tmp4 = *(ptrJ - 3);
-        tmp3 = *(ptrJ - 2);
-        tmp2 = *(ptrJ - 1);
+        const u8 *src = ref + (y * width);
 
-        /* 4 pels per iteration */
-        for (x = (partWidth >> 2); x; x--)
+        for (x = 0; x < partWidth; ++x)
         {
-            /* First pixel */
-            tmp7 = tmp3 + tmp4;
-            tmp6 += (tmp7 << 4);
-            tmp6 += (tmp7 << 2);
-            tmp7 = tmp2 + tmp5;
-            tmp1 = *ptrJ++;
-            tmp6 -= (tmp7 << 2);
-            tmp6 -= tmp7;
-            tmp6 += tmp1;
-            *b1++ = tmp6;
-            /* Second pixel */
-            tmp7 = tmp2 + tmp3;
-            tmp5 += (tmp7 << 4);
-            tmp5 += (tmp7 << 2);
-            tmp7 = tmp1 + tmp4;
-            tmp6 = *ptrJ++;
-            tmp5 -= (tmp7 << 2);
-            tmp5 -= tmp7;
-            tmp5 += tmp6;
-            *b1++ = tmp5;
-            /* Third pixel */
-            tmp7 = tmp1 + tmp2;
-            tmp4 += (tmp7 << 4);
-            tmp4 += (tmp7 << 2);
-            tmp7 = tmp6 + tmp3;
-            tmp5 = *ptrJ++;
-            tmp4 -= (tmp7 << 2);
-            tmp4 -= tmp7;
-            tmp4 += tmp5;
-            *b1++ = tmp4;
-            /* Fourth pixel */
-            tmp7 = tmp6 + tmp1;
-            tmp3 += (tmp7 << 4);
-            tmp3 += (tmp7 << 2);
-            tmp7 = tmp5 + tmp2;
-            tmp4 = *ptrJ++;
-            tmp3 -= (tmp7 << 2);
-            tmp3 -= tmp7;
-            tmp3 += tmp4;
-            *b1++ = tmp3;
-            tmp7 = tmp4;
-            tmp4 = tmp6;
-            tmp6 = tmp2;
-            tmp2 = tmp7;
-            tmp3 = tmp5;
-            tmp5 = tmp1;
+            *table_ptr++ = H264SixTapRaw(src[x], src[x + 1U], src[x + 2U],
+                                         src[x + 3U], src[x + 4U], src[x + 5U]);
         }
-        ptrJ += width - partWidth;
     }
 
-    /* Second step: calculate vertical interpolation */
-    ptrC = table + partWidth;
-    ptrV = ptrC + 5*partWidth;
-    for (y = (partHeight >> 2); y; y--)
+    for (y = 0; y < partHeight; ++y)
     {
-        /* 4 pels per iteration */
-        for (x = partWidth; x; x--)
+        const i32 *row0 = table + (y * partWidth);
+        const i32 *row1 = row0 + partWidth;
+        const i32 *row2 = row1 + partWidth;
+        const i32 *row3 = row2 + partWidth;
+        const i32 *row4 = row3 + partWidth;
+        const i32 *row5 = row4 + partWidth;
+        u8 *dst = mb + (y * 16U);
+
+        for (x = 0; x < partWidth; x += 4U)
         {
-            tmp4 = ptrV[-(i32)partWidth*2];
-            tmp5 = ptrV[-(i32)partWidth];
-            tmp1 = ptrV[partWidth];
-            tmp2 = ptrV[partWidth*2];
-            tmp6 = *ptrV++;
-
-            tmp7 = tmp4 + tmp1;
-            tmp2 -= (tmp7 << 2);
-            tmp2 -= tmp7;
-            tmp2 += 512;
-            tmp7 = tmp5 + tmp6;
-            tmp3 = ptrC[partWidth*2];
-            tmp2 += (tmp7 << 4);
-            tmp2 += (tmp7 << 2);
-            tmp2 += tmp3;
-            tmp7 = clp[tmp2>>10];
-            tmp1 += 512;
-            mb[48] = (u8)tmp7;
-
-            tmp7 = tmp3 + tmp6;
-            tmp1 -= (tmp7 << 2);
-            tmp1 -= tmp7;
-            tmp7 = tmp4 + tmp5;
-            tmp2 = ptrC[partWidth];
-            tmp1 += (tmp7 << 4);
-            tmp1 += (tmp7 << 2);
-            tmp1 += tmp2;
-            tmp7 = clp[tmp1>>10];
-            tmp6 += 512;
-            mb[32] = (u8)tmp7;
-
-            tmp1 = *ptrC;
-            tmp7 = tmp2 + tmp5;
-            tmp6 -= (tmp7 << 2);
-            tmp6 -= tmp7;
-            tmp7 = tmp4 + tmp3;
-            tmp6 += (tmp7 << 4);
-            tmp6 += (tmp7 << 2);
-            tmp6 += tmp1;
-            tmp7 = clp[tmp6>>10];
-            tmp5 += 512;
-            mb[16] = (u8)tmp7;
-
-            tmp6 = ptrC[-(i32)partWidth];
-            tmp1 += tmp4;
-            tmp5 -= (tmp1 << 2);
-            tmp5 -= tmp1;
-            tmp3 += tmp2;
-            tmp5 += (tmp3 << 4);
-            tmp5 += (tmp3 << 2);
-            tmp5 += tmp6;
-            tmp7 = clp[tmp5>>10];
-            *mb++ = (u8)tmp7;
-            ptrC++;
+            u8 p0 = clp[(512 + H264SixTapRaw(row0[x], row1[x], row2[x], row3[x], row4[x], row5[x])) >> 10];
+            u8 p1 = clp[(512 + H264SixTapRaw(row0[x + 1U], row1[x + 1U], row2[x + 1U], row3[x + 1U], row4[x + 1U], row5[x + 1U])) >> 10];
+            u8 p2 = clp[(512 + H264SixTapRaw(row0[x + 2U], row1[x + 2U], row2[x + 2U], row3[x + 2U], row4[x + 2U], row5[x + 2U])) >> 10];
+            u8 p3 = clp[(512 + H264SixTapRaw(row0[x + 3U], row1[x + 3U], row2[x + 3U], row3[x + 3U], row4[x + 3U], row5[x + 3U])) >> 10];
+            H264StoreFourBytes(dst + x, p0, p1, p2, p3);
         }
-        mb += 4*16 - partWidth;
-        ptrC += 3*partWidth;
-        ptrV += 3*partWidth;
     }
-
 }
 
 

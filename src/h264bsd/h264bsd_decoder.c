@@ -472,7 +472,11 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
 
     if (picReady)
     {
-        /* Loop filtering is intentionally disabled for CX II playback speed. */
+        if (pStorage->validSliceInAccessUnit &&
+            IS_I_SLICE(pStorage->sliceHeader->sliceType))
+        {
+            h264bsdFilterPicture(pStorage->currImage, pStorage->mb);
+        }
 
         h264bsdResetStorage(pStorage);
 

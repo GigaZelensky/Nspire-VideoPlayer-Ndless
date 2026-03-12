@@ -83,6 +83,8 @@ static void GetPredictionMv(mv_t *mv, interNeighbour_t *a, u32 refIndex);
 #ifndef H264DEC_OMXDL
 static void CopyZeroMotionMacroblock(u8 *data, image_t *refPic, u32 col, u32 row);
 static u32 HasInterResidual(const macroblockLayer_t *pMbLayer);
+static void CopyAligned16Bytes(u8 *dst, const u8 *src);
+static void CopyAligned8Bytes(u8 *dst, const u8 *src);
 #endif
 
 static const neighbour_t N_A_SUB_PART[4][4][4] = {
@@ -182,6 +184,42 @@ static u32 HasInterResidual(const macroblockLayer_t *pMbLayer)
     return HANTRO_FALSE;
 }
 
+static void CopyAligned16Bytes(u8 *dst, const u8 *src)
+{
+#if defined(__arm__) && !defined(__thumb__)
+    if ((((u32) dst | (u32) src) & 0x3U) == 0U)
+    {
+        __asm__ volatile(
+            "ldmia %0, {r0, r1, r2, r3}\n\t"
+            "stmia %1, {r0, r1, r2, r3}\n\t"
+            :
+            : "r" (src), "r" (dst)
+            : "r0", "r1", "r2", "r3", "memory"
+        );
+        return;
+    }
+#endif
+    __builtin_memcpy(dst, src, 16U);
+}
+
+static void CopyAligned8Bytes(u8 *dst, const u8 *src)
+{
+#if defined(__arm__) && !defined(__thumb__)
+    if ((((u32) dst | (u32) src) & 0x3U) == 0U)
+    {
+        __asm__ volatile(
+            "ldmia %0, {r0, r1}\n\t"
+            "stmia %1, {r0, r1}\n\t"
+            :
+            : "r" (src), "r" (dst)
+            : "r0", "r1", "memory"
+        );
+        return;
+    }
+#endif
+    __builtin_memcpy(dst, src, 8U);
+}
+
 static void CopyZeroMotionMacroblock(u8 *data, image_t *refPic, u32 col, u32 row)
 {
     const u32 luma_stride = refPic->width * 16U;
@@ -197,11 +235,11 @@ static void CopyZeroMotionMacroblock(u8 *data, image_t *refPic, u32 col, u32 row
     u32 i;
 
     for (i = 0; i < 16U; ++i) {
-        __builtin_memcpy(dst_luma + (i * 16U), src_luma + (i * luma_stride), 16U);
+        CopyAligned16Bytes(dst_luma + (i * 16U), src_luma + (i * luma_stride));
     }
     for (i = 0; i < 8U; ++i) {
-        __builtin_memcpy(dst_cb + (i * 8U), src_cb + (i * chroma_stride), 8U);
-        __builtin_memcpy(dst_cr + (i * 8U), src_cr + (i * chroma_stride), 8U);
+        CopyAligned8Bytes(dst_cb + (i * 8U), src_cb + (i * chroma_stride));
+        CopyAligned8Bytes(dst_cr + (i * 8U), src_cr + (i * chroma_stride));
     }
 }
 #endif
