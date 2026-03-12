@@ -64,6 +64,7 @@
 #define H264_PREFETCH_ACTIVE_MAX_DECODES_PER_TICK 1U
 #define H264_PREFETCH_ACTIVE_MAX_DECODES_RECOVERY 2U
 #define H264_PREFETCH_NEXT_CHUNK_GUARD_FRAMES 12U
+#define H264_PREFETCH_NEXT_CHUNK_BRIDGE_FRAMES 6U
 #define H264_PREFETCH_IO_PRIORITY_SLICE_MS 4U
 #define H264_PREFETCH_DECODE_GUARD_DEFAULT_MS 24U
 #define H264_PREFETCH_DECODE_GUARD_MIN_MS 18U
@@ -2043,7 +2044,9 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
         uint32_t frames_until_next_chunk = next_entry->first_frame - movie->current_frame;
         uint32_t guard_frames = next_chunk_prefetch_guard_frames(movie, current_chunk);
         if (frames_until_next_chunk <= guard_frames) {
-            size_t next_chunk_bonus = next_entry->frame_count > 4U ? 4U : next_entry->frame_count;
+            size_t next_chunk_bonus = next_entry->frame_count > H264_PREFETCH_NEXT_CHUNK_BRIDGE_FRAMES
+                ? H264_PREFETCH_NEXT_CHUNK_BRIDGE_FRAMES
+                : next_entry->frame_count;
             boundary_target = (size_t) frames_until_next_chunk + next_chunk_bonus;
         }
     }
@@ -4170,6 +4173,34 @@ static bool should_prioritize_next_chunk_io(const Movie *movie, int current_chun
     return frames_remaining <= guard_frames;
 }
 
+static bool h264_can_bridge_next_chunk(const Movie *movie, int current_chunk, uint32_t next_frame)
+{
+    const ChunkIndexEntry *current_entry;
+    const ChunkIndexEntry *next_entry;
+    uint32_t frames_remaining;
+    uint32_t bridge_frames;
+
+    if (!movie || current_chunk < 0 || (uint32_t) (current_chunk + 1) >= movie->header.chunk_count) {
+        return false;
+    }
+
+    current_entry = movie->chunk_index + current_chunk;
+    next_entry = current_entry + 1;
+    if (movie->current_frame < current_entry->first_frame || next_frame < next_entry->first_frame) {
+        return false;
+    }
+
+    frames_remaining = (current_entry->first_frame + current_entry->frame_count) - movie->current_frame;
+    if (frames_remaining > next_chunk_prefetch_guard_frames(movie, current_chunk)) {
+        return false;
+    }
+
+    bridge_frames = next_entry->frame_count > H264_PREFETCH_NEXT_CHUNK_BRIDGE_FRAMES
+        ? H264_PREFETCH_NEXT_CHUNK_BRIDGE_FRAMES
+        : next_entry->frame_count;
+    return next_frame < next_entry->first_frame + bridge_frames;
+}
+
 static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, uint32_t deadline_ms)
 {
     size_t target_ready_count;
@@ -4215,7 +4246,10 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
             break;
         }
         if (!paused && playback_chunk >= 0 && next_chunk != playback_chunk) {
-            break;
+            if (next_chunk != playback_chunk + 1 ||
+                !h264_can_bridge_next_chunk(movie, playback_chunk, next_frame)) {
+                break;
+            }
         }
         if (!paused && deadline_ms != 0) {
             uint32_t now_ms = monotonic_clock_now_ms();
