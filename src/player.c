@@ -46,12 +46,20 @@
 #define H264_PREFETCH_ACTIVE_GUARD_MS 2U
 #define H264_PREFETCH_MIN_READY_FRAMES 10U
 #define H264_PREFETCH_LOOKAHEAD_FRAMES 128U
+#define H264_PREFETCH_ACTIVE_SCAN_MIN_FRAMES 40U
+#define H264_PREFETCH_ACTIVE_SCAN_MID_FRAMES 56U
+#define H264_PREFETCH_ACTIVE_SCAN_MAX_FRAMES 72U
 #define H264_PREFETCH_HEAVY_FRAME_BYTES 8192U
 #define H264_PREFETCH_VERY_HEAVY_FRAME_BYTES 12288U
 #define H264_PREFETCH_AVG_MIN_FRAME_BYTES 2048U
 #define H264_PREFETCH_ABOVE_AVG_NUMERATOR 9U
 #define H264_PREFETCH_ABOVE_AVG_DENOMINATOR 8U
 #define H264_PREFETCH_NEAR_WINDOW_FRAMES 24U
+#define H264_PREFETCH_ACTIVE_READY_BASE 14U
+#define H264_PREFETCH_ACTIVE_READY_MID 18U
+#define H264_PREFETCH_ACTIVE_READY_HIGH 22U
+#define H264_PREFETCH_ACTIVE_READY_MAX 28U
+#define H264_PREFETCH_MAX_PROXIMITY_BONUS 4U
 #define H264_PREFETCH_NEXT_CHUNK_GUARD_FRAMES 12U
 #define H264_PREFETCH_IO_PRIORITY_SLICE_MS 4U
 #define H264_PREFETCH_DECODE_GUARD_DEFAULT_MS 24U
@@ -1457,21 +1465,31 @@ static void discard_h264_frame_ring_before(Movie *movie, uint32_t first_frame_to
     }
 }
 
-static size_t h264_frame_ring_ready_count(const Movie *movie)
+static size_t h264_frame_ring_contiguous_ready_count(const Movie *movie)
 {
     size_t count = 0;
-    size_t index;
+    uint32_t frame_index;
 
     if (!movie) {
         return 0;
     }
 
-    for (index = 0; index < active_h264_frame_ring_capacity(movie); ++index) {
-        if (movie->h264_frame_ring[index].valid &&
-            movie->h264_frame_ring[index].frame_index > movie->current_frame) {
-            count++;
+    for (frame_index = movie->current_frame + 1U; frame_index < movie->header.frame_count; ++frame_index) {
+        size_t index;
+        bool found = false;
+        for (index = 0; index < active_h264_frame_ring_capacity(movie); ++index) {
+            if (movie->h264_frame_ring[index].valid &&
+                movie->h264_frame_ring[index].frame_index == frame_index) {
+                found = true;
+                break;
+            }
         }
+        if (!found) {
+            break;
+        }
+        count++;
     }
+
     return count;
 }
 
@@ -1645,6 +1663,40 @@ static uint32_t estimate_h264_frame_bytes(const Movie *movie, uint32_t frame_ind
     return estimate_h264_chunk_average_frame_bytes(movie, entry);
 }
 
+static uint32_t h264_prefetch_active_scan_frames(uint32_t spare_ms)
+{
+    if (spare_ms >= 28U) {
+        return H264_PREFETCH_ACTIVE_SCAN_MAX_FRAMES;
+    }
+    if (spare_ms >= 20U) {
+        return H264_PREFETCH_ACTIVE_SCAN_MID_FRAMES;
+    }
+    return H264_PREFETCH_ACTIVE_SCAN_MIN_FRAMES;
+}
+
+static size_t h264_prefetch_active_ready_cap(const Movie *movie, uint32_t spare_ms)
+{
+    size_t cap = H264_PREFETCH_ACTIVE_READY_BASE;
+
+    if (!movie) {
+        return 0;
+    }
+
+    if (spare_ms >= 18U) {
+        cap = H264_PREFETCH_ACTIVE_READY_MID;
+    }
+    if (spare_ms >= 24U) {
+        cap = H264_PREFETCH_ACTIVE_READY_HIGH;
+    }
+    if (spare_ms >= 32U) {
+        cap = H264_PREFETCH_ACTIVE_READY_MAX;
+    }
+    if (cap > active_h264_frame_ring_capacity(movie)) {
+        cap = active_h264_frame_ring_capacity(movie);
+    }
+    return cap;
+}
+
 static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spare_ms)
 {
     size_t capacity;
@@ -1652,6 +1704,8 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
     size_t heavy_target = 0;
     size_t proximity_bonus = 0;
     size_t boundary_target = 0;
+    size_t contiguous_ready;
+    size_t active_cap;
     uint64_t total_frame_bytes = 0;
     uint32_t sampled_frames = 0;
     uint32_t average_frame_bytes;
@@ -1659,6 +1713,7 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
     uint32_t heavy_hits = 0;
     uint32_t frame_index;
     uint32_t limit;
+    uint32_t scan_frames;
     int current_chunk;
 
     if (!movie || movie->current_frame + 1U >= movie->header.frame_count) {
@@ -1675,7 +1730,21 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
         target = capacity;
     }
 
-    limit = movie->current_frame + H264_PREFETCH_LOOKAHEAD_FRAMES + 1U;
+    contiguous_ready = h264_frame_ring_contiguous_ready_count(movie);
+    active_cap = h264_prefetch_active_ready_cap(movie, spare_ms);
+    if (active_cap < target) {
+        active_cap = target;
+    }
+
+    scan_frames = h264_prefetch_active_scan_frames(spare_ms);
+    if (contiguous_ready + 8U < target && scan_frames < H264_PREFETCH_ACTIVE_SCAN_MID_FRAMES) {
+        scan_frames = H264_PREFETCH_ACTIVE_SCAN_MID_FRAMES;
+    }
+    if (scan_frames > H264_PREFETCH_LOOKAHEAD_FRAMES) {
+        scan_frames = H264_PREFETCH_LOOKAHEAD_FRAMES;
+    }
+
+    limit = movie->current_frame + scan_frames + 1U;
     if (limit > movie->header.frame_count) {
         limit = movie->header.frame_count;
     }
@@ -1712,7 +1781,7 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
             if (distance <= H264_PREFETCH_NEAR_WINDOW_FRAMES) {
                 proximity_bonus++;
             }
-            if (frame_bytes >= H264_PREFETCH_VERY_HEAVY_FRAME_BYTES || heavy_hits >= 4U) {
+            if (frame_bytes >= H264_PREFETCH_VERY_HEAVY_FRAME_BYTES || heavy_hits >= 3U) {
                 break;
             }
         }
@@ -1740,12 +1809,18 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
     if (spare_ms >= 32U) {
         target += 8U;
     }
+    if (proximity_bonus > H264_PREFETCH_MAX_PROXIMITY_BONUS) {
+        proximity_bonus = H264_PREFETCH_MAX_PROXIMITY_BONUS;
+    }
     target += proximity_bonus;
     if (heavy_target > target) {
         target = heavy_target;
     }
     if (boundary_target > target) {
         target = boundary_target;
+    }
+    if (target > active_cap && boundary_target <= active_cap) {
+        target = active_cap;
     }
     if (target > capacity) {
         target = capacity;
@@ -3761,7 +3836,7 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
     }
     decode_guard_ms = h264_prefetch_decode_guard_ms(movie);
 
-    while (h264_frame_ring_ready_count(movie) < target_ready_count) {
+    while (h264_frame_ring_contiguous_ready_count(movie) < target_ready_count) {
         int64_t decoded_frame = h264_decoded_global_frame(movie);
         uint32_t next_frame = (decoded_frame >= (int64_t) movie->current_frame)
             ? ((uint32_t) decoded_frame + 1U)
