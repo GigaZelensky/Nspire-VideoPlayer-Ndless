@@ -472,12 +472,6 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
 
     if (picReady)
     {
-        if (pStorage->validSliceInAccessUnit &&
-            IS_I_SLICE(pStorage->sliceHeader->sliceType))
-        {
-            h264bsdFilterPicture(pStorage->currImage, pStorage->mb);
-        }
-
         h264bsdResetStorage(pStorage);
 
          picOrderCnt = h264bsdDecodePicOrderCnt(pStorage->poc,

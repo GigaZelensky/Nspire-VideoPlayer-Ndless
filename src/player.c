@@ -1746,25 +1746,6 @@ static inline uint32_t h264_pack_rgb565_pair(uint16_t left_pixel, uint16_t right
     return ((uint32_t) right_pixel << 16) | left_pixel;
 }
 
-static inline uint16_t h264_pack_rgb565_pixel(
-    const int32_t *restrict y_base,
-    const uint16_t *restrict red565,
-    const uint16_t *restrict green565,
-    const uint16_t *restrict blue565,
-    uint8_t y_sample,
-    int32_t chroma_red,
-    int32_t chroma_green,
-    int32_t chroma_blue
-)
-{
-    const int32_t luma = y_base[y_sample];
-    const uint8_t red = h264_clip_byte((luma + chroma_red) >> 8);
-    const uint8_t green = h264_clip_byte((luma + chroma_green) >> 8);
-    const uint8_t blue = h264_clip_byte((luma + chroma_blue) >> 8);
-
-    return (uint16_t) (red565[red] | green565[green] | blue565[blue]);
-}
-
 static bool blit_h264_planes_to_framebuffer(
     Movie *movie,
     const uint8_t *restrict y_plane,
@@ -1797,43 +1778,85 @@ static bool blit_h264_planes_to_framebuffer(
         for (x = 0; x < main_width; x += 4U) {
             const size_t chroma_index = x / 2U;
             const size_t dst_index = x / 2U;
-            int32_t chroma_red0;
-            int32_t chroma_green0;
-            int32_t chroma_blue0;
-            int32_t chroma_red1;
-            int32_t chroma_green1;
-            int32_t chroma_blue1;
+            int32_t r0;
+            int32_t g0;
+            int32_t b0;
+            int32_t r1;
+            int32_t g1;
+            int32_t b1;
             uint16_t p0;
             uint16_t p1;
             uint16_t p2;
             uint16_t p3;
+            int32_t luma0;
+            int32_t luma1;
 
             h264_compute_chroma_terms(
                 u_row[chroma_index],
                 v_row[chroma_index],
-                &chroma_red0,
-                &chroma_green0,
-                &chroma_blue0
+                &r0,
+                &g0,
+                &b0
             );
             h264_compute_chroma_terms(
                 u_row[chroma_index + 1U],
                 v_row[chroma_index + 1U],
-                &chroma_red1,
-                &chroma_green1,
-                &chroma_blue1
+                &r1,
+                &g1,
+                &b1
             );
 
-            p0 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row0[x], chroma_red0, chroma_green0, chroma_blue0);
-            p1 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row0[x + 1U], chroma_red0, chroma_green0, chroma_blue0);
-            p2 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row0[x + 2U], chroma_red1, chroma_green1, chroma_blue1);
-            p3 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row0[x + 3U], chroma_red1, chroma_green1, chroma_blue1);
+            luma0 = y_base[y_row0[x]];
+            luma1 = y_base[y_row0[x + 1U]];
+            p0 = (uint16_t) (
+                red565[h264_clip_byte((luma0 + r0) >> 8)] |
+                green565[h264_clip_byte((luma0 + g0) >> 8)] |
+                blue565[h264_clip_byte((luma0 + b0) >> 8)]
+            );
+            p1 = (uint16_t) (
+                red565[h264_clip_byte((luma1 + r0) >> 8)] |
+                green565[h264_clip_byte((luma1 + g0) >> 8)] |
+                blue565[h264_clip_byte((luma1 + b0) >> 8)]
+            );
+            luma0 = y_base[y_row0[x + 2U]];
+            luma1 = y_base[y_row0[x + 3U]];
+            p2 = (uint16_t) (
+                red565[h264_clip_byte((luma0 + r1) >> 8)] |
+                green565[h264_clip_byte((luma0 + g1) >> 8)] |
+                blue565[h264_clip_byte((luma0 + b1) >> 8)]
+            );
+            p3 = (uint16_t) (
+                red565[h264_clip_byte((luma1 + r1) >> 8)] |
+                green565[h264_clip_byte((luma1 + g1) >> 8)] |
+                blue565[h264_clip_byte((luma1 + b1) >> 8)]
+            );
             dst_row0[dst_index] = h264_pack_rgb565_pair(p0, p1);
             dst_row0[dst_index + 1U] = h264_pack_rgb565_pair(p2, p3);
 
-            p0 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row1[x], chroma_red0, chroma_green0, chroma_blue0);
-            p1 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row1[x + 1U], chroma_red0, chroma_green0, chroma_blue0);
-            p2 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row1[x + 2U], chroma_red1, chroma_green1, chroma_blue1);
-            p3 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row1[x + 3U], chroma_red1, chroma_green1, chroma_blue1);
+            luma0 = y_base[y_row1[x]];
+            luma1 = y_base[y_row1[x + 1U]];
+            p0 = (uint16_t) (
+                red565[h264_clip_byte((luma0 + r0) >> 8)] |
+                green565[h264_clip_byte((luma0 + g0) >> 8)] |
+                blue565[h264_clip_byte((luma0 + b0) >> 8)]
+            );
+            p1 = (uint16_t) (
+                red565[h264_clip_byte((luma1 + r0) >> 8)] |
+                green565[h264_clip_byte((luma1 + g0) >> 8)] |
+                blue565[h264_clip_byte((luma1 + b0) >> 8)]
+            );
+            luma0 = y_base[y_row1[x + 2U]];
+            luma1 = y_base[y_row1[x + 3U]];
+            p2 = (uint16_t) (
+                red565[h264_clip_byte((luma0 + r1) >> 8)] |
+                green565[h264_clip_byte((luma0 + g1) >> 8)] |
+                blue565[h264_clip_byte((luma0 + b1) >> 8)]
+            );
+            p3 = (uint16_t) (
+                red565[h264_clip_byte((luma1 + r1) >> 8)] |
+                green565[h264_clip_byte((luma1 + g1) >> 8)] |
+                blue565[h264_clip_byte((luma1 + b1) >> 8)]
+            );
             dst_row1[dst_index] = h264_pack_rgb565_pair(p0, p1);
             dst_row1[dst_index + 1U] = h264_pack_rgb565_pair(p2, p3);
         }
@@ -1846,6 +1869,8 @@ static bool blit_h264_planes_to_framebuffer(
             int32_t chroma_blue;
             uint16_t p0;
             uint16_t p1;
+            int32_t luma0;
+            int32_t luma1;
 
             h264_compute_chroma_terms(
                 u_row[chroma_index],
@@ -1855,12 +1880,32 @@ static bool blit_h264_planes_to_framebuffer(
                 &chroma_blue
             );
 
-            p0 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row0[x], chroma_red, chroma_green, chroma_blue);
-            p1 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row0[x + 1U], chroma_red, chroma_green, chroma_blue);
+            luma0 = y_base[y_row0[x]];
+            luma1 = y_base[y_row0[x + 1U]];
+            p0 = (uint16_t) (
+                red565[h264_clip_byte((luma0 + chroma_red) >> 8)] |
+                green565[h264_clip_byte((luma0 + chroma_green) >> 8)] |
+                blue565[h264_clip_byte((luma0 + chroma_blue) >> 8)]
+            );
+            p1 = (uint16_t) (
+                red565[h264_clip_byte((luma1 + chroma_red) >> 8)] |
+                green565[h264_clip_byte((luma1 + chroma_green) >> 8)] |
+                blue565[h264_clip_byte((luma1 + chroma_blue) >> 8)]
+            );
             dst_row0[dst_index] = h264_pack_rgb565_pair(p0, p1);
 
-            p0 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row1[x], chroma_red, chroma_green, chroma_blue);
-            p1 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row1[x + 1U], chroma_red, chroma_green, chroma_blue);
+            luma0 = y_base[y_row1[x]];
+            luma1 = y_base[y_row1[x + 1U]];
+            p0 = (uint16_t) (
+                red565[h264_clip_byte((luma0 + chroma_red) >> 8)] |
+                green565[h264_clip_byte((luma0 + chroma_green) >> 8)] |
+                blue565[h264_clip_byte((luma0 + chroma_blue) >> 8)]
+            );
+            p1 = (uint16_t) (
+                red565[h264_clip_byte((luma1 + chroma_red) >> 8)] |
+                green565[h264_clip_byte((luma1 + chroma_green) >> 8)] |
+                blue565[h264_clip_byte((luma1 + chroma_blue) >> 8)]
+            );
             dst_row1[dst_index] = h264_pack_rgb565_pair(p0, p1);
         }
     }

@@ -28,7 +28,7 @@ PACKFLAGS = --name "ND Video Player" --author "GigaZelensky" --version 1 --ndles
 
 ifeq ($(DEBUG),FALSE)
 	GCCFLAGS = $(GCCFLAGS_BASE) -Os
-	FAST_GCCFLAGS = $(GCCFLAGS_BASE) -O3 -fno-strict-aliasing -fomit-frame-pointer -falign-functions=32 -falign-loops=32 -flto -funroll-loops
+	FAST_GCCFLAGS = $(GCCFLAGS_BASE) -O3 -DNDEBUG -fno-strict-aliasing -fomit-frame-pointer -falign-functions=32 -falign-loops=32 -flto -funroll-loops
 else
 	GCCFLAGS = $(GCCFLAGS_BASE) -O0 -g
 	FAST_GCCFLAGS = $(GCCFLAGS_BASE) -O0 -g -falign-functions=32 -falign-loops=32

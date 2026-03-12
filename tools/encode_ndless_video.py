@@ -38,6 +38,8 @@ NAL_AUD = 9
 VCL_NAL_TYPES = {1, NAL_IDR}
 CHUNK_BOUNDARY_NAL_TYPES = {NAL_SPS, NAL_PPS, NAL_IDR}
 STREAM_PROFILES = ("fast", "balanced", "quality", "intra")
+DEFAULT_MAX_CHUNK_KIB = 1024
+DEFAULT_MAX_IDR_FRAMES = 24
 
 
 @dataclass(slots=True)
@@ -103,6 +105,13 @@ class AccessUnit:
 
     def bytes(self) -> bytes:
         return b"".join(unit.data for unit in self.nal_units)
+
+
+@dataclass(slots=True)
+class ChunkSegment:
+    first_frame: int
+    access_units: list[AccessUnit]
+    blob_size: int
 
 
 def log(message: str, *, quiet: bool = False) -> None:
@@ -577,8 +586,20 @@ def format_fps_value(fps: float) -> str:
     return f"{fps:.6f}".rstrip("0").rstrip(".")
 
 
-def h264_stream_profile_options(chunk_frames: int, stream_profile: str) -> tuple[str | None, str, list[str]]:
-    keyint = 1 if stream_profile == "intra" else chunk_frames
+def resolve_idr_frames(chunk_frames: int, requested_idr_frames: int | None, stream_profile: str) -> int:
+    if stream_profile == "intra":
+        return 1
+    if chunk_frames <= 0:
+        raise ValueError("chunk_frames must be greater than zero.")
+    if requested_idr_frames is None:
+        return min(chunk_frames, DEFAULT_MAX_IDR_FRAMES)
+    if requested_idr_frames <= 0:
+        raise ValueError("idr_frames must be greater than zero.")
+    return min(chunk_frames, requested_idr_frames)
+
+
+def h264_stream_profile_options(idr_frames: int, stream_profile: str) -> tuple[str | None, str, list[str]]:
+    keyint = 1 if stream_profile == "intra" else idr_frames
     base_params = [
         f"keyint={keyint}",
         f"min-keyint={keyint}",
@@ -647,7 +668,7 @@ def build_ffmpeg_command(
     width: int,
     height: int,
     fps: float,
-    chunk_frames: int,
+    idr_frames: int,
     crf: float,
     preset: str,
     level: str,
@@ -657,7 +678,7 @@ def build_ffmpeg_command(
 ) -> list[str]:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     vf = f"fps={format_fps_value(fps)},scale={width}:{height}:flags=lanczos,setsar=1"
-    tune, x264_params, bitstream_filters = h264_stream_profile_options(chunk_frames, stream_profile)
+    tune, x264_params, bitstream_filters = h264_stream_profile_options(idr_frames, stream_profile)
     command = [ffmpeg, "-y"]
     if start > 0:
         command += ["-ss", f"{start:.3f}"]
@@ -689,9 +710,9 @@ def build_ffmpeg_command(
         "-pix_fmt",
         "yuv420p",
         "-g",
-        str(chunk_frames),
+        str(idr_frames),
         "-keyint_min",
-        str(chunk_frames),
+        str(idr_frames),
         "-sc_threshold",
         "0",
         "-bf",
@@ -699,7 +720,7 @@ def build_ffmpeg_command(
         "-refs",
         "1",
         "-force_key_frames",
-        f"expr:gte(n,n_forced*{chunk_frames})",
+        f"expr:gte(n,n_forced*{idr_frames})",
         "-x264-params",
         x264_params,
     ]
@@ -721,7 +742,7 @@ def encode_h264_bitstream(
     width: int,
     height: int,
     fps: float,
-    chunk_frames: int,
+    idr_frames: int,
     crf: float,
     preset: str,
     level: str,
@@ -739,7 +760,7 @@ def encode_h264_bitstream(
             width=width,
             height=height,
             fps=fps,
-            chunk_frames=chunk_frames,
+            idr_frames=idr_frames,
             crf=crf,
             preset=preset,
             level=level,
@@ -846,26 +867,97 @@ def group_nals_into_access_units(nal_units: list[NalUnit]) -> list[AccessUnit]:
     return access_units
 
 
-def access_unit_starts_chunk(unit: AccessUnit) -> bool:
-    return any(nal.nal_type in CHUNK_BOUNDARY_NAL_TYPES for nal in unit.nal_units)
-
-
 def chunk_has_independent_start(unit: AccessUnit) -> bool:
     return unit.contains_type(NAL_IDR) and unit.contains_type(NAL_SPS) and unit.contains_type(NAL_PPS)
 
 
-def group_access_units_into_chunks(access_units: list[AccessUnit], chunk_frames: int, stream_profile: str) -> list[list[AccessUnit]]:
+def align4(value: int) -> int:
+    return (value + 3) & ~3
+
+
+def access_unit_payload_size(unit: AccessUnit, *, keep_parameter_sets: bool) -> int:
+    size = 0
+    for nal in unit.nal_units:
+        if nal.nal_type == NAL_AUD:
+            continue
+        if not keep_parameter_sets and nal.nal_type in {NAL_SPS, NAL_PPS, NAL_SEI}:
+            continue
+        size += len(nal.data)
+    return size
+
+
+def estimate_chunk_blob_size(access_units: list[AccessUnit], stream_profile: str) -> int:
+    payload_size = 0
+    for index, unit in enumerate(access_units):
+        payload_size += access_unit_payload_size(
+            unit,
+            keep_parameter_sets=(index == 0 or stream_profile != "intra"),
+        )
+    return align4(4 + (len(access_units) * 4) + payload_size)
+
+
+def split_access_units_into_segments(access_units: list[AccessUnit], stream_profile: str) -> list[ChunkSegment]:
+    segments: list[ChunkSegment] = []
+    current: list[AccessUnit] = []
+    current_first_frame = 0
+
+    for frame_index, unit in enumerate(access_units):
+        starts_independent = (stream_profile == "intra") or chunk_has_independent_start(unit)
+        if current and starts_independent:
+            segments.append(ChunkSegment(
+                first_frame=current_first_frame,
+                access_units=current,
+                blob_size=estimate_chunk_blob_size(current, stream_profile),
+            ))
+            current = []
+        if not current:
+            current_first_frame = frame_index
+        current.append(unit)
+
+    if current:
+        segments.append(ChunkSegment(
+            first_frame=current_first_frame,
+            access_units=current,
+            blob_size=estimate_chunk_blob_size(current, stream_profile),
+        ))
+
+    return segments
+
+
+def group_access_units_into_chunks(
+    access_units: list[AccessUnit],
+    chunk_frames: int,
+    max_chunk_bytes: int | None,
+    stream_profile: str,
+) -> list[list[AccessUnit]]:
     chunks: list[list[AccessUnit]] = []
     current: list[AccessUnit] = []
+    segments = split_access_units_into_segments(access_units, stream_profile)
 
-    for unit in access_units:
-        if current and (
-            (stream_profile == "intra" and len(current) >= chunk_frames)
-            or (stream_profile != "intra" and access_unit_starts_chunk(unit))
-        ):
-            chunks.append(current)
-            current = []
-        current.append(unit)
+    if not segments:
+        raise RuntimeError("The H.264 bitstream did not produce any `.nvp` chunks.")
+
+    for segment in segments:
+        if len(segment.access_units) > chunk_frames:
+            raise RuntimeError(
+                f"GOP starting at frame {segment.first_frame} spans {len(segment.access_units)} frames, "
+                f"which exceeds --chunk-frames={chunk_frames}. Lower --idr-frames or raise the chunk frame limit."
+            )
+        if max_chunk_bytes and segment.blob_size > max_chunk_bytes:
+            raise RuntimeError(
+                f"GOP starting at frame {segment.first_frame} stores to {segment.blob_size / 1024:.1f} KiB, "
+                f"which exceeds --max-chunk-kib={max_chunk_bytes // 1024}. Lower --idr-frames or raise the chunk size limit."
+            )
+        if current:
+            candidate = current + segment.access_units
+            candidate_size = estimate_chunk_blob_size(candidate, stream_profile)
+            if len(candidate) > chunk_frames or (max_chunk_bytes and candidate_size > max_chunk_bytes):
+                chunks.append(current)
+                current = list(segment.access_units)
+            else:
+                current = candidate
+        else:
+            current = list(segment.access_units)
 
     if current:
         chunks.append(current)
@@ -881,14 +973,14 @@ def group_access_units_into_chunks(access_units: list[AccessUnit], chunk_frames:
                 f"Chunk {index} does not start with SPS/PPS/IDR. "
                 "Check the FFmpeg keyframe and repeat-headers settings."
             )
-        if index + 1 < len(chunks) and len(chunk) != chunk_frames:
-            raise RuntimeError(
-                f"Chunk {index} has {len(chunk)} frames, expected {chunk_frames}. "
-                "FFmpeg did not honor the requested fixed IDR cadence."
-            )
         if len(chunk) > chunk_frames:
             raise RuntimeError(
                 f"Chunk {index} has {len(chunk)} frames, which exceeds chunk_frames={chunk_frames}."
+            )
+        if max_chunk_bytes and estimate_chunk_blob_size(chunk, stream_profile) > max_chunk_bytes:
+            raise RuntimeError(
+                f"Chunk {index} exceeds --max-chunk-kib={max_chunk_bytes // 1024} even after regrouping. "
+                "Lower --idr-frames or increase the chunk size limit."
             )
 
     return chunks
@@ -952,12 +1044,13 @@ def encode(args: argparse.Namespace) -> EncodeStats:
     )
 
     start_time = time.time()
+    idr_frames = resolve_idr_frames(args.chunk_frames, args.idr_frames, args.stream_profile)
     bitstream = encode_h264_bitstream(
         input_path=input_path,
         width=target_width,
         height=target_height,
         fps=fps,
-        chunk_frames=args.chunk_frames,
+        idr_frames=idr_frames,
         crf=args.crf,
         preset=args.preset,
         level=args.level,
@@ -968,13 +1061,19 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         quiet=args.quiet,
     )
     log(
-        f"FFmpeg produced {len(bitstream) / 1024:.1f} KiB of Annex B H.264 in {time.time() - start_time:.1f}s.",
+        f"FFmpeg produced {len(bitstream) / 1024:.1f} KiB of Annex B H.264 in {time.time() - start_time:.1f}s "
+        f"(IDR every {idr_frames} frame(s)).",
         quiet=args.quiet,
     )
 
     nal_units = parse_annex_b_nalus(bitstream)
     access_units = group_nals_into_access_units(nal_units)
-    chunks = group_access_units_into_chunks(access_units, args.chunk_frames, args.stream_profile)
+    chunks = group_access_units_into_chunks(
+        access_units,
+        args.chunk_frames,
+        (args.max_chunk_kib * 1024) if args.max_chunk_kib > 0 else None,
+        args.stream_profile,
+    )
 
     if not access_units:
         raise RuntimeError("No frames were found in the encoded H.264 bitstream.")
@@ -1089,7 +1188,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--fps", default="12", help="Target framerate or 'source'")
     parser.add_argument("--max-width", type=int, default=SCREEN_W, help="Fit width")
     parser.add_argument("--max-height", type=int, default=SCREEN_H, help="Fit height")
-    parser.add_argument("--chunk-frames", type=int, default=24, help="Frames per streamed chunk and forced IDR interval")
+    parser.add_argument("--chunk-frames", type=int, default=48, help="Maximum frames per streamed chunk")
+    parser.add_argument("--idr-frames", type=int, help="Maximum frames between forced IDR access units; defaults to min(chunk-frames, 24)")
+    parser.add_argument("--max-chunk-kib", type=int, default=DEFAULT_MAX_CHUNK_KIB, help="Maximum stored chunk size target in KiB; 0 disables the byte cap")
     parser.add_argument("--crf", type=float, default=24.0, help="libx264 CRF quality target (fractional values allowed)")
     parser.add_argument("--preset", default="slow", help="libx264 preset")
     parser.add_argument("--level", default="1.3", help="Target H.264 level")
