@@ -110,6 +110,19 @@ def log(message: str, *, quiet: bool = False) -> None:
         print(message, flush=True)
 
 
+def parse_ffmpeg_time(value: str) -> float:
+    parts = value.strip().split(":")
+    if len(parts) != 3:
+        return 0.0
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+    except ValueError:
+        return 0.0
+    return (hours * 3600.0) + (minutes * 60.0) + seconds
+
+
 def format_duration_hms(seconds: float) -> str:
     total_seconds = max(0, int(round(seconds)))
     hours = total_seconds // 3600
@@ -579,9 +592,9 @@ def h264_stream_profile_options(chunk_frames: int, stream_profile: str) -> tuple
         "force-cfr=1",
         "weightp=0",
         "no-deblock=1",
-        "partitions=all",
-        "me=hex",
-        "subme=2",
+        "partitions=none",
+        "me=dia",
+        "subme=0",
         "no-8x8dct=1",
     ]
 
@@ -635,7 +648,7 @@ def build_ffmpeg_command(
     height: int,
     fps: float,
     chunk_frames: int,
-    crf: int,
+    crf: float,
     preset: str,
     level: str,
     stream_profile: str,
@@ -709,12 +722,14 @@ def encode_h264_bitstream(
     height: int,
     fps: float,
     chunk_frames: int,
-    crf: int,
+    crf: float,
     preset: str,
     level: str,
     stream_profile: str,
     start: float,
     duration: float | None,
+    encode_duration: float | None,
+    quiet: bool,
 ) -> bytes:
     with tempfile.TemporaryDirectory(prefix="nvp-h264-") as temp_dir:
         bitstream_path = Path(temp_dir) / "video.264"
@@ -732,9 +747,53 @@ def encode_h264_bitstream(
             start=start,
             duration=duration,
         )
-        completed = subprocess.run(command, capture_output=True, text=True)
-        if completed.returncode != 0:
-            raise RuntimeError(completed.stderr.strip() or "ffmpeg H.264 encoding failed")
+        command = command[:1] + ["-hide_banner", "-loglevel", "error", "-progress", "pipe:2", "-nostats"] + command[1:]
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        if process.stderr is None:
+            raise RuntimeError("Failed to capture FFmpeg progress output.")
+
+        progress_state: dict[str, str] = {}
+        stderr_lines: list[str] = []
+        encode_start = time.time()
+        for raw_line in process.stderr:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if "=" not in line:
+                stderr_lines.append(line)
+                continue
+
+            key, value = line.split("=", 1)
+            progress_state[key] = value
+            if key != "progress":
+                continue
+
+            if value == "continue" and not quiet:
+                out_time = parse_ffmpeg_time(progress_state.get("out_time", "00:00:00.000"))
+                ratio = (out_time / encode_duration) if encode_duration and encode_duration > 0 else 0.0
+                ratio = min(max(ratio, 0.0), 1.0)
+                elapsed = time.time() - encode_start
+                eta = (elapsed * (1.0 - ratio) / ratio) if ratio > 0.0 else 0.0
+                total_size = int(progress_state.get("total_size", "0") or "0")
+                speed = progress_state.get("speed", "?")
+                log(
+                    f"FFmpeg {ratio * 100.0:5.1f}% | ETA {format_duration_hms(eta)} | "
+                    f"time {format_duration_hms(out_time)} | size {total_size / (1024 * 1024):.2f} MiB | "
+                    f"speed {speed}",
+                    quiet=False,
+                )
+
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError("\n".join(stderr_lines[-20:]).strip() or "ffmpeg H.264 encoding failed")
         return bitstream_path.read_bytes()
 
 
@@ -905,6 +964,8 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         stream_profile=args.stream_profile,
         start=args.start,
         duration=args.duration,
+        encode_duration=args.duration if args.duration is not None else max(0.0, video_probe.duration - args.start),
+        quiet=args.quiet,
     )
     log(
         f"FFmpeg produced {len(bitstream) / 1024:.1f} KiB of Annex B H.264 in {time.time() - start_time:.1f}s.",
@@ -1029,7 +1090,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-width", type=int, default=SCREEN_W, help="Fit width")
     parser.add_argument("--max-height", type=int, default=SCREEN_H, help="Fit height")
     parser.add_argument("--chunk-frames", type=int, default=24, help="Frames per streamed chunk and forced IDR interval")
-    parser.add_argument("--crf", type=int, default=24, help="libx264 CRF quality target")
+    parser.add_argument("--crf", type=float, default=24.0, help="libx264 CRF quality target (fractional values allowed)")
     parser.add_argument("--preset", default="slow", help="libx264 preset")
     parser.add_argument("--level", default="1.3", help="Target H.264 level")
     parser.add_argument("--stream-profile", choices=STREAM_PROFILES, default="fast", help="Decoder-complexity profile: fast is smoothest, balanced/quality trade more CPU for better image quality")

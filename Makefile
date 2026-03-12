@@ -22,13 +22,13 @@ GXX = nspire-g++
 LD  = nspire-ld
 
 GCCFLAGS_BASE = -Wall -Wextra -Wno-unused-parameter -std=c99 -marm -mcpu=arm926ej-s -mtune=arm926ej-s -mfloat-abi=soft -ffunction-sections -fdata-sections -Isrc/h264bsd
-LDFLAGS = -Wl,--gc-sections -lSDL -lz
+LDFLAGS = -Wl,--gc-sections -lSDL -lz -flto -O3
 LOADER_GXXFLAGS = -g -Os -Wall -Wextra -march=armv5te -fPIE -std=c++11 -fno-rtti -fno-exceptions -Wl,-Tldscript -Wl,--gc-sections -nostdlib -nostartfiles -ffreestanding -I ../../include
 PACKFLAGS = --name "ND Video Player" --author "GigaZelensky" --version 1 --ndless-min 45 --hww-support --no-uses-lcd-blit
 
 ifeq ($(DEBUG),FALSE)
 	GCCFLAGS = $(GCCFLAGS_BASE) -Os
-	FAST_GCCFLAGS = $(GCCFLAGS_BASE) -O3 -fomit-frame-pointer -falign-functions=32 -falign-loops=32
+	FAST_GCCFLAGS = $(GCCFLAGS_BASE) -O3 -fno-strict-aliasing -fomit-frame-pointer -falign-functions=32 -falign-loops=32 -flto -funroll-loops
 else
 	GCCFLAGS = $(GCCFLAGS_BASE) -O0 -g
 	FAST_GCCFLAGS = $(GCCFLAGS_BASE) -O0 -g -falign-functions=32 -falign-loops=32

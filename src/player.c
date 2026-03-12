@@ -33,7 +33,7 @@
 #define POINTER_UI_TIMEOUT_MS 1800U
 #define POINTER_GAIN_NUM 5
 #define POINTER_GAIN_DEN 4
-#define PREFETCH_FILE_BLOCK_SIZE 4096U
+#define PREFETCH_FILE_BLOCK_SIZE 32768U
 #define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
 #define PREFETCH_PAUSED_SLICE_MS 12U
 #define PREFETCH_ACTIVE_H264_MIN_SPARE_MS 12U
@@ -65,7 +65,7 @@
 #define RESUME_CLEAR_TAIL_MS 3000U
 #define STATUS_OVERLAY_MS 1200U
 #define MOVIE_VERSION_H264 9
-#define H264_CLIP_OFFSET 512
+#define H264_CLIP_OFFSET 384
 #define H264_CLIP_TABLE_SIZE 1024
 
 #pragma pack(push, 1)
@@ -1112,15 +1112,10 @@ static void init_h264_color_tables(void)
     g_h264_color_tables.initialized = true;
 }
 
-static uint8_t h264_clip_byte(int32_t value)
+static inline uint8_t h264_clip_byte(int32_t value)
 {
-    int32_t table_index = value + H264_CLIP_OFFSET;
-    if (table_index < 0) {
-        table_index = 0;
-    } else if (table_index >= H264_CLIP_TABLE_SIZE) {
-        table_index = H264_CLIP_TABLE_SIZE - 1;
-    }
-    return g_h264_color_tables.clip[table_index];
+    /* The YUV->RGB fixed-point path keeps this in [-258, 534]. */
+    return g_h264_color_tables.clip[value + H264_CLIP_OFFSET];
 }
 
 static uint8_t *alloc_aligned_bytes(size_t size, size_t alignment, uint8_t **allocation)
@@ -1751,6 +1746,25 @@ static inline uint32_t h264_pack_rgb565_pair(uint16_t left_pixel, uint16_t right
     return ((uint32_t) right_pixel << 16) | left_pixel;
 }
 
+static inline uint16_t h264_pack_rgb565_pixel(
+    const int32_t *restrict y_base,
+    const uint16_t *restrict red565,
+    const uint16_t *restrict green565,
+    const uint16_t *restrict blue565,
+    uint8_t y_sample,
+    int32_t chroma_red,
+    int32_t chroma_green,
+    int32_t chroma_blue
+)
+{
+    const int32_t luma = y_base[y_sample];
+    const uint8_t red = h264_clip_byte((luma + chroma_red) >> 8);
+    const uint8_t green = h264_clip_byte((luma + chroma_green) >> 8);
+    const uint8_t blue = h264_clip_byte((luma + chroma_blue) >> 8);
+
+    return (uint16_t) (red565[red] | green565[green] | blue565[blue]);
+}
+
 static bool blit_h264_planes_to_framebuffer(
     Movie *movie,
     const uint8_t *restrict y_plane,
@@ -1771,65 +1785,83 @@ static bool blit_h264_planes_to_framebuffer(
     }
 
     for (y = 0; y < movie->h264_crop_height; y += 2U) {
-        const uint8_t *y_row0 = y_plane + ((size_t) y * luma_stride);
-        const uint8_t *y_row1 = y_row0 + luma_stride;
-        const uint8_t *u_row = u_plane + ((size_t) (y / 2U) * chroma_stride);
-        const uint8_t *v_row = v_plane + ((size_t) (y / 2U) * chroma_stride);
-        uint32_t *dst_row0 = (uint32_t *) (void *) (movie->framebuffer + ((size_t) y * movie->header.video_width));
-        uint32_t *dst_row1 = (uint32_t *) (void *) (movie->framebuffer + ((size_t) (y + 1U) * movie->header.video_width));
+        const uint8_t *restrict y_row0 = y_plane + ((size_t) y * luma_stride);
+        const uint8_t *restrict y_row1 = y_row0 + luma_stride;
+        const uint8_t *restrict u_row = u_plane + ((size_t) (y / 2U) * chroma_stride);
+        const uint8_t *restrict v_row = v_plane + ((size_t) (y / 2U) * chroma_stride);
+        uint32_t *restrict dst_row0 = (uint32_t *) (void *) (movie->framebuffer + ((size_t) y * movie->header.video_width));
+        uint32_t *restrict dst_row1 = (uint32_t *) (void *) (movie->framebuffer + ((size_t) (y + 1U) * movie->header.video_width));
+        const size_t main_width = movie->h264_crop_width & ~(size_t) 3U;
         size_t x;
 
-        for (x = 0; x < movie->h264_crop_width; x += 2U) {
-            const uint8_t u = u_row[x / 2U];
-            const uint8_t v = v_row[x / 2U];
+        for (x = 0; x < main_width; x += 4U) {
+            const size_t chroma_index = x / 2U;
+            const size_t dst_index = x / 2U;
+            int32_t chroma_red0;
+            int32_t chroma_green0;
+            int32_t chroma_blue0;
+            int32_t chroma_red1;
+            int32_t chroma_green1;
+            int32_t chroma_blue1;
+            uint16_t p0;
+            uint16_t p1;
+            uint16_t p2;
+            uint16_t p3;
+
+            h264_compute_chroma_terms(
+                u_row[chroma_index],
+                v_row[chroma_index],
+                &chroma_red0,
+                &chroma_green0,
+                &chroma_blue0
+            );
+            h264_compute_chroma_terms(
+                u_row[chroma_index + 1U],
+                v_row[chroma_index + 1U],
+                &chroma_red1,
+                &chroma_green1,
+                &chroma_blue1
+            );
+
+            p0 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row0[x], chroma_red0, chroma_green0, chroma_blue0);
+            p1 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row0[x + 1U], chroma_red0, chroma_green0, chroma_blue0);
+            p2 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row0[x + 2U], chroma_red1, chroma_green1, chroma_blue1);
+            p3 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row0[x + 3U], chroma_red1, chroma_green1, chroma_blue1);
+            dst_row0[dst_index] = h264_pack_rgb565_pair(p0, p1);
+            dst_row0[dst_index + 1U] = h264_pack_rgb565_pair(p2, p3);
+
+            p0 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row1[x], chroma_red0, chroma_green0, chroma_blue0);
+            p1 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row1[x + 1U], chroma_red0, chroma_green0, chroma_blue0);
+            p2 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row1[x + 2U], chroma_red1, chroma_green1, chroma_blue1);
+            p3 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row1[x + 3U], chroma_red1, chroma_green1, chroma_blue1);
+            dst_row1[dst_index] = h264_pack_rgb565_pair(p0, p1);
+            dst_row1[dst_index + 1U] = h264_pack_rgb565_pair(p2, p3);
+        }
+
+        for (; x < movie->h264_crop_width; x += 2U) {
+            const size_t chroma_index = x / 2U;
+            const size_t dst_index = x / 2U;
             int32_t chroma_red;
             int32_t chroma_green;
             int32_t chroma_blue;
-            int32_t luma;
-            uint8_t red;
-            uint8_t green;
-            uint8_t blue;
+            uint16_t p0;
+            uint16_t p1;
 
-#if defined(__GNUC__)
-            if ((x & 15U) == 0U) {
-                __builtin_prefetch(y_row0 + x + 32U, 0, 0);
-                __builtin_prefetch(y_row1 + x + 32U, 0, 0);
-                __builtin_prefetch(u_row + (x / 2U) + 16U, 0, 0);
-                __builtin_prefetch(v_row + (x / 2U) + 16U, 0, 0);
-            }
-#endif
-
-            h264_compute_chroma_terms(u, v, &chroma_red, &chroma_green, &chroma_blue);
-
-            luma = y_base[y_row0[x]];
-            red = h264_clip_byte((luma + chroma_red) >> 8);
-            green = h264_clip_byte((luma + chroma_green) >> 8);
-            blue = h264_clip_byte((luma + chroma_blue) >> 8);
-            dst_row0[x / 2U] = h264_pack_rgb565_pair(
-                (uint16_t) (red565[red] | green565[green] | blue565[blue]),
-                0
+            h264_compute_chroma_terms(
+                u_row[chroma_index],
+                v_row[chroma_index],
+                &chroma_red,
+                &chroma_green,
+                &chroma_blue
             );
 
-            luma = y_base[y_row0[x + 1U]];
-            red = h264_clip_byte((luma + chroma_red) >> 8);
-            green = h264_clip_byte((luma + chroma_green) >> 8);
-            blue = h264_clip_byte((luma + chroma_blue) >> 8);
-            dst_row0[x / 2U] |= (uint32_t) ((uint16_t) (red565[red] | green565[green] | blue565[blue])) << 16;
+            p0 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row0[x], chroma_red, chroma_green, chroma_blue);
+            p1 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row0[x + 1U], chroma_red, chroma_green, chroma_blue);
+            dst_row0[dst_index] = h264_pack_rgb565_pair(p0, p1);
 
-            luma = y_base[y_row1[x]];
-            red = h264_clip_byte((luma + chroma_red) >> 8);
-            green = h264_clip_byte((luma + chroma_green) >> 8);
-            blue = h264_clip_byte((luma + chroma_blue) >> 8);
-            dst_row1[x / 2U] = h264_pack_rgb565_pair(
-                (uint16_t) (red565[red] | green565[green] | blue565[blue]),
-                0
-            );
-
-            luma = y_base[y_row1[x + 1U]];
-            red = h264_clip_byte((luma + chroma_red) >> 8);
-            green = h264_clip_byte((luma + chroma_green) >> 8);
-            blue = h264_clip_byte((luma + chroma_blue) >> 8);
-            dst_row1[x / 2U] |= (uint32_t) ((uint16_t) (red565[red] | green565[green] | blue565[blue])) << 16;
+            p0 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row1[x], chroma_red, chroma_green, chroma_blue);
+            p1 = h264_pack_rgb565_pixel(y_base, red565, green565, blue565, y_row1[x + 1U], chroma_red, chroma_green, chroma_blue);
+            dst_row1[dst_index] = h264_pack_rgb565_pair(p0, p1);
         }
     }
 
@@ -5825,6 +5857,13 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 uint64_t elapsed_ticks = now_ticks - playback_anchor_ticks;
                 uint32_t frames_to_advance = movie_frames_from_scaled_ticks(&movie, elapsed_ticks, playback_rate);
                 uint32_t target_frame = playback_anchor_frame + frames_to_advance;
+                bool lagged = false;
+
+                if (target_frame > movie.current_frame + 1U) {
+                    target_frame = movie.current_frame + 1U;
+                    lagged = true;
+                }
+
                 if (target_frame >= movie.header.frame_count) {
                     if (movie.current_frame + 1 < movie.header.frame_count) {
                         if (!decode_to_frame(&movie, movie.header.frame_count - 1)) {
@@ -5841,7 +5880,11 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                         result = -1;
                         break;
                     }
-                    next_frame_due_ticks = playback_anchor_ticks + movie_frame_time_scaled_ticks(&movie, (target_frame - playback_anchor_frame) + 1, playback_rate);
+                    if (lagged) {
+                        reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                    } else {
+                        next_frame_due_ticks = playback_anchor_ticks + movie_frame_time_scaled_ticks(&movie, (target_frame - playback_anchor_frame) + 1, playback_rate);
+                    }
                 }
             }
         }
