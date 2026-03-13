@@ -6153,6 +6153,52 @@ static void save_history_position_for_movie(const char *movie_path, const Movie 
     free_history_store(&history);
 }
 
+static void maybe_defer_history_save(const Movie *movie, uint32_t *last_history_saved_ms, bool *pending)
+{
+    uint32_t history_ms;
+
+    if (!movie || !last_history_saved_ms || !pending) {
+        return;
+    }
+
+    history_ms = movie_frame_time_ms(movie, movie->current_frame);
+    if (history_ms + 1000U < *last_history_saved_ms || history_ms >= *last_history_saved_ms + 15000U) {
+        if (!*pending) {
+            debug_tracef(
+                "history defer frame=%lu time_ms=%lu",
+                (unsigned long) movie->current_frame,
+                (unsigned long) history_ms
+            );
+        }
+        *pending = true;
+        *last_history_saved_ms = history_ms;
+    }
+}
+
+static void flush_deferred_history_save(const char *movie_path, const Movie *movie, bool *pending, const char *reason, bool force)
+{
+    uint32_t start_ms;
+    uint32_t elapsed_ms;
+
+    if (!movie_path || !movie || !pending) {
+        return;
+    }
+    if (!force && !*pending) {
+        return;
+    }
+
+    start_ms = monotonic_clock_now_ms();
+    save_history_position_for_movie(movie_path, movie);
+    elapsed_ms = monotonic_clock_now_ms() - start_ms;
+    debug_tracef(
+        "history flush reason=%s frame=%lu ms=%lu",
+        reason ? reason : "unknown",
+        (unsigned long) movie->current_frame,
+        (unsigned long) elapsed_ms
+    );
+    *pending = false;
+}
+
 static bool save_screenshot_bitmap(SDL_Surface *screen, const char *movie_path, char *saved_path, size_t saved_path_size)
 {
     char directory[MAX_PATH_LEN];
@@ -6465,6 +6511,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     bool help_resume_playback = false;
     uint32_t resume_frame = 0;
     uint32_t last_history_saved_ms = 0;
+    bool history_save_pending = false;
 
     g_debug_ring_count = 0;
     g_debug_ring_next = 0;
@@ -6607,6 +6654,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             if (take_screenshot) {
                 save_screenshot_bitmap(screen, path, NULL, 0);
             }
+            flush_deferred_history_save(path, &movie, &history_save_pending, "help", false);
             prefetch_tick(&movie, true, 1000);
             msleep(16);
             continue;
@@ -6718,13 +6766,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             }
         }
-        {
-            uint32_t history_ms = movie_frame_time_ms(&movie, movie.current_frame);
-            if (history_ms + 1000U < last_history_saved_ms || history_ms >= last_history_saved_ms + 15000U) {
-                save_history_position_for_movie(path, &movie);
-                last_history_saved_ms = history_ms;
-            }
-        }
+        maybe_defer_history_save(&movie, &last_history_saved_ms, &history_save_pending);
         if (!paused && frame_interval_ticks > 0) {
             if (now_ticks >= next_frame_due_ticks) {
                 uint64_t elapsed_ticks = now_ticks - playback_anchor_ticks;
@@ -6832,6 +6874,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             save_screenshot_bitmap(screen, path, NULL, 0);
         }
         if (paused || frame_interval_ticks == 0) {
+            flush_deferred_history_save(path, &movie, &history_save_pending, "paused", false);
             prefetch_tick(&movie, true, 1000);
             if (now_ms - movie.diag_last_snapshot_ms >= DEBUG_SNAPSHOT_INTERVAL_MS) {
                 movie.diag_last_snapshot_ms = now_ms;
@@ -6856,25 +6899,15 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             spare_ticks = next_frame_due_ticks > after_render_ticks ? (next_frame_due_ticks - after_render_ticks) : 0;
             if (spare_ticks > 0) {
                 uint64_t max_wait_ticks = (((uint64_t) monotonic_clock_ticks_per_second()) * 8U) / 1000U;
-                uint32_t wait_ms = monotonic_clock_ticks_to_ms(spare_ticks);
                 if (spare_ticks > max_wait_ticks) {
                     wait_target_ticks = after_render_ticks + max_wait_ticks;
                 }
-                wait_ms = monotonic_clock_ticks_to_ms(wait_target_ticks - after_render_ticks);
-                if (wait_ms > 8U) {
-                    wait_ms = 8U;
-                }
-                if (wait_ms > FRAME_PACING_SPIN_MS) {
-                    msleep(wait_ms - FRAME_PACING_SPIN_MS);
-                }
-                if (wait_ms > 0) {
-                    wait_until_ticks_precise(wait_target_ticks);
-                }
+                wait_until_ticks_precise(wait_target_ticks);
             }
         }
     }
 
-    save_history_position_for_movie(path, &movie);
+    flush_deferred_history_save(path, &movie, &history_save_pending, "exit", true);
     {
         char log_path[MAX_PATH_LEN];
         debug_log_path_for_movie(path, log_path, sizeof(log_path));
