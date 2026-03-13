@@ -72,9 +72,9 @@
 #define H264_PREFETCH_NEXT_CHUNK_BRIDGE_FRAMES 6U
 #define H264_BOUNDARY_MISS_WINDOW_FRAMES 4U
 #define H264_PREFETCH_IO_PRIORITY_SLICE_MS 4U
-#define H264_PREFETCH_DECODE_GUARD_DEFAULT_MS 24U
-#define H264_PREFETCH_DECODE_GUARD_MIN_MS 18U
-#define H264_PREFETCH_DECODE_GUARD_MAX_MS 40U
+#define H264_PREFETCH_DECODE_GUARD_DEFAULT_MS 16U
+#define H264_PREFETCH_DECODE_GUARD_MIN_MS 10U
+#define H264_PREFETCH_DECODE_GUARD_MAX_MS 22U
 #define H264_FOREGROUND_DECODE_SOFT_MS 35U
 #define H264_FOREGROUND_DECODE_HARD_MS 50U
 #define H264_ACTIVE_PREFETCH_BACKOFF_LIGHT 0U
@@ -2115,10 +2115,10 @@ static uint32_t h264_prefetch_active_decode_limit(size_t contiguous_ready, size_
     if (contiguous_ready >= target_ready_count) {
         return 0U;
     }
-    if (contiguous_ready < H264_PREFETCH_ACTIVE_LOW_WATERMARK && spare_ms >= 20U) {
-        return H264_PREFETCH_ACTIVE_MAX_DECODES_RECOVERY;
+    if (contiguous_ready < H264_PREFETCH_ACTIVE_LOW_WATERMARK && spare_ms >= 14U) {
+        return 3U;
     }
-    return H264_PREFETCH_ACTIVE_MAX_DECODES_PER_TICK;
+    return 2U;
 }
 
 static bool h264_should_allow_active_prefetch(const Movie *movie, uint32_t spare_ms)
@@ -2229,9 +2229,6 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
             }
         }
     }
-
-    /* Next-chunk boundary runway is intentionally ignored here because the
-     * background decoder no longer crosses chunk boundaries. */
 
     if (spare_ms >= 18U) {
         target += 2U;
@@ -3522,7 +3519,6 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
     uint32_t decode_guard_ms;
     uint32_t max_decodes_this_tick;
     uint32_t decoded_this_tick = 0;
-    int playback_chunk = -1;
     int current_chunk = -1;
 
     if (!movie || !movie_uses_h264(movie) || movie->header.frame_count == 0 || active_h264_frame_ring_capacity(movie) == 0) {
@@ -3534,9 +3530,6 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
     contiguous_ready_count = h264_frame_ring_contiguous_ready_count(movie);
     if (!paused && spare_ms < H264_PREFETCH_ACTIVE_MIN_SPARE_MS) {
         return;
-    }
-    if (!paused) {
-        playback_chunk = movie_chunk_for_frame(movie, movie->current_frame);
     }
     current_chunk = movie_chunk_for_frame(movie, movie->current_frame);
     max_decodes_this_tick = paused
@@ -3563,16 +3556,6 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
             break;
         }
         same_chunk = (current_chunk >= 0 && next_chunk == current_chunk);
-        if (!paused && playback_chunk >= 0 && next_chunk != playback_chunk) {
-            /* Do not let the background decoder cross chunk boundaries.
-             * It mutates the shared playback chunk/decoder state and can
-             * force the foreground back into synchronous re-reads of the
-             * previous chunk on the next ring miss. */
-            if (debug_should_collect_metrics()) {
-                movie->diag_bg_chunk_cross_blocked_count++;
-            }
-            break;
-        }
         if (!paused && deadline_ms != 0) {
             uint32_t now_ms = monotonic_clock_now_ms();
             if ((int32_t) ((now_ms + decode_guard_ms) - deadline_ms) >= 0) {
