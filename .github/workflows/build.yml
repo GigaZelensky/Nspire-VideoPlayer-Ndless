@@ -15,6 +15,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Fetch Ndless dependency
+        id: ndless-source
+        run: |
+          if [ ! -d external/Ndless-official/.git ]; then
+            rm -rf external/Ndless-official
+            git clone --branch master https://github.com/ndless-nspire/Ndless.git external/Ndless-official
+          fi
+          git -C external/Ndless-official fetch --tags origin master
+          git -C external/Ndless-official checkout master
+          git -C external/Ndless-official reset --hard origin/master
+          echo "sha=$(git -C external/Ndless-official rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Install host dependencies
         run: |
           sudo apt-get update
@@ -37,7 +49,7 @@ jobs:
         id: ndless-toolchain-cache
         with:
           path: external/Ndless-official/ndless-sdk/toolchain/install
-          key: ${{ runner.os }}-ndless-toolchain-${{ hashFiles('external/Ndless-official/ndless-sdk/toolchain/build_toolchain.sh') }}
+          key: ${{ runner.os }}-ndless-toolchain-${{ steps.ndless-source.outputs.sha }}-${{ hashFiles('external/Ndless-official/ndless-sdk/toolchain/build_toolchain.sh') }}
 
       - name: Build Ndless ARM toolchain
         if: steps.ndless-toolchain-cache.outputs.cache-hit != 'true'
