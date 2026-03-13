@@ -11,8 +11,6 @@ OBJCOPY ?= arm-none-eabi-objcopy
 LOADER = $(SDKROOT)/tools/zehn_loader/zehn_loader.tns
 LOADER_DIR = $(SDKROOT)/tools/zehn_loader
 LOADER_ELF = $(LOADER_DIR)/zehn_loader.tns.elf
-SDK_ZLIB = $(SDKROOT)/lib/libz.a
-SDK_ZLIB_HEADERS = $(SDKROOT)/include/zlib.h $(SDKROOT)/include/zconf.h
 
 export PATH := $(abspath $(SDKROOT)/bin):$(PATH)
 
@@ -22,7 +20,7 @@ GXX = nspire-g++
 LD  = nspire-ld
 
 GCCFLAGS_BASE = -Wall -Wextra -Wno-unused-parameter -std=c99 -marm -mcpu=arm926ej-s -mtune=arm926ej-s -mfloat-abi=soft -ffunction-sections -fdata-sections -Isrc/h264bsd
-LDFLAGS = -Wl,--gc-sections -lSDL -lz -flto -O3
+LDFLAGS = -Wl,--gc-sections -lSDL -flto -O3
 LOADER_GXXFLAGS = -g -Os -Wall -Wextra -march=armv5te -fPIE -std=c++11 -fno-rtti -fno-exceptions -Wl,-Tldscript -Wl,--gc-sections -nostdlib -nostartfiles -ffreestanding -I ../../include
 PACKFLAGS = --name "ND Video Player" --author "GigaZelensky" --version 1 --ndless-min 45 --hww-support --no-uses-lcd-blit
 
@@ -44,11 +42,6 @@ vpath %.elf $(DISTDIR)
 
 all: $(EXE).tns
 
-$(SDK_ZLIB) $(SDK_ZLIB_HEADERS):
-	$(MAKE) -C $(SDKROOT)/thirdparty zlib
-
-$(OBJS): $(SDK_ZLIB_HEADERS)
-
 %.o: %.c
 	$(GCC) $(if $(filter src/h264bsd/% src/player.c,$<),$(FAST_GCCFLAGS),$(GCCFLAGS)) -c $< -o $@
 
@@ -58,7 +51,7 @@ $(OBJS): $(SDK_ZLIB_HEADERS)
 %.o: %.S
 	$(AS) -c $< -o $@
 
-$(EXE).elf: $(OBJS) $(SDK_ZLIB)
+$(EXE).elf: $(OBJS)
 	mkdir -p $(DISTDIR)
 	$(LD) $^ -o $(DISTDIR)/$@ $(LDFLAGS)
 

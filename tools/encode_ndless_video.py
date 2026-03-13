@@ -534,12 +534,6 @@ def probe_video(input_path: Path) -> VideoProbe:
         duration=duration,
     )
 
-
-def compress_chunk_payload(chunk_blob: bytes, zlib_level: int) -> bytes:
-    del zlib_level
-    return chunk_blob
-
-
 def write_header(
     handle,
     *,
@@ -1093,7 +1087,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         while len(stored_chunk_blob) % 4:
             stored_chunk_blob.append(0)
 
-        stored_blob = compress_chunk_payload(bytes(stored_chunk_blob), args.zlib_level)
+        stored_blob = bytes(stored_chunk_blob)
         offset = output_handle.tell()
         output_handle.write(stored_blob)
         chunk_index.append((
@@ -1195,7 +1189,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--preset", default="slow", help="libx264 preset")
     parser.add_argument("--level", default="1.3", help="Target H.264 level")
     parser.add_argument("--stream-profile", choices=STREAM_PROFILES, default="fast", help="Decoder-complexity profile: fast is smoothest, balanced/quality trade more CPU for better image quality")
-    parser.add_argument("--zlib-level", type=int, default=9, help="Ignored for H.264 output; chunks are stored raw")
     parser.add_argument("--start", type=float, default=0.0, help="Optional clip start offset in seconds")
     parser.add_argument("--duration", type=float, help="Optional clip duration in seconds")
     parser.add_argument("--quiet", action="store_true", help="Silence progress logging")
