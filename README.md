@@ -7,16 +7,20 @@ This project targets the **TI-Nspire CX II-T** and plays streamed `.nvp` movies 
 - `ndvideo.tns`: the Ndless launcher
 - `*.nvp.tns`: movie containers produced by the encoder
 
+## Screenshots
+
+| Subtitle playback | UI overlay | Dialogue scene |
+| --- | --- | --- |
+| ![Subtitle playback](./examples/screenshots/subtitles.png) | ![Playback UI overlay](./examples/screenshots/ui-overlay.png) | ![Dialogue scene](./examples/screenshots/dialogue.png) |
+
 ## Current Format
 
-The current `.nvp` format is **H.264-only**:
+The `.nvp` format used by the current player is:
 
 - H.264 Annex B video bitstream
 - chunked container with per-chunk frame tables
 - raw stored chunk payloads (no zlib layer)
 - optional text subtitle tracks stored in the container
-
-Older pre-H.264 block-delta / motion / RLE movie formats are no longer documented here.
 
 ## Features
 
@@ -25,11 +29,19 @@ Older pre-H.264 block-delta / motion / RLE movie formats are no longer documente
 - H.264 decode through `h264bsd`
 - RGB565 output
 - chunk-byte prefetching for smoother playback
+- accurate frame pacing from a hardware-backed monotonic timer
 - subtitle support for text subtitle tracks
+- built-in subtitle font cycling
 - scale modes: `FIT`, `FILL`, `STRETCH`, `1:1`
 - playback speed control from `0.25x` to `2.0x`
 - picker UI for multiple `.nvp` / `.nvp.tns` files
 - debug log output and in-player memory/playback overlay
+
+## Current Limits
+
+- no audio yet
+- subtitle rendering is text-only
+- the runtime is tuned for streamed local playback, not full in-memory decode
 
 ## Controls
 
@@ -54,6 +66,16 @@ Older pre-H.264 block-delta / motion / RLE movie formats are no longer documente
 - `Catalog`: open / close the help overlay
 - `Esc`: close help, or leave the movie if help is not open
 
+## Subtitle Fonts
+
+The built-in subtitle font cycle currently includes:
+
+- `Tinytype`
+- `VGA`
+- `Thin`
+- `Space`
+- `Fantasy`
+
 ## Repository Layout
 
 - [src/player.c](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/src/player.c): native player
@@ -61,6 +83,8 @@ Older pre-H.264 block-delta / motion / RLE movie formats are no longer documente
 - [src/initfini.c](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/src/initfini.c): startup / shutdown glue
 - [tools/encode_ndless_video.py](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/tools/encode_ndless_video.py): PC-side encoder
 - [tools/pack_zehn.py](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/tools/pack_zehn.py): Zehn packer used by the build
+- [examples/screenshots](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/examples/screenshots): README screenshot assets
+- [examples](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/examples): packaged sample files for quick calculator-side testing
 - [Makefile](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/Makefile): build entry point
 
 ## Build
@@ -110,10 +134,16 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mp4" --output ".\dist\vi
 python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --output ".\dist\video.nvp.tns"
 ```
 
+### Preserve Source Framerate
+
+```powershell
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --fps source --output ".\dist\video.nvp.tns"
+```
+
 ### Recommended Full-Episode Example
 
 ```powershell
-python .\tools\encode_ndless_video.py "C:\path\to\episode.mkv" --subtitle embedded --output ".\dist\episode.nvp.tns" --fps 16 --max-width 320 --max-height 180 --chunk-frames 72 --idr-frames 24 --max-chunk-kib 1024 --stream-profile quality --crf 16.2 --preset veryslow --level 1.3
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --output ".\dist\video.nvp.tns" --fps 16 --max-width 320 --max-height 180 --chunk-frames 72 --stream-profile quality --crf 14.5 --preset veryslow --level 1.3
 ```
 
 ### Main Encoder Options
@@ -150,6 +180,8 @@ The `M` overlay shows:
 - decode target
 - lag count
 - ring-hit vs direct-decode counts
+
+The [examples](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/examples) folder also includes a short packaged sample movie and a matching `ndvideo.tns` for quick on-device smoke testing.
 
 ## Install On Calculator
 
