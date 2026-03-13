@@ -75,10 +75,10 @@
 #define H264_PREFETCH_DECODE_GUARD_DEFAULT_MS 24U
 #define H264_PREFETCH_DECODE_GUARD_MIN_MS 18U
 #define H264_PREFETCH_DECODE_GUARD_MAX_MS 40U
-#define H264_FOREGROUND_DECODE_SOFT_MS 18U
-#define H264_FOREGROUND_DECODE_HARD_MS 26U
-#define H264_ACTIVE_PREFETCH_BACKOFF_LIGHT 2U
-#define H264_ACTIVE_PREFETCH_BACKOFF_HEAVY 4U
+#define H264_FOREGROUND_DECODE_SOFT_MS 35U
+#define H264_FOREGROUND_DECODE_HARD_MS 50U
+#define H264_ACTIVE_PREFETCH_BACKOFF_LIGHT 0U
+#define H264_ACTIVE_PREFETCH_BACKOFF_HEAVY 1U
 #define H264_SAME_CHUNK_RESCUE_MIN_SPARE_MS 10U
 #define FRAME_PACING_SPIN_MS 2U
 #define MONOTONIC_TIMER_VALUE_ADDR 0x900C0004U
@@ -2121,10 +2121,11 @@ static uint32_t h264_prefetch_active_decode_limit(size_t contiguous_ready, size_
     return H264_PREFETCH_ACTIVE_MAX_DECODES_PER_TICK;
 }
 
-static bool h264_should_allow_active_prefetch(const Movie *movie, uint32_t spare_ms) __attribute__((unused));
-
 static bool h264_should_allow_active_prefetch(const Movie *movie, uint32_t spare_ms)
 {
+    if (spare_ms >= 16U) {
+        return true;
+    }
     if (!movie) {
         return false;
     }
@@ -3632,9 +3633,8 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
     size_t ring_growth = paused ? 8U : 0U;
 
     if (movie_uses_h264(movie)) {
-        /* Keep decoded-frame H.264 prefetch as paused-only warmup.
-         * During active playback this work runs on the same cooperative loop
-         * as presentation and steals deadline-critical time. */
+        /* Let decoded-frame H.264 prefetch run whenever the cooperative
+         * playback loop has enough slack to hide the work. */
         if (debug_should_collect_metrics()) {
             movie->diag_prefetch_tick_count++;
         }
@@ -3643,17 +3643,21 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
                 movie->diag_active_prefetch_tick_count++;
             }
             if (movie->h264_active_prefetch_backoff > 0) {
-                active_backoff = true;
-                if (debug_should_collect_metrics()) {
-                    movie->diag_prefetch_backoff_skip_count++;
+                if (spare_ms >= 16U) {
+                    movie->h264_active_prefetch_backoff = 0;
+                } else {
+                    active_backoff = true;
+                    if (debug_should_collect_metrics()) {
+                        movie->diag_prefetch_backoff_skip_count++;
+                    }
+                    movie->h264_active_prefetch_backoff--;
                 }
-                movie->h264_active_prefetch_backoff--;
-            }
-            if (debug_should_collect_metrics()) {
-                movie->diag_prefetch_suppressed_count++;
             }
         }
-        allow_active_h264_prefetch = paused;
+        allow_active_h264_prefetch = paused || h264_should_allow_active_prefetch(movie, spare_ms);
+        if (!paused && debug_should_collect_metrics() && !allow_active_h264_prefetch) {
+            movie->diag_prefetch_suppressed_count++;
+        }
     }
 
     if (!paused && movie_uses_h264(movie) && current_chunk >= 0) {
@@ -3685,7 +3689,7 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
     if (!paused && movie_uses_h264(movie) && !prioritize_io && time_slice_ms > PREFETCH_ACTIVE_H264_SLICE_MS) {
         time_slice_ms = PREFETCH_ACTIVE_H264_SLICE_MS;
     }
-    if (paused && movie_uses_h264(movie) && allow_active_h264_prefetch && !prioritize_io) {
+    if (movie_uses_h264(movie) && allow_active_h264_prefetch && !prioritize_io) {
         prefetch_h264_frames(movie, paused, spare_ms, deadline_ms);
     }
     if (current_chunk >= 0 && budget > 0 && time_slice_ms > 0) {
@@ -3734,8 +3738,7 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
             }
         }
     }
-    if (paused &&
-        movie_uses_h264(movie) &&
+    if (movie_uses_h264(movie) &&
         allow_active_h264_prefetch &&
         (!deadline_ms || !h264_prefetch_deadline_reached(deadline_ms))) {
         prefetch_h264_frames(movie, paused, spare_ms, deadline_ms);
@@ -6399,9 +6402,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                         if (lagged || decode_elapsed_ms >= H264_FOREGROUND_DECODE_HARD_MS) {
                             movie.h264_active_prefetch_backoff = H264_ACTIVE_PREFETCH_BACKOFF_HEAVY;
                         } else if (decode_elapsed_ms >= H264_FOREGROUND_DECODE_SOFT_MS) {
-                            if (movie.h264_active_prefetch_backoff < H264_ACTIVE_PREFETCH_BACKOFF_LIGHT) {
-                                movie.h264_active_prefetch_backoff = H264_ACTIVE_PREFETCH_BACKOFF_LIGHT;
-                            }
+                            movie.h264_active_prefetch_backoff = H264_ACTIVE_PREFETCH_BACKOFF_LIGHT;
                         }
                     }
                     if (lagged) {
