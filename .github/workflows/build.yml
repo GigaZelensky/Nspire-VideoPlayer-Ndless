@@ -61,6 +61,13 @@ jobs:
           echo "$GITHUB_WORKSPACE/external/Ndless-official/ndless-sdk/toolchain/install/bin" >> "$GITHUB_PATH"
           echo "$GITHUB_WORKSPACE/external/Ndless-official/ndless-sdk/bin" >> "$GITHUB_PATH"
 
+      - name: Build Ndless SDK libraries
+        working-directory: external/Ndless-official/ndless-sdk
+        run: |
+          make build-libsyscalls
+          make build-libndls
+          make build-thirdparty
+
       - name: Build ndvideo
         run: make SDKROOT=./external/Ndless-official/ndless-sdk
 
