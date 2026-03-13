@@ -35,6 +35,7 @@ The `.nvp` format used by the current player is:
 - scale modes: `FIT`, `FILL`, `STRETCH`, `1:1`
 - playback speed control from `0.25x` to `2.0x`
 - picker UI for multiple `.nvp` / `.nvp.tns` files
+- per-video resume history with saved playback and subtitle settings
 - debug log output and in-player memory/playback overlay
 
 ## Current Limits

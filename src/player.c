@@ -17,6 +17,7 @@
 #define SCREEN_H 240
 #define UI_BAR_H 28
 #define SEEK_STEP_MS 5000
+#define SEEK_STACK_DELAY_MS 280U
 #define PICKER_MAX_FILES 128
 #define PICKER_VISIBLE_ROWS 9
 #define MAX_PATH_LEN 512
@@ -29,8 +30,12 @@
 #define PREFETCH_MAX_TOTAL_BYTES (12U * 1024U * 1024U)
 #define POINTER_FIXED_SHIFT 6
 #define POINTER_UI_TIMEOUT_MS 1800U
-#define POINTER_GAIN_NUM 5
+#define POINTER_GAIN_NUM 3
 #define POINTER_GAIN_DEN 4
+#define POINTER_JITTER_THRESHOLD 2
+#define POINTER_DECISIVE_SUM_THRESHOLD 5
+#define POINTER_AXIS_LOCK_RATIO_NUM 2
+#define POINTER_AXIS_LOCK_RATIO_DEN 1
 #define PREFETCH_FILE_BLOCK_SIZE 32768U
 #define PREFETCH_ACTIVE_FILE_BLOCK_SIZE 8192U
 #define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
@@ -88,6 +93,8 @@
 #define DEBUG_TRACE_PREFETCH_MS 10U
 #define HISTORY_FILE_NAME "ndhistory.ts.tns"
 #define HISTORY_MAX_ENTRIES 5
+#define HISTORY_MAGIC_V1 "NDVH1"
+#define HISTORY_MAGIC_V2 "NDVH2"
 #define RESUME_MIN_MS 5000U
 #define RESUME_CLEAR_TAIL_MS 3000U
 #define STATUS_OVERLAY_MS 1200U
@@ -149,6 +156,13 @@ typedef struct {
 typedef struct {
     char *path;
     uint32_t frame;
+    bool has_resume;
+    uint8_t scale_mode;
+    uint8_t playback_rate_index;
+    uint8_t subtitle_font_index;
+    int8_t subtitle_size;
+    uint8_t subtitle_placement;
+    uint16_t selected_subtitle_track;
 } HistoryEntry;
 
 typedef struct {
@@ -399,6 +413,16 @@ static void debug_dump_session(const char *path, const Movie *movie, const char 
 static void history_path_for_directory(const char *directory, char *history_path, size_t history_path_size);
 static bool load_history_store_from_path(const char *history_path, HistoryStore *history);
 static int history_find_entry_index(const HistoryStore *history, const char *movie_path);
+static void history_entry_init_defaults(HistoryEntry *entry);
+static void apply_history_entry_settings(
+    const HistoryEntry *entry,
+    Movie *movie,
+    ScaleMode *scale_mode,
+    size_t *playback_rate_index,
+    size_t *subtitle_font_index,
+    int *subtitle_size,
+    SubtitlePlacement *subtitle_placement
+);
 static bool debug_is_runtime_logging_enabled(void);
 static void debug_clear_last_error(void);
 static bool debug_should_collect_metrics(void);
@@ -868,8 +892,25 @@ static bool pointer_update(PointerState *pointer)
         } else {
             int dx = (int) report.x - pointer->last_touch_x;
             int dy = (int) report.y - pointer->last_touch_y;
+            int abs_dx;
+            int abs_dy;
             pointer->last_touch_x = report.x;
             pointer->last_touch_y = report.y;
+            abs_dx = dx < 0 ? -dx : dx;
+            abs_dy = dy < 0 ? -dy : dy;
+            if (abs_dx <= POINTER_JITTER_THRESHOLD && abs_dy <= POINTER_JITTER_THRESHOLD) {
+                dx = 0;
+                dy = 0;
+            } else {
+                if (abs_dx * POINTER_AXIS_LOCK_RATIO_DEN >= abs_dy * POINTER_AXIS_LOCK_RATIO_NUM) {
+                    dy = 0;
+                } else if (abs_dy * POINTER_AXIS_LOCK_RATIO_DEN >= abs_dx * POINTER_AXIS_LOCK_RATIO_NUM) {
+                    dx = 0;
+                } else if (abs_dx + abs_dy < POINTER_DECISIVE_SUM_THRESHOLD) {
+                    dx = 0;
+                    dy = 0;
+                }
+            }
             if (dx != 0 || dy != 0) {
                 pointer->fx += (dx * SCREEN_W * POINTER_GAIN_NUM << POINTER_FIXED_SHIFT) / ((int) pointer->info->width * POINTER_GAIN_DEN);
                 pointer->fy -= (dy * SCREEN_H * POINTER_GAIN_NUM << POINTER_FIXED_SHIFT) / ((int) pointer->info->height * POINTER_GAIN_DEN);
@@ -884,7 +925,10 @@ static bool pointer_update(PointerState *pointer)
     } else {
         pointer->tracking = false;
     }
-    current_down = report.pressed ? true : false;
+    /* Treat only the touchpad center click as a pointer activation.
+     * Generic "pressed" also fires for directional pad presses, which should
+     * not activate UI elements such as progress-bar seeking. */
+    current_down = (report.pressed && report.arrow == TPAD_ARROW_CLICK) ? true : false;
     click_edge = current_down && !pointer->down;
     pointer->down = current_down;
     return click_edge;
@@ -4001,7 +4045,7 @@ static MovieFile *scan_movies(const char *directory, size_t *out_count)
         if (have_history) {
             for (history_index = 0; history_index < history.count; ++history_index) {
                 if (strcmp(history.entries[history_index].path, files[count].path) == 0) {
-                    files[count].has_resume = true;
+                    files[count].has_resume = history.entries[history_index].has_resume;
                     files[count].resume_frame = history.entries[history_index].frame;
                     break;
                 }
@@ -4516,6 +4560,40 @@ static int draw_left_text_badge(SDL_Surface *screen, const Fonts *fonts, int lef
     return badge.x + badge.w + 6;
 }
 
+static void draw_centered_text_badge(SDL_Surface *screen, const Fonts *fonts, int center_x, int y, const char *label)
+{
+    int text_w = nSDL_GetStringWidth(fonts->white, label);
+    int width = text_w + 10;
+    SDL_Rect badge = {
+        (Sint16) clamp_int(center_x - (width / 2), 0, SCREEN_W - width),
+        (Sint16) y,
+        (Uint16) width,
+        16
+    };
+
+    SDL_FillRect(screen, &badge, SDL_MapRGB(screen->format, 18, 18, 24));
+    nSDL_DrawString(screen, fonts->white, badge.x + 5, badge.y + 4, "%s", label);
+}
+
+static void format_seek_delta(int32_t delta_ms, char *buffer, size_t buffer_size)
+{
+    uint32_t magnitude_ms;
+    char time_text[24];
+
+    if (!buffer || buffer_size == 0) {
+        return;
+    }
+
+    if (delta_ms == 0) {
+        snprintf(buffer, buffer_size, "0s");
+        return;
+    }
+
+    magnitude_ms = (uint32_t) (delta_ms < 0 ? -delta_ms : delta_ms);
+    format_clock(magnitude_ms, time_text, sizeof(time_text));
+    snprintf(buffer, buffer_size, "%c%s", delta_ms < 0 ? '-' : '+', time_text);
+}
+
 static int draw_status_badges(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *video_rect, ScaleMode scale_mode, const PlaybackRate *playback_rate)
 {
     int right_x = SCREEN_W - 8;
@@ -4723,7 +4801,8 @@ static void draw_progress(
     const Fonts *fonts,
     const Movie *movie,
     uint32_t current_ms,
-    const PointerState *pointer
+    const PointerState *pointer,
+    int32_t pending_seek_ms
 )
 {
     SDL_Rect overlay = {0, SCREEN_H - UI_BAR_H, SCREEN_W, UI_BAR_H};
@@ -4735,7 +4814,11 @@ static void draw_progress(
     char left_text[56];
     char remaining_text[24];
     char right_text[32];
+    char hover_text[24];
+    char seek_text[24];
     uint32_t duration_ms = movie_duration_ms(movie);
+    bool hover_bar = false;
+    uint32_t hover_ms = 0;
     SDL_FillRect(screen, &overlay, SDL_MapRGB(screen->format, 0, 0, 0));
     SDL_FillRect(screen, &bar_back, SDL_MapRGB(screen->format, 52, 52, 68));
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
@@ -4755,8 +4838,15 @@ static void draw_progress(
     }
     SDL_FillRect(screen, &bar_front, SDL_MapRGB(screen->format, 32, 182, 255));
     if (pointer && pointer->visible) {
-        SDL_Rect marker = {(Sint16) clamp_int(pointer->x, bar_back.x, bar_back.x + bar_back.w - 1), (Sint16) (bar_back.y - 2), 1, 10};
+        int marker_x = clamp_int(pointer->x, bar_back.x, bar_back.x + bar_back.w - 1);
+        SDL_Rect marker = {(Sint16) marker_x, (Sint16) (bar_back.y - 2), 1, 10};
         SDL_FillRect(screen, &marker, SDL_MapRGB(screen->format, 255, 255, 255));
+        hover_bar = pointer->y >= overlay.y && pointer->y < SCREEN_H;
+        if (hover_bar && duration_ms > 0) {
+            hover_ms = (uint32_t) (((uint64_t) duration_ms * (uint32_t) (marker_x - bar_back.x)) / (uint32_t) bar_back.w);
+            format_clock(hover_ms, hover_text, sizeof(hover_text));
+            draw_centered_text_badge(screen, fonts, marker_x, bar_back.y - 20, hover_text);
+        }
     }
     format_clock(current_ms, current_text, sizeof(current_text));
     format_clock(duration_ms, total_text, sizeof(total_text));
@@ -4772,6 +4862,14 @@ static void draw_progress(
         "%s",
         right_text
     );
+    if (pending_seek_ms != 0) {
+        format_seek_delta(pending_seek_ms, seek_text, sizeof(seek_text));
+        if (pending_seek_ms < 0) {
+            draw_left_text_badge(screen, fonts, 10, (SCREEN_H / 2) - 8, seek_text);
+        } else {
+            draw_text_badge(screen, fonts, SCREEN_W - 10, (SCREEN_H / 2) - 8, seek_text);
+        }
+    }
 }
 
 static bool blit_rgb565_direct(SDL_Surface *screen, const Movie *movie, const SDL_Rect *dst)
@@ -4825,7 +4923,8 @@ static void render_movie(
     int subtitle_size,
     SubtitlePlacement subtitle_placement,
     const char *status_overlay_text,
-    const PointerState *pointer
+    const PointerState *pointer,
+    int32_t pending_seek_ms
 )
 {
     SDL_Rect src;
@@ -4870,7 +4969,7 @@ static void render_movie(
                 draw_left_text_badge(screen, fonts, playback_badge_visible ? 36 : 8, top_overlay_y_for_rect(&dst, 16), status_overlay_text);
             }
         }
-        draw_progress(screen, fonts, movie, current_ms, pointer);
+        draw_progress(screen, fonts, movie, current_ms, pointer, pending_seek_ms);
         if (!help_menu_open && pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
@@ -5023,34 +5122,116 @@ static void history_path_for_movie(const char *movie_path, char *history_path, s
     history_path_for_directory(directory, history_path, history_path_size);
 }
 
+static void history_entry_init_defaults(HistoryEntry *entry)
+{
+    if (!entry) {
+        return;
+    }
+    memset(entry, 0, sizeof(*entry));
+    entry->scale_mode = (uint8_t) SCALE_FIT;
+    entry->playback_rate_index = (uint8_t) PLAYBACK_RATE_DEFAULT_INDEX;
+    entry->subtitle_font_index = (uint8_t) SUBTITLE_FONT_DEFAULT_INDEX;
+    entry->subtitle_size = 0;
+    entry->subtitle_placement = (uint8_t) SUBTITLE_POS_BAR_BOTTOM;
+}
+
+static void apply_history_entry_settings(
+    const HistoryEntry *entry,
+    Movie *movie,
+    ScaleMode *scale_mode,
+    size_t *playback_rate_index,
+    size_t *subtitle_font_index,
+    int *subtitle_size,
+    SubtitlePlacement *subtitle_placement
+)
+{
+    if (!entry || !movie || !scale_mode || !playback_rate_index || !subtitle_font_index || !subtitle_size || !subtitle_placement) {
+        return;
+    }
+
+    *scale_mode = (ScaleMode) clamp_int((int) entry->scale_mode, SCALE_FIT, SCALE_NATIVE);
+    *playback_rate_index = (size_t) clamp_int((int) entry->playback_rate_index, 0, (int) (PLAYBACK_RATE_COUNT - 1U));
+    *subtitle_font_index = (size_t) clamp_int((int) entry->subtitle_font_index, 0, (int) (SUBTITLE_FONT_CHOICE_COUNT - 1U));
+    *subtitle_size = clamp_int((int) entry->subtitle_size, -1, 3);
+    *subtitle_placement = (SubtitlePlacement) clamp_int((int) entry->subtitle_placement, SUBTITLE_POS_BAR_BOTTOM, SUBTITLE_POS_COUNT - 1);
+
+    if (movie->subtitle_track_count == 0) {
+        movie->selected_subtitle_track = 0;
+    } else {
+        uint16_t max_track = (uint16_t) (movie->subtitle_track_count - 1U);
+        movie->selected_subtitle_track = (uint16_t) clamp_int((int) entry->selected_subtitle_track, 0, (int) max_track);
+    }
+}
+
 static bool load_history_store_from_path(const char *history_path, HistoryStore *history)
 {
     FILE *file;
     char line[MAX_PATH_LEN + 64];
+    bool version2 = false;
 
     memset(history, 0, sizeof(*history));
     file = fopen(history_path, "rb");
     if (!file) {
         return true;
     }
-    if (!fgets(line, sizeof(line), file) || strncmp(line, "NDVH1", 5) != 0) {
+    if (!fgets(line, sizeof(line), file)) {
+        fclose(file);
+        return false;
+    }
+    if (strncmp(line, HISTORY_MAGIC_V2, 5) == 0) {
+        version2 = true;
+    } else if (strncmp(line, HISTORY_MAGIC_V1, 5) != 0) {
         fclose(file);
         return false;
     }
     while (history->count < HISTORY_MAX_ENTRIES && fgets(line, sizeof(line), file)) {
-        char *separator = strchr(line, '\t');
-        char *path;
-        if (!separator) {
-            continue;
+        char *path = NULL;
+        HistoryEntry entry;
+
+        history_entry_init_defaults(&entry);
+        if (version2) {
+            char *fields[9];
+            size_t field_index;
+
+            fields[0] = line;
+            for (field_index = 1; field_index < 9; ++field_index) {
+                char *separator = strchr(fields[field_index - 1], '\t');
+                if (!separator) {
+                    break;
+                }
+                *separator = '\0';
+                fields[field_index] = separator + 1;
+            }
+            if (field_index < 9) {
+                continue;
+            }
+
+            path = fields[8];
+            entry.has_resume = strtoul(fields[0], NULL, 10) != 0;
+            entry.frame = (uint32_t) strtoul(fields[1], NULL, 10);
+            entry.scale_mode = (uint8_t) strtoul(fields[2], NULL, 10);
+            entry.playback_rate_index = (uint8_t) strtoul(fields[3], NULL, 10);
+            entry.subtitle_font_index = (uint8_t) strtoul(fields[4], NULL, 10);
+            entry.subtitle_size = (int8_t) strtol(fields[5], NULL, 10);
+            entry.subtitle_placement = (uint8_t) strtoul(fields[6], NULL, 10);
+            entry.selected_subtitle_track = (uint16_t) strtoul(fields[7], NULL, 10);
+        } else {
+            char *separator = strchr(line, '\t');
+            if (!separator) {
+                continue;
+            }
+            *separator = '\0';
+            path = separator + 1;
+            entry.has_resume = true;
+            entry.frame = (uint32_t) strtoul(line, NULL, 10);
         }
-        *separator = '\0';
-        path = separator + 1;
+
         path[strcspn(path, "\r\n")] = '\0';
         if (path[0] == '\0') {
             continue;
         }
-        history->entries[history->count].frame = (uint32_t) strtoul(line, NULL, 10);
-        history->entries[history->count].path = dup_string(path);
+        entry.path = dup_string(path);
+        history->entries[history->count] = entry;
         if (!history->entries[history->count].path) {
             fclose(file);
             free_history_store(history);
@@ -5080,9 +5261,21 @@ static bool save_history_store(const char *movie_path, const HistoryStore *histo
     if (!file) {
         return false;
     }
-    fputs("NDVH1\n", file);
+    fputs(HISTORY_MAGIC_V2 "\n", file);
     for (index = 0; index < history->count && index < HISTORY_MAX_ENTRIES; ++index) {
-        fprintf(file, "%lu\t%s\n", (unsigned long) history->entries[index].frame, history->entries[index].path);
+        fprintf(
+            file,
+            "%u\t%lu\t%u\t%u\t%u\t%d\t%u\t%u\t%s\n",
+            history->entries[index].has_resume ? 1U : 0U,
+            (unsigned long) history->entries[index].frame,
+            (unsigned) history->entries[index].scale_mode,
+            (unsigned) history->entries[index].playback_rate_index,
+            (unsigned) history->entries[index].subtitle_font_index,
+            (int) history->entries[index].subtitle_size,
+            (unsigned) history->entries[index].subtitle_placement,
+            (unsigned) history->entries[index].selected_subtitle_track,
+            history->entries[index].path
+        );
     }
     fclose(file);
     return true;
@@ -5114,14 +5307,33 @@ static void history_remove_entry(HistoryStore *history, const char *movie_path)
     history->count--;
 }
 
-static void history_upsert_entry(HistoryStore *history, const char *movie_path, uint32_t frame)
+static void history_upsert_entry(
+    HistoryStore *history,
+    const char *movie_path,
+    const Movie *movie,
+    bool has_resume,
+    uint32_t frame,
+    ScaleMode scale_mode,
+    size_t playback_rate_index,
+    size_t subtitle_font_index,
+    int subtitle_size,
+    SubtitlePlacement subtitle_placement
+)
 {
     HistoryEntry entry;
     size_t index;
 
+    history_entry_init_defaults(&entry);
     history_remove_entry(history, movie_path);
     entry.path = dup_string(movie_path);
+    entry.has_resume = has_resume;
     entry.frame = frame;
+    entry.scale_mode = (uint8_t) clamp_int((int) scale_mode, SCALE_FIT, SCALE_NATIVE);
+    entry.playback_rate_index = (uint8_t) clamp_int((int) playback_rate_index, 0, (int) (PLAYBACK_RATE_COUNT - 1U));
+    entry.subtitle_font_index = (uint8_t) clamp_int((int) subtitle_font_index, 0, (int) (SUBTITLE_FONT_CHOICE_COUNT - 1U));
+    entry.subtitle_size = (int8_t) clamp_int(subtitle_size, -1, 3);
+    entry.subtitle_placement = (uint8_t) clamp_int((int) subtitle_placement, SUBTITLE_POS_BAR_BOTTOM, SUBTITLE_POS_COUNT - 1);
+    entry.selected_subtitle_track = movie ? movie->selected_subtitle_track : 0;
     if (!entry.path) {
         return;
     }
@@ -5136,6 +5348,7 @@ static void history_upsert_entry(HistoryStore *history, const char *movie_path, 
     history->count++;
 }
 
+static bool history_resume_frame_for_movie(const char *movie_path, uint32_t *out_frame) __attribute__((unused));
 static bool history_resume_frame_for_movie(const char *movie_path, uint32_t *out_frame)
 {
     HistoryStore history;
@@ -5144,7 +5357,7 @@ static bool history_resume_frame_for_movie(const char *movie_path, uint32_t *out
         return false;
     }
     found_index = history_find_entry_index(&history, movie_path);
-    if (found_index >= 0) {
+    if (found_index >= 0 && history.entries[found_index].has_resume) {
         *out_frame = history.entries[found_index].frame;
         free_history_store(&history);
         return true;
@@ -5160,17 +5373,39 @@ static bool should_save_history_position(const Movie *movie)
     return now_ms >= RESUME_MIN_MS && (duration_ms == 0 || now_ms + RESUME_CLEAR_TAIL_MS < duration_ms);
 }
 
-static void save_history_position_for_movie(const char *movie_path, const Movie *movie)
+static void save_history_position_for_movie(
+    const char *movie_path,
+    const Movie *movie,
+    ScaleMode scale_mode,
+    size_t playback_rate_index,
+    size_t subtitle_font_index,
+    int subtitle_size,
+    SubtitlePlacement subtitle_placement
+)
 {
     HistoryStore history;
+    bool has_resume = false;
+    uint32_t frame = 0;
+
     if (!load_history_store(movie_path, &history)) {
         return;
     }
     if (should_save_history_position(movie)) {
-        history_upsert_entry(&history, movie_path, movie->current_frame);
-    } else {
-        history_remove_entry(&history, movie_path);
+        has_resume = true;
+        frame = movie->current_frame;
     }
+    history_upsert_entry(
+        &history,
+        movie_path,
+        movie,
+        has_resume,
+        frame,
+        scale_mode,
+        playback_rate_index,
+        subtitle_font_index,
+        subtitle_size,
+        subtitle_placement
+    );
     save_history_store(movie_path, &history);
     free_history_store(&history);
 }
@@ -5197,7 +5432,18 @@ static void maybe_defer_history_save(const Movie *movie, uint32_t *last_history_
     }
 }
 
-static void flush_deferred_history_save(const char *movie_path, const Movie *movie, bool *pending, const char *reason, bool force)
+static void flush_deferred_history_save(
+    const char *movie_path,
+    const Movie *movie,
+    bool *pending,
+    const char *reason,
+    bool force,
+    ScaleMode scale_mode,
+    size_t playback_rate_index,
+    size_t subtitle_font_index,
+    int subtitle_size,
+    SubtitlePlacement subtitle_placement
+)
 {
     uint32_t start_ms;
     uint32_t elapsed_ms;
@@ -5210,7 +5456,15 @@ static void flush_deferred_history_save(const char *movie_path, const Movie *mov
     }
 
     start_ms = monotonic_clock_now_ms();
-    save_history_position_for_movie(movie_path, movie);
+    save_history_position_for_movie(
+        movie_path,
+        movie,
+        scale_mode,
+        playback_rate_index,
+        subtitle_font_index,
+        subtitle_size,
+        subtitle_placement
+    );
     elapsed_ms = monotonic_clock_now_ms() - start_ms;
     debug_tracef(
         "history flush reason=%s frame=%lu ms=%lu",
@@ -5271,6 +5525,7 @@ static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *direc
 {
     bool prev_up = false;
     bool prev_down = false;
+    bool prev_click = false;
     bool prev_enter = false;
     bool prev_esc = false;
     PointerState pointer;
@@ -5293,6 +5548,9 @@ static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *direc
         }
         if (key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) && selected + 1 < count) {
             selected++;
+        }
+        if (key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click)) {
+            pointer_click = true;
         }
         if (pointer_click && hovered_index >= 0 && (size_t) hovered_index < count) {
             int phase;
@@ -5535,6 +5793,11 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     uint32_t resume_frame = 0;
     uint32_t last_history_saved_ms = 0;
     bool history_save_pending = false;
+    HistoryStore startup_history;
+    int startup_history_index = -1;
+    bool startup_has_resume = false;
+    int32_t pending_seek_ms = 0;
+    uint32_t pending_seek_commit_at_ms = 0;
 
     if (debug_is_runtime_logging_enabled()) {
         g_debug_ring_count = 0;
@@ -5556,7 +5819,26 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         report_movie_open_failure(path);
         return -1;
     }
-    if (history_resume_frame_for_movie(path, &resume_frame) && resume_frame < movie.header.frame_count) {
+    if (load_history_store(path, &startup_history)) {
+        startup_history_index = history_find_entry_index(&startup_history, path);
+        if (startup_history_index >= 0) {
+            apply_history_entry_settings(
+                &startup_history.entries[startup_history_index],
+                &movie,
+                &scale_mode,
+                &playback_rate_index,
+                &subtitle_font_index,
+                &subtitle_size,
+                &subtitle_placement
+            );
+            if (startup_history.entries[startup_history_index].has_resume) {
+                startup_has_resume = true;
+                resume_frame = startup_history.entries[startup_history_index].frame;
+            }
+        }
+        free_history_store(&startup_history);
+    }
+    if (startup_has_resume && resume_frame < movie.header.frame_count) {
         int resume_choice = prompt_resume_position(screen, fonts, &movie, path, resume_frame);
         if (resume_choice < 0) {
             if (debug_is_runtime_logging_enabled()) {
@@ -5605,6 +5887,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
 
     while (1) {
         bool pointer_click = pointer_update(&pointer);
+        bool pending_seek_consumed_click = false;
         uint64_t now_ticks = monotonic_clock_now_ticks();
         uint32_t now_ms = monotonic_clock_ticks_to_ms(now_ticks);
         const PlaybackRate *playback_rate = playback_rate_for_index(playback_rate_index);
@@ -5621,6 +5904,8 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         bool gthan_edge = key_pressed_edge(KEY_NSPIRE_GTHAN, &prev_gthan);
         bool speed_down_edge = lp_edge || lthan_edge;
         bool speed_up_edge = rp_edge || gthan_edge;
+        bool seek_left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left);
+        bool seek_right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right);
         bool subtitle_font_edge = key_pressed_edge(KEY_NSPIRE_F, &prev_f);
         bool subtitle_track_edge = key_pressed_edge(KEY_NSPIRE_T, &prev_t);
         bool memory_overlay_edge = key_pressed_edge(KEY_NSPIRE_M, &prev_m);
@@ -5637,6 +5922,38 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             pointer_click = true;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             show_ui = true;
+        }
+        if (seek_left_edge || seek_right_edge) {
+            int64_t next_seek_ms = (int64_t) pending_seek_ms + (seek_left_edge ? -SEEK_STEP_MS : SEEK_STEP_MS);
+            int64_t seek_limit_ms = (int64_t) movie_duration_ms(&movie);
+
+            if (!paused) {
+                paused = true;
+            }
+            if (next_seek_ms < -seek_limit_ms) {
+                next_seek_ms = -seek_limit_ms;
+            }
+            if (next_seek_ms > seek_limit_ms) {
+                next_seek_ms = seek_limit_ms;
+            }
+            pending_seek_ms = (int32_t) next_seek_ms;
+            pending_seek_commit_at_ms = now_ms + SEEK_STACK_DELAY_MS;
+            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (pending_seek_ms != 0 &&
+            !seek_left_edge &&
+            !seek_right_edge &&
+            (now_ms >= pending_seek_commit_at_ms || enter_edge || tab_edge || pointer_click)) {
+            pending_seek_consumed_click = pointer_click;
+            clamp_seek(&movie, pending_seek_ms);
+            pending_seek_ms = 0;
+            pending_seek_commit_at_ms = 0;
+            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (pending_seek_consumed_click) {
+            pointer_click = false;
         }
         if (screenshot_edge) {
             take_screenshot = true;
@@ -5687,12 +6004,24 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 subtitle_size,
                 subtitle_placement,
                 (now_ms <= status_overlay_until) ? status_overlay_text : NULL,
-                &pointer
+                &pointer,
+                0
             );
             if (take_screenshot) {
-                save_screenshot_bitmap(screen, path, NULL, 0);
-            }
-            flush_deferred_history_save(path, &movie, &history_save_pending, "help", false);
+            save_screenshot_bitmap(screen, path, NULL, 0);
+        }
+            flush_deferred_history_save(
+                path,
+                &movie,
+                &history_save_pending,
+                "help",
+                false,
+                scale_mode,
+                playback_rate_index,
+                subtitle_font_index,
+                subtitle_size,
+                subtitle_placement
+            );
             prefetch_tick(&movie, true, 1000);
             msleep(16);
             continue;
@@ -5704,18 +6033,6 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             } else {
                 paused = !paused;
             }
-            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
-            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
-        }
-        if (key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left)) {
-            clamp_seek(&movie, -SEEK_STEP_MS);
-            paused = true;
-            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
-            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
-        }
-        if (key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right)) {
-            clamp_seek(&movie, SEEK_STEP_MS);
-            paused = true;
             reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
@@ -5938,13 +6255,25 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             subtitle_size,
             subtitle_placement,
             (now_ms <= status_overlay_until) ? status_overlay_text : NULL,
-            &pointer
+            &pointer,
+            pending_seek_ms
         );
         if (take_screenshot) {
             save_screenshot_bitmap(screen, path, NULL, 0);
         }
         if (paused || frame_interval_ticks == 0) {
-            flush_deferred_history_save(path, &movie, &history_save_pending, "paused", false);
+            flush_deferred_history_save(
+                path,
+                &movie,
+                &history_save_pending,
+                "paused",
+                false,
+                scale_mode,
+                playback_rate_index,
+                subtitle_font_index,
+                subtitle_size,
+                subtitle_placement
+            );
             prefetch_tick(&movie, true, 1000);
             if (debug_is_runtime_logging_enabled() &&
                 now_ms - movie.diag_last_snapshot_ms >= DEBUG_SNAPSHOT_INTERVAL_MS) {
@@ -5981,7 +6310,18 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         }
     }
 
-    flush_deferred_history_save(path, &movie, &history_save_pending, "exit", true);
+    flush_deferred_history_save(
+        path,
+        &movie,
+        &history_save_pending,
+        "exit",
+        true,
+        scale_mode,
+        playback_rate_index,
+        subtitle_font_index,
+        subtitle_size,
+        subtitle_placement
+    );
     if (debug_is_runtime_logging_enabled() || result != 0) {
         char log_path[MAX_PATH_LEN];
         debug_log_path_for_movie(path, log_path, sizeof(log_path));
