@@ -1,3 +1,4 @@
+#define OLD_SCREEN_API
 #include <dirent.h>
 #include <libndls.h>
 #include <os.h>
@@ -391,7 +392,12 @@ static const char *g_subtitle_font_names[] = {
 #define SUBTITLE_FONT_OVERLAY_MS 1200U
 
 static bool decode_to_frame(Movie *movie, uint32_t frame_index);
-static bool decode_h264_frame(Movie *movie, uint32_t frame_index, bool blit_output, bool store_prefetched);
+static bool decode_h264_frame(
+    Movie *movie,
+    uint32_t frame_index,
+    bool blit_output,
+    bool store_prefetched
+);
 static bool load_chunk(Movie *movie, int chunk_index);
 static bool prefetch_chunk(Movie *movie, int chunk_index);
 static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks);
@@ -458,6 +464,30 @@ static bool debug_is_runtime_logging_enabled(void)
 static bool debug_should_collect_metrics(void)
 {
     return g_debug_metrics_enabled || g_debug_logging_enabled;
+}
+
+static uint8_t *hardware_screen_bytes(void)
+{
+    return (uint8_t *) (uintptr_t) SCREEN_BASE_ADDRESS;
+}
+
+static void present_screen(SDL_Surface *screen)
+{
+    bool locked = false;
+
+    if (!screen) {
+        return;
+    }
+    if (SDL_MUSTLOCK(screen)) {
+        if (SDL_LockSurface(screen) != 0) {
+            return;
+        }
+        locked = true;
+    }
+    memcpy(hardware_screen_bytes(), screen->pixels, SCREEN_BYTES_SIZE);
+    if (locked) {
+        SDL_UnlockSurface(screen);
+    }
 }
 
 static void debug_set_metrics_collection(bool enabled)
@@ -2388,13 +2418,15 @@ static inline uint32_t h264_pack_rgb565_pair(uint16_t left_pixel, uint16_t right
     return ((uint32_t) right_pixel << 16) | left_pixel;
 }
 
-static bool blit_h264_planes_to_framebuffer(
-    Movie *movie,
+static bool blit_h264_planes_to_rgb565_target(
+    const Movie *movie,
     const uint8_t *restrict y_plane,
     const uint8_t *restrict u_plane,
     const uint8_t *restrict v_plane,
     size_t luma_stride,
-    size_t chroma_stride
+    size_t chroma_stride,
+    uint16_t *restrict dst_pixels,
+    size_t dst_pitch_pixels
 )
 {
     const int32_t *restrict y_base = g_h264_color_tables.y_base;
@@ -2403,7 +2435,7 @@ static bool blit_h264_planes_to_framebuffer(
     const uint16_t *restrict blue565 = g_h264_color_tables.blue565;
     size_t y;
 
-    if (!movie || !y_plane || !u_plane || !v_plane || !movie->framebuffer || !movie->h264_headers_ready) {
+    if (!movie || !y_plane || !u_plane || !v_plane || !dst_pixels || !movie->h264_headers_ready) {
         return false;
     }
 
@@ -2412,143 +2444,287 @@ static bool blit_h264_planes_to_framebuffer(
         const uint8_t *restrict y_row1 = y_row0 + luma_stride;
         const uint8_t *restrict u_row = u_plane + ((size_t) (y / 2U) * chroma_stride);
         const uint8_t *restrict v_row = v_plane + ((size_t) (y / 2U) * chroma_stride);
-        uint32_t *restrict dst_row0 = (uint32_t *) (void *) (movie->framebuffer + ((size_t) y * movie->header.video_width));
-        uint32_t *restrict dst_row1 = (uint32_t *) (void *) (movie->framebuffer + ((size_t) (y + 1U) * movie->header.video_width));
+        uint16_t *restrict dst_row0_16 = dst_pixels + ((size_t) y * dst_pitch_pixels);
+        uint16_t *restrict dst_row1_16 = dst_row0_16 + dst_pitch_pixels;
+        const bool packed_writes = ((((uintptr_t) dst_row0_16) | ((uintptr_t) dst_row1_16)) & (sizeof(uint32_t) - 1U)) == 0U;
         const size_t main_width = movie->h264_crop_width & ~(size_t) 3U;
         size_t x;
 
-        for (x = 0; x < main_width; x += 4U) {
-            const size_t chroma_index = x / 2U;
-            const size_t dst_index = x / 2U;
-            int32_t r0;
-            int32_t g0;
-            int32_t b0;
-            int32_t r1;
-            int32_t g1;
-            int32_t b1;
-            uint16_t p0;
-            uint16_t p1;
-            uint16_t p2;
-            uint16_t p3;
-            int32_t luma0;
-            int32_t luma1;
+        if (packed_writes) {
+            uint32_t *restrict dst_row0 = (uint32_t *) (void *) dst_row0_16;
+            uint32_t *restrict dst_row1 = (uint32_t *) (void *) dst_row1_16;
 
-            h264_compute_chroma_terms(
-                u_row[chroma_index],
-                v_row[chroma_index],
-                &r0,
-                &g0,
-                &b0
-            );
-            h264_compute_chroma_terms(
-                u_row[chroma_index + 1U],
-                v_row[chroma_index + 1U],
-                &r1,
-                &g1,
-                &b1
-            );
+            for (x = 0; x < main_width; x += 4U) {
+                const size_t chroma_index = x / 2U;
+                const size_t dst_index = x / 2U;
+                int32_t r0;
+                int32_t g0;
+                int32_t b0;
+                int32_t r1;
+                int32_t g1;
+                int32_t b1;
+                uint16_t p0;
+                uint16_t p1;
+                uint16_t p2;
+                uint16_t p3;
+                int32_t luma0;
+                int32_t luma1;
 
-            luma0 = y_base[y_row0[x]];
-            luma1 = y_base[y_row0[x + 1U]];
-            p0 = (uint16_t) (
-                red565[h264_clip_byte((luma0 + r0) >> 8)] |
-                green565[h264_clip_byte((luma0 + g0) >> 8)] |
-                blue565[h264_clip_byte((luma0 + b0) >> 8)]
-            );
-            p1 = (uint16_t) (
-                red565[h264_clip_byte((luma1 + r0) >> 8)] |
-                green565[h264_clip_byte((luma1 + g0) >> 8)] |
-                blue565[h264_clip_byte((luma1 + b0) >> 8)]
-            );
-            luma0 = y_base[y_row0[x + 2U]];
-            luma1 = y_base[y_row0[x + 3U]];
-            p2 = (uint16_t) (
-                red565[h264_clip_byte((luma0 + r1) >> 8)] |
-                green565[h264_clip_byte((luma0 + g1) >> 8)] |
-                blue565[h264_clip_byte((luma0 + b1) >> 8)]
-            );
-            p3 = (uint16_t) (
-                red565[h264_clip_byte((luma1 + r1) >> 8)] |
-                green565[h264_clip_byte((luma1 + g1) >> 8)] |
-                blue565[h264_clip_byte((luma1 + b1) >> 8)]
-            );
-            dst_row0[dst_index] = h264_pack_rgb565_pair(p0, p1);
-            dst_row0[dst_index + 1U] = h264_pack_rgb565_pair(p2, p3);
+                h264_compute_chroma_terms(
+                    u_row[chroma_index],
+                    v_row[chroma_index],
+                    &r0,
+                    &g0,
+                    &b0
+                );
+                h264_compute_chroma_terms(
+                    u_row[chroma_index + 1U],
+                    v_row[chroma_index + 1U],
+                    &r1,
+                    &g1,
+                    &b1
+                );
 
-            luma0 = y_base[y_row1[x]];
-            luma1 = y_base[y_row1[x + 1U]];
-            p0 = (uint16_t) (
-                red565[h264_clip_byte((luma0 + r0) >> 8)] |
-                green565[h264_clip_byte((luma0 + g0) >> 8)] |
-                blue565[h264_clip_byte((luma0 + b0) >> 8)]
-            );
-            p1 = (uint16_t) (
-                red565[h264_clip_byte((luma1 + r0) >> 8)] |
-                green565[h264_clip_byte((luma1 + g0) >> 8)] |
-                blue565[h264_clip_byte((luma1 + b0) >> 8)]
-            );
-            luma0 = y_base[y_row1[x + 2U]];
-            luma1 = y_base[y_row1[x + 3U]];
-            p2 = (uint16_t) (
-                red565[h264_clip_byte((luma0 + r1) >> 8)] |
-                green565[h264_clip_byte((luma0 + g1) >> 8)] |
-                blue565[h264_clip_byte((luma0 + b1) >> 8)]
-            );
-            p3 = (uint16_t) (
-                red565[h264_clip_byte((luma1 + r1) >> 8)] |
-                green565[h264_clip_byte((luma1 + g1) >> 8)] |
-                blue565[h264_clip_byte((luma1 + b1) >> 8)]
-            );
-            dst_row1[dst_index] = h264_pack_rgb565_pair(p0, p1);
-            dst_row1[dst_index + 1U] = h264_pack_rgb565_pair(p2, p3);
-        }
+                luma0 = y_base[y_row0[x]];
+                luma1 = y_base[y_row0[x + 1U]];
+                p0 = (uint16_t) (
+                    red565[h264_clip_byte((luma0 + r0) >> 8)] |
+                    green565[h264_clip_byte((luma0 + g0) >> 8)] |
+                    blue565[h264_clip_byte((luma0 + b0) >> 8)]
+                );
+                p1 = (uint16_t) (
+                    red565[h264_clip_byte((luma1 + r0) >> 8)] |
+                    green565[h264_clip_byte((luma1 + g0) >> 8)] |
+                    blue565[h264_clip_byte((luma1 + b0) >> 8)]
+                );
+                luma0 = y_base[y_row0[x + 2U]];
+                luma1 = y_base[y_row0[x + 3U]];
+                p2 = (uint16_t) (
+                    red565[h264_clip_byte((luma0 + r1) >> 8)] |
+                    green565[h264_clip_byte((luma0 + g1) >> 8)] |
+                    blue565[h264_clip_byte((luma0 + b1) >> 8)]
+                );
+                p3 = (uint16_t) (
+                    red565[h264_clip_byte((luma1 + r1) >> 8)] |
+                    green565[h264_clip_byte((luma1 + g1) >> 8)] |
+                    blue565[h264_clip_byte((luma1 + b1) >> 8)]
+                );
+                dst_row0[dst_index] = h264_pack_rgb565_pair(p0, p1);
+                dst_row0[dst_index + 1U] = h264_pack_rgb565_pair(p2, p3);
 
-        for (; x < movie->h264_crop_width; x += 2U) {
-            const size_t chroma_index = x / 2U;
-            const size_t dst_index = x / 2U;
-            int32_t chroma_red;
-            int32_t chroma_green;
-            int32_t chroma_blue;
-            uint16_t p0;
-            uint16_t p1;
-            int32_t luma0;
-            int32_t luma1;
+                luma0 = y_base[y_row1[x]];
+                luma1 = y_base[y_row1[x + 1U]];
+                p0 = (uint16_t) (
+                    red565[h264_clip_byte((luma0 + r0) >> 8)] |
+                    green565[h264_clip_byte((luma0 + g0) >> 8)] |
+                    blue565[h264_clip_byte((luma0 + b0) >> 8)]
+                );
+                p1 = (uint16_t) (
+                    red565[h264_clip_byte((luma1 + r0) >> 8)] |
+                    green565[h264_clip_byte((luma1 + g0) >> 8)] |
+                    blue565[h264_clip_byte((luma1 + b0) >> 8)]
+                );
+                luma0 = y_base[y_row1[x + 2U]];
+                luma1 = y_base[y_row1[x + 3U]];
+                p2 = (uint16_t) (
+                    red565[h264_clip_byte((luma0 + r1) >> 8)] |
+                    green565[h264_clip_byte((luma0 + g1) >> 8)] |
+                    blue565[h264_clip_byte((luma0 + b1) >> 8)]
+                );
+                p3 = (uint16_t) (
+                    red565[h264_clip_byte((luma1 + r1) >> 8)] |
+                    green565[h264_clip_byte((luma1 + g1) >> 8)] |
+                    blue565[h264_clip_byte((luma1 + b1) >> 8)]
+                );
+                dst_row1[dst_index] = h264_pack_rgb565_pair(p0, p1);
+                dst_row1[dst_index + 1U] = h264_pack_rgb565_pair(p2, p3);
+            }
 
-            h264_compute_chroma_terms(
-                u_row[chroma_index],
-                v_row[chroma_index],
-                &chroma_red,
-                &chroma_green,
-                &chroma_blue
-            );
+            for (; x < movie->h264_crop_width; x += 2U) {
+                const size_t chroma_index = x / 2U;
+                const size_t dst_index = x / 2U;
+                int32_t chroma_red;
+                int32_t chroma_green;
+                int32_t chroma_blue;
+                uint16_t p0;
+                uint16_t p1;
+                int32_t luma0;
+                int32_t luma1;
 
-            luma0 = y_base[y_row0[x]];
-            luma1 = y_base[y_row0[x + 1U]];
-            p0 = (uint16_t) (
-                red565[h264_clip_byte((luma0 + chroma_red) >> 8)] |
-                green565[h264_clip_byte((luma0 + chroma_green) >> 8)] |
-                blue565[h264_clip_byte((luma0 + chroma_blue) >> 8)]
-            );
-            p1 = (uint16_t) (
-                red565[h264_clip_byte((luma1 + chroma_red) >> 8)] |
-                green565[h264_clip_byte((luma1 + chroma_green) >> 8)] |
-                blue565[h264_clip_byte((luma1 + chroma_blue) >> 8)]
-            );
-            dst_row0[dst_index] = h264_pack_rgb565_pair(p0, p1);
+                h264_compute_chroma_terms(
+                    u_row[chroma_index],
+                    v_row[chroma_index],
+                    &chroma_red,
+                    &chroma_green,
+                    &chroma_blue
+                );
 
-            luma0 = y_base[y_row1[x]];
-            luma1 = y_base[y_row1[x + 1U]];
-            p0 = (uint16_t) (
-                red565[h264_clip_byte((luma0 + chroma_red) >> 8)] |
-                green565[h264_clip_byte((luma0 + chroma_green) >> 8)] |
-                blue565[h264_clip_byte((luma0 + chroma_blue) >> 8)]
-            );
-            p1 = (uint16_t) (
-                red565[h264_clip_byte((luma1 + chroma_red) >> 8)] |
-                green565[h264_clip_byte((luma1 + chroma_green) >> 8)] |
-                blue565[h264_clip_byte((luma1 + chroma_blue) >> 8)]
-            );
-            dst_row1[dst_index] = h264_pack_rgb565_pair(p0, p1);
+                luma0 = y_base[y_row0[x]];
+                luma1 = y_base[y_row0[x + 1U]];
+                p0 = (uint16_t) (
+                    red565[h264_clip_byte((luma0 + chroma_red) >> 8)] |
+                    green565[h264_clip_byte((luma0 + chroma_green) >> 8)] |
+                    blue565[h264_clip_byte((luma0 + chroma_blue) >> 8)]
+                );
+                p1 = (uint16_t) (
+                    red565[h264_clip_byte((luma1 + chroma_red) >> 8)] |
+                    green565[h264_clip_byte((luma1 + chroma_green) >> 8)] |
+                    blue565[h264_clip_byte((luma1 + chroma_blue) >> 8)]
+                );
+                dst_row0[dst_index] = h264_pack_rgb565_pair(p0, p1);
+
+                luma0 = y_base[y_row1[x]];
+                luma1 = y_base[y_row1[x + 1U]];
+                p0 = (uint16_t) (
+                    red565[h264_clip_byte((luma0 + chroma_red) >> 8)] |
+                    green565[h264_clip_byte((luma0 + chroma_green) >> 8)] |
+                    blue565[h264_clip_byte((luma0 + chroma_blue) >> 8)]
+                );
+                p1 = (uint16_t) (
+                    red565[h264_clip_byte((luma1 + chroma_red) >> 8)] |
+                    green565[h264_clip_byte((luma1 + chroma_green) >> 8)] |
+                    blue565[h264_clip_byte((luma1 + chroma_blue) >> 8)]
+                );
+                dst_row1[dst_index] = h264_pack_rgb565_pair(p0, p1);
+            }
+        } else {
+            for (x = 0; x < main_width; x += 4U) {
+                const size_t chroma_index = x / 2U;
+                int32_t r0;
+                int32_t g0;
+                int32_t b0;
+                int32_t r1;
+                int32_t g1;
+                int32_t b1;
+                uint16_t p0;
+                uint16_t p1;
+                uint16_t p2;
+                uint16_t p3;
+                int32_t luma0;
+                int32_t luma1;
+
+                h264_compute_chroma_terms(
+                    u_row[chroma_index],
+                    v_row[chroma_index],
+                    &r0,
+                    &g0,
+                    &b0
+                );
+                h264_compute_chroma_terms(
+                    u_row[chroma_index + 1U],
+                    v_row[chroma_index + 1U],
+                    &r1,
+                    &g1,
+                    &b1
+                );
+
+                luma0 = y_base[y_row0[x]];
+                luma1 = y_base[y_row0[x + 1U]];
+                p0 = (uint16_t) (
+                    red565[h264_clip_byte((luma0 + r0) >> 8)] |
+                    green565[h264_clip_byte((luma0 + g0) >> 8)] |
+                    blue565[h264_clip_byte((luma0 + b0) >> 8)]
+                );
+                p1 = (uint16_t) (
+                    red565[h264_clip_byte((luma1 + r0) >> 8)] |
+                    green565[h264_clip_byte((luma1 + g0) >> 8)] |
+                    blue565[h264_clip_byte((luma1 + b0) >> 8)]
+                );
+                luma0 = y_base[y_row0[x + 2U]];
+                luma1 = y_base[y_row0[x + 3U]];
+                p2 = (uint16_t) (
+                    red565[h264_clip_byte((luma0 + r1) >> 8)] |
+                    green565[h264_clip_byte((luma0 + g1) >> 8)] |
+                    blue565[h264_clip_byte((luma0 + b1) >> 8)]
+                );
+                p3 = (uint16_t) (
+                    red565[h264_clip_byte((luma1 + r1) >> 8)] |
+                    green565[h264_clip_byte((luma1 + g1) >> 8)] |
+                    blue565[h264_clip_byte((luma1 + b1) >> 8)]
+                );
+                dst_row0_16[x] = p0;
+                dst_row0_16[x + 1U] = p1;
+                dst_row0_16[x + 2U] = p2;
+                dst_row0_16[x + 3U] = p3;
+
+                luma0 = y_base[y_row1[x]];
+                luma1 = y_base[y_row1[x + 1U]];
+                p0 = (uint16_t) (
+                    red565[h264_clip_byte((luma0 + r0) >> 8)] |
+                    green565[h264_clip_byte((luma0 + g0) >> 8)] |
+                    blue565[h264_clip_byte((luma0 + b0) >> 8)]
+                );
+                p1 = (uint16_t) (
+                    red565[h264_clip_byte((luma1 + r0) >> 8)] |
+                    green565[h264_clip_byte((luma1 + g0) >> 8)] |
+                    blue565[h264_clip_byte((luma1 + b0) >> 8)]
+                );
+                luma0 = y_base[y_row1[x + 2U]];
+                luma1 = y_base[y_row1[x + 3U]];
+                p2 = (uint16_t) (
+                    red565[h264_clip_byte((luma0 + r1) >> 8)] |
+                    green565[h264_clip_byte((luma0 + g1) >> 8)] |
+                    blue565[h264_clip_byte((luma0 + b1) >> 8)]
+                );
+                p3 = (uint16_t) (
+                    red565[h264_clip_byte((luma1 + r1) >> 8)] |
+                    green565[h264_clip_byte((luma1 + g1) >> 8)] |
+                    blue565[h264_clip_byte((luma1 + b1) >> 8)]
+                );
+                dst_row1_16[x] = p0;
+                dst_row1_16[x + 1U] = p1;
+                dst_row1_16[x + 2U] = p2;
+                dst_row1_16[x + 3U] = p3;
+            }
+
+            for (; x < movie->h264_crop_width; x += 2U) {
+                const size_t chroma_index = x / 2U;
+                int32_t chroma_red;
+                int32_t chroma_green;
+                int32_t chroma_blue;
+                uint16_t p0;
+                uint16_t p1;
+                int32_t luma0;
+                int32_t luma1;
+
+                h264_compute_chroma_terms(
+                    u_row[chroma_index],
+                    v_row[chroma_index],
+                    &chroma_red,
+                    &chroma_green,
+                    &chroma_blue
+                );
+
+                luma0 = y_base[y_row0[x]];
+                luma1 = y_base[y_row0[x + 1U]];
+                p0 = (uint16_t) (
+                    red565[h264_clip_byte((luma0 + chroma_red) >> 8)] |
+                    green565[h264_clip_byte((luma0 + chroma_green) >> 8)] |
+                    blue565[h264_clip_byte((luma0 + chroma_blue) >> 8)]
+                );
+                p1 = (uint16_t) (
+                    red565[h264_clip_byte((luma1 + chroma_red) >> 8)] |
+                    green565[h264_clip_byte((luma1 + chroma_green) >> 8)] |
+                    blue565[h264_clip_byte((luma1 + chroma_blue) >> 8)]
+                );
+                dst_row0_16[x] = p0;
+                dst_row0_16[x + 1U] = p1;
+
+                luma0 = y_base[y_row1[x]];
+                luma1 = y_base[y_row1[x + 1U]];
+                p0 = (uint16_t) (
+                    red565[h264_clip_byte((luma0 + chroma_red) >> 8)] |
+                    green565[h264_clip_byte((luma0 + chroma_green) >> 8)] |
+                    blue565[h264_clip_byte((luma0 + chroma_blue) >> 8)]
+                );
+                p1 = (uint16_t) (
+                    red565[h264_clip_byte((luma1 + chroma_red) >> 8)] |
+                    green565[h264_clip_byte((luma1 + chroma_green) >> 8)] |
+                    blue565[h264_clip_byte((luma1 + chroma_blue) >> 8)]
+                );
+                dst_row1_16[x] = p0;
+                dst_row1_16[x + 1U] = p1;
+            }
         }
     }
 
@@ -2625,7 +2801,7 @@ static bool blit_h264_picture(Movie *movie, const uint8_t *picture)
     const uint8_t *u_plane;
     const uint8_t *v_plane;
 
-    if (!movie || !picture || !movie->framebuffer || !movie->h264_headers_ready) {
+    if (!movie || !picture || !movie->h264_headers_ready || !movie->framebuffer) {
         return false;
     }
 
@@ -2637,7 +2813,16 @@ static bool blit_h264_picture(Movie *movie, const uint8_t *picture)
         + ((size_t) (movie->h264_crop_top / 2U) * chroma_stride)
         + (movie->h264_crop_left / 2U);
 
-    return blit_h264_planes_to_framebuffer(movie, y_plane, u_plane, v_plane, luma_stride, chroma_stride);
+    return blit_h264_planes_to_rgb565_target(
+        movie,
+        y_plane,
+        u_plane,
+        v_plane,
+        luma_stride,
+        chroma_stride,
+        movie->framebuffer,
+        movie->header.video_width
+    );
 }
 
 static bool blit_h264_frame_slot(Movie *movie, const H264FrameSlot *slot)
@@ -2649,13 +2834,15 @@ static bool blit_h264_frame_slot(Movie *movie, const H264FrameSlot *slot)
         return false;
     }
 
-    return blit_h264_planes_to_framebuffer(
+    return blit_h264_planes_to_rgb565_target(
         movie,
         slot->data,
         slot->data + luma_plane_size,
         slot->data + luma_plane_size + chroma_plane_size,
         movie->header.video_width,
-        movie->header.video_width / 2U
+        movie->header.video_width / 2U,
+        movie->framebuffer,
+        movie->header.video_width
     );
 }
 
@@ -3572,7 +3759,12 @@ static int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index)
     return -1;
 }
 
-static bool decode_h264_frame(Movie *movie, uint32_t frame_index, bool blit_output, bool store_prefetched)
+static bool decode_h264_frame(
+    Movie *movie,
+    uint32_t frame_index,
+    bool blit_output,
+    bool store_prefetched
+)
 {
     int chunk_index = movie_chunk_for_frame(movie, frame_index);
     const ChunkIndexEntry *entry;
@@ -4872,42 +5064,6 @@ static void draw_progress(
     }
 }
 
-static bool blit_rgb565_direct(SDL_Surface *screen, const Movie *movie, const SDL_Rect *dst)
-{
-    const uint8_t *src_row;
-    uint8_t *dst_row;
-    int row;
-    bool locked = false;
-
-    if (!screen || !movie || !dst || !movie->framebuffer || !screen->pixels ||
-        screen->format->BitsPerPixel != 16 ||
-        screen->format->Rmask != 0xF800 ||
-        screen->format->Gmask != 0x07E0 ||
-        screen->format->Bmask != 0x001F) {
-        return false;
-    }
-
-    if (SDL_MUSTLOCK(screen)) {
-        if (SDL_LockSurface(screen) != 0) {
-            return false;
-        }
-        locked = true;
-    }
-
-    src_row = (const uint8_t *) movie->framebuffer;
-    dst_row = (uint8_t *) screen->pixels + ((size_t) dst->y * screen->pitch) + ((size_t) dst->x * 2U);
-    for (row = 0; row < movie->header.video_height; ++row) {
-        memcpy(dst_row, src_row, (size_t) movie->header.video_width * 2U);
-        src_row += (size_t) movie->header.video_width * 2U;
-        dst_row += screen->pitch;
-    }
-
-    if (locked) {
-        SDL_UnlockSurface(screen);
-    }
-    return true;
-}
-
 static void render_movie(
     SDL_Surface *screen,
     const Fonts *fonts,
@@ -4929,6 +5085,7 @@ static void render_movie(
 {
     SDL_Rect src;
     SDL_Rect dst;
+    Uint32 black = SDL_MapRGB(screen->format, 0, 0, 0);
     int memory_right_limit = SCREEN_W - 8;
     uint32_t current_ms = movie_frame_time_ms(movie, movie->current_frame);
     const char *subtitle = active_subtitle(movie, current_ms);
@@ -4936,12 +5093,28 @@ static void render_movie(
     bool memory_badge_visible = !help_menu_open && (memory_overlay_mode == MEMORY_OVERLAY_ALWAYS);
 
     compute_video_rects(movie, scale_mode, &src, &dst);
-    SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
-    if (src.w == movie->header.video_width && src.h == movie->header.video_height &&
-        dst.w == movie->header.video_width && dst.h == movie->header.video_height) {
-        if (!blit_rgb565_direct(screen, movie, &dst)) {
-            SDL_BlitSurface(movie->frame_surface, NULL, screen, &dst);
+    if (dst.y > 0) {
+        SDL_Rect top_bar = {0, 0, SCREEN_W, dst.y};
+        int bottom_y = dst.y + dst.h;
+        SDL_Rect bottom_bar = {0, bottom_y, SCREEN_W, SCREEN_H - bottom_y};
+
+        SDL_FillRect(screen, &top_bar, black);
+        if (bottom_bar.h > 0) {
+            SDL_FillRect(screen, &bottom_bar, black);
         }
+    }
+    if (dst.x > 0) {
+        SDL_Rect left_bar = {0, dst.y, dst.x, dst.h};
+        int right_x = dst.x + dst.w;
+        SDL_Rect right_bar = {right_x, dst.y, SCREEN_W - right_x, dst.h};
+
+        SDL_FillRect(screen, &left_bar, black);
+        if (right_bar.w > 0) {
+            SDL_FillRect(screen, &right_bar, black);
+        }
+    }
+    if (dst.w == movie->header.video_width && dst.h == movie->header.video_height) {
+        SDL_BlitSurface(movie->frame_surface, NULL, screen, &dst);
     } else {
         SDL_SoftStretch(movie->frame_surface, &src, screen, &dst);
     }
@@ -4980,7 +5153,7 @@ static void render_movie(
     if (help_menu_open) {
         draw_help_menu(screen, fonts);
     }
-    SDL_Flip(screen);
+    present_screen(screen);
 }
 
 static int picker_row_index_at(size_t count, size_t selected, int y)
@@ -5043,7 +5216,7 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
         if (pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
-        SDL_Flip(screen);
+        present_screen(screen);
         return;
     }
     start_index = selected > (PICKER_VISIBLE_ROWS / 2) ? selected - (PICKER_VISIBLE_ROWS / 2) : 0;
@@ -5082,7 +5255,7 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
     if (pointer && pointer->visible) {
         draw_cursor(screen, pointer->x, pointer->y);
     }
-    SDL_Flip(screen);
+    present_screen(screen);
 }
 
 static void strip_filename(char *path)
@@ -5706,7 +5879,7 @@ static int prompt_resume_position(
         if (pointer.visible) {
             draw_cursor(screen, pointer.x, pointer.y);
         }
-        SDL_Flip(screen);
+        present_screen(screen);
 
         if (pointer.visible) {
             if (pointer.x >= continue_button.x && pointer.x < continue_button.x + continue_button.w &&
@@ -5811,7 +5984,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         for (phase = 0; phase < 4; ++phase) {
             SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 8, 10, 14));
             draw_loading_overlay(screen, fonts, "Loading", phase);
-            SDL_Flip(screen);
+            present_screen(screen);
             msleep(24);
         }
     }
@@ -6008,8 +6181,8 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 0
             );
             if (take_screenshot) {
-            save_screenshot_bitmap(screen, path, NULL, 0);
-        }
+                save_screenshot_bitmap(screen, path, NULL, 0);
+            }
             flush_deferred_history_save(
                 path,
                 &movie,
@@ -6239,27 +6412,32 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 }
             }
         }
-        show_ui = paused || (monotonic_clock_now_ms() <= ui_visible_until);
-        render_movie(
-            screen,
-            fonts,
-            &movie,
-            paused,
-            show_ui,
-            false,
-            scale_mode,
-            playback_rate,
-            memory_overlay_mode,
-            subtitle_font_index,
-            now_ms <= subtitle_font_overlay_until,
-            subtitle_size,
-            subtitle_placement,
-            (now_ms <= status_overlay_until) ? status_overlay_text : NULL,
-            &pointer,
-            pending_seek_ms
-        );
-        if (take_screenshot) {
-            save_screenshot_bitmap(screen, path, NULL, 0);
+        {
+            uint32_t render_now_ms = monotonic_clock_now_ms();
+            bool subtitle_font_overlay_visible = render_now_ms <= subtitle_font_overlay_until;
+
+            show_ui = paused || (render_now_ms <= ui_visible_until);
+            render_movie(
+                screen,
+                fonts,
+                &movie,
+                paused,
+                show_ui,
+                false,
+                scale_mode,
+                playback_rate,
+                memory_overlay_mode,
+                subtitle_font_index,
+                subtitle_font_overlay_visible,
+                subtitle_size,
+                subtitle_placement,
+                (render_now_ms <= status_overlay_until) ? status_overlay_text : NULL,
+                &pointer,
+                pending_seek_ms
+            );
+            if (take_screenshot) {
+                save_screenshot_bitmap(screen, path, NULL, 0);
+            }
         }
         if (paused || frame_interval_ticks == 0) {
             flush_deferred_history_save(

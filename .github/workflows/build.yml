@@ -20,11 +20,13 @@ jobs:
         run: |
           if [ ! -d external/Ndless-official/.git ]; then
             rm -rf external/Ndless-official
-            git clone --branch master https://github.com/ndless-nspire/Ndless.git external/Ndless-official
+            git clone --branch master --recurse-submodules https://github.com/ndless-nspire/Ndless.git external/Ndless-official
           fi
           git -C external/Ndless-official fetch --tags origin master
           git -C external/Ndless-official checkout master
           git -C external/Ndless-official reset --hard origin/master
+          git -C external/Ndless-official submodule sync --recursive
+          git -C external/Ndless-official submodule update --init --recursive
           echo "sha=$(git -C external/Ndless-official rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install host dependencies
