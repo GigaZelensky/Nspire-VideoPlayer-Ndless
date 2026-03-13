@@ -338,10 +338,12 @@ typedef struct {
 } MonotonicClock;
 
 static MonotonicClock g_clock;
-static char g_debug_ring[DEBUG_RING_SIZE][DEBUG_LINE_LEN];
+static char (*g_debug_ring)[DEBUG_LINE_LEN] = NULL;
 static size_t g_debug_ring_count = 0;
 static size_t g_debug_ring_next = 0;
 static char g_last_error_message[DEBUG_LINE_LEN];
+static bool g_debug_logging_enabled = false;
+static bool g_debug_metrics_enabled = false;
 static H264ColorTables g_h264_color_tables;
 static const PlaybackRate g_playback_rates[] = {
     {1, 4, "0.25x"},
@@ -397,17 +399,80 @@ static void debug_dump_session(const char *path, const Movie *movie, const char 
 static void history_path_for_directory(const char *directory, char *history_path, size_t history_path_size);
 static bool load_history_store_from_path(const char *history_path, HistoryStore *history);
 static int history_find_entry_index(const HistoryStore *history, const char *movie_path);
+static bool debug_is_runtime_logging_enabled(void);
+static void debug_clear_last_error(void);
+static bool debug_should_collect_metrics(void);
 
-static void debug_tracef(const char *fmt, ...)
+static bool ensure_debug_ring_storage(void)
+{
+    if (g_debug_ring) {
+        return true;
+    }
+
+    g_debug_ring = (char (*)[DEBUG_LINE_LEN]) calloc(DEBUG_RING_SIZE, sizeof(*g_debug_ring));
+    if (!g_debug_ring) {
+        g_debug_ring_count = 0;
+        g_debug_ring_next = 0;
+        return false;
+    }
+    return true;
+}
+
+static void release_debug_ring_storage(void)
+{
+    free(g_debug_ring);
+    g_debug_ring = NULL;
+    g_debug_ring_count = 0;
+    g_debug_ring_next = 0;
+}
+
+static bool debug_is_runtime_logging_enabled(void)
+{
+    return g_debug_logging_enabled;
+}
+
+static bool debug_should_collect_metrics(void)
+{
+    return g_debug_metrics_enabled || g_debug_logging_enabled;
+}
+
+static void debug_set_metrics_collection(bool enabled)
+{
+    g_debug_metrics_enabled = enabled;
+}
+
+static void debug_set_runtime_logging(bool enabled)
+{
+    if (enabled) {
+        if (ensure_debug_ring_storage()) {
+            g_debug_logging_enabled = true;
+            g_debug_ring_count = 0;
+            g_debug_ring_next = 0;
+            debug_clear_last_error();
+        } else {
+            g_debug_logging_enabled = false;
+        }
+    } else {
+        g_debug_logging_enabled = false;
+        release_debug_ring_storage();
+        debug_clear_last_error();
+    }
+}
+
+static void debug_tracevf(bool force, const char *fmt, va_list args)
 {
     char line[DEBUG_LINE_LEN];
     size_t slot_index;
-    va_list args;
     uint32_t now_ms = g_clock.initialized ? monotonic_clock_now_ms() : 0;
 
-    va_start(args, fmt);
+    if (!force && !g_debug_logging_enabled) {
+        return;
+    }
+
     vsnprintf(line, sizeof(line), fmt, args);
-    va_end(args);
+    if (!ensure_debug_ring_storage()) {
+        return;
+    }
 
     slot_index = g_debug_ring_next;
     snprintf(
@@ -422,6 +487,28 @@ static void debug_tracef(const char *fmt, ...)
     if (g_debug_ring_count < DEBUG_RING_SIZE) {
         g_debug_ring_count++;
     }
+}
+
+static void debug_tracef(const char *fmt, ...)
+{
+    va_list args;
+
+    if (!g_debug_logging_enabled) {
+        return;
+    }
+
+    va_start(args, fmt);
+    debug_tracevf(false, fmt, args);
+    va_end(args);
+}
+
+static void debug_tracef_force(const char *fmt, ...)
+{
+    va_list args;
+
+    va_start(args, fmt);
+    debug_tracevf(true, fmt, args);
+    va_end(args);
 }
 
 static void debug_clear_last_error(void)
@@ -441,7 +528,7 @@ static void debug_failf(const char *fmt, ...)
     va_start(args, fmt);
     vsnprintf(g_last_error_message, sizeof(g_last_error_message), fmt, args);
     va_end(args);
-    debug_tracef("%s", g_last_error_message);
+    debug_tracef_force("%s", g_last_error_message);
 }
 
 static size_t total_prefetched_chunk_bytes(const Movie *movie)
@@ -557,7 +644,7 @@ static void report_movie_decode_failure(const Movie *movie, const char *movie_pa
     char message[192];
 
     if (movie) {
-        debug_tracef(
+        debug_tracef_force(
             "decode failed reason=%s frame=%lu loaded_chunk=%d decoded_local=%d prefetched=%lu",
             reason ? reason : "unknown",
             (unsigned long) movie->current_frame,
@@ -566,7 +653,7 @@ static void report_movie_decode_failure(const Movie *movie, const char *movie_pa
             (unsigned long) total_prefetched_chunk_bytes(movie)
         );
     } else {
-        debug_tracef("decode failed reason=%s", reason ? reason : "unknown");
+        debug_tracef_force("decode failed reason=%s", reason ? reason : "unknown");
     }
     debug_log_path_for_movie(movie_path, log_path, sizeof(log_path));
     debug_dump_session(log_path, movie, "decode-failure");
@@ -584,6 +671,7 @@ static void report_movie_open_failure(const char *movie_path)
     char log_path[MAX_PATH_LEN];
     char message[192];
 
+    debug_tracef_force("open failed: %s", debug_last_error());
     debug_log_path_for_movie(movie_path, log_path, sizeof(log_path));
     debug_dump_session(log_path, NULL, "open-failure");
     snprintf(
@@ -1006,6 +1094,9 @@ static void record_h264_prefetch_decode_time(Movie *movie, uint32_t elapsed_ms)
 static void record_h264_background_decode_kind(Movie *movie, bool same_chunk, uint32_t elapsed_ms)
 {
     if (!movie) {
+        return;
+    }
+    if (!debug_should_collect_metrics()) {
         return;
     }
 
@@ -1654,6 +1745,8 @@ static void debug_dump_session(const char *path, const Movie *movie, const char 
     fputs("ND Video Player diagnostic log\n", log_file);
     fprintf(log_file, "reason=%s\n", reason ? reason : "unknown");
     fprintf(log_file, "last_error=%s\n", debug_last_error());
+    fprintf(log_file, "verbose_logging=%u\n", debug_is_runtime_logging_enabled() ? 1U : 0U);
+    fprintf(log_file, "metrics_collection=%u\n", debug_should_collect_metrics() ? 1U : 0U);
 
     if (movie) {
         MemoryStats stats = query_memory_stats(movie);
@@ -2138,15 +2231,19 @@ static bool prefetch_one_h264_same_chunk_frame(Movie *movie, uint32_t spare_ms, 
 
     decode_start_ms = monotonic_clock_now_ms();
     if (!decode_h264_frame(movie, next_frame, false, true)) {
-        movie->diag_prefetch_frame_decode_fail_count++;
+        if (debug_should_collect_metrics()) {
+            movie->diag_prefetch_frame_decode_fail_count++;
+        }
         debug_tracef("prefetch rescue fail frame=%lu chunk=%d", (unsigned long) next_frame, current_chunk);
         return false;
     }
     decode_elapsed_ms = monotonic_clock_now_ms() - decode_start_ms;
-    movie->diag_prefetch_frame_decode_count++;
+    if (debug_should_collect_metrics()) {
+        movie->diag_prefetch_frame_decode_count++;
+    }
     record_h264_prefetch_decode_time(movie, decode_elapsed_ms);
     record_h264_background_decode_kind(movie, true, decode_elapsed_ms);
-    if (decode_elapsed_ms >= DEBUG_TRACE_PREFETCH_MS) {
+    if (debug_is_runtime_logging_enabled() && decode_elapsed_ms >= DEBUG_TRACE_PREFETCH_MS) {
         debug_tracef(
             "prefetch rescue frame=%lu ms=%lu contig=%lu chunk=%d",
             (unsigned long) next_frame,
@@ -2751,8 +2848,10 @@ static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respec
         return false;
     }
 
-    movie->diag_prefetch_read_ops++;
-    movie->diag_prefetch_read_bytes += (uint32_t) read_size;
+    if (debug_should_collect_metrics()) {
+        movie->diag_prefetch_read_ops++;
+        movie->diag_prefetch_read_bytes += (uint32_t) read_size;
+    }
     chunk->read_offset += read_size;
     if (chunk->read_offset == entry->packed_size) {
         chunk->state = PREFETCH_READY;
@@ -2870,7 +2969,9 @@ retry:
         return false;
     }
     movie->h264_chunk_dirty = false;
-    movie->diag_chunk_load_sync_count++;
+    if (debug_should_collect_metrics()) {
+        movie->diag_chunk_load_sync_count++;
+    }
     debug_tracef(
         "load chunk=%d sync packed=%lu unpacked=%lu prefetched=%lu",
         chunk_index,
@@ -2931,7 +3032,9 @@ static bool load_chunk(Movie *movie, int chunk_index)
             return false;
         }
         movie->h264_chunk_dirty = false;
-        movie->diag_chunk_load_prefetched_count++;
+        if (debug_should_collect_metrics()) {
+            movie->diag_chunk_load_prefetched_count++;
+        }
         debug_tracef(
             "load chunk=%d prefetched packed=%lu unpacked=%lu prefetched=%lu",
             chunk_index,
@@ -3233,7 +3336,9 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
              * It mutates the shared playback chunk/decoder state and can
              * force the foreground back into synchronous re-reads of the
              * previous chunk on the next ring miss. */
-            movie->diag_bg_chunk_cross_blocked_count++;
+            if (debug_should_collect_metrics()) {
+                movie->diag_bg_chunk_cross_blocked_count++;
+            }
             break;
         }
         if (!paused && deadline_ms != 0) {
@@ -3253,15 +3358,19 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
         }
         decode_start_ms = monotonic_clock_now_ms();
         if (!decode_h264_frame(movie, next_frame, false, true)) {
-            movie->diag_prefetch_frame_decode_fail_count++;
+            if (debug_should_collect_metrics()) {
+                movie->diag_prefetch_frame_decode_fail_count++;
+            }
             debug_tracef("h264 predecode fail frame=%lu", (unsigned long) next_frame);
             break;
         }
         decode_elapsed_ms = monotonic_clock_now_ms() - decode_start_ms;
-        movie->diag_prefetch_frame_decode_count++;
+        if (debug_should_collect_metrics()) {
+            movie->diag_prefetch_frame_decode_count++;
+        }
         record_h264_prefetch_decode_time(movie, decode_elapsed_ms);
         record_h264_background_decode_kind(movie, same_chunk, decode_elapsed_ms);
-        if (decode_elapsed_ms >= DEBUG_TRACE_PREFETCH_MS) {
+        if (debug_is_runtime_logging_enabled() && decode_elapsed_ms >= DEBUG_TRACE_PREFETCH_MS) {
             debug_tracef(
                 "prefetch frame=%lu ms=%lu contig=%lu target=%lu chunk=%d",
                 (unsigned long) next_frame,
@@ -3295,15 +3404,23 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
         /* Keep decoded-frame H.264 prefetch as paused-only warmup.
          * During active playback this work runs on the same cooperative loop
          * as presentation and steals deadline-critical time. */
-        movie->diag_prefetch_tick_count++;
+        if (debug_should_collect_metrics()) {
+            movie->diag_prefetch_tick_count++;
+        }
         if (!paused) {
-            movie->diag_active_prefetch_tick_count++;
+            if (debug_should_collect_metrics()) {
+                movie->diag_active_prefetch_tick_count++;
+            }
             if (movie->h264_active_prefetch_backoff > 0) {
                 active_backoff = true;
-                movie->diag_prefetch_backoff_skip_count++;
+                if (debug_should_collect_metrics()) {
+                    movie->diag_prefetch_backoff_skip_count++;
+                }
                 movie->h264_active_prefetch_backoff--;
             }
-            movie->diag_prefetch_suppressed_count++;
+            if (debug_should_collect_metrics()) {
+                movie->diag_prefetch_suppressed_count++;
+            }
         }
         allow_active_h264_prefetch = paused;
     }
@@ -3311,7 +3428,9 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
     if (!paused && movie_uses_h264(movie) && current_chunk >= 0) {
         prioritize_io = should_prioritize_next_chunk_io(movie, current_chunk);
         if (prioritize_io) {
-            movie->diag_io_priority_count++;
+            if (debug_should_collect_metrics()) {
+                movie->diag_io_priority_count++;
+            }
             if (budget < 1) {
                 budget = 1;
             }
@@ -3429,10 +3548,12 @@ static bool decode_h264_frame(Movie *movie, uint32_t frame_index, bool blit_outp
     local_index = frame_index - entry->first_frame;
     if (movie->decoded_local_frame > (int) local_index) {
         uint32_t replay_distance = (uint32_t) (movie->decoded_local_frame - (int) local_index);
-        movie->diag_h264_replay_count++;
-        movie->diag_h264_replay_frames_total += replay_distance;
-        if (replay_distance > movie->diag_h264_replay_max_distance) {
-            movie->diag_h264_replay_max_distance = replay_distance;
+        if (debug_should_collect_metrics()) {
+            movie->diag_h264_replay_count++;
+            movie->diag_h264_replay_frames_total += replay_distance;
+            if (replay_distance > movie->diag_h264_replay_max_distance) {
+                movie->diag_h264_replay_max_distance = replay_distance;
+            }
         }
         debug_tracef(
             "h264 replay frame=%lu chunk=%d local=%lu decoded_local=%d dirty=%u",
@@ -3501,7 +3622,9 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
         int current_chunk = movie_chunk_for_frame(movie, movie->current_frame);
         prefetched_frame = find_h264_frame_slot(movie, frame_index);
         if (prefetched_frame) {
-            movie->diag_foreground_ring_hit_count++;
+            if (debug_should_collect_metrics()) {
+                movie->diag_foreground_ring_hit_count++;
+            }
             if (!blit_h264_frame_slot(movie, prefetched_frame)) {
                 debug_failf("h264 frame ring blit failed frame=%lu", (unsigned long) frame_index);
                 return false;
@@ -3510,22 +3633,24 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
             discard_h264_frame_ring_before(movie, frame_index + 1U);
             return true;
         }
-        movie->diag_ring_miss_not_cached_count++;
-        if (h264_frame_ring_valid_count(movie) > 0U && h264_frame_ring_contiguous_ready_count(movie) == 0U) {
-            movie->diag_ring_miss_not_contiguous_count++;
-        }
-        if (current_chunk >= 0 && chunk_index == current_chunk + 1 && next_chunk_needs_prefetch(movie, current_chunk)) {
-            movie->diag_ring_miss_chunk_not_ready_count++;
-        }
-        if (active_h264_frame_ring_capacity(movie) > 0U &&
-            h264_frame_ring_valid_count(movie) >= active_h264_frame_ring_capacity(movie)) {
-            movie->diag_ring_miss_slot_unavailable_count++;
-        }
-        {
-            const ChunkIndexEntry *miss_entry = movie->chunk_index + chunk_index;
-            uint32_t miss_local_index = frame_index - miss_entry->first_frame;
-            if (miss_local_index < H264_BOUNDARY_MISS_WINDOW_FRAMES) {
-                movie->diag_chunk_boundary_miss_count++;
+        if (debug_should_collect_metrics()) {
+            movie->diag_ring_miss_not_cached_count++;
+            if (h264_frame_ring_valid_count(movie) > 0U && h264_frame_ring_contiguous_ready_count(movie) == 0U) {
+                movie->diag_ring_miss_not_contiguous_count++;
+            }
+            if (current_chunk >= 0 && chunk_index == current_chunk + 1 && next_chunk_needs_prefetch(movie, current_chunk)) {
+                movie->diag_ring_miss_chunk_not_ready_count++;
+            }
+            if (active_h264_frame_ring_capacity(movie) > 0U &&
+                h264_frame_ring_valid_count(movie) >= active_h264_frame_ring_capacity(movie)) {
+                movie->diag_ring_miss_slot_unavailable_count++;
+            }
+            {
+                const ChunkIndexEntry *miss_entry = movie->chunk_index + chunk_index;
+                uint32_t miss_local_index = frame_index - miss_entry->first_frame;
+                if (miss_local_index < H264_BOUNDARY_MISS_WINDOW_FRAMES) {
+                    movie->diag_chunk_boundary_miss_count++;
+                }
             }
         }
     }
@@ -3541,7 +3666,9 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
         debug_failf("decode frame=%lu empty chunk=%d", (unsigned long) frame_index, chunk_index);
         return false;
     }
-    movie->diag_foreground_direct_decode_count++;
+    if (debug_should_collect_metrics()) {
+        movie->diag_foreground_direct_decode_count++;
+    }
     if (!decode_h264_frame(movie, frame_index, true, false)) {
         return false;
     }
@@ -4481,32 +4608,33 @@ static void draw_memory_badge(
     snprintf(
         perf_full,
         sizeof(perf_full),
-        "F%lu R%lu/%lu T%lu L%lu H%lu D%lu",
+        "F%lu R%lu/%lu T%lu L%lu H%lu D%lu%s",
         movie ? (unsigned long) movie->current_frame : 0UL,
         (unsigned long) ring_contig,
         (unsigned long) ring_cap,
         (unsigned long) ready_target,
         movie ? (unsigned long) movie->diag_lag_event_count : 0UL,
         movie ? (unsigned long) movie->diag_foreground_ring_hit_count : 0UL,
-        movie ? (unsigned long) movie->diag_foreground_direct_decode_count : 0UL
+        movie ? (unsigned long) movie->diag_foreground_direct_decode_count : 0UL,
+        debug_is_runtime_logging_enabled() ? " DBG ON" : ""
     );
     snprintf(
         perf_medium,
         sizeof(perf_medium),
-        "F%lu R%lu/%lu L%lu H%lu D%lu",
+        "F%lu R%lu/%lu L%lu%s",
         movie ? (unsigned long) movie->current_frame : 0UL,
         (unsigned long) ring_contig,
         (unsigned long) ring_cap,
         movie ? (unsigned long) movie->diag_lag_event_count : 0UL,
-        movie ? (unsigned long) movie->diag_foreground_ring_hit_count : 0UL,
-        movie ? (unsigned long) movie->diag_foreground_direct_decode_count : 0UL
+        debug_is_runtime_logging_enabled() ? " DBG ON" : ""
     );
     snprintf(
         perf_short,
         sizeof(perf_short),
-        "F%lu L%lu",
+        "F%lu L%lu%s",
         movie ? (unsigned long) movie->current_frame : 0UL,
-        movie ? (unsigned long) movie->diag_lag_event_count : 0UL
+        movie ? (unsigned long) movie->diag_lag_event_count : 0UL,
+        debug_is_runtime_logging_enabled() ? " DBG" : ""
     );
 
     left_x = playback_badge_visible ? 36 : 8;
@@ -4580,6 +4708,8 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "T", "Switch subtitle track");
     y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "M", "Memory overlay");
+    y += 11;
+    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "D", "Toggle debug logging");
     y += 11;
     draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "S", "Save BMP screenshot");
     y += 11;
@@ -5379,6 +5509,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     bool prev_f = false;
     bool prev_t = false;
     bool prev_m = false;
+    bool prev_d = false;
     bool prev_s = false;
     bool prev_plus = false;
     bool prev_minus = false;
@@ -5405,8 +5536,12 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     uint32_t last_history_saved_ms = 0;
     bool history_save_pending = false;
 
-    g_debug_ring_count = 0;
-    g_debug_ring_next = 0;
+    if (debug_is_runtime_logging_enabled()) {
+        g_debug_ring_count = 0;
+        g_debug_ring_next = 0;
+    } else {
+        release_debug_ring_storage();
+    }
     debug_clear_last_error();
     {
         int phase;
@@ -5424,9 +5559,11 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     if (history_resume_frame_for_movie(path, &resume_frame) && resume_frame < movie.header.frame_count) {
         int resume_choice = prompt_resume_position(screen, fonts, &movie, path, resume_frame);
         if (resume_choice < 0) {
-            char log_path[MAX_PATH_LEN];
-            debug_log_path_for_movie(path, log_path, sizeof(log_path));
-            debug_dump_session(log_path, &movie, "resume-cancel");
+            if (debug_is_runtime_logging_enabled()) {
+                char log_path[MAX_PATH_LEN];
+                debug_log_path_for_movie(path, log_path, sizeof(log_path));
+                debug_dump_session(log_path, &movie, "resume-cancel");
+            }
             destroy_movie(&movie);
             return 0;
         }
@@ -5441,7 +5578,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     prev_tab = isKeyPressed(KEY_NSPIRE_TAB);
     prev_t = isKeyPressed(KEY_NSPIRE_T);
     prev_m = isKeyPressed(KEY_NSPIRE_M);
+    prev_d = isKeyPressed(KEY_NSPIRE_D);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
+    debug_set_metrics_collection(debug_is_runtime_logging_enabled());
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
     last_history_saved_ms = movie_frame_time_ms(&movie, movie.current_frame);
     {
@@ -5485,6 +5624,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         bool subtitle_font_edge = key_pressed_edge(KEY_NSPIRE_F, &prev_f);
         bool subtitle_track_edge = key_pressed_edge(KEY_NSPIRE_T, &prev_t);
         bool memory_overlay_edge = key_pressed_edge(KEY_NSPIRE_M, &prev_m);
+        bool debug_logging_edge = key_pressed_edge(KEY_NSPIRE_D, &prev_d);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool click_edge = key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click);
         bool take_screenshot = false;
@@ -5631,6 +5771,35 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             memory_overlay_mode = (memory_overlay_mode == MEMORY_OVERLAY_OFF)
                 ? MEMORY_OVERLAY_ALWAYS
                 : MEMORY_OVERLAY_OFF;
+            debug_set_metrics_collection(
+                memory_overlay_mode != MEMORY_OVERLAY_OFF || debug_is_runtime_logging_enabled()
+            );
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (debug_logging_edge) {
+            if (debug_is_runtime_logging_enabled()) {
+                debug_set_runtime_logging(false);
+                snprintf(status_overlay_text, sizeof(status_overlay_text), "DEBUG LOG OFF");
+            } else {
+                debug_set_runtime_logging(true);
+                snprintf(
+                    status_overlay_text,
+                    sizeof(status_overlay_text),
+                    "%s",
+                    debug_is_runtime_logging_enabled() ? "DEBUG LOG ON" : "DEBUG LOG NO RAM"
+                );
+                if (debug_is_runtime_logging_enabled()) {
+                    debug_tracef(
+                        "debug logging enabled frame=%lu chunk=%d",
+                        (unsigned long) movie.current_frame,
+                        movie.loaded_chunk
+                    );
+                }
+            }
+            debug_set_metrics_collection(
+                memory_overlay_mode != MEMORY_OVERLAY_OFF || debug_is_runtime_logging_enabled()
+            );
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (tab_edge) {
@@ -5720,9 +5889,12 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                             break;
                         }
                         decode_elapsed_ms = monotonic_clock_now_ms() - decode_start_ms;
-                        movie.diag_foreground_decode_count++;
+                        if (debug_should_collect_metrics()) {
+                            movie.diag_foreground_decode_count++;
+                        }
                         record_h264_foreground_decode_time(&movie, decode_elapsed_ms);
-                        if (decode_elapsed_ms >= DEBUG_TRACE_FOREGROUND_MS || lagged) {
+                        if (debug_is_runtime_logging_enabled() &&
+                            (decode_elapsed_ms >= DEBUG_TRACE_FOREGROUND_MS || lagged)) {
                             debug_tracef(
                                 "fg frame=%lu ms=%lu lagged=%u chunk=%d contig=%lu ringhits=%lu direct=%lu",
                                 (unsigned long) target_frame,
@@ -5774,7 +5946,8 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         if (paused || frame_interval_ticks == 0) {
             flush_deferred_history_save(path, &movie, &history_save_pending, "paused", false);
             prefetch_tick(&movie, true, 1000);
-            if (now_ms - movie.diag_last_snapshot_ms >= DEBUG_SNAPSHOT_INTERVAL_MS) {
+            if (debug_is_runtime_logging_enabled() &&
+                now_ms - movie.diag_last_snapshot_ms >= DEBUG_SNAPSHOT_INTERVAL_MS) {
                 movie.diag_last_snapshot_ms = now_ms;
                 debug_trace_runtime_snapshot(&movie, true, 1000U, playback_rate, "paused");
             }
@@ -5784,12 +5957,15 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             uint64_t spare_ticks = next_frame_due_ticks > after_render_ticks ? (next_frame_due_ticks - after_render_ticks) : 0;
             uint32_t spare_ms = monotonic_clock_ticks_to_ms(spare_ticks);
             uint64_t wait_target_ticks = next_frame_due_ticks;
-            if (spare_ms > movie.diag_max_spare_ms) {
-                movie.diag_max_spare_ms = spare_ms;
+            if (debug_should_collect_metrics()) {
+                if (spare_ms > movie.diag_max_spare_ms) {
+                    movie.diag_max_spare_ms = spare_ms;
+                }
+                movie.diag_last_spare_ms = spare_ms;
             }
-            movie.diag_last_spare_ms = spare_ms;
             prefetch_tick(&movie, false, spare_ms);
-            if (now_ms - movie.diag_last_snapshot_ms >= DEBUG_SNAPSHOT_INTERVAL_MS) {
+            if (debug_is_runtime_logging_enabled() &&
+                now_ms - movie.diag_last_snapshot_ms >= DEBUG_SNAPSHOT_INTERVAL_MS) {
                 movie.diag_last_snapshot_ms = now_ms;
                 debug_trace_runtime_snapshot(&movie, false, spare_ms, playback_rate, "play");
             }
@@ -5806,7 +5982,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     }
 
     flush_deferred_history_save(path, &movie, &history_save_pending, "exit", true);
-    {
+    if (debug_is_runtime_logging_enabled() || result != 0) {
         char log_path[MAX_PATH_LEN];
         debug_log_path_for_movie(path, log_path, sizeof(log_path));
         debug_dump_session(log_path, &movie, result == 0 ? "normal-exit" : "aborted");

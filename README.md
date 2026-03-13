@@ -63,6 +63,7 @@ The `.nvp` format used by the current player is:
 - `+` / `-`: increase / decrease subtitle size, down to hidden
 - `F`: cycle subtitle font
 - `M`: toggle memory / playback diagnostics overlay
+- `D`: toggle verbose debug logging
 - `Catalog`: open / close the help overlay
 - `Esc`: close help, or leave the movie if help is not open
 
@@ -180,6 +181,9 @@ The `M` overlay shows:
 - decode target
 - lag count
 - ring-hit vs direct-decode counts
+- whether verbose debug logging is currently enabled
+
+Verbose debug logging is off by default. Press `D` during playback to enable it; normal playback exits do not write `ndvideo-debug.log` unless logging was enabled or the player hits an error.
 
 The [examples](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/examples) folder also includes a short packaged sample movie and a matching `ndvideo.tns` for quick on-device smoke testing.
 
