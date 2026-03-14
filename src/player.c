@@ -282,7 +282,10 @@ typedef struct {
     uint16_t h264_prefetch_decode_peak_ms;
     uint16_t h264_foreground_decode_avg_ms;
     uint16_t h264_foreground_decode_peak_ms;
+    uint16_t io_avg_ms;
+    uint16_t io_peak_ms;
     uint8_t h264_active_prefetch_backoff;
+    bool io_throttled;
     uint32_t diag_last_snapshot_ms;
     uint32_t diag_prefetch_tick_count;
     uint32_t diag_active_prefetch_tick_count;
@@ -401,7 +404,7 @@ static bool decode_h264_frame(
 );
 static bool load_chunk(Movie *movie, int chunk_index);
 static bool prefetch_chunk(Movie *movie, int chunk_index);
-static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks);
+static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks, int max_new_distance);
 static void clear_prefetched_chunk(PrefetchedChunk *chunk);
 static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk);
 static void prefetch_do_work(Movie *movie, int current_chunk, int max_work_distance, uint32_t deadline_ms, bool single_step);
@@ -1130,6 +1133,35 @@ static uint16_t rolling_u16_average(uint16_t current, uint32_t sample_ms)
         return (uint16_t) sample_ms;
     }
     return (uint16_t) (((current * 7U) + sample_ms + 4U) / 8U);
+}
+
+static void record_prefetch_io_time(Movie *movie, uint32_t elapsed_ms)
+{
+    uint32_t average_ms;
+    uint32_t peak_ms;
+
+    if (!movie) {
+        return;
+    }
+
+    average_ms = movie->io_avg_ms == 0U
+        ? elapsed_ms
+        : (((uint32_t) movie->io_avg_ms * 15U) + elapsed_ms + 8U) / 16U;
+    peak_ms = movie->io_peak_ms;
+    if (elapsed_ms > peak_ms) {
+        peak_ms = elapsed_ms;
+    } else if (peak_ms > average_ms) {
+        peak_ms--;
+    }
+    if (average_ms > UINT16_MAX) {
+        average_ms = UINT16_MAX;
+    }
+    if (peak_ms > UINT16_MAX) {
+        peak_ms = UINT16_MAX;
+    }
+
+    movie->io_avg_ms = (uint16_t) average_ms;
+    movie->io_peak_ms = (uint16_t) peak_ms;
 }
 
 static void record_h264_prefetch_decode_time(Movie *movie, uint32_t elapsed_ms)
@@ -1880,12 +1912,14 @@ static void debug_dump_session(const char *path, const Movie *movie, const char 
         );
         fprintf(
             log_file,
-            "chunk loads_sync=%lu loads_prefetched=%lu read_ops=%lu read_bytes=%lu max_spare_ms=%lu\n",
+            "chunk loads_sync=%lu loads_prefetched=%lu read_ops=%lu read_bytes=%lu max_spare_ms=%lu io_avg_ms=%u io_peak_ms=%u\n",
             (unsigned long) movie->diag_chunk_load_sync_count,
             (unsigned long) movie->diag_chunk_load_prefetched_count,
             (unsigned long) movie->diag_prefetch_read_ops,
             (unsigned long) movie->diag_prefetch_read_bytes,
-            (unsigned long) movie->diag_max_spare_ms
+            (unsigned long) movie->diag_max_spare_ms,
+            (unsigned) movie->io_avg_ms,
+            (unsigned) movie->io_peak_ms
         );
         fprintf(
             log_file,
@@ -3046,7 +3080,10 @@ static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respec
     size_t remaining;
     size_t read_size;
     size_t block_size;
+    size_t bytes_read;
     long target_pos;
+    uint32_t read_start_ms;
+    uint32_t read_elapsed_ms;
 
     if (!movie || !chunk || chunk->chunk_index < 0) {
         return false;
@@ -3080,10 +3117,14 @@ static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respec
         }
         movie->current_file_pos = target_pos;
     }
-    if (fread(chunk->chunk_storage + chunk->read_offset, 1, read_size, movie->file) != read_size) {
+    read_start_ms = monotonic_clock_now_ms();
+    bytes_read = fread(chunk->chunk_storage + chunk->read_offset, 1, read_size, movie->file);
+    read_elapsed_ms = monotonic_clock_now_ms() - read_start_ms;
+    if (bytes_read != read_size) {
         movie->current_file_pos = -1;
         return false;
     }
+    record_prefetch_io_time(movie, read_elapsed_ms);
     movie->current_file_pos += (long) read_size;
 
     if (debug_should_collect_metrics()) {
@@ -3373,10 +3414,17 @@ static bool prefetch_chunk(Movie *movie, int chunk_index)
     return true;
 }
 
-static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks)
+static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks, int max_new_distance)
 {
     int index;
     int loaded = 0;
+
+    if (max_new_distance < 1) {
+        max_new_distance = 1;
+    } else if (max_new_distance > PREFETCH_CHUNK_COUNT) {
+        max_new_distance = PREFETCH_CHUNK_COUNT;
+    }
+
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
         int wanted_min = current_chunk + 1;
         int wanted_max = current_chunk + PREFETCH_CHUNK_COUNT;
@@ -3385,7 +3433,7 @@ static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks)
             clear_prefetched_chunk(&movie->prefetched[index]);
         }
     }
-    for (index = 1; index <= PREFETCH_CHUNK_COUNT; ++index) {
+    for (index = 1; index <= max_new_distance; ++index) {
         int wanted_chunk = current_chunk + index;
         if ((uint32_t) wanted_chunk < movie->header.chunk_count &&
             movie->loaded_chunk != wanted_chunk &&
@@ -3618,15 +3666,18 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
     }
 }
 
-static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
+static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, uint32_t frame_budget_ms)
 {
     uint32_t time_slice_ms = paused && spare_ms > PREFETCH_PAUSED_SLICE_MS ? PREFETCH_PAUSED_SLICE_MS : spare_ms;
     uint32_t deadline_ms = spare_ms > 0 ? (monotonic_clock_now_ms() + spare_ms) : 0;
     int current_chunk = prefetch_target_chunk(movie);
     int budget = prefetch_budget_for_state(movie, paused, spare_ms);
+    uint32_t dynamic_cushion = 0U;
+    size_t ring_contig = movie_uses_h264(movie) ? h264_frame_ring_contiguous_ready_count(movie) : 0U;
     bool prioritize_io = false;
     bool allow_active_h264_prefetch = false;
     bool active_backoff = false;
+    int max_new_prefetch_distance = PREFETCH_CHUNK_COUNT;
     int max_work_distance = PREFETCH_CHUNK_COUNT;
     size_t ring_growth = paused ? 8U : 0U;
 
@@ -3656,9 +3707,25 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
         if (!paused && debug_should_collect_metrics() && !allow_active_h264_prefetch) {
             movie->diag_prefetch_suppressed_count++;
         }
+        if (!paused) {
+            dynamic_cushion = (frame_budget_ms * 3U) / 4U;
+            if (movie->io_peak_ms > 50U) {
+                dynamic_cushion += 10U;
+            }
+            if (frame_budget_ms > 8U && dynamic_cushion > frame_budget_ms - 8U) {
+                dynamic_cushion = frame_budget_ms - 8U;
+            } else if (frame_budget_ms <= 8U) {
+                dynamic_cushion = 0U;
+            }
+        }
     }
 
     if (!paused && movie_uses_h264(movie) && current_chunk >= 0) {
+        /* Keep active-playback chunk I/O focused on the immediate next chunk.
+         * Farther speculative chunks may stay resident, but do not start or
+         * advance them on the frame-critical playback path. */
+        max_new_prefetch_distance = 1;
+        max_work_distance = 1;
         prioritize_io = should_prioritize_next_chunk_io(movie, current_chunk);
         if (prioritize_io) {
             if (debug_should_collect_metrics()) {
@@ -3672,12 +3739,35 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
                     ? spare_ms
                     : H264_PREFETCH_IO_PRIORITY_SLICE_MS;
             }
-        } else if (active_backoff) {
-            /* Keep far-future chunk work off the cooperative playback path for
-             * a few frames after a long foreground decode. Immediate next-chunk
-             * I/O still gets priority through prioritize_io above. */
-            budget = 0;
-            max_work_distance = 3;
+        } else {
+            if (ring_contig >= 30U) {
+                movie->io_throttled = true;
+            } else if (ring_contig < 15U) {
+                movie->io_throttled = false;
+            }
+
+            if (movie->io_throttled) {
+                budget = 0;
+                if (debug_is_runtime_logging_enabled() && ((movie->current_frame & 31U) == 0U)) {
+                    debug_tracef("io rest: buffer=%lu", (unsigned long) ring_contig);
+                }
+            } else {
+                /* Burst mode: do at most one small file read per playback tick. */
+                budget = (spare_ms < PREFETCH_ACTIVE_H264_MIN_SPARE_MS) ? 0 : 1;
+                if (ring_contig > 12U && spare_ms < dynamic_cushion) {
+                    budget = 0;
+                    if (debug_is_runtime_logging_enabled()) {
+                        debug_tracef(
+                            "io skip: buffer_healthy=%lu spare=%lu cushion=%lu peak_io=%u avg_io=%u",
+                            (unsigned long) ring_contig,
+                            (unsigned long) spare_ms,
+                            (unsigned long) dynamic_cushion,
+                            (unsigned) movie->io_peak_ms,
+                            (unsigned) movie->io_avg_ms
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -3697,31 +3787,7 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
         uint32_t io_start_ms = monotonic_clock_now_ms();
         uint32_t io_deadline_ms = io_start_ms + time_slice_ms;
         if (!io_deadline_ms || !prefetch_deadline_reached(io_deadline_ms)) {
-            prefetch_ahead(movie, current_chunk, budget);
-            prefetch_do_work(movie, current_chunk, max_work_distance, io_deadline_ms, !paused);
-            if (!paused) {
-                uint32_t io_elapsed_ms = monotonic_clock_now_ms() - io_start_ms;
-                if (io_elapsed_ms >= time_slice_ms + 8U) {
-                    debug_tracef(
-                        "prefetch io overrun ms=%lu slice=%lu spare=%lu chunk=%d prio=%u backoff=%u",
-                        (unsigned long) io_elapsed_ms,
-                        (unsigned long) time_slice_ms,
-                        (unsigned long) spare_ms,
-                        current_chunk,
-                        prioritize_io ? 1U : 0U,
-                        active_backoff ? 1U : 0U
-                    );
-                }
-            }
-        }
-    } else if (active_backoff &&
-        current_chunk >= 0 &&
-        time_slice_ms > 0 &&
-        max_work_distance > 0 &&
-        spare_ms >= PREFETCH_ACTIVE_H264_MIN_SPARE_MS) {
-        uint32_t io_start_ms = monotonic_clock_now_ms();
-        uint32_t io_deadline_ms = io_start_ms + time_slice_ms;
-        if (!io_deadline_ms || !prefetch_deadline_reached(io_deadline_ms)) {
+            prefetch_ahead(movie, current_chunk, budget, max_new_prefetch_distance);
             prefetch_do_work(movie, current_chunk, max_work_distance, io_deadline_ms, !paused);
             if (!paused) {
                 uint32_t io_elapsed_ms = monotonic_clock_now_ms() - io_start_ms;
@@ -4094,6 +4160,9 @@ static bool load_movie(const char *path, Movie *movie)
         }
     }
     movie->decoded_local_frame = -1;
+    movie->io_avg_ms = 0;
+    movie->io_peak_ms = 0;
+    movie->io_throttled = false;
     debug_tracef("open start path=%s", path ? path : "(null)");
 
     movie->file = fopen(path, "rb");
@@ -6051,7 +6120,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
     last_history_saved_ms = movie_frame_time_ms(&movie, movie.current_frame);
     {
-        prefetch_tick(&movie, true, 1000);
+        prefetch_tick(&movie, true, 1000, 1000);
     }
     debug_tracef(
         "play start path=%s frames=%lu chunks=%lu frame=%lu chunk=%d",
@@ -6207,7 +6276,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 subtitle_size,
                 subtitle_placement
             );
-            prefetch_tick(&movie, true, 1000);
+            prefetch_tick(&movie, true, 1000, 1000);
             msleep(16);
             continue;
         }
@@ -6462,7 +6531,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 subtitle_size,
                 subtitle_placement
             );
-            prefetch_tick(&movie, true, 1000);
+            prefetch_tick(&movie, true, 1000, 1000);
             if (debug_is_runtime_logging_enabled() &&
                 now_ms - movie.diag_last_snapshot_ms >= DEBUG_SNAPSHOT_INTERVAL_MS) {
                 movie.diag_last_snapshot_ms = now_ms;
@@ -6473,6 +6542,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             uint64_t after_render_ticks = monotonic_clock_now_ticks();
             uint64_t spare_ticks = next_frame_due_ticks > after_render_ticks ? (next_frame_due_ticks - after_render_ticks) : 0;
             uint32_t spare_ms = monotonic_clock_ticks_to_ms(spare_ticks);
+            uint32_t frame_budget_ms = monotonic_clock_ticks_to_ms(movie_frame_time_scaled_ticks(&movie, 1U, playback_rate));
             uint64_t wait_target_ticks = next_frame_due_ticks;
             if (debug_should_collect_metrics()) {
                 if (spare_ms > movie.diag_max_spare_ms) {
@@ -6480,7 +6550,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 }
                 movie.diag_last_spare_ms = spare_ms;
             }
-            prefetch_tick(&movie, false, spare_ms);
+            prefetch_tick(&movie, false, spare_ms, frame_budget_ms);
             if (debug_is_runtime_logging_enabled() &&
                 now_ms - movie.diag_last_snapshot_ms >= DEBUG_SNAPSHOT_INTERVAL_MS) {
                 movie.diag_last_snapshot_ms = now_ms;
