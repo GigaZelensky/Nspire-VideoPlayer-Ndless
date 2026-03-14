@@ -38,7 +38,7 @@
 #define POINTER_AXIS_LOCK_RATIO_NUM 2
 #define POINTER_AXIS_LOCK_RATIO_DEN 1
 #define PREFETCH_FILE_BLOCK_SIZE 32768U
-#define PREFETCH_ACTIVE_FILE_BLOCK_SIZE 4096U
+#define PREFETCH_ACTIVE_FILE_BLOCK_SIZE 2048U
 #define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
 #define PREFETCH_PAUSED_SLICE_MS 12U
 #define PREFETCH_ACTIVE_H264_MIN_SPARE_MS 12U
@@ -250,6 +250,7 @@ typedef struct {
 
 typedef struct {
     FILE *file;
+    long current_file_pos;
     MovieHeader header;
     ChunkIndexEntry *chunk_index;
     SubtitleCue *subtitles;
@@ -403,7 +404,7 @@ static bool prefetch_chunk(Movie *movie, int chunk_index);
 static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks);
 static void clear_prefetched_chunk(PrefetchedChunk *chunk);
 static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk);
-static void prefetch_do_work(Movie *movie, int current_chunk, int max_work_distance, uint32_t deadline_ms);
+static void prefetch_do_work(Movie *movie, int current_chunk, int max_work_distance, uint32_t deadline_ms, bool single_step);
 static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, uint32_t deadline_ms);
 static bool prefetch_one_h264_same_chunk_frame(Movie *movie, uint32_t spare_ms, uint32_t deadline_ms) __attribute__((unused));
 static int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index);
@@ -3072,14 +3073,18 @@ static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respec
     block_size = respect_deadline ? PREFETCH_ACTIVE_FILE_BLOCK_SIZE : PREFETCH_FILE_BLOCK_SIZE;
     read_size = remaining > block_size ? block_size : remaining;
     target_pos = (long) (entry->offset + chunk->read_offset);
-    if (ftell(movie->file) != target_pos) {
+    if (movie->current_file_pos != target_pos) {
         if (fseek(movie->file, target_pos, SEEK_SET) != 0) {
+            movie->current_file_pos = -1;
             return false;
         }
+        movie->current_file_pos = target_pos;
     }
     if (fread(chunk->chunk_storage + chunk->read_offset, 1, read_size, movie->file) != read_size) {
+        movie->current_file_pos = -1;
         return false;
     }
+    movie->current_file_pos += (long) read_size;
 
     if (debug_should_collect_metrics()) {
         movie->diag_prefetch_read_ops++;
@@ -3172,16 +3177,19 @@ retry:
     }
     if (fseek(movie->file, (long) entry->offset, SEEK_SET) != 0) {
         debug_failf("load chunk=%d fseek fail offset=%lu", chunk_index, (unsigned long) entry->offset);
+        movie->current_file_pos = -1;
         free(movie->chunk_storage);
         movie->chunk_storage = NULL;
         return false;
     }
     if (fread(movie->chunk_storage, 1, entry->packed_size, movie->file) != entry->packed_size) {
         debug_failf("load chunk=%d fread fail packed=%lu", chunk_index, (unsigned long) entry->packed_size);
+        movie->current_file_pos = -1;
         free(movie->chunk_storage);
         movie->chunk_storage = NULL;
         return false;
     }
+    movie->current_file_pos = (long) entry->offset + (long) entry->packed_size;
     movie->chunk_storage_size = entry->packed_size;
     if (!configure_chunk_view(movie, chunk_index)) {
         debug_tracef(
@@ -3393,7 +3401,7 @@ static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks)
     }
 }
 
-static void prefetch_do_work(Movie *movie, int current_chunk, int max_work_distance, uint32_t deadline_ms)
+static void prefetch_do_work(Movie *movie, int current_chunk, int max_work_distance, uint32_t deadline_ms, bool single_step)
 {
     while (!prefetch_deadline_reached(deadline_ms)) {
         PrefetchedChunk *slot = find_prefetch_work_chunk(movie, current_chunk, max_work_distance);
@@ -3408,6 +3416,9 @@ static void prefetch_do_work(Movie *movie, int current_chunk, int max_work_dista
                 (unsigned long) slot->read_offset
             );
             clear_prefetched_chunk(slot);
+            break;
+        }
+        if (single_step) {
             break;
         }
     }
@@ -3687,7 +3698,7 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
         uint32_t io_deadline_ms = io_start_ms + time_slice_ms;
         if (!io_deadline_ms || !prefetch_deadline_reached(io_deadline_ms)) {
             prefetch_ahead(movie, current_chunk, budget);
-            prefetch_do_work(movie, current_chunk, max_work_distance, io_deadline_ms);
+            prefetch_do_work(movie, current_chunk, max_work_distance, io_deadline_ms, !paused);
             if (!paused) {
                 uint32_t io_elapsed_ms = monotonic_clock_now_ms() - io_start_ms;
                 if (io_elapsed_ms >= time_slice_ms + 8U) {
@@ -3711,7 +3722,7 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
         uint32_t io_start_ms = monotonic_clock_now_ms();
         uint32_t io_deadline_ms = io_start_ms + time_slice_ms;
         if (!io_deadline_ms || !prefetch_deadline_reached(io_deadline_ms)) {
-            prefetch_do_work(movie, current_chunk, max_work_distance, io_deadline_ms);
+            prefetch_do_work(movie, current_chunk, max_work_distance, io_deadline_ms, !paused);
             if (!paused) {
                 uint32_t io_elapsed_ms = monotonic_clock_now_ms() - io_start_ms;
                 if (io_elapsed_ms >= time_slice_ms + 8U) {
@@ -3907,6 +3918,7 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
 }
 
 static bool load_subtitles(
+    Movie *movie,
     FILE *file,
     const MovieHeader *header,
     SubtitleCue **out_cues,
@@ -3936,6 +3948,9 @@ static bool load_subtitles(
         debug_failf("subtitle seek failed offset=%lu", (unsigned long) header->subtitle_offset);
         free(cues);
         return false;
+    }
+    if (movie) {
+        movie->current_file_pos = -1;
     }
 
     {
@@ -4086,10 +4101,12 @@ static bool load_movie(const char *path, Movie *movie)
         debug_failf("open failed: fopen");
         return false;
     }
+    movie->current_file_pos = 0;
     if (fread(&movie->header, 1, sizeof(movie->header), movie->file) != sizeof(movie->header)) {
         debug_failf("open failed: header read");
         return false;
     }
+    movie->current_file_pos = (long) sizeof(movie->header);
     if (memcmp(movie->header.magic, "NVP1", 4) != 0) {
         debug_failf("open failed: bad magic");
         return false;
@@ -4116,10 +4133,12 @@ static bool load_movie(const char *path, Movie *movie)
         debug_failf("open failed: index seek offset=%lu", (unsigned long) movie->header.index_offset);
         return false;
     }
+    movie->current_file_pos = (long) movie->header.index_offset;
     if (fread(movie->chunk_index, sizeof(ChunkIndexEntry), movie->header.chunk_count, movie->file) != movie->header.chunk_count) {
         debug_failf("open failed: chunk index read count=%lu", (unsigned long) movie->header.chunk_count);
         return false;
     }
+    movie->current_file_pos += (long) (sizeof(ChunkIndexEntry) * movie->header.chunk_count);
     debug_tracef("open index loaded chunks=%lu", (unsigned long) movie->header.chunk_count);
     framebuffer_words = (size_t) movie->header.video_width * movie->header.video_height;
     movie->framebuffer = (uint16_t *) calloc(framebuffer_words, sizeof(uint16_t));
@@ -4160,7 +4179,7 @@ static bool load_movie(const char *path, Movie *movie)
         return false;
     }
     debug_tracef("open first frame ok");
-    if (!load_subtitles(movie->file, &movie->header, &movie->subtitles, &movie->subtitle_tracks, &movie->subtitle_track_count)) {
+    if (!load_subtitles(movie, movie->file, &movie->header, &movie->subtitles, &movie->subtitle_tracks, &movie->subtitle_track_count)) {
         debug_tracef("open subtitles disabled after alloc/read failure");
     }
     return true;
