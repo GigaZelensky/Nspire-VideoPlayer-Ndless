@@ -3712,6 +3712,13 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, uint32_t
             if (movie->io_peak_ms > 50U) {
                 dynamic_cushion += 10U;
             }
+            if (ring_contig < 15U) {
+                if (ring_contig <= 5U) {
+                    dynamic_cushion = 0U;
+                } else {
+                    dynamic_cushion = (dynamic_cushion * (uint32_t) (ring_contig - 5U)) / 10U;
+                }
+            }
             if (frame_budget_ms > 8U && dynamic_cushion > frame_budget_ms - 8U) {
                 dynamic_cushion = frame_budget_ms - 8U;
             } else if (frame_budget_ms <= 8U) {
@@ -3742,7 +3749,7 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, uint32_t
         } else {
             if (ring_contig >= 30U) {
                 movie->io_throttled = true;
-            } else if (ring_contig < 15U) {
+            } else if (ring_contig < 20U) {
                 movie->io_throttled = false;
             }
 
