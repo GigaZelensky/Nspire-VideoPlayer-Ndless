@@ -38,11 +38,11 @@
 #define POINTER_AXIS_LOCK_RATIO_NUM 2
 #define POINTER_AXIS_LOCK_RATIO_DEN 1
 #define PREFETCH_FILE_BLOCK_SIZE 32768U
-#define PREFETCH_ACTIVE_FILE_BLOCK_SIZE 8192U
+#define PREFETCH_ACTIVE_FILE_BLOCK_SIZE 4096U
 #define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
 #define PREFETCH_PAUSED_SLICE_MS 12U
 #define PREFETCH_ACTIVE_H264_MIN_SPARE_MS 12U
-#define PREFETCH_ACTIVE_H264_SLICE_MS 2U
+#define PREFETCH_ACTIVE_H264_SLICE_MS 8U
 #define H264_FRAME_RING_MAX_COUNT 160
 #define H264_FRAME_RING_ALIGNMENT 32U
 #define H264_FRAME_RING_BUDGET_BYTES (12U * 1024U * 1024U)
@@ -3045,6 +3045,7 @@ static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respec
     size_t remaining;
     size_t read_size;
     size_t block_size;
+    long target_pos;
 
     if (!movie || !chunk || chunk->chunk_index < 0) {
         return false;
@@ -3070,8 +3071,11 @@ static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respec
 
     block_size = respect_deadline ? PREFETCH_ACTIVE_FILE_BLOCK_SIZE : PREFETCH_FILE_BLOCK_SIZE;
     read_size = remaining > block_size ? block_size : remaining;
-    if (fseek(movie->file, (long) (entry->offset + chunk->read_offset), SEEK_SET) != 0) {
-        return false;
+    target_pos = (long) (entry->offset + chunk->read_offset);
+    if (ftell(movie->file) != target_pos) {
+        if (fseek(movie->file, target_pos, SEEK_SET) != 0) {
+            return false;
+        }
     }
     if (fread(chunk->chunk_storage + chunk->read_offset, 1, read_size, movie->file) != read_size) {
         return false;
@@ -3669,8 +3673,11 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
     if (paused && movie_uses_h264(movie)) {
         try_grow_h264_frame_ring(movie, ring_growth);
     }
-    if (!paused && movie_uses_h264(movie) && !prioritize_io && time_slice_ms > PREFETCH_ACTIVE_H264_SLICE_MS) {
-        time_slice_ms = PREFETCH_ACTIVE_H264_SLICE_MS;
+    if (!paused && movie_uses_h264(movie) && !prioritize_io) {
+        uint32_t max_io_slice = (spare_ms > 16U) ? (spare_ms / 2U) : PREFETCH_ACTIVE_H264_SLICE_MS;
+        if (time_slice_ms > max_io_slice) {
+            time_slice_ms = max_io_slice;
+        }
     }
     if (movie_uses_h264(movie) && allow_active_h264_prefetch && !prioritize_io) {
         prefetch_h264_frames(movie, paused, spare_ms, deadline_ms);
