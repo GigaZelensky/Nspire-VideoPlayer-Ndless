@@ -283,6 +283,7 @@ typedef struct {
     uint16_t h264_foreground_decode_avg_ms;
     uint16_t h264_foreground_decode_peak_ms;
     uint8_t h264_active_prefetch_backoff;
+    bool io_throttled;
     uint32_t diag_last_snapshot_ms;
     uint32_t diag_prefetch_tick_count;
     uint32_t diag_active_prefetch_tick_count;
@@ -3670,6 +3671,7 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
 
     if (!paused && movie_uses_h264(movie) && current_chunk >= 0) {
         uint32_t io_cushion;
+        bool entered_rest = false;
 
         /* Keep active-playback chunk I/O focused on the immediate next chunk.
          * Farther speculative chunks may stay resident, but do not start or
@@ -3688,15 +3690,31 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
             }
         }
 
-        if (ring_contig >= 25U) {
+        if (ring_contig >= 32U) {
+            if (!movie->io_throttled) {
+                movie->io_throttled = true;
+                entered_rest = true;
+            }
+        } else if (ring_contig < 25U) {
+            movie->io_throttled = false;
+        }
+
+        if (ring_contig >= 26U) {
             io_cushion = 50U;
-        } else if (ring_contig >= 10U) {
-            io_cushion = 20U;
+        } else if (ring_contig >= 15U) {
+            io_cushion = 10U;
         } else {
             io_cushion = 0U;
         }
 
-        if (spare_ms < io_cushion && !prioritize_io) {
+        if (prioritize_io) {
+            budget = 1;
+        } else if (movie->io_throttled) {
+            budget = 0;
+            if (debug_is_runtime_logging_enabled() && entered_rest) {
+                debug_tracef("io rest: buffer=%lu", (unsigned long) ring_contig);
+            }
+        } else if (spare_ms < io_cushion) {
             budget = 0;
             if (debug_is_runtime_logging_enabled() && ((movie->current_frame & 15U) == 0U)) {
                 debug_tracef(
@@ -4089,6 +4107,7 @@ static bool load_movie(const char *path, Movie *movie)
     size_t framebuffer_words;
     memset(movie, 0, sizeof(*movie));
     movie->loaded_chunk = -1;
+    movie->io_throttled = false;
     {
         int h264_ring_index;
         int prefetch_index;
