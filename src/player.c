@@ -103,6 +103,15 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define RESUME_MIN_MS 5000U
 #define RESUME_CLEAR_TAIL_MS 3000U
 #define STATUS_OVERLAY_MS 1200U
+#define SCREENSHOT_PREVIEW_MS 1200U
+#define SEEK_PREROLL_TIMEOUT_MS 120U
+#define SEEK_PREROLL_TARGET_LOW_FRAMES 3U
+#define SEEK_PREROLL_TARGET_HIGH_FRAMES 6U
+#define SEEK_BAR_PREVIEW_DEBOUNCE_MS 250U
+#define SCREENSHOT_PREVIEW_MAX_W 96
+#define SCREENSHOT_PREVIEW_MAX_H 72
+#define SEEK_BAR_PREVIEW_MAX_W 80
+#define SEEK_BAR_PREVIEW_MAX_H 60
 #define MOVIE_VERSION_H264 9
 #define H264_CLIP_OFFSET 384
 #define H264_CLIP_TABLE_SIZE 1024
@@ -330,6 +339,36 @@ typedef struct {
 } Movie;
 
 typedef struct {
+    SDL_Surface *surface;
+    const char *text;
+    size_t subtitle_font_index;
+    int subtitle_size;
+    SubtitlePlacement placement;
+    bool overlay_visible;
+    int video_x;
+    int video_y;
+    int video_w;
+    int video_h;
+} SubtitleSurfaceCache;
+
+typedef struct {
+    SDL_Surface *surface;
+    char label[96];
+    uint32_t until_ms;
+} ScreenshotPreviewState;
+
+typedef struct {
+    SDL_Surface *surface;
+    int decoded_chunk_index;
+    int marker_x;
+    uint32_t hover_ms;
+    uint32_t last_move_ms;
+    int last_pointer_x;
+    bool tracking;
+    bool over_bar;
+} SeekBarPreviewState;
+
+typedef struct {
     bool initialized;
     int32_t y_base[256];
     int32_t u_to_blue[256];
@@ -443,6 +482,17 @@ static bool debug_is_runtime_logging_enabled(void);
 static void debug_clear_last_error(void);
 static bool debug_should_collect_metrics(void);
 static void debug_log_sram_status(void);
+static void free_subtitle_surface_cache(SubtitleSurfaceCache *cache);
+static void invalidate_subtitle_surface_cache(SubtitleSurfaceCache *cache);
+static SDL_Surface *create_rgb565_surface(int width, int height);
+static SDL_Surface *create_scaled_surface_from_surface(SDL_Surface *source, int max_width, int max_height);
+static const char *filename_from_path(const char *path);
+static bool decode_h264_frame_to_rgb565_buffer(Movie *movie, uint32_t frame_index, uint16_t *dst_pixels, size_t dst_pitch_pixels);
+static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, const PointerState *pointer, bool show_ui, uint32_t now_ms);
+static void clear_seek_bar_preview(SeekBarPreviewState *preview);
+static void clear_screenshot_preview(ScreenshotPreviewState *preview);
+static void prepare_screenshot_preview(ScreenshotPreviewState *preview, SDL_Surface *screen, const char *saved_path);
+static void begin_seek_preroll(const Movie *movie, bool *active, uint32_t *started_ms, size_t *target_ready_count);
 
 static bool ensure_debug_ring_storage(void)
 {
@@ -815,6 +865,117 @@ static int clamp_int(int value, int min_value, int max_value)
         return max_value;
     }
     return value;
+}
+
+static const char *filename_from_path(const char *path)
+{
+    const char *slash;
+    const char *backslash;
+
+    if (!path || path[0] == '\0') {
+        return "";
+    }
+
+    slash = strrchr(path, '/');
+    backslash = strrchr(path, '\\');
+    if (slash && backslash) {
+        return (slash > backslash ? slash : backslash) + 1;
+    }
+    if (slash) {
+        return slash + 1;
+    }
+    if (backslash) {
+        return backslash + 1;
+    }
+    return path;
+}
+
+static SDL_Surface *create_rgb565_surface(int width, int height)
+{
+    if (width <= 0 || height <= 0) {
+        return NULL;
+    }
+    return SDL_CreateRGBSurface(
+        SDL_SWSURFACE,
+        width,
+        height,
+        16,
+        0xF800, 0x07E0, 0x001F, 0
+    );
+}
+
+static SDL_Surface *create_scaled_surface_from_surface(SDL_Surface *source, int max_width, int max_height)
+{
+    SDL_Surface *scaled;
+    int dst_width;
+    int dst_height;
+
+    if (!source || max_width <= 0 || max_height <= 0 || source->w <= 0 || source->h <= 0) {
+        return NULL;
+    }
+
+    dst_width = max_width;
+    dst_height = (source->h * max_width) / source->w;
+    if (dst_height <= 0) {
+        dst_height = 1;
+    }
+    if (dst_height > max_height) {
+        dst_height = max_height;
+        dst_width = (source->w * max_height) / source->h;
+        if (dst_width <= 0) {
+            dst_width = 1;
+        }
+    }
+
+    scaled = create_rgb565_surface(dst_width, dst_height);
+    if (!scaled) {
+        return NULL;
+    }
+    if (SDL_SoftStretch(source, NULL, scaled, NULL) != 0) {
+        SDL_FreeSurface(scaled);
+        return NULL;
+    }
+    return scaled;
+}
+
+static void invalidate_subtitle_surface_cache(SubtitleSurfaceCache *cache)
+{
+    if (!cache) {
+        return;
+    }
+    if (cache->surface) {
+        SDL_FreeSurface(cache->surface);
+    }
+    memset(cache, 0, sizeof(*cache));
+}
+
+static void free_subtitle_surface_cache(SubtitleSurfaceCache *cache)
+{
+    invalidate_subtitle_surface_cache(cache);
+}
+
+static void clear_screenshot_preview(ScreenshotPreviewState *preview)
+{
+    if (!preview) {
+        return;
+    }
+    if (preview->surface) {
+        SDL_FreeSurface(preview->surface);
+    }
+    memset(preview, 0, sizeof(*preview));
+}
+
+static void clear_seek_bar_preview(SeekBarPreviewState *preview)
+{
+    if (!preview) {
+        return;
+    }
+    if (preview->surface) {
+        SDL_FreeSurface(preview->surface);
+    }
+    memset(preview, 0, sizeof(*preview));
+    preview->decoded_chunk_index = -1;
+    preview->last_pointer_x = -1;
 }
 
 static bool monotonic_clock_try_init_hw_timer(void)
@@ -2853,7 +3014,12 @@ static bool copy_h264_picture_to_slot(Movie *movie, H264FrameSlot *slot, const u
     return true;
 }
 
-static bool blit_h264_picture(Movie *movie, const uint8_t *picture)
+static bool blit_h264_picture_to_target(
+    Movie *movie,
+    const uint8_t *picture,
+    uint16_t *dst_pixels,
+    size_t dst_pitch_pixels
+)
 {
     const size_t luma_stride = movie->h264_full_width;
     const size_t chroma_stride = luma_stride / 2U;
@@ -2863,7 +3029,7 @@ static bool blit_h264_picture(Movie *movie, const uint8_t *picture)
     const uint8_t *u_plane;
     const uint8_t *v_plane;
 
-    if (!movie || !picture || !movie->h264_headers_ready || !movie->framebuffer) {
+    if (!movie || !picture || !movie->h264_headers_ready || !dst_pixels) {
         return false;
     }
 
@@ -2882,8 +3048,8 @@ static bool blit_h264_picture(Movie *movie, const uint8_t *picture)
         v_plane,
         luma_stride,
         chroma_stride,
-        movie->framebuffer,
-        movie->header.video_width
+        dst_pixels,
+        dst_pitch_pixels
     );
 }
 
@@ -2908,12 +3074,13 @@ static bool blit_h264_frame_slot(Movie *movie, const H264FrameSlot *slot)
     );
 }
 
-static bool decode_h264_access_unit(
+static bool decode_h264_access_unit_to_target(
     Movie *movie,
     uint8_t *frame_data,
     size_t frame_size,
     uint32_t frame_index,
-    bool blit_output,
+    uint16_t *dst_pixels,
+    size_t dst_pitch_pixels,
     bool store_prefetched
 )
 {
@@ -2957,7 +3124,7 @@ static bool decode_h264_access_unit(
                     return false;
                 }
             }
-            if (blit_output && !blit_h264_picture(movie, picture)) {
+            if (dst_pixels && !blit_h264_picture_to_target(movie, picture, dst_pixels, dst_pitch_pixels)) {
                 debug_failf("h264 blit failed");
                 return false;
             }
@@ -2994,6 +3161,26 @@ static bool decode_h264_access_unit(
     }
 
     return picture_ready;
+}
+
+static bool decode_h264_access_unit(
+    Movie *movie,
+    uint8_t *frame_data,
+    size_t frame_size,
+    uint32_t frame_index,
+    bool blit_output,
+    bool store_prefetched
+)
+{
+    return decode_h264_access_unit_to_target(
+        movie,
+        frame_data,
+        frame_size,
+        frame_index,
+        blit_output ? movie->framebuffer : NULL,
+        movie ? movie->header.video_width : 0U,
+        store_prefetched
+    );
 }
 
 static bool configure_chunk_view(Movie *movie, int chunk_index)
@@ -3958,6 +4145,91 @@ static bool decode_h264_frame(
     return true;
 }
 
+static bool decode_h264_frame_to_rgb565_buffer(
+    Movie *movie,
+    uint32_t frame_index,
+    uint16_t *dst_pixels,
+    size_t dst_pitch_pixels
+)
+{
+    int chunk_index = movie_chunk_for_frame(movie, frame_index);
+    const ChunkIndexEntry *entry;
+    uint32_t local_index;
+    uint32_t replay_index;
+
+    if (!movie || !dst_pixels || dst_pitch_pixels == 0) {
+        return false;
+    }
+    if (chunk_index < 0) {
+        debug_failf("preview frame=%lu invalid h264 chunk", (unsigned long) frame_index);
+        return false;
+    }
+    if (!load_chunk(movie, chunk_index)) {
+        debug_tracef("preview frame=%lu load h264 chunk=%d fail", (unsigned long) frame_index, chunk_index);
+        return false;
+    }
+
+    entry = movie->chunk_index + chunk_index;
+    local_index = frame_index - entry->first_frame;
+    if (movie->decoded_local_frame > (int) local_index) {
+        if (movie->h264_chunk_dirty) {
+            if (!load_chunk_from_file(movie, chunk_index, true)) {
+                debug_failf("preview chunk reload failed chunk=%d", chunk_index);
+                return false;
+            }
+            entry = movie->chunk_index + chunk_index;
+            local_index = frame_index - entry->first_frame;
+        } else if (!reset_h264_decoder(movie)) {
+            return false;
+        }
+        movie->decoded_local_frame = -1;
+    }
+
+    for (replay_index = (uint32_t) (movie->decoded_local_frame + 1); replay_index <= local_index; ++replay_index) {
+        size_t start = movie->frame_offsets[replay_index];
+        size_t end = (replay_index + 1 < entry->frame_count)
+            ? movie->frame_offsets[replay_index + 1]
+            : movie->chunk_size;
+        uint32_t decoded_frame_index = entry->first_frame + replay_index;
+
+        movie->h264_chunk_dirty = true;
+        if (!decode_h264_access_unit_to_target(
+                movie,
+                movie->chunk_bytes + start,
+                end - start,
+                decoded_frame_index,
+                decoded_frame_index == frame_index ? dst_pixels : NULL,
+                dst_pitch_pixels,
+                false)) {
+            debug_tracef(
+                "preview frame decode fail frame=%lu chunk=%d local=%lu size=%lu",
+                (unsigned long) decoded_frame_index,
+                chunk_index,
+                (unsigned long) replay_index,
+                (unsigned long) (end - start)
+            );
+            return false;
+        }
+        movie->decoded_local_frame = (int) replay_index;
+    }
+
+    return true;
+}
+
+static void invalidate_loaded_chunk_state(Movie *movie)
+{
+    if (!movie) {
+        return;
+    }
+    free(movie->frame_offsets);
+    movie->frame_offsets = NULL;
+    movie->chunk_bytes = NULL;
+    movie->chunk_size = 0;
+    movie->loaded_chunk = -1;
+    movie->decoded_local_frame = -1;
+    movie->h264_chunk_dirty = false;
+}
+
 static bool decode_to_frame(Movie *movie, uint32_t frame_index)
 {
     int chunk_index = movie_chunk_for_frame(movie, frame_index);
@@ -4648,6 +4920,219 @@ static void draw_scaled_outlined_text(
     SDL_FreeSurface(text_surface);
 }
 
+static bool ensure_subtitle_surface_cache(
+    SubtitleSurfaceCache *cache,
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    const SDL_Rect *video_rect,
+    const char *text,
+    bool overlay_visible,
+    size_t subtitle_font_index,
+    int subtitle_size,
+    SubtitlePlacement placement
+)
+{
+    char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN];
+    int line_count;
+    int area_width;
+    int max_width;
+    nSDL_Font *white_font;
+    nSDL_Font *outline_font;
+    int scale_num;
+    int scale_den;
+    int line_height;
+    int total_height;
+    int line_index;
+    int max_line_width = 0;
+    Uint32 key;
+
+    (void) screen;
+
+    if (!cache || !screen || !fonts || !video_rect || !text || !*text || subtitle_size < 0) {
+        invalidate_subtitle_surface_cache(cache);
+        return false;
+    }
+
+    subtitle_size = clamp_int(subtitle_size, 0, 3);
+    if (cache->surface &&
+        cache->text == text &&
+        cache->subtitle_font_index == subtitle_font_index &&
+        cache->subtitle_size == subtitle_size &&
+        cache->placement == placement &&
+        cache->overlay_visible == overlay_visible &&
+        cache->video_x == video_rect->x &&
+        cache->video_y == video_rect->y &&
+        cache->video_w == video_rect->w &&
+        cache->video_h == video_rect->h) {
+        return true;
+    }
+
+    invalidate_subtitle_surface_cache(cache);
+    subtitle_fonts_for_style(fonts, subtitle_font_index, &white_font, &outline_font);
+    scale_num = subtitle_scale_num(subtitle_size);
+    scale_den = subtitle_scale_den(subtitle_size);
+    if (placement == SUBTITLE_POS_BAR_BOTTOM || placement == SUBTITLE_POS_BAR_TOP) {
+        area_width = SCREEN_W;
+    } else {
+        area_width = video_rect->w;
+    }
+    max_width = area_width - 12;
+    if (max_width <= 0) {
+        return false;
+    }
+
+    line_count = wrap_subtitle(white_font, text, (max_width * scale_den) / scale_num, lines);
+    if (line_count <= 0) {
+        return false;
+    }
+
+    line_height = nSDL_GetStringHeight(white_font, "Ag");
+    if (line_height < 10) {
+        line_height = 10;
+    }
+    line_height = (line_height * scale_num) / scale_den;
+    if (line_height < 10) {
+        line_height = 10;
+    }
+    total_height = line_count * line_height;
+    if (line_count > 1) {
+        total_height += (line_count - 1) * 2;
+    }
+
+    for (line_index = 0; line_index < line_count; ++line_index) {
+        int width = (nSDL_GetStringWidth(white_font, lines[line_index]) * scale_num) / scale_den;
+        if (width > max_line_width) {
+            max_line_width = width;
+        }
+    }
+    if (max_line_width <= 0 || total_height <= 0) {
+        return false;
+    }
+
+    cache->surface = create_rgb565_surface(max_line_width, total_height);
+    if (!cache->surface) {
+        return false;
+    }
+    key = SDL_MapRGB(cache->surface->format, 255, 0, 255);
+    SDL_FillRect(cache->surface, NULL, key);
+    SDL_SetColorKey(cache->surface, SDL_SRCCOLORKEY, key);
+    for (line_index = 0; line_index < line_count; ++line_index) {
+        int width = (nSDL_GetStringWidth(white_font, lines[line_index]) * scale_num) / scale_den;
+        int x = (max_line_width - width) / 2;
+        draw_scaled_outlined_text(
+            cache->surface,
+            white_font,
+            outline_font,
+            x,
+            line_index * (line_height + 2),
+            lines[line_index],
+            scale_num,
+            scale_den
+        );
+    }
+
+    cache->text = text;
+    cache->subtitle_font_index = subtitle_font_index;
+    cache->subtitle_size = subtitle_size;
+    cache->placement = placement;
+    cache->overlay_visible = overlay_visible;
+    cache->video_x = video_rect->x;
+    cache->video_y = video_rect->y;
+    cache->video_w = video_rect->w;
+    cache->video_h = video_rect->h;
+    return true;
+}
+
+static void draw_subtitle_cached(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    SubtitleSurfaceCache *cache,
+    const SDL_Rect *video_rect,
+    const char *text,
+    bool overlay_visible,
+    size_t subtitle_font_index,
+    int subtitle_size,
+    SubtitlePlacement placement
+)
+{
+    int base_x;
+    int base_y;
+    int area_width;
+    int area_top;
+    int area_bottom;
+    int area_height;
+    int total_height;
+    SDL_Rect dst;
+
+    if (!screen || !cache || !video_rect || !text || !*text || subtitle_size < 0) {
+        invalidate_subtitle_surface_cache(cache);
+        return;
+    }
+    if (!ensure_subtitle_surface_cache(
+            cache,
+            screen,
+            fonts,
+            video_rect,
+            text,
+            overlay_visible,
+            subtitle_font_index,
+            subtitle_size,
+            placement)) {
+        return;
+    }
+
+    total_height = cache->surface ? cache->surface->h : 0;
+    if (placement == SUBTITLE_POS_BAR_BOTTOM || placement == SUBTITLE_POS_BAR_TOP) {
+        base_x = 0;
+        area_width = SCREEN_W;
+    } else {
+        base_x = video_rect->x;
+        area_width = video_rect->w;
+    }
+
+    switch (placement) {
+        case SUBTITLE_POS_BAR_BOTTOM:
+            area_top = video_rect->y + video_rect->h + 2;
+            area_bottom = (overlay_visible ? (SCREEN_H - UI_BAR_H) : SCREEN_H) - 2;
+            area_height = area_bottom - area_top;
+            if (area_height >= total_height) {
+                base_y = area_top + (area_height - total_height) / 2;
+            } else {
+                base_y = area_bottom - total_height;
+                if (base_y < 2) {
+                    base_y = 2;
+                }
+            }
+            break;
+        case SUBTITLE_POS_VIDEO_TOP:
+            base_y = video_rect->y + 4;
+            break;
+        case SUBTITLE_POS_BAR_TOP:
+            area_top = 2;
+            area_bottom = video_rect->y - 2;
+            area_height = area_bottom - area_top;
+            if (area_height >= total_height) {
+                base_y = area_top + (area_height - total_height) / 2;
+            } else {
+                base_y = 4;
+            }
+            break;
+        case SUBTITLE_POS_VIDEO_BOTTOM:
+        default:
+            base_y = (video_rect->y + video_rect->h - 8) - total_height;
+            if (base_y < video_rect->y + 4) {
+                base_y = video_rect->y + 4;
+            }
+            break;
+    }
+
+    dst.x = (Sint16) (base_x + (area_width - cache->surface->w) / 2);
+    dst.y = (Sint16) base_y;
+    dst.w = (Uint16) cache->surface->w;
+    dst.h = (Uint16) cache->surface->h;
+    SDL_BlitSurface(cache->surface, NULL, screen, &dst);
+}
+
 static void draw_subtitle(
     SDL_Surface *screen,
     const Fonts *fonts,
@@ -4892,6 +5377,54 @@ static void draw_centered_text_badge(SDL_Surface *screen, const Fonts *fonts, in
     nSDL_DrawString(screen, fonts->white, badge.x + 5, badge.y + 4, "%s", label);
 }
 
+static void draw_surface_panel(SDL_Surface *screen, SDL_Surface *surface, int x, int y)
+{
+    SDL_Rect border;
+    SDL_Rect inner;
+    SDL_Rect dst;
+
+    if (!screen || !surface) {
+        return;
+    }
+
+    border.x = (Sint16) x;
+    border.y = (Sint16) y;
+    border.w = (Uint16) (surface->w + 4);
+    border.h = (Uint16) (surface->h + 4);
+    inner.x = (Sint16) (x + 1);
+    inner.y = (Sint16) (y + 1);
+    inner.w = (Uint16) (surface->w + 2);
+    inner.h = (Uint16) (surface->h + 2);
+    dst.x = (Sint16) (x + 2);
+    dst.y = (Sint16) (y + 2);
+    dst.w = (Uint16) surface->w;
+    dst.h = (Uint16) surface->h;
+
+    SDL_FillRect(screen, &border, SDL_MapRGB(screen->format, 0, 0, 0));
+    SDL_FillRect(screen, &inner, SDL_MapRGB(screen->format, 12, 18, 28));
+    SDL_BlitSurface(surface, NULL, screen, &dst);
+}
+
+static void draw_screenshot_preview_osd(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    const ScreenshotPreviewState *preview,
+    uint32_t now_ms
+)
+{
+    int panel_x;
+    int panel_y;
+
+    if (!screen || !fonts || !preview || !preview->surface || now_ms > preview->until_ms) {
+        return;
+    }
+
+    panel_x = 8;
+    panel_y = 30;
+    draw_surface_panel(screen, preview->surface, panel_x, panel_y);
+    draw_left_text_badge(screen, fonts, panel_x, panel_y + preview->surface->h + 8, preview->label);
+}
+
 static void format_seek_delta(int32_t delta_ms, char *buffer, size_t buffer_size)
 {
     uint32_t magnitude_ms;
@@ -5119,7 +5652,8 @@ static void draw_progress(
     const Movie *movie,
     uint32_t current_ms,
     const PointerState *pointer,
-    int32_t pending_seek_ms
+    int32_t pending_seek_ms,
+    const SeekBarPreviewState *seek_preview
 )
 {
     SDL_Rect overlay = {0, SCREEN_H - UI_BAR_H, SCREEN_W, UI_BAR_H};
@@ -5136,6 +5670,7 @@ static void draw_progress(
     uint32_t duration_ms = movie_duration_ms(movie);
     bool hover_bar = false;
     uint32_t hover_ms = 0;
+    int hover_badge_y = bar_back.y - 20;
     SDL_FillRect(screen, &overlay, SDL_MapRGB(screen->format, 0, 0, 0));
     SDL_FillRect(screen, &bar_back, SDL_MapRGB(screen->format, 52, 52, 68));
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
@@ -5160,9 +5695,24 @@ static void draw_progress(
         SDL_FillRect(screen, &marker, SDL_MapRGB(screen->format, 255, 255, 255));
         hover_bar = pointer->y >= overlay.y && pointer->y < SCREEN_H;
         if (hover_bar && duration_ms > 0) {
+            int preview_x;
+            int preview_y;
             hover_ms = (uint32_t) (((uint64_t) duration_ms * (uint32_t) (marker_x - bar_back.x)) / (uint32_t) bar_back.w);
             format_clock(hover_ms, hover_text, sizeof(hover_text));
-            draw_centered_text_badge(screen, fonts, marker_x, bar_back.y - 20, hover_text);
+            if (seek_preview && seek_preview->surface && seek_preview->over_bar) {
+                preview_x = clamp_int(
+                    marker_x - ((seek_preview->surface->w + 4) / 2),
+                    0,
+                    SCREEN_W - (seek_preview->surface->w + 4)
+                );
+                preview_y = bar_back.y - seek_preview->surface->h - 28;
+                if (preview_y < 0) {
+                    preview_y = 0;
+                }
+                draw_surface_panel(screen, seek_preview->surface, preview_x, preview_y);
+                hover_badge_y = preview_y + seek_preview->surface->h + 8;
+            }
+            draw_centered_text_badge(screen, fonts, marker_x, hover_badge_y, hover_text);
         }
     }
     format_clock(current_ms, current_text, sizeof(current_text));
@@ -5199,11 +5749,15 @@ static void render_movie(
     ScaleMode scale_mode,
     const PlaybackRate *playback_rate,
     MemoryOverlayMode memory_overlay_mode,
+    SubtitleSurfaceCache *subtitle_cache,
     size_t subtitle_font_index,
     bool subtitle_font_overlay_visible,
     int subtitle_size,
     SubtitlePlacement subtitle_placement,
     const char *status_overlay_text,
+    const ScreenshotPreviewState *screenshot_preview,
+    const SeekBarPreviewState *seek_preview,
+    uint32_t now_ms,
     const PointerState *pointer,
     int32_t pending_seek_ms
 )
@@ -5243,7 +5797,17 @@ static void render_movie(
     } else {
         SDL_SoftStretch(movie->frame_surface, &src, screen, &dst);
     }
-    draw_subtitle(screen, fonts, &dst, subtitle, show_ui, subtitle_font_index, subtitle_size, subtitle_placement);
+    draw_subtitle_cached(
+        screen,
+        fonts,
+        subtitle_cache,
+        &dst,
+        subtitle,
+        show_ui,
+        subtitle_font_index,
+        subtitle_size,
+        subtitle_placement
+    );
     if (subtitle_font_overlay_visible) {
         int preview_size = subtitle_size < 0 ? 0 : clamp_int(subtitle_size, 0, 1);
         draw_subtitle(
@@ -5267,7 +5831,7 @@ static void render_movie(
                 draw_left_text_badge(screen, fonts, playback_badge_visible ? 36 : 8, top_overlay_y_for_rect(&dst, 16), status_overlay_text);
             }
         }
-        draw_progress(screen, fonts, movie, current_ms, pointer, pending_seek_ms);
+        draw_progress(screen, fonts, movie, current_ms, pointer, pending_seek_ms, seek_preview);
         if (!help_menu_open && pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
@@ -5278,6 +5842,7 @@ static void render_movie(
     if (help_menu_open) {
         draw_help_menu(screen, fonts);
     }
+    draw_screenshot_preview_osd(screen, fonts, screenshot_preview, now_ms);
     present_screen(screen);
 }
 
@@ -5819,6 +6384,177 @@ static bool save_screenshot_bitmap(SDL_Surface *screen, const char *movie_path, 
     return false;
 }
 
+static void prepare_screenshot_preview(ScreenshotPreviewState *preview, SDL_Surface *screen, const char *saved_path)
+{
+    SDL_Surface *thumbnail;
+
+    if (!preview) {
+        return;
+    }
+
+    clear_screenshot_preview(preview);
+    if (!screen || !saved_path || saved_path[0] == '\0') {
+        return;
+    }
+
+    thumbnail = create_scaled_surface_from_surface(screen, SCREENSHOT_PREVIEW_MAX_W, SCREENSHOT_PREVIEW_MAX_H);
+    if (!thumbnail) {
+        return;
+    }
+
+    preview->surface = thumbnail;
+    snprintf(preview->label, sizeof(preview->label), "Saved %.72s", filename_from_path(saved_path));
+    preview->until_ms = monotonic_clock_now_ms() + SCREENSHOT_PREVIEW_MS;
+}
+
+static void begin_seek_preroll(const Movie *movie, bool *active, uint32_t *started_ms, size_t *target_ready_count)
+{
+    size_t capacity;
+    size_t target;
+
+    if (!active || !started_ms || !target_ready_count) {
+        return;
+    }
+
+    *active = false;
+    *started_ms = 0;
+    *target_ready_count = 0;
+    if (!movie || !movie_uses_h264(movie)) {
+        return;
+    }
+
+    capacity = active_h264_frame_ring_capacity(movie);
+    if (capacity >= SEEK_PREROLL_TARGET_HIGH_FRAMES) {
+        target = SEEK_PREROLL_TARGET_HIGH_FRAMES;
+    } else if (capacity >= SEEK_PREROLL_TARGET_LOW_FRAMES) {
+        target = SEEK_PREROLL_TARGET_LOW_FRAMES;
+    } else if (capacity == 0) {
+        target = SEEK_PREROLL_TARGET_LOW_FRAMES;
+    } else {
+        target = capacity;
+    }
+    if (target == 0) {
+        target = 1;
+    }
+
+    *active = true;
+    *started_ms = monotonic_clock_now_ms();
+    *target_ready_count = target;
+}
+
+static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, const PointerState *pointer, bool show_ui, uint32_t now_ms)
+{
+    SDL_Rect bar = progress_bar_rect();
+    int marker_x;
+    uint32_t duration_ms;
+    uint32_t target_ms;
+    uint32_t target_frame;
+    int chunk_index;
+    const ChunkIndexEntry *entry;
+    uint16_t *preview_pixels = NULL;
+    SDL_Surface *full_surface = NULL;
+    SDL_Surface *thumbnail = NULL;
+    bool ok = true;
+
+    if (!preview) {
+        return false;
+    }
+
+    preview->over_bar = false;
+    if (!movie || !pointer || !pointer->visible || !show_ui ||
+        pointer->y < SCREEN_H - UI_BAR_H || pointer->y >= SCREEN_H) {
+        preview->tracking = false;
+        preview->last_pointer_x = -1;
+        return false;
+    }
+
+    preview->over_bar = true;
+    marker_x = clamp_int(pointer->x, bar.x, bar.x + bar.w - 1);
+    preview->marker_x = marker_x;
+    duration_ms = movie_duration_ms(movie);
+    if (duration_ms > 0) {
+        target_ms = (uint32_t) (((uint64_t) duration_ms * (uint32_t) (marker_x - bar.x)) / (uint32_t) bar.w);
+    } else {
+        target_ms = 0;
+    }
+    preview->hover_ms = target_ms;
+
+    if (!preview->tracking || pointer->moved || preview->last_pointer_x != marker_x) {
+        preview->tracking = true;
+        preview->last_pointer_x = marker_x;
+        preview->last_move_ms = now_ms;
+        return true;
+    }
+    if ((int32_t) (now_ms - preview->last_move_ms) < (int32_t) SEEK_BAR_PREVIEW_DEBOUNCE_MS) {
+        return true;
+    }
+    if (movie->header.frame_count == 0) {
+        return true;
+    }
+
+    target_frame = movie_frames_from_ms(movie, target_ms);
+    if (target_frame >= movie->header.frame_count) {
+        target_frame = movie->header.frame_count - 1U;
+    }
+    chunk_index = movie_chunk_for_frame(movie, target_frame);
+    if (chunk_index < 0) {
+        return false;
+    }
+    if (preview->surface && preview->decoded_chunk_index == chunk_index) {
+        return true;
+    }
+
+    entry = movie->chunk_index + chunk_index;
+    clear_h264_frame_ring(movie);
+    clear_all_prefetched_chunks(movie);
+    movie->h264_active_prefetch_backoff = H264_ACTIVE_PREFETCH_BACKOFF_HEAVY;
+    preview_pixels = (uint16_t *) calloc((size_t) movie->header.video_width * movie->header.video_height, sizeof(uint16_t));
+    if (!preview_pixels) {
+        ok = false;
+        goto cleanup;
+    }
+    if (!decode_h264_frame_to_rgb565_buffer(movie, entry->first_frame, preview_pixels, movie->header.video_width)) {
+        ok = false;
+        goto cleanup;
+    }
+
+    full_surface = SDL_CreateRGBSurfaceFrom(
+        preview_pixels,
+        movie->header.video_width,
+        movie->header.video_height,
+        16,
+        movie->header.video_width * 2,
+        0xF800, 0x07E0, 0x001F, 0
+    );
+    if (!full_surface) {
+        ok = false;
+        goto cleanup;
+    }
+    thumbnail = create_scaled_surface_from_surface(full_surface, SEEK_BAR_PREVIEW_MAX_W, SEEK_BAR_PREVIEW_MAX_H);
+    if (!thumbnail) {
+        ok = false;
+        goto cleanup;
+    }
+
+cleanup:
+    if (full_surface) {
+        SDL_FreeSurface(full_surface);
+    }
+    free(preview_pixels);
+    invalidate_loaded_chunk_state(movie);
+    reset_h264_decoder(movie);
+    if (!ok) {
+        return false;
+    }
+
+    if (preview->surface) {
+        SDL_FreeSurface(preview->surface);
+    }
+    preview->surface = thumbnail;
+    preview->decoded_chunk_index = chunk_index;
+    return true;
+}
+
 static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *directory, char *selected_path, size_t selected_size)
 {
     bool prev_up = false;
@@ -5880,7 +6616,7 @@ static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *direc
     }
 }
 
-static void clamp_seek(Movie *movie, int32_t delta_ms)
+static bool clamp_seek(Movie *movie, int32_t delta_ms)
 {
     int64_t current_ms = (int64_t) movie_frame_time_ms(movie, movie->current_frame);
     int64_t target_ms = current_ms + delta_ms;
@@ -5896,16 +6632,16 @@ static void clamp_seek(Movie *movie, int32_t delta_ms)
     if (target_frame >= movie->header.frame_count) {
         target_frame = movie->header.frame_count - 1;
     }
-    decode_to_frame(movie, target_frame);
+    return decode_to_frame(movie, target_frame);
 }
 
-static void seek_to_ratio(Movie *movie, uint32_t numerator, uint32_t denominator)
+static bool seek_to_ratio(Movie *movie, uint32_t numerator, uint32_t denominator)
 {
     uint32_t duration_ms;
     uint32_t target_ms;
     uint32_t target_frame;
     if (denominator == 0 || movie->header.frame_count == 0) {
-        return;
+        return false;
     }
     duration_ms = movie_duration_ms(movie);
     target_ms = (uint32_t) (((uint64_t) duration_ms * numerator) / denominator);
@@ -5913,7 +6649,7 @@ static void seek_to_ratio(Movie *movie, uint32_t numerator, uint32_t denominator
     if (target_frame >= movie->header.frame_count) {
         target_frame = movie->header.frame_count - 1;
     }
-    decode_to_frame(movie, target_frame);
+    return decode_to_frame(movie, target_frame);
 }
 
 static void draw_prompt_button(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *button, const char *label, bool selected)
@@ -6093,6 +6829,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     SubtitlePlacement subtitle_placement = SUBTITLE_POS_BAR_BOTTOM;
     char status_overlay_text[64] = {0};
     uint32_t status_overlay_until = 0;
+    SubtitleSurfaceCache subtitle_cache;
+    ScreenshotPreviewState screenshot_preview;
+    SeekBarPreviewState seek_preview;
     PointerState pointer;
     bool help_menu_open = false;
     bool help_resume_playback = false;
@@ -6104,6 +6843,16 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     bool startup_has_resume = false;
     int32_t pending_seek_ms = 0;
     uint32_t pending_seek_commit_at_ms = 0;
+    bool seek_preroll_active = false;
+    uint32_t seek_preroll_started_ms = 0;
+    size_t seek_preroll_target_ready_count = 0;
+    bool hover_preview_needs_rebuffer = false;
+
+    memset(&subtitle_cache, 0, sizeof(subtitle_cache));
+    memset(&screenshot_preview, 0, sizeof(screenshot_preview));
+    memset(&seek_preview, 0, sizeof(seek_preview));
+    seek_preview.decoded_chunk_index = -1;
+    seek_preview.last_pointer_x = -1;
 
     if (debug_is_runtime_logging_enabled()) {
         g_debug_ring_count = 0;
@@ -6160,6 +6909,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         } else {
             snprintf(status_overlay_text, sizeof(status_overlay_text), "RESUMED");
             status_overlay_until = monotonic_clock_now_ms() + STATUS_OVERLAY_MS;
+            begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
         }
     }
     pointer_init(&pointer);
@@ -6183,13 +6933,18 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         movie.loaded_chunk
     );
     debug_log_sram_status();
-    reset_playback_timeline(
-        &movie,
-        playback_rate_for_index(playback_rate_index),
-        &playback_anchor_ticks,
-        &playback_anchor_frame,
-        &next_frame_due_ticks
-    );
+    playback_anchor_ticks = monotonic_clock_now_ticks();
+    playback_anchor_frame = movie.current_frame;
+    next_frame_due_ticks = playback_anchor_ticks;
+    if (!seek_preroll_active) {
+        reset_playback_timeline(
+            &movie,
+            playback_rate_for_index(playback_rate_index),
+            &playback_anchor_ticks,
+            &playback_anchor_frame,
+            &next_frame_due_ticks
+        );
+    }
     ui_visible_until = monotonic_clock_now_ms() + POINTER_UI_TIMEOUT_MS;
 
     while (1) {
@@ -6230,6 +6985,20 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             show_ui = true;
         }
+        if (!pointer_click) {
+            int previous_preview_chunk = seek_preview.decoded_chunk_index;
+            if (update_seek_bar_preview(&movie, &seek_preview, &pointer, show_ui && !help_menu_open, now_ms) &&
+                seek_preview.surface &&
+                seek_preview.decoded_chunk_index != previous_preview_chunk) {
+                if (paused) {
+                    hover_preview_needs_rebuffer = true;
+                } else {
+                    begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+                }
+            }
+        } else {
+            seek_preview.over_bar = false;
+        }
         if (seek_left_edge || seek_right_edge) {
             int64_t next_seek_ms = (int64_t) pending_seek_ms + (seek_left_edge ? -SEEK_STEP_MS : SEEK_STEP_MS);
             int64_t seek_limit_ms = (int64_t) movie_duration_ms(&movie);
@@ -6253,10 +7022,18 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             !seek_right_edge &&
             (now_ms >= pending_seek_commit_at_ms || enter_edge || tab_edge || pointer_click)) {
             pending_seek_consumed_click = pointer_click;
-            clamp_seek(&movie, pending_seek_ms);
+            if (!clamp_seek(&movie, pending_seek_ms)) {
+                report_movie_decode_failure(&movie, path, "seek");
+                result = -1;
+                break;
+            }
+            begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+            hover_preview_needs_rebuffer = false;
             pending_seek_ms = 0;
             pending_seek_commit_at_ms = 0;
-            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            if (!seek_preroll_active) {
+                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            }
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (pending_seek_consumed_click) {
@@ -6270,6 +7047,10 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 help_menu_open = false;
                 if (help_resume_playback) {
                     paused = false;
+                    if (hover_preview_needs_rebuffer) {
+                        begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+                        hover_preview_needs_rebuffer = false;
+                    }
                 }
                 help_resume_playback = false;
             } else {
@@ -6277,7 +7058,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 help_resume_playback = !paused;
                 paused = true;
             }
-            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            if (!seek_preroll_active) {
+                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            }
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             show_ui = true;
         }
@@ -6286,9 +7069,15 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 help_menu_open = false;
                 if (help_resume_playback) {
                     paused = false;
+                    if (hover_preview_needs_rebuffer) {
+                        begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+                        hover_preview_needs_rebuffer = false;
+                    }
                 }
                 help_resume_playback = false;
-                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                if (!seek_preroll_active) {
+                    reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                }
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
                 show_ui = true;
             } else {
@@ -6306,16 +7095,23 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 scale_mode,
                 playback_rate,
                 memory_overlay_mode,
+                &subtitle_cache,
                 subtitle_font_index,
                 false,
                 subtitle_size,
                 subtitle_placement,
                 (now_ms <= status_overlay_until) ? status_overlay_text : NULL,
+                &screenshot_preview,
+                &seek_preview,
+                now_ms,
                 &pointer,
                 0
             );
             if (take_screenshot) {
-                save_screenshot_bitmap(screen, path, NULL, 0);
+                char saved_path[MAX_PATH_LEN];
+                if (save_screenshot_bitmap(screen, path, saved_path, sizeof(saved_path))) {
+                    prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
+                }
             }
             flush_deferred_history_save(
                 path,
@@ -6335,12 +7131,23 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         }
         if (enter_edge) {
             if (movie.current_frame + 1 >= movie.header.frame_count) {
-                decode_to_frame(&movie, 0);
+                if (!decode_to_frame(&movie, 0)) {
+                    report_movie_decode_failure(&movie, path, "restart");
+                    result = -1;
+                    break;
+                }
+                hover_preview_needs_rebuffer = false;
                 paused = false;
             } else {
                 paused = !paused;
             }
-            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            if (!paused && hover_preview_needs_rebuffer) {
+                begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+                hover_preview_needs_rebuffer = false;
+            }
+            if (!seek_preroll_active) {
+                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            }
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (divide_edge) {
@@ -6436,6 +7243,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                     result = -1;
                     break;
                 }
+                hover_preview_needs_rebuffer = false;
             }
             reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
@@ -6444,22 +7252,53 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             SDL_Rect bar = progress_bar_rect();
             if (show_ui && pointer.y >= SCREEN_H - UI_BAR_H && pointer.y < SCREEN_H) {
                 int seek_x = clamp_int(pointer.x, bar.x, bar.x + bar.w);
-                seek_to_ratio(&movie, (uint32_t) (seek_x - bar.x), (uint32_t) bar.w);
-                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                if (!seek_to_ratio(&movie, (uint32_t) (seek_x - bar.x), (uint32_t) bar.w)) {
+                    report_movie_decode_failure(&movie, path, "pointer seek");
+                    result = -1;
+                    break;
+                }
+                begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+                hover_preview_needs_rebuffer = false;
+                if (!seek_preroll_active) {
+                    reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                }
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             } else {
                 if (movie.current_frame + 1 >= movie.header.frame_count) {
-                    decode_to_frame(&movie, 0);
+                    if (!decode_to_frame(&movie, 0)) {
+                        report_movie_decode_failure(&movie, path, "pointer restart");
+                        result = -1;
+                        break;
+                    }
+                    hover_preview_needs_rebuffer = false;
                     paused = false;
                 } else {
                     paused = !paused;
                 }
-                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                if (!paused && hover_preview_needs_rebuffer) {
+                    begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+                    hover_preview_needs_rebuffer = false;
+                }
+                if (!seek_preroll_active) {
+                    reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                }
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             }
         }
         maybe_defer_history_save(&movie, &last_history_saved_ms, &history_save_pending);
-        if (!paused && frame_interval_ticks > 0) {
+        if (seek_preroll_active) {
+            size_t ready_frames = h264_frame_ring_contiguous_ready_count(&movie);
+            if (ready_frames >= seek_preroll_target_ready_count ||
+                (int32_t) (now_ms - seek_preroll_started_ms) >= (int32_t) SEEK_PREROLL_TIMEOUT_MS) {
+                seek_preroll_active = false;
+                seek_preroll_started_ms = 0;
+                seek_preroll_target_ready_count = 0;
+                if (!paused) {
+                    reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                }
+            }
+        }
+        if (!paused && frame_interval_ticks > 0 && !seek_preroll_active) {
             if (now_ticks >= next_frame_due_ticks) {
                 uint64_t elapsed_ticks = now_ticks - playback_anchor_ticks;
                 uint32_t frames_to_advance = movie_frames_from_scaled_ticks(&movie, elapsed_ticks, playback_rate);
@@ -6560,19 +7399,26 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 scale_mode,
                 playback_rate,
                 memory_overlay_mode,
+                &subtitle_cache,
                 subtitle_font_index,
                 subtitle_font_overlay_visible,
                 subtitle_size,
                 subtitle_placement,
                 (render_now_ms <= status_overlay_until) ? status_overlay_text : NULL,
+                &screenshot_preview,
+                &seek_preview,
+                render_now_ms,
                 &pointer,
                 pending_seek_ms
             );
             if (take_screenshot) {
-                save_screenshot_bitmap(screen, path, NULL, 0);
+                char saved_path[MAX_PATH_LEN];
+                if (save_screenshot_bitmap(screen, path, saved_path, sizeof(saved_path))) {
+                    prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
+                }
             }
         }
-        if (paused || frame_interval_ticks == 0) {
+        if (paused || frame_interval_ticks == 0 || seek_preroll_active) {
             flush_deferred_history_save(
                 path,
                 &movie,
@@ -6638,6 +7484,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         debug_log_path_for_movie(path, log_path, sizeof(log_path));
         debug_dump_session(log_path, &movie, result == 0 ? "normal-exit" : "aborted");
     }
+    free_subtitle_surface_cache(&subtitle_cache);
+    clear_screenshot_preview(&screenshot_preview);
+    clear_seek_bar_preview(&seek_preview);
     destroy_movie(&movie);
     return result;
 }
