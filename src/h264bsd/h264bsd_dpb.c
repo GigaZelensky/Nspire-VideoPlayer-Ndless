@@ -1023,11 +1023,11 @@ u32 h264bsdInitDpb(
          * DL implementation Functions may read beyond the end of an array,
          * by a maximum of 32 bytes. And +15 cames for the need to align memory
          * to 16-byte boundary */
-        ALLOCATE(dpb->buffer[i].pAllocatedData, (picSizeInMbs*384 + 32+15), u8);
+        ALLOCATE(dpb->buffer[i].pAllocatedData, (picSizeInMbs*384 + 32+31), u8);
         if (dpb->buffer[i].pAllocatedData == NULL)
             return(MEMORY_ALLOCATION_ERROR);
 
-        dpb->buffer[i].data = ALIGN(dpb->buffer[i].pAllocatedData, 16);
+        dpb->buffer[i].data = ALIGN(dpb->buffer[i].pAllocatedData, 32);
     }
 
     ALLOCATE(dpb->list, MAX_NUM_REF_IDX_L0_ACTIVE + 1, dpbPicture_t*);

@@ -12,7 +12,9 @@
 #include <stdarg.h>
 #include <string.h>
 #include "h264bsd_decoder.h"
+#include "h264bsd_sram.h"
 #include "h264bsd_util.h"
+#include "sram.h"
 
 extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 
@@ -365,7 +367,9 @@ static size_t g_debug_ring_next = 0;
 static char g_last_error_message[DEBUG_LINE_LEN];
 static bool g_debug_logging_enabled = false;
 static bool g_debug_metrics_enabled = false;
-static H264ColorTables g_h264_color_tables;
+static H264ColorTables g_h264_color_tables_storage;
+static H264ColorTables *g_h264_color_tables = &g_h264_color_tables_storage;
+static bool g_h264_color_tables_in_sram = false;
 static const PlaybackRate g_playback_rates[] = {
     {1, 4, "0.25x"},
     {1, 2, "0.5x"},
@@ -438,6 +442,7 @@ static void apply_history_entry_settings(
 static bool debug_is_runtime_logging_enabled(void);
 static void debug_clear_last_error(void);
 static bool debug_should_collect_metrics(void);
+static void debug_log_sram_status(void);
 
 static bool ensure_debug_ring_storage(void)
 {
@@ -1386,11 +1391,27 @@ static bool movie_uses_h264(const Movie *movie)
     return movie && movie->header.version == MOVIE_VERSION_H264;
 }
 
-static void init_h264_color_tables(void)
+static bool init_h264_color_tables(void)
 {
     int index;
-    if (g_h264_color_tables.initialized) {
-        return;
+    H264ColorTables *tables = g_h264_color_tables;
+
+    if (tables->initialized) {
+        return true;
+    }
+    if (tables == &g_h264_color_tables_storage) {
+        H264ColorTables *sram_tables = (H264ColorTables *) sram_alloc(sizeof(*sram_tables), 32U);
+        if (sram_tables) {
+            memset(sram_tables, 0, sizeof(*sram_tables));
+            g_h264_color_tables = sram_tables;
+            g_h264_color_tables_in_sram = true;
+            tables = sram_tables;
+        } else {
+            memset(&g_h264_color_tables_storage, 0, sizeof(g_h264_color_tables_storage));
+            g_h264_color_tables = &g_h264_color_tables_storage;
+            g_h264_color_tables_in_sram = false;
+            tables = &g_h264_color_tables_storage;
+        }
     }
 
     for (index = 0; index < 256; ++index) {
@@ -1399,14 +1420,14 @@ static void init_h264_color_tables(void)
         if (y < 0) {
             y = 0;
         }
-        g_h264_color_tables.y_base[index] = (298 * y) + 128;
-        g_h264_color_tables.u_to_blue[index] = 516 * chroma;
-        g_h264_color_tables.u_to_green[index] = -100 * chroma;
-        g_h264_color_tables.v_to_red[index] = 409 * chroma;
-        g_h264_color_tables.v_to_green[index] = -208 * chroma;
-        g_h264_color_tables.red565[index] = (uint16_t) ((index & 0xF8) << 8);
-        g_h264_color_tables.green565[index] = (uint16_t) ((index & 0xFC) << 3);
-        g_h264_color_tables.blue565[index] = (uint16_t) (index >> 3);
+        tables->y_base[index] = (298 * y) + 128;
+        tables->u_to_blue[index] = 516 * chroma;
+        tables->u_to_green[index] = -100 * chroma;
+        tables->v_to_red[index] = 409 * chroma;
+        tables->v_to_green[index] = -208 * chroma;
+        tables->red565[index] = (uint16_t) ((index & 0xF8) << 8);
+        tables->green565[index] = (uint16_t) ((index & 0xFC) << 3);
+        tables->blue565[index] = (uint16_t) (index >> 3);
     }
 
     for (index = 0; index < H264_CLIP_TABLE_SIZE; ++index) {
@@ -1416,16 +1437,17 @@ static void init_h264_color_tables(void)
         } else if (value > 255) {
             value = 255;
         }
-        g_h264_color_tables.clip[index] = (uint8_t) value;
+        tables->clip[index] = (uint8_t) value;
     }
 
-    g_h264_color_tables.initialized = true;
+    tables->initialized = true;
+    return true;
 }
 
 static inline uint8_t h264_clip_byte(int32_t value)
 {
     /* The YUV->RGB fixed-point path keeps this in [-258, 534]. */
-    return g_h264_color_tables.clip[value + H264_CLIP_OFFSET];
+    return g_h264_color_tables->clip[value + H264_CLIP_OFFSET];
 }
 
 static uint8_t *alloc_aligned_bytes(size_t size, size_t alignment, uint8_t **allocation)
@@ -1481,9 +1503,9 @@ static inline void h264_compute_chroma_terms(uint8_t u_sample, uint8_t v_sample,
 #else
 static inline void h264_compute_chroma_terms(uint8_t u_sample, uint8_t v_sample, int32_t *red, int32_t *green, int32_t *blue)
 {
-    *red = g_h264_color_tables.v_to_red[v_sample];
-    *green = g_h264_color_tables.u_to_green[u_sample] + g_h264_color_tables.v_to_green[v_sample];
-    *blue = g_h264_color_tables.u_to_blue[u_sample];
+    *red = g_h264_color_tables->v_to_red[v_sample];
+    *green = g_h264_color_tables->u_to_green[u_sample] + g_h264_color_tables->v_to_green[v_sample];
+    *blue = g_h264_color_tables->u_to_blue[u_sample];
 }
 #endif
 
@@ -1812,6 +1834,9 @@ static void debug_dump_session(const char *path, const Movie *movie, const char 
 {
     FILE *log_file;
     size_t index;
+    bool clip_in_sram = false;
+    bool qpc_in_sram = false;
+    bool deblocking_in_sram = false;
 
     if (!path) {
         return;
@@ -1827,6 +1852,19 @@ static void debug_dump_session(const char *path, const Movie *movie, const char 
     fprintf(log_file, "last_error=%s\n", debug_last_error());
     fprintf(log_file, "verbose_logging=%u\n", debug_is_runtime_logging_enabled() ? 1U : 0U);
     fprintf(log_file, "metrics_collection=%u\n", debug_should_collect_metrics() ? 1U : 0U);
+    h264bsdGetSramStatus(&clip_in_sram, &qpc_in_sram, &deblocking_in_sram);
+    fprintf(
+        log_file,
+        "sram enabled=%u used=%lu cap=%lu state=%s color=%u clip=%u qpc=%u deblock=%u\n",
+        sram_is_enabled() ? 1U : 0U,
+        (unsigned long) sram_bytes_used(),
+        (unsigned long) sram_bytes_capacity(),
+        sram_status_message(),
+        g_h264_color_tables_in_sram ? 1U : 0U,
+        clip_in_sram ? 1U : 0U,
+        qpc_in_sram ? 1U : 0U,
+        deblocking_in_sram ? 1U : 0U
+    );
 
     if (movie) {
         MemoryStats stats = query_memory_stats(movie);
@@ -1914,6 +1952,26 @@ static void debug_dump_session(const char *path, const Movie *movie, const char 
     }
 
     fclose(log_file);
+}
+
+static void debug_log_sram_status(void)
+{
+    bool clip_in_sram = false;
+    bool qpc_in_sram = false;
+    bool deblocking_in_sram = false;
+
+    h264bsdGetSramStatus(&clip_in_sram, &qpc_in_sram, &deblocking_in_sram);
+    debug_tracef(
+        "sram status enabled=%u used=%lu/%lu state=%s color=%u clip=%u qpc=%u deblock=%u",
+        sram_is_enabled() ? 1U : 0U,
+        (unsigned long) sram_bytes_used(),
+        (unsigned long) sram_bytes_capacity(),
+        sram_status_message(),
+        g_h264_color_tables_in_sram ? 1U : 0U,
+        clip_in_sram ? 1U : 0U,
+        qpc_in_sram ? 1U : 0U,
+        deblocking_in_sram ? 1U : 0U
+    );
 }
 
 static H264FrameSlot *find_h264_frame_slot(Movie *movie, uint32_t frame_index)
@@ -2433,10 +2491,10 @@ static bool blit_h264_planes_to_rgb565_target(
     size_t dst_pitch_pixels
 )
 {
-    const int32_t *restrict y_base = g_h264_color_tables.y_base;
-    const uint16_t *restrict red565 = g_h264_color_tables.red565;
-    const uint16_t *restrict green565 = g_h264_color_tables.green565;
-    const uint16_t *restrict blue565 = g_h264_color_tables.blue565;
+    const int32_t *restrict y_base = g_h264_color_tables->y_base;
+    const uint16_t *restrict red565 = g_h264_color_tables->red565;
+    const uint16_t *restrict green565 = g_h264_color_tables->green565;
+    const uint16_t *restrict blue565 = g_h264_color_tables->blue565;
     size_t y;
 
     if (!movie || !y_plane || !u_plane || !v_plane || !dst_pixels || !movie->h264_headers_ready) {
@@ -6116,6 +6174,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         (unsigned long) movie.current_frame,
         movie.loaded_chunk
     );
+    debug_log_sram_status();
     reset_playback_timeline(
         &movie,
         playback_rate_for_index(playback_rate_index),
@@ -6351,6 +6410,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                         (unsigned long) movie.current_frame,
                         movie.loaded_chunk
                     );
+                    debug_log_sram_status();
                 }
             }
             debug_set_metrics_collection(
@@ -6607,6 +6667,9 @@ int main(int argc, char **argv)
         monotonic_clock_shutdown();
         return 1;
     }
+    sram_init();
+    h264bsdInitSramTables();
+    init_h264_color_tables();
 
     strncpy(directory, argv[0], sizeof(directory) - 1);
     directory[sizeof(directory) - 1] = '\0';
@@ -6630,6 +6693,7 @@ int main(int argc, char **argv)
 
     free_fonts(&fonts);
     SDL_Quit();
+    sram_shutdown();
     monotonic_clock_shutdown();
     return result == 0 ? 0 : 1;
 }

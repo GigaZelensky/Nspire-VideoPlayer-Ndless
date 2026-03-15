@@ -124,19 +124,19 @@
 #endif
 
 /* macro to get smaller of two values */
-#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define MIN(a, b) ({ __typeof__(a) _a = (a); __typeof__(b) _b = (b); _a < _b ? _a : _b; })
 
 /* macro to get greater of two values */
-#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#define MAX(a, b) ({ __typeof__(a) _a = (a); __typeof__(b) _b = (b); _a > _b ? _a : _b; })
 
 /* macro to get absolute value */
-#define ABS(a) (((a) < 0) ? -(a) : (a))
+#define ABS(a) ({ __typeof__(a) _a = (a); _a < 0 ? -_a : _a; })
 
 /* macro to clip a value z, so that x <= z =< y */
-#define CLIP3(x,y,z) (((z) < (x)) ? (x) : (((z) > (y)) ? (y) : (z)))
+#define CLIP3(x, y, z) ({ __typeof__(x) _x = (x); __typeof__(y) _y = (y); __typeof__(z) _z = (z); _z < _x ? _x : (_z > _y ? _y : _z); })
 
 /* macro to clip a value z, so that 0 <= z =< 255 */
-#define CLIP1(z) (((z) < 0) ? 0 : (((z) > 255) ? 255 : (z)))
+#define CLIP1(z) ({ __typeof__(z) _z = (z); _z < 0 ? 0 : (_z > 255 ? 255 : _z); })
 
 /* macro to allocate memory */
 #define ALLOCATE(ptr, count, type) \
@@ -153,7 +153,7 @@
 #define ALIGN(ptr, bytePos) \
         (ptr + ( ((bytePos - (uintptr_t)ptr) & (bytePos - 1)) / sizeof(*ptr) ))
 
-extern const u32 h264bsdQpC[52];
+extern const u32 *h264bsdQpC;
 
 /*------------------------------------------------------------------------------
     3. Data types

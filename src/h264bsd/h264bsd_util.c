@@ -38,6 +38,10 @@
 
 #include "h264bsd_util.h"
 
+#include <string.h>
+
+#include "../sram.h"
+
 /*------------------------------------------------------------------------------
     2. External compiler flags
 --------------------------------------------------------------------------------
@@ -50,9 +54,29 @@
 static const u32 stuffingTable[8] = {0x1,0x2,0x4,0x8,0x10,0x20,0x40,0x80};
 
 /* look-up table for chroma quantization parameter as a function of luma QP */
-const u32 h264bsdQpC[52] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,
+static const u32 h264bsdQpCDefault[52] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,
     20,21,22,23,24,25,26,27,28,29,29,30,31,32,32,33,34,34,35,35,36,36,37,37,37,
     38,38,38,39,39,39,39};
+const u32 *h264bsdQpC = h264bsdQpCDefault;
+
+bool h264bsdInitQpCTable(void)
+{
+    static u32 initialized = 0;
+    u32 *sram_qpc;
+
+    if (initialized) {
+        return h264bsdQpC != h264bsdQpCDefault;
+    }
+    sram_qpc = (u32 *) sram_alloc(sizeof(h264bsdQpCDefault), 32U);
+    if (!sram_qpc) {
+        initialized = 1;
+        return false;
+    }
+    memcpy(sram_qpc, h264bsdQpCDefault, sizeof(h264bsdQpCDefault));
+    h264bsdQpC = sram_qpc;
+    initialized = 1;
+    return true;
+}
 
 /*------------------------------------------------------------------------------
     4. Local function prototypes

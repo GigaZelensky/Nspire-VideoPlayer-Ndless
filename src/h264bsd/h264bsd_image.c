@@ -50,7 +50,7 @@ extern const u32 h264bsdBlockX[];
 extern const u32 h264bsdBlockY[];
 
 /* clipping table, defined in h264bsd_intra_prediction.c */
-extern const u8 h264bsdClip[];
+extern const u8 *h264bsdClip;
 
 /*------------------------------------------------------------------------------
     4. Local function prototypes

@@ -75,7 +75,7 @@ static const u32 lumaFracPos[4][4] = {
 #endif /* H264DEC_OMXDL */
 
 /* clipping table, defined in h264bsd_intra_prediction.c */
-extern const u8 h264bsdClip[];
+extern const u8 *h264bsdClip;
 
 /*------------------------------------------------------------------------------
     4. Local function prototypes

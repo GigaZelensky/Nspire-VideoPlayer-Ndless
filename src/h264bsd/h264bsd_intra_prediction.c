@@ -63,6 +63,10 @@
 #include "h264bsd_neighbour.h"
 #include "h264bsd_image.h"
 
+#include <string.h>
+
+#include "../sram.h"
+
 #ifdef H264DEC_OMXDL
 #include "omxtypes.h"
 #include "omxVC.h"
@@ -88,7 +92,7 @@ const u32 h264bsdBlockX[16] =
 const u32 h264bsdBlockY[16] =
     { 0, 0, 4, 4, 0, 0, 4, 4, 8, 8, 12, 12, 8, 8, 12, 12 };
 
-const u8 h264bsdClip[1280] =
+static const u8 h264bsdClipDefault[1280] =
 {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -155,9 +159,29 @@ const u8 h264bsdClip[1280] =
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255
 };
+const u8 *h264bsdClip = h264bsdClipDefault;
+
+bool h264bsdInitClipTable(void)
+{
+    static u32 initialized = 0;
+    u8 *sram_clip;
+
+    if (initialized) {
+        return h264bsdClip != h264bsdClipDefault;
+    }
+    sram_clip = (u8 *) sram_alloc(sizeof(h264bsdClipDefault), 32U);
+    if (!sram_clip) {
+        initialized = 1;
+        return false;
+    }
+    memcpy(sram_clip, h264bsdClipDefault, sizeof(h264bsdClipDefault));
+    h264bsdClip = sram_clip;
+    initialized = 1;
+    return true;
+}
 
 u8 *get_h264bsdClip() {
-    return (u8*)h264bsdClip;
+    return (u8*) h264bsdClip;
 }
 
 #ifndef H264DEC_OMXDL

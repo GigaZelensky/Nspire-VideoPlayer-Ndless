@@ -54,6 +54,10 @@
 #include "h264bsd_deblocking.h"
 #include "h264bsd_dpb.h"
 
+#include <string.h>
+
+#include "../sram.h"
+
 #ifdef H264DEC_OMXDL
 #include "omxtypes.h"
 #include "omxVC.h"
@@ -75,20 +79,22 @@
 /*lint -e701 -e702 */
 
 /* array of alpha values, from the standard */
-static const u8 alphas[52] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,4,5,6,7,8,9,10,
+static const u8 alphasDefault[52] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,4,5,6,7,8,9,10,
     12,13,15,17,20,22,25,28,32,36,40,45,50,56,63,71,80,90,101,113,127,144,162,
     182,203,226,255,255};
+static const u8 *alphas = alphasDefault;
 
 /* array of beta values, from the standard */
-static const u8 betas[52] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,3,3,3,3,4,4,
+static const u8 betasDefault[52] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2,3,3,3,3,4,4,
     4,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15,16,16,17,17,18,18};
+static const u8 *betas = betasDefault;
 
 
 
 #ifndef H264DEC_OMXDL
 /* array of tc0 values, from the standard, each triplet corresponds to a
  * column in the table. Indexing goes as tc0[indexA][bS-1] */
-static const u8 tc0[52][3] = {
+static const u8 tc0Default[52][3] = {
     {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},
     {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},
     {0,0,0},{0,0,1},{0,0,1},{0,0,1},{0,0,1},{0,1,1},{0,1,1},{1,1,1},
@@ -97,10 +103,11 @@ static const u8 tc0[52][3] = {
     {4,5,7},{4,5,8},{4,6,9},{5,7,10},{6,8,11},{6,8,13},{7,10,14},{8,11,16},
     {9,12,18},{10,13,20},{11,15,23},{13,17,25}
 };
+static const u8 (*tc0)[3] = tc0Default;
 #else
 /* array of tc0 values, from the standard, each triplet corresponds to a
  * column in the table. Indexing goes as tc0[indexA][bS] */
-static const u8 tc0[52][5] = {
+static const u8 tc0Default[52][5] = {
     {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0},
     {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0},
     {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0},
@@ -116,7 +123,46 @@ static const u8 tc0[52][5] = {
     {0, 8, 11, 16, 0}, {0, 9, 12, 18, 0}, {0, 10, 13, 20, 0},
     {0, 11, 15, 23, 0}, {0, 13, 17, 25, 0}
 };
+static const u8 (*tc0)[5] = tc0Default;
 #endif
+
+bool h264bsdInitDeblockingTables(void)
+{
+    static u32 initialized = 0;
+    u8 *sram_block;
+    size_t offset = 0;
+
+    if (initialized) {
+        return alphas != alphasDefault || betas != betasDefault || tc0 != tc0Default;
+    }
+
+    sram_block = (u8 *) sram_alloc(sizeof(alphasDefault) + sizeof(betasDefault) + sizeof(tc0Default), 32U);
+    if (!sram_block) {
+        initialized = 1;
+        return false;
+    }
+    memcpy(sram_block + offset, alphasDefault, sizeof(alphasDefault));
+    alphas = sram_block + offset;
+    offset += sizeof(alphasDefault);
+    memcpy(sram_block + offset, betasDefault, sizeof(betasDefault));
+    betas = sram_block + offset;
+    offset += sizeof(betasDefault);
+
+#ifndef H264DEC_OMXDL
+    {
+        memcpy(sram_block + offset, tc0Default, sizeof(tc0Default));
+        tc0 = (const u8 (*)[3]) (sram_block + offset);
+    }
+#else
+    {
+        memcpy(sram_block + offset, tc0Default, sizeof(tc0Default));
+        tc0 = (const u8 (*)[5]) (sram_block + offset);
+    }
+#endif
+
+    initialized = 1;
+    return true;
+}
 
 
 #ifndef H264DEC_OMXDL
@@ -144,7 +190,7 @@ enum { TOP = 0, LEFT = 1, INNER = 2 };
 
 
 /* clipping table defined in intra_prediction.c */
-extern const u8 h264bsdClip[];
+extern const u8 *h264bsdClip;
 
 /*------------------------------------------------------------------------------
     4. Local function prototypes
