@@ -14,6 +14,8 @@
 #include "h264bsd_decoder.h"
 #include "h264bsd_util.h"
 
+extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
+
 #define SCREEN_W 320
 #define SCREEN_H 240
 #define UI_BAR_H 28
@@ -488,7 +490,7 @@ static void present_screen(SDL_Surface *screen)
         }
         locked = true;
     }
-    memcpy(hardware_screen_bytes(), screen->pixels, SCREEN_BYTES_SIZE);
+    FastMemcpy(hardware_screen_bytes(), screen->pixels, SCREEN_BYTES_SIZE / 32);
     if (locked) {
         SDL_UnlockSurface(screen);
     }
