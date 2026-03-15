@@ -5967,6 +5967,9 @@ static int prompt_resume_position(
     char *display_name = NULL;
     int selected_button = 0;
     uint32_t preview_ms;
+    const int title_y = panel.y + 28;
+    int title_preview_gap;
+    int time_label_y;
 
     if (resume_frame >= movie->header.frame_count) {
         resume_frame = movie->header.frame_count ? (movie->header.frame_count - 1) : 0;
@@ -5984,6 +5987,11 @@ static int prompt_resume_position(
     }
     display_name = display_name_for_movie(filename);
     snprintf(title, sizeof(title), "%s", display_name ? display_name : filename);
+    title_preview_gap = preview.y - (title_y + nSDL_GetStringHeight(fonts->white, title));
+    if (title_preview_gap < 0) {
+        title_preview_gap = 0;
+    }
+    time_label_y = preview.y + preview.h + title_preview_gap;
     pointer_init(&pointer);
 
     while (1) {
@@ -5997,8 +6005,8 @@ static int prompt_resume_position(
         SDL_FillRect(screen, &preview_border, SDL_MapRGB(screen->format, 0, 0, 0));
         SDL_SoftStretch(movie->frame_surface, NULL, screen, &preview);
         nSDL_DrawString(screen, fonts->white, panel.x + 12, panel.y + 8, "Continue Watching?");
-        nSDL_DrawString(screen, fonts->white, panel.x + 12, panel.y + 28, "%s", title);
-        nSDL_DrawString(screen, fonts->white, panel.x + 12, panel.y + 44, "%s", time_label);
+        nSDL_DrawString(screen, fonts->white, panel.x + 12, title_y, "%s", title);
+        nSDL_DrawString(screen, fonts->white, panel.x + 12, time_label_y, "%s", time_label);
         draw_prompt_button(screen, fonts, &continue_button, "CONTINUE", selected_button == 0);
         draw_prompt_button(screen, fonts, &restart_button, "START OVER", selected_button == 1);
         if (pointer.visible) {
