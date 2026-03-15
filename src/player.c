@@ -284,6 +284,8 @@ typedef struct {
     uint16_t h264_foreground_decode_peak_ms;
     uint8_t h264_active_prefetch_backoff;
     bool io_throttled;
+    uint32_t last_read_bytes;
+    uint32_t last_read_time_ms;
     uint32_t diag_last_snapshot_ms;
     uint32_t diag_prefetch_tick_count;
     uint32_t diag_active_prefetch_tick_count;
@@ -3041,7 +3043,7 @@ static PrefetchedChunk *find_prefetch_work_chunk(Movie *movie, int current_chunk
     return best;
 }
 
-static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respect_deadline)
+static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respect_deadline, uint32_t deadline_ms)
 {
     const ChunkIndexEntry *entry;
     size_t remaining;
@@ -3049,6 +3051,9 @@ static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respec
     size_t block_size;
     size_t bytes_read;
     long target_pos;
+    uint32_t bytes_per_ms;
+    uint32_t read_start_ms;
+    uint32_t read_elapsed_ms;
 
     if (!movie || !chunk || chunk->chunk_index < 0) {
         return false;
@@ -3072,7 +3077,24 @@ static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respec
         return false;
     }
 
-    block_size = respect_deadline ? PREFETCH_ACTIVE_FILE_BLOCK_SIZE : PREFETCH_FILE_BLOCK_SIZE;
+    if (respect_deadline) {
+        int32_t time_left_ms = (int32_t) (deadline_ms - monotonic_clock_now_ms());
+        uint64_t dynamic_block_size;
+
+        if (time_left_ms <= 0) {
+            return false;
+        }
+        bytes_per_ms = movie->last_read_bytes / (movie->last_read_time_ms > 0 ? movie->last_read_time_ms : 1U);
+        dynamic_block_size = (uint64_t) (uint32_t) time_left_ms * (uint64_t) bytes_per_ms;
+        if (dynamic_block_size < 512U) {
+            dynamic_block_size = 512U;
+        } else if (dynamic_block_size > PREFETCH_FILE_BLOCK_SIZE) {
+            dynamic_block_size = PREFETCH_FILE_BLOCK_SIZE;
+        }
+        block_size = (size_t) dynamic_block_size;
+    } else {
+        block_size = PREFETCH_FILE_BLOCK_SIZE;
+    }
     read_size = remaining > block_size ? block_size : remaining;
     target_pos = (long) (entry->offset + chunk->read_offset);
     if (movie->current_file_pos != target_pos) {
@@ -3082,7 +3104,11 @@ static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respec
         }
         movie->current_file_pos = target_pos;
     }
+    read_start_ms = monotonic_clock_now_ms();
     bytes_read = fread(chunk->chunk_storage + chunk->read_offset, 1, read_size, movie->file);
+    read_elapsed_ms = monotonic_clock_now_ms() - read_start_ms;
+    movie->last_read_time_ms = read_elapsed_ms;
+    movie->last_read_bytes = (uint32_t) bytes_read;
     if (bytes_read != read_size) {
         movie->current_file_pos = -1;
         return false;
@@ -3105,7 +3131,7 @@ static bool prefetch_process_chunk(Movie *movie, PrefetchedChunk *chunk, uint32_
         if (chunk->state != PREFETCH_READING) {
             return false;
         }
-        if (!prefetch_read_step(movie, chunk, respect_deadline)) {
+        if (!prefetch_read_step(movie, chunk, respect_deadline, deadline_ms)) {
             return false;
         }
 
@@ -4108,6 +4134,8 @@ static bool load_movie(const char *path, Movie *movie)
     memset(movie, 0, sizeof(*movie));
     movie->loaded_chunk = -1;
     movie->io_throttled = false;
+    movie->last_read_bytes = 2048U;
+    movie->last_read_time_ms = 1U;
     {
         int h264_ring_index;
         int prefetch_index;
