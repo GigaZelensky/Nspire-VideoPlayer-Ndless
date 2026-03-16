@@ -136,6 +136,12 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mp4" --output ".\dist\vi
 python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --output ".\dist\video.nvp.tns"
 ```
 
+### Burn Subtitles Into Video
+
+```powershell
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --burn-subtitles --output ".\dist\video.nvp.tns"
+```
+
 ### Preserve Source Framerate
 
 ```powershell
@@ -152,6 +158,7 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded
 
 - `--output`
 - `--subtitle`
+- `--burn-subtitles`
 - `--subtitle-track`
 - `--fps`
 - `--max-width`

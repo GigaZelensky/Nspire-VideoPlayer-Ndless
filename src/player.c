@@ -113,6 +113,8 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define SEEK_BAR_PREVIEW_MAX_W 80
 #define SEEK_BAR_PREVIEW_MAX_H 60
 #define MOVIE_VERSION_H264 9
+#define MOVIE_VERSION_POSITIONED_SUBS 10
+#define SUBTITLE_COORD_SCALE 10000U
 #define H264_CLIP_OFFSET 384
 #define H264_CLIP_TABLE_SIZE 1024
 
@@ -152,12 +154,20 @@ typedef struct {
     uint32_t start_ms;
     uint32_t end_ms;
     char *text;
+    uint8_t position_mode;
+    uint8_t align;
+    uint16_t pos_x;
+    uint16_t pos_y;
+    uint16_t margin_l;
+    uint16_t margin_r;
+    uint16_t margin_v;
 } SubtitleCue;
 
 typedef struct {
     char *name;
     uint32_t cue_start;
     uint32_t cue_count;
+    uint8_t supports_positioning;
 } SubtitleTrack;
 
 typedef struct {
@@ -203,8 +213,15 @@ typedef enum {
     SUBTITLE_POS_VIDEO_BOTTOM,
     SUBTITLE_POS_VIDEO_TOP,
     SUBTITLE_POS_BAR_TOP,
+    SUBTITLE_POS_AUTO,
     SUBTITLE_POS_COUNT,
 } SubtitlePlacement;
+
+typedef enum {
+    SUBTITLE_CUE_POSITION_NONE = 0,
+    SUBTITLE_CUE_POSITION_MARGIN = 1,
+    SUBTITLE_CUE_POSITION_ABSOLUTE = 2,
+} SubtitleCuePositionMode;
 
 typedef struct {
     uint8_t numerator;
@@ -343,13 +360,22 @@ typedef struct {
     const char *text;
     size_t subtitle_font_index;
     int subtitle_size;
-    SubtitlePlacement placement;
-    bool overlay_visible;
-    int video_x;
-    int video_y;
-    int video_w;
-    int video_h;
+    int wrap_width;
 } SubtitleSurfaceCache;
+
+typedef struct {
+    uint8_t mode;
+    uint8_t align;
+    int wrap_width;
+    SDL_Rect video_rect;
+    int absolute_x;
+    int absolute_y;
+    int margin_l;
+    int margin_r;
+    int margin_v;
+    SubtitlePlacement manual_placement;
+    bool overlay_visible;
+} SubtitleLayoutSpec;
 
 typedef struct {
     SDL_Surface *surface;
@@ -1549,7 +1575,8 @@ static void free_fonts(Fonts *fonts)
 
 static bool movie_uses_h264(const Movie *movie)
 {
-    return movie && movie->header.version == MOVIE_VERSION_H264;
+    return movie &&
+           (movie->header.version == MOVIE_VERSION_H264 || movie->header.version == MOVIE_VERSION_POSITIONED_SUBS);
 }
 
 static bool init_h264_color_tables(void)
@@ -4413,15 +4440,25 @@ static bool load_subtitles(
     }
 
     for (cue_index = 0; cue_index < header->subtitle_count; ++cue_index) {
-        uint8_t meta[10];
+        uint8_t meta[22];
+        size_t meta_size = header->version >= MOVIE_VERSION_POSITIONED_SUBS ? 22U : 10U;
         uint16_t text_len;
-        if (fread(meta, 1, sizeof(meta), file) != sizeof(meta)) {
+        if (fread(meta, 1, meta_size, file) != meta_size) {
             debug_failf("subtitle cue meta read failed cue=%lu", (unsigned long) cue_index);
             goto fail;
         }
         cues[cue_index].start_ms = read_le32(meta);
         cues[cue_index].end_ms = read_le32(meta + 4);
         text_len = read_le16(meta + 8);
+        if (meta_size > 10U) {
+            cues[cue_index].position_mode = meta[10];
+            cues[cue_index].align = meta[11];
+            cues[cue_index].pos_x = read_le16(meta + 12);
+            cues[cue_index].pos_y = read_le16(meta + 14);
+            cues[cue_index].margin_l = read_le16(meta + 16);
+            cues[cue_index].margin_r = read_le16(meta + 18);
+            cues[cue_index].margin_v = read_le16(meta + 20);
+        }
         cues[cue_index].text = (char *) malloc(text_len + 1);
         if (!cues[cue_index].text) {
             debug_failf("subtitle text alloc failed cue=%lu len=%u", (unsigned long) cue_index, (unsigned) text_len);
@@ -4432,6 +4469,24 @@ static bool load_subtitles(
             goto fail;
         }
         cues[cue_index].text[text_len] = '\0';
+    }
+    for (track_index = 0; track_index < *out_track_count; ++track_index) {
+        uint32_t start_index = tracks[track_index].cue_start;
+        uint32_t end_index = start_index + tracks[track_index].cue_count;
+
+        if (end_index > header->subtitle_count) {
+            end_index = header->subtitle_count;
+        }
+        tracks[track_index].supports_positioning = 0;
+        for (cue_index = start_index; cue_index < end_index; ++cue_index) {
+            if ((cues[cue_index].position_mode == SUBTITLE_CUE_POSITION_MARGIN ||
+                 cues[cue_index].position_mode == SUBTITLE_CUE_POSITION_ABSOLUTE) &&
+                cues[cue_index].align >= 1 &&
+                cues[cue_index].align <= 9) {
+                tracks[track_index].supports_positioning = 1;
+                break;
+            }
+        }
     }
 
     debug_tracef(
@@ -4496,7 +4551,7 @@ static bool load_movie(const char *path, Movie *movie)
         debug_failf("open failed: bad magic");
         return false;
     }
-    if (movie->header.version != MOVIE_VERSION_H264) {
+    if (!movie_uses_h264(movie)) {
         debug_failf("open failed: unsupported version=%u", (unsigned) movie->header.version);
         return false;
     }
@@ -4651,11 +4706,17 @@ static MovieFile *scan_movies(const char *directory, size_t *out_count)
     return files;
 }
 
-static const char *active_subtitle(const Movie *movie, uint32_t now_ms)
+static const SubtitleCue *active_subtitle_cue(const Movie *movie, uint32_t now_ms)
 {
     uint32_t index;
-    uint32_t start_index = 0;
-    uint32_t end_index = movie->header.subtitle_count;
+    uint32_t start_index;
+    uint32_t end_index;
+
+    if (!movie || !movie->subtitles) {
+        return NULL;
+    }
+    start_index = 0;
+    end_index = movie->header.subtitle_count;
 
     if (movie->subtitle_track_count > 0 && movie->selected_subtitle_track < movie->subtitle_track_count) {
         start_index = movie->subtitle_tracks[movie->selected_subtitle_track].cue_start;
@@ -4663,7 +4724,7 @@ static const char *active_subtitle(const Movie *movie, uint32_t now_ms)
     }
     for (index = start_index; index < end_index; ++index) {
         if (now_ms >= movie->subtitles[index].start_ms && now_ms <= movie->subtitles[index].end_ms) {
-            return movie->subtitles[index].text;
+            return &movie->subtitles[index];
         }
     }
     return NULL;
@@ -4792,6 +4853,8 @@ static const char *subtitle_font_name_for_index(size_t subtitle_font_index)
 static SubtitlePlacement subtitle_opposite_placement(SubtitlePlacement placement)
 {
     switch (placement) {
+        case SUBTITLE_POS_AUTO:
+            return SUBTITLE_POS_BAR_TOP;
         case SUBTITLE_POS_VIDEO_BOTTOM:
             return SUBTITLE_POS_VIDEO_TOP;
         case SUBTITLE_POS_VIDEO_TOP:
@@ -4802,6 +4865,286 @@ static SubtitlePlacement subtitle_opposite_placement(SubtitlePlacement placement
         default:
             return SUBTITLE_POS_BAR_TOP;
     }
+}
+
+static const char *subtitle_placement_label(SubtitlePlacement placement)
+{
+    switch (placement) {
+        case SUBTITLE_POS_VIDEO_BOTTOM:
+            return "VIDEO BOTTOM";
+        case SUBTITLE_POS_VIDEO_TOP:
+            return "VIDEO TOP";
+        case SUBTITLE_POS_BAR_TOP:
+            return "BAR TOP";
+        case SUBTITLE_POS_AUTO:
+            return "AUTO";
+        case SUBTITLE_POS_BAR_BOTTOM:
+        default:
+            return "BAR BOTTOM";
+    }
+}
+
+static bool subtitle_track_supports_auto_positioning(const Movie *movie, uint16_t track_index)
+{
+    if (!movie || !movie->subtitle_tracks || movie->subtitle_track_count == 0 || track_index >= movie->subtitle_track_count) {
+        return false;
+    }
+    return movie->subtitle_tracks[track_index].supports_positioning != 0;
+}
+
+static bool selected_subtitle_track_supports_auto_positioning(const Movie *movie)
+{
+    if (!movie || movie->subtitle_track_count == 0 || movie->selected_subtitle_track >= movie->subtitle_track_count) {
+        return false;
+    }
+    return subtitle_track_supports_auto_positioning(movie, movie->selected_subtitle_track);
+}
+
+static SubtitlePlacement subtitle_normalize_placement(SubtitlePlacement placement, bool auto_supported)
+{
+    placement = (SubtitlePlacement) clamp_int((int) placement, SUBTITLE_POS_BAR_BOTTOM, SUBTITLE_POS_COUNT - 1);
+    if (!auto_supported && placement == SUBTITLE_POS_AUTO) {
+        return SUBTITLE_POS_BAR_BOTTOM;
+    }
+    return placement;
+}
+
+static SubtitlePlacement subtitle_cycle_placement(SubtitlePlacement placement, bool auto_supported)
+{
+    SubtitlePlacement next = subtitle_normalize_placement(placement, auto_supported);
+
+    do {
+        next = (SubtitlePlacement) ((next + 1) % SUBTITLE_POS_COUNT);
+    } while (!auto_supported && next == SUBTITLE_POS_AUTO);
+    return next;
+}
+
+static SubtitlePlacement subtitle_effective_manual_placement(SubtitlePlacement placement, SubtitlePlacement fallback)
+{
+    if (placement == SUBTITLE_POS_AUTO) {
+        if (fallback == SUBTITLE_POS_AUTO) {
+            return SUBTITLE_POS_BAR_BOTTOM;
+        }
+        return fallback;
+    }
+    return placement;
+}
+
+static int subtitle_align_column(uint8_t align)
+{
+    int value = clamp_int((int) align, 1, 9) - 1;
+    return value % 3;
+}
+
+static int subtitle_align_row(uint8_t align)
+{
+    int value = clamp_int((int) align, 1, 9) - 1;
+    return value / 3;
+}
+
+static int subtitle_scale_coord(uint16_t value, int extent)
+{
+    if (extent <= 0) {
+        return 0;
+    }
+    return (int) (((uint32_t) value * (uint32_t) extent + (SUBTITLE_COORD_SCALE / 2U)) / SUBTITLE_COORD_SCALE);
+}
+
+static bool subtitle_resolve_layout_spec(
+    const SDL_Rect *video_rect,
+    bool overlay_visible,
+    SubtitlePlacement placement,
+    SubtitlePlacement manual_fallback,
+    const SubtitleCue *cue,
+    SubtitleLayoutSpec *layout
+)
+{
+    SubtitlePlacement effective_manual;
+
+    if (!video_rect || !layout) {
+        return false;
+    }
+
+    memset(layout, 0, sizeof(*layout));
+    layout->video_rect = *video_rect;
+    layout->overlay_visible = overlay_visible;
+    effective_manual = subtitle_effective_manual_placement(placement, manual_fallback);
+    layout->manual_placement = effective_manual;
+
+    if (placement == SUBTITLE_POS_AUTO &&
+        cue &&
+        cue->position_mode != SUBTITLE_CUE_POSITION_NONE &&
+        cue->align >= 1 &&
+        cue->align <= 9) {
+        int column = subtitle_align_column(cue->align);
+
+        layout->mode = cue->position_mode;
+        layout->align = cue->align;
+        layout->margin_l = subtitle_scale_coord(cue->margin_l, video_rect->w);
+        layout->margin_r = subtitle_scale_coord(cue->margin_r, video_rect->w);
+        layout->margin_v = subtitle_scale_coord(cue->margin_v, video_rect->h);
+        layout->absolute_x = video_rect->x + subtitle_scale_coord(cue->pos_x, video_rect->w);
+        layout->absolute_y = video_rect->y + subtitle_scale_coord(cue->pos_y, video_rect->h);
+
+        if (layout->mode == SUBTITLE_CUE_POSITION_ABSOLUTE) {
+            int left_space = layout->absolute_x - video_rect->x;
+            int right_space = (video_rect->x + video_rect->w) - layout->absolute_x;
+
+            if (column == 0) {
+                layout->wrap_width = right_space - 6;
+            } else if (column == 2) {
+                layout->wrap_width = left_space - 6;
+            } else {
+                layout->wrap_width = (2 * (left_space < right_space ? left_space : right_space)) - 6;
+            }
+        } else if (layout->mode == SUBTITLE_CUE_POSITION_MARGIN) {
+            if (column == 0) {
+                layout->wrap_width = video_rect->w - layout->margin_l - 6;
+            } else if (column == 2) {
+                layout->wrap_width = video_rect->w - layout->margin_r - 6;
+            } else {
+                layout->wrap_width = video_rect->w - layout->margin_l - layout->margin_r - 12;
+            }
+        }
+
+        if (layout->wrap_width >= 32) {
+            return true;
+        }
+
+        memset(layout, 0, sizeof(*layout));
+        layout->video_rect = *video_rect;
+        layout->overlay_visible = overlay_visible;
+        layout->manual_placement = effective_manual;
+    }
+
+    if (layout->manual_placement == SUBTITLE_POS_BAR_BOTTOM || layout->manual_placement == SUBTITLE_POS_BAR_TOP) {
+        layout->wrap_width = SCREEN_W - 12;
+    } else {
+        layout->wrap_width = video_rect->w - 12;
+    }
+    return layout->wrap_width > 0;
+}
+
+static void subtitle_layout_dst_rect(
+    const SubtitleLayoutSpec *layout,
+    int surface_w,
+    int surface_h,
+    SDL_Rect *dst
+)
+{
+    int x = 0;
+    int y = 0;
+    const SDL_Rect *video_rect;
+
+    if (!layout || !dst) {
+        return;
+    }
+
+    video_rect = &layout->video_rect;
+    if (layout->mode == SUBTITLE_CUE_POSITION_ABSOLUTE && layout->align >= 1 && layout->align <= 9) {
+        int column = subtitle_align_column(layout->align);
+        int row = subtitle_align_row(layout->align);
+
+        if (column == 0) {
+            x = layout->absolute_x;
+        } else if (column == 2) {
+            x = layout->absolute_x - surface_w;
+        } else {
+            x = layout->absolute_x - (surface_w / 2);
+        }
+
+        if (row == 0) {
+            y = layout->absolute_y - surface_h;
+        } else if (row == 2) {
+            y = layout->absolute_y;
+        } else {
+            y = layout->absolute_y - (surface_h / 2);
+        }
+
+        x = clamp_int(x, video_rect->x, video_rect->x + video_rect->w - surface_w);
+        y = clamp_int(y, video_rect->y, video_rect->y + video_rect->h - surface_h);
+    } else if (layout->mode == SUBTITLE_CUE_POSITION_MARGIN && layout->align >= 1 && layout->align <= 9) {
+        int column = subtitle_align_column(layout->align);
+        int row = subtitle_align_row(layout->align);
+
+        if (column == 0) {
+            x = video_rect->x + layout->margin_l;
+        } else if (column == 2) {
+            x = (video_rect->x + video_rect->w) - layout->margin_r - surface_w;
+        } else {
+            x = video_rect->x + ((video_rect->w - surface_w) / 2) + ((layout->margin_l - layout->margin_r) / 2);
+        }
+
+        if (row == 0) {
+            y = (video_rect->y + video_rect->h) - layout->margin_v - surface_h;
+        } else if (row == 2) {
+            y = video_rect->y + layout->margin_v;
+        } else {
+            y = video_rect->y + ((video_rect->h - surface_h) / 2);
+        }
+
+        x = clamp_int(x, video_rect->x, video_rect->x + video_rect->w - surface_w);
+        y = clamp_int(y, video_rect->y, video_rect->y + video_rect->h - surface_h);
+    } else {
+        int area_x;
+        int area_y;
+        int area_w;
+        int area_top;
+        int area_bottom;
+        int area_height;
+
+        if (layout->manual_placement == SUBTITLE_POS_BAR_BOTTOM || layout->manual_placement == SUBTITLE_POS_BAR_TOP) {
+            area_x = 0;
+            area_w = SCREEN_W;
+        } else {
+            area_x = video_rect->x;
+            area_w = video_rect->w;
+        }
+
+        switch (layout->manual_placement) {
+            case SUBTITLE_POS_BAR_BOTTOM:
+                area_top = video_rect->y + video_rect->h + 2;
+                area_bottom = (layout->overlay_visible ? (SCREEN_H - UI_BAR_H) : SCREEN_H) - 2;
+                area_height = area_bottom - area_top;
+                if (area_height >= surface_h) {
+                    area_y = area_top + (area_height - surface_h) / 2;
+                } else {
+                    area_y = area_bottom - surface_h;
+                    if (area_y < 2) {
+                        area_y = 2;
+                    }
+                }
+                break;
+            case SUBTITLE_POS_VIDEO_TOP:
+                area_y = video_rect->y + 4;
+                break;
+            case SUBTITLE_POS_BAR_TOP:
+                area_top = 2;
+                area_bottom = video_rect->y - 2;
+                area_height = area_bottom - area_top;
+                if (area_height >= surface_h) {
+                    area_y = area_top + (area_height - surface_h) / 2;
+                } else {
+                    area_y = 4;
+                }
+                break;
+            case SUBTITLE_POS_VIDEO_BOTTOM:
+            default:
+                area_y = (video_rect->y + video_rect->h - 8) - surface_h;
+                if (area_y < video_rect->y + 4) {
+                    area_y = video_rect->y + 4;
+                }
+                break;
+        }
+
+        x = area_x + (area_w - surface_w) / 2;
+        y = area_y;
+    }
+
+    dst->x = (Sint16) x;
+    dst->y = (Sint16) y;
+    dst->w = (Uint16) surface_w;
+    dst->h = (Uint16) surface_h;
 }
 
 static void subtitle_fonts_for_style(const Fonts *fonts, size_t subtitle_font_index, nSDL_Font **white_font, nSDL_Font **outline_font)
@@ -4924,18 +5267,14 @@ static bool ensure_subtitle_surface_cache(
     SubtitleSurfaceCache *cache,
     SDL_Surface *screen,
     const Fonts *fonts,
-    const SDL_Rect *video_rect,
     const char *text,
-    bool overlay_visible,
     size_t subtitle_font_index,
     int subtitle_size,
-    SubtitlePlacement placement
+    int wrap_width
 )
 {
     char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN];
     int line_count;
-    int area_width;
-    int max_width;
     nSDL_Font *white_font;
     nSDL_Font *outline_font;
     int scale_num;
@@ -4948,7 +5287,7 @@ static bool ensure_subtitle_surface_cache(
 
     (void) screen;
 
-    if (!cache || !screen || !fonts || !video_rect || !text || !*text || subtitle_size < 0) {
+    if (!cache || !screen || !fonts || !text || !*text || subtitle_size < 0 || wrap_width <= 0) {
         invalidate_subtitle_surface_cache(cache);
         return false;
     }
@@ -4958,12 +5297,7 @@ static bool ensure_subtitle_surface_cache(
         cache->text == text &&
         cache->subtitle_font_index == subtitle_font_index &&
         cache->subtitle_size == subtitle_size &&
-        cache->placement == placement &&
-        cache->overlay_visible == overlay_visible &&
-        cache->video_x == video_rect->x &&
-        cache->video_y == video_rect->y &&
-        cache->video_w == video_rect->w &&
-        cache->video_h == video_rect->h) {
+        cache->wrap_width == wrap_width) {
         return true;
     }
 
@@ -4971,17 +5305,8 @@ static bool ensure_subtitle_surface_cache(
     subtitle_fonts_for_style(fonts, subtitle_font_index, &white_font, &outline_font);
     scale_num = subtitle_scale_num(subtitle_size);
     scale_den = subtitle_scale_den(subtitle_size);
-    if (placement == SUBTITLE_POS_BAR_BOTTOM || placement == SUBTITLE_POS_BAR_TOP) {
-        area_width = SCREEN_W;
-    } else {
-        area_width = video_rect->w;
-    }
-    max_width = area_width - 12;
-    if (max_width <= 0) {
-        return false;
-    }
 
-    line_count = wrap_subtitle(white_font, text, (max_width * scale_den) / scale_num, lines);
+    line_count = wrap_subtitle(white_font, text, (wrap_width * scale_den) / scale_num, lines);
     if (line_count <= 0) {
         return false;
     }
@@ -5034,12 +5359,7 @@ static bool ensure_subtitle_surface_cache(
     cache->text = text;
     cache->subtitle_font_index = subtitle_font_index;
     cache->subtitle_size = subtitle_size;
-    cache->placement = placement;
-    cache->overlay_visible = overlay_visible;
-    cache->video_x = video_rect->x;
-    cache->video_y = video_rect->y;
-    cache->video_w = video_rect->w;
-    cache->video_h = video_rect->h;
+    cache->wrap_width = wrap_width;
     return true;
 }
 
@@ -5047,24 +5367,15 @@ static void draw_subtitle_cached(
     SDL_Surface *screen,
     const Fonts *fonts,
     SubtitleSurfaceCache *cache,
-    const SDL_Rect *video_rect,
     const char *text,
-    bool overlay_visible,
     size_t subtitle_font_index,
     int subtitle_size,
-    SubtitlePlacement placement
+    const SubtitleLayoutSpec *layout
 )
 {
-    int base_x;
-    int base_y;
-    int area_width;
-    int area_top;
-    int area_bottom;
-    int area_height;
-    int total_height;
     SDL_Rect dst;
 
-    if (!screen || !cache || !video_rect || !text || !*text || subtitle_size < 0) {
+    if (!screen || !cache || !layout || !text || !*text || subtitle_size < 0) {
         invalidate_subtitle_surface_cache(cache);
         return;
     }
@@ -5072,98 +5383,42 @@ static void draw_subtitle_cached(
             cache,
             screen,
             fonts,
-            video_rect,
             text,
-            overlay_visible,
             subtitle_font_index,
             subtitle_size,
-            placement)) {
+            layout->wrap_width)) {
         return;
     }
 
-    total_height = cache->surface ? cache->surface->h : 0;
-    if (placement == SUBTITLE_POS_BAR_BOTTOM || placement == SUBTITLE_POS_BAR_TOP) {
-        base_x = 0;
-        area_width = SCREEN_W;
-    } else {
-        base_x = video_rect->x;
-        area_width = video_rect->w;
-    }
-
-    switch (placement) {
-        case SUBTITLE_POS_BAR_BOTTOM:
-            area_top = video_rect->y + video_rect->h + 2;
-            area_bottom = (overlay_visible ? (SCREEN_H - UI_BAR_H) : SCREEN_H) - 2;
-            area_height = area_bottom - area_top;
-            if (area_height >= total_height) {
-                base_y = area_top + (area_height - total_height) / 2;
-            } else {
-                base_y = area_bottom - total_height;
-                if (base_y < 2) {
-                    base_y = 2;
-                }
-            }
-            break;
-        case SUBTITLE_POS_VIDEO_TOP:
-            base_y = video_rect->y + 4;
-            break;
-        case SUBTITLE_POS_BAR_TOP:
-            area_top = 2;
-            area_bottom = video_rect->y - 2;
-            area_height = area_bottom - area_top;
-            if (area_height >= total_height) {
-                base_y = area_top + (area_height - total_height) / 2;
-            } else {
-                base_y = 4;
-            }
-            break;
-        case SUBTITLE_POS_VIDEO_BOTTOM:
-        default:
-            base_y = (video_rect->y + video_rect->h - 8) - total_height;
-            if (base_y < video_rect->y + 4) {
-                base_y = video_rect->y + 4;
-            }
-            break;
-    }
-
-    dst.x = (Sint16) (base_x + (area_width - cache->surface->w) / 2);
-    dst.y = (Sint16) base_y;
-    dst.w = (Uint16) cache->surface->w;
-    dst.h = (Uint16) cache->surface->h;
+    subtitle_layout_dst_rect(layout, cache->surface->w, cache->surface->h, &dst);
     SDL_BlitSurface(cache->surface, NULL, screen, &dst);
 }
 
 static void draw_subtitle(
     SDL_Surface *screen,
     const Fonts *fonts,
-    const SDL_Rect *video_rect,
     const char *text,
-    bool overlay_visible,
     size_t subtitle_font_index,
     int subtitle_size,
-    SubtitlePlacement placement
+    const SubtitleLayoutSpec *layout
 )
 {
     char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN];
     int line_count;
     int line_index;
-    int base_x;
-    int base_y;
-    int area_width;
-    int max_width;
     nSDL_Font *white_font;
     nSDL_Font *outline_font;
     int scale_num;
     int scale_den;
     int line_height;
     int total_height;
-    int area_top;
-    int area_bottom;
-    int area_height;
+    int base_y = 0;
+    int line_max_width = 0;
+    SDL_Rect dst;
     if (!text || !*text) {
         return;
     }
-    if (subtitle_size < 0) {
+    if (!layout || subtitle_size < 0 || layout->wrap_width <= 0) {
         return;
     }
     subtitle_size = clamp_int(subtitle_size, 0, 3);
@@ -5178,18 +5433,7 @@ static void draw_subtitle(
     if (line_height < 10) {
         line_height = 10;
     }
-    if (placement == SUBTITLE_POS_BAR_BOTTOM || placement == SUBTITLE_POS_BAR_TOP) {
-        base_x = 0;
-        area_width = SCREEN_W;
-    } else {
-        base_x = video_rect->x;
-        area_width = video_rect->w;
-    }
-    max_width = area_width - 12;
-    if (max_width <= 0) {
-        return;
-    }
-    line_count = wrap_subtitle(white_font, text, (max_width * scale_den) / scale_num, lines);
+    line_count = wrap_subtitle(white_font, text, (layout->wrap_width * scale_den) / scale_num, lines);
     if (line_count <= 0) {
         return;
     }
@@ -5197,44 +5441,20 @@ static void draw_subtitle(
     if (line_count > 1) {
         total_height += (line_count - 1) * 2;
     }
-    switch (placement) {
-        case SUBTITLE_POS_BAR_BOTTOM:
-            area_top = video_rect->y + video_rect->h + 2;
-            area_bottom = (overlay_visible ? (SCREEN_H - UI_BAR_H) : SCREEN_H) - 2;
-            area_height = area_bottom - area_top;
-            if (area_height >= total_height) {
-                base_y = area_top + (area_height - total_height) / 2;
-            } else {
-                base_y = area_bottom - total_height;
-                if (base_y < 2) {
-                    base_y = 2;
-                }
-            }
-            break;
-        case SUBTITLE_POS_VIDEO_TOP:
-            base_y = video_rect->y + 4;
-            break;
-        case SUBTITLE_POS_BAR_TOP:
-            area_top = 2;
-            area_bottom = video_rect->y - 2;
-            area_height = area_bottom - area_top;
-            if (area_height >= total_height) {
-                base_y = area_top + (area_height - total_height) / 2;
-            } else {
-                base_y = 4;
-            }
-            break;
-        case SUBTITLE_POS_VIDEO_BOTTOM:
-        default:
-            base_y = (video_rect->y + video_rect->h - 8) - total_height;
-            if (base_y < video_rect->y + 4) {
-                base_y = video_rect->y + 4;
-            }
-            break;
-    }
     for (line_index = 0; line_index < line_count; ++line_index) {
         int width = (nSDL_GetStringWidth(white_font, lines[line_index]) * scale_num) / scale_den;
-        int x = base_x + (area_width - width) / 2;
+        if (width > line_max_width) {
+            line_max_width = width;
+        }
+    }
+    if (line_max_width <= 0) {
+        return;
+    }
+    subtitle_layout_dst_rect(layout, line_max_width, total_height, &dst);
+    base_y = dst.y;
+    for (line_index = 0; line_index < line_count; ++line_index) {
+        int width = (nSDL_GetStringWidth(white_font, lines[line_index]) * scale_num) / scale_den;
+        int x = dst.x + (line_max_width - width) / 2;
         draw_scaled_outlined_text(
             screen,
             white_font,
@@ -5786,7 +6006,12 @@ static void render_movie(
     Uint32 black = SDL_MapRGB(screen->format, 0, 0, 0);
     int memory_right_limit = SCREEN_W - 8;
     uint32_t current_ms = movie_frame_time_ms(movie, movie->current_frame);
-    const char *subtitle = active_subtitle(movie, current_ms);
+    const SubtitleCue *subtitle_cue = active_subtitle_cue(movie, current_ms);
+    const char *subtitle = subtitle_cue ? subtitle_cue->text : NULL;
+    SubtitlePlacement effective_subtitle_placement = subtitle_normalize_placement(
+        subtitle_placement,
+        selected_subtitle_track_supports_auto_positioning(movie)
+    );
     bool playback_badge_visible = show_ui && !help_menu_open;
     bool memory_badge_visible = !help_menu_open && (memory_overlay_mode == MEMORY_OVERLAY_ALWAYS);
 
@@ -5816,29 +6041,47 @@ static void render_movie(
     } else {
         SDL_SoftStretch(movie->frame_surface, &src, screen, &dst);
     }
-    draw_subtitle_cached(
-        screen,
-        fonts,
-        subtitle_cache,
-        &dst,
-        subtitle,
-        show_ui,
-        subtitle_font_index,
-        subtitle_size,
-        subtitle_placement
-    );
+    if (subtitle && subtitle_size >= 0) {
+        SubtitleLayoutSpec subtitle_layout;
+
+        if (subtitle_resolve_layout_spec(
+                &dst,
+                show_ui,
+                effective_subtitle_placement,
+                SUBTITLE_POS_BAR_BOTTOM,
+                subtitle_cue,
+                &subtitle_layout)) {
+            draw_subtitle_cached(
+                screen,
+                fonts,
+                subtitle_cache,
+                subtitle,
+                subtitle_font_index,
+                subtitle_size,
+                &subtitle_layout
+            );
+        }
+    }
     if (subtitle_font_overlay_visible) {
         int preview_size = subtitle_size < 0 ? 0 : clamp_int(subtitle_size, 0, 1);
-        draw_subtitle(
-            screen,
-            fonts,
-            &dst,
-            subtitle_font_name_for_index(subtitle_font_index),
-            show_ui,
-            subtitle_font_index,
-            preview_size,
-            subtitle_opposite_placement(subtitle_placement)
-        );
+        SubtitleLayoutSpec preview_layout;
+
+        if (subtitle_resolve_layout_spec(
+                &dst,
+                show_ui,
+                subtitle_opposite_placement(effective_subtitle_placement),
+                SUBTITLE_POS_BAR_TOP,
+                NULL,
+                &preview_layout)) {
+            draw_subtitle(
+                screen,
+                fonts,
+                subtitle_font_name_for_index(subtitle_font_index),
+                subtitle_font_index,
+                preview_size,
+                &preview_layout
+            );
+        }
     }
     if (show_ui) {
         if (!help_menu_open) {
@@ -6035,7 +6278,6 @@ static void apply_history_entry_settings(
     *playback_rate_index = (size_t) clamp_int((int) entry->playback_rate_index, 0, (int) (PLAYBACK_RATE_COUNT - 1U));
     *subtitle_font_index = (size_t) clamp_int((int) entry->subtitle_font_index, 0, (int) (SUBTITLE_FONT_CHOICE_COUNT - 1U));
     *subtitle_size = clamp_int((int) entry->subtitle_size, -1, 3);
-    *subtitle_placement = (SubtitlePlacement) clamp_int((int) entry->subtitle_placement, SUBTITLE_POS_BAR_BOTTOM, SUBTITLE_POS_COUNT - 1);
 
     if (movie->subtitle_track_count == 0) {
         movie->selected_subtitle_track = 0;
@@ -6043,6 +6285,10 @@ static void apply_history_entry_settings(
         uint16_t max_track = (uint16_t) (movie->subtitle_track_count - 1U);
         movie->selected_subtitle_track = (uint16_t) clamp_int((int) entry->selected_subtitle_track, 0, (int) max_track);
     }
+    *subtitle_placement = subtitle_normalize_placement(
+        (SubtitlePlacement) clamp_int((int) entry->subtitle_placement, SUBTITLE_POS_BAR_BOTTOM, SUBTITLE_POS_COUNT - 1),
+        selected_subtitle_track_supports_auto_positioning(movie)
+    );
 }
 
 static bool load_history_store_from_path(const char *history_path, HistoryStore *history)
@@ -6912,6 +7158,13 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         }
         free_history_store(&startup_history);
     }
+    if (startup_history_index < 0 && selected_subtitle_track_supports_auto_positioning(&movie)) {
+        subtitle_placement = SUBTITLE_POS_AUTO;
+    }
+    subtitle_placement = subtitle_normalize_placement(
+        subtitle_placement,
+        selected_subtitle_track_supports_auto_positioning(&movie)
+    );
     if (startup_has_resume && resume_frame < movie.header.frame_count) {
         int resume_choice = prompt_resume_position(screen, fonts, &movie, path, resume_frame);
         if (resume_choice < 0) {
@@ -7188,7 +7441,17 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (exp_edge || tenx_edge) {
-            subtitle_placement = (SubtitlePlacement) ((subtitle_placement + 1) % SUBTITLE_POS_COUNT);
+            subtitle_placement = subtitle_cycle_placement(
+                subtitle_placement,
+                selected_subtitle_track_supports_auto_positioning(&movie)
+            );
+            snprintf(
+                status_overlay_text,
+                sizeof(status_overlay_text),
+                "SUB POS %s",
+                subtitle_placement_label(subtitle_placement)
+            );
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (key_pressed_edge(KEY_NSPIRE_PLUS, &prev_plus) && subtitle_size < 3) {
@@ -7210,6 +7473,10 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             } else {
                 movie.selected_subtitle_track = 0;
             }
+            subtitle_placement = subtitle_normalize_placement(
+                subtitle_placement,
+                selected_subtitle_track_supports_auto_positioning(&movie)
+            );
             snprintf(
                 status_overlay_text,
                 sizeof(status_overlay_text),

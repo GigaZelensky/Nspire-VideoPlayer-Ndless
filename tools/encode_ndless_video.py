@@ -20,7 +20,7 @@ import imageio_ffmpeg
 
 
 MAGIC = b"NVP1"
-VERSION = 9
+VERSION = 10
 SCREEN_W = 320
 SCREEN_H = 240
 HEADER_STRUCT = struct.Struct("<4sHHHHHHHHHHHHIIIII")
@@ -29,6 +29,13 @@ START_CODE_RE = re.compile(rb"\x00\x00(?:\x00)?\x01")
 SUBTITLE_LINE_BREAK_RE = re.compile(r"(?i)<br\s*/?>|\\N|\\n")
 SUBTITLE_TAG_RE = re.compile(r"(?s)<[^>]+>")
 SUBTITLE_ASS_OVERRIDE_RE = re.compile(r"\{\\[^}]*\}")
+ASS_OVERRIDE_BLOCK_RE = re.compile(r"\{([^}]*)\}")
+ASS_POS_RE = re.compile(r"\\pos\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)")
+ASS_MOVE_RE = re.compile(
+    r"\\move\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)"
+)
+ASS_AN_RE = re.compile(r"\\an(\d)")
+ASS_A_RE = re.compile(r"\\a(\d+)")
 
 NAL_IDR = 5
 NAL_SEI = 6
@@ -40,6 +47,12 @@ CHUNK_BOUNDARY_NAL_TYPES = {NAL_SPS, NAL_PPS, NAL_IDR}
 STREAM_PROFILES = ("fast", "balanced", "quality", "intra")
 DEFAULT_MAX_CHUNK_KIB = 1024
 DEFAULT_MAX_IDR_FRAMES = 24
+SUBTITLE_COORD_SCALE = 10000
+SUBTITLE_CUE_POSITION_NONE = 0
+SUBTITLE_CUE_POSITION_MARGIN = 1
+SUBTITLE_CUE_POSITION_ABSOLUTE = 2
+ASS_DEFAULT_PLAYRES_X = 384
+ASS_DEFAULT_PLAYRES_Y = 288
 
 
 @dataclass(slots=True)
@@ -47,6 +60,13 @@ class SubtitleCue:
     start_ms: int
     end_ms: int
     text: str
+    position_mode: int = SUBTITLE_CUE_POSITION_NONE
+    align: int = 2
+    pos_x: int = 0
+    pos_y: int = 0
+    margin_l: int = 0
+    margin_r: int = 0
+    margin_v: int = 0
 
 
 @dataclass(slots=True)
@@ -56,11 +76,27 @@ class SubtitleTrack:
 
 
 @dataclass(slots=True)
+class AssStyle:
+    align: int = 2
+    margin_l: int = 0
+    margin_r: int = 0
+    margin_v: int = 0
+
+
+@dataclass(slots=True)
 class EmbeddedSubtitleTrackInfo:
     ordinal: int
     name: str
     codec_name: str
     text_supported: bool
+
+
+@dataclass(slots=True)
+class BurnSubtitleSource:
+    kind: str
+    label: str
+    path: Path | None = None
+    stream_index: int | None = None
 
 
 @dataclass(slots=True)
@@ -178,6 +214,149 @@ def sanitize_subtitle_text(text: str) -> str:
     return text.strip()
 
 
+def parse_int(value: str | None, default: int = 0) -> int:
+    try:
+        return int((value or "").strip())
+    except ValueError:
+        return default
+
+
+def scale_subtitle_coord(value: float, extent: int) -> int:
+    if extent <= 0:
+        return 0
+    scaled = int(round((max(0.0, value) * SUBTITLE_COORD_SCALE) / extent))
+    return max(0, min(SUBTITLE_COORD_SCALE, scaled))
+
+
+def normalize_ass_alignment(value: int, *, legacy: bool = False) -> int:
+    legacy_map = {
+        1: 1,
+        2: 2,
+        3: 3,
+        5: 7,
+        6: 8,
+        7: 9,
+        9: 4,
+        10: 5,
+        11: 6,
+    }
+
+    if legacy:
+        return legacy_map.get(value, 2)
+    if 1 <= value <= 9:
+        return value
+    return legacy_map.get(value, 2)
+
+
+def parse_ass_timecode(value: str) -> int | None:
+    match = re.match(r"^\s*(\d+):(\d+):(\d+)[.,](\d+)\s*$", value)
+    if not match:
+        return None
+    return (
+        int(match.group(1)) * 3600
+        + int(match.group(2)) * 60
+        + int(match.group(3))
+    ) * 1000 + int(match.group(4)[:3].ljust(3, "0"))
+
+
+def split_ass_fields(payload: str, field_count: int) -> list[str]:
+    if field_count <= 0:
+        return []
+    parts = payload.split(",", field_count - 1)
+    if len(parts) < field_count:
+        parts.extend([""] * (field_count - len(parts)))
+    if field_count == 1:
+        return [parts[0]]
+    return [part.strip() for part in parts[:-1]] + [parts[-1]]
+
+
+def extract_ass_alignment_and_position(text: str, default_align: int) -> tuple[int, tuple[float, float] | None]:
+    align = default_align
+    absolute_pos: tuple[float, float] | None = None
+
+    for block in ASS_OVERRIDE_BLOCK_RE.findall(text):
+        an_matches = ASS_AN_RE.findall(block)
+        if an_matches:
+            align = normalize_ass_alignment(parse_int(an_matches[-1], 2))
+        else:
+            legacy_matches = ASS_A_RE.findall(block)
+            if legacy_matches:
+                align = normalize_ass_alignment(parse_int(legacy_matches[-1], 2), legacy=True)
+
+        pos_match = ASS_POS_RE.search(block)
+        if pos_match:
+            absolute_pos = (float(pos_match.group(1)), float(pos_match.group(2)))
+            continue
+
+        if absolute_pos is None:
+            move_match = ASS_MOVE_RE.search(block)
+            if move_match:
+                absolute_pos = (float(move_match.group(1)), float(move_match.group(2)))
+
+    return align, absolute_pos
+
+
+def parse_ass_style(fields: list[str], values: list[str], *, legacy_alignment: bool) -> tuple[str | None, AssStyle]:
+    field_map = {
+        fields[index]: values[index].strip()
+        for index in range(min(len(fields), len(values)))
+    }
+    name = field_map.get("name", "").strip()
+    style = AssStyle(
+        align=normalize_ass_alignment(parse_int(field_map.get("alignment"), 2), legacy=legacy_alignment),
+        margin_l=max(0, parse_int(field_map.get("marginl"), 0)),
+        margin_r=max(0, parse_int(field_map.get("marginr"), 0)),
+        margin_v=max(0, parse_int(field_map.get("marginv"), 0)),
+    )
+    return (name.casefold() or None), style
+
+
+def build_ass_cue(
+    event_fields: list[str],
+    values: list[str],
+    styles: dict[str, AssStyle],
+    play_res_x: int,
+    play_res_y: int,
+) -> SubtitleCue | None:
+    field_map = {
+        event_fields[index]: values[index]
+        for index in range(min(len(event_fields), len(values)))
+    }
+    start_ms = parse_ass_timecode(field_map.get("start", ""))
+    end_ms = parse_ass_timecode(field_map.get("end", ""))
+    if start_ms is None or end_ms is None or end_ms < start_ms:
+        return None
+
+    style = styles.get(field_map.get("style", "").strip().casefold(), styles.get("default", AssStyle()))
+    margin_l = max(0, parse_int(field_map.get("marginl"), 0))
+    margin_r = max(0, parse_int(field_map.get("marginr"), 0))
+    margin_v = max(0, parse_int(field_map.get("marginv"), 0))
+    if margin_l <= 0:
+        margin_l = style.margin_l
+    if margin_r <= 0:
+        margin_r = style.margin_r
+    if margin_v <= 0:
+        margin_v = style.margin_v
+
+    text_field = field_map.get("text", "")
+    align, absolute_pos = extract_ass_alignment_and_position(text_field, style.align)
+    text = sanitize_subtitle_text(text_field)
+    if not text:
+        return None
+
+    cue = SubtitleCue(start_ms=start_ms, end_ms=end_ms, text=text, align=align)
+    if absolute_pos is not None:
+        cue.position_mode = SUBTITLE_CUE_POSITION_ABSOLUTE
+        cue.pos_x = scale_subtitle_coord(absolute_pos[0], play_res_x)
+        cue.pos_y = scale_subtitle_coord(absolute_pos[1], play_res_y)
+    else:
+        cue.position_mode = SUBTITLE_CUE_POSITION_MARGIN
+        cue.margin_l = scale_subtitle_coord(margin_l, play_res_x)
+        cue.margin_r = scale_subtitle_coord(margin_r, play_res_x)
+        cue.margin_v = scale_subtitle_coord(margin_v, play_res_y)
+    return cue
+
+
 def parse_srt(path: Path) -> list[SubtitleCue]:
     raw = path.read_text(encoding="utf-8-sig", errors="replace").replace("\r\n", "\n")
     entries = re.split(r"\n\s*\n", raw.strip())
@@ -214,6 +393,67 @@ def parse_srt(path: Path) -> list[SubtitleCue]:
     return cues
 
 
+def parse_ass(path: Path) -> list[SubtitleCue]:
+    lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    cues: list[SubtitleCue] = []
+    styles: dict[str, AssStyle] = {}
+    play_res_x = ASS_DEFAULT_PLAYRES_X
+    play_res_y = ASS_DEFAULT_PLAYRES_Y
+    section = ""
+    style_fields: list[str] = []
+    style_legacy_alignment = False
+    event_fields: list[str] = []
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith(";"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line.casefold()
+            continue
+        key, separator, value = line.partition(":")
+        if not separator:
+            continue
+        key = key.strip().casefold()
+        value = value.lstrip()
+
+        if section == "[script info]":
+            if key == "playresx":
+                play_res_x = max(1, parse_int(value, ASS_DEFAULT_PLAYRES_X))
+            elif key == "playresy":
+                play_res_y = max(1, parse_int(value, ASS_DEFAULT_PLAYRES_Y))
+        elif section in {"[v4+ styles]", "[v4 styles]"}:
+            if key == "format":
+                style_fields = [field.strip().casefold() for field in value.split(",")]
+                style_legacy_alignment = section == "[v4 styles]"
+            elif key == "style" and style_fields:
+                values = split_ass_fields(value, len(style_fields))
+                name, style = parse_ass_style(style_fields, values, legacy_alignment=style_legacy_alignment)
+                if name:
+                    styles[name] = style
+        elif section == "[events]":
+            if key == "format":
+                event_fields = [field.strip().casefold() for field in value.split(",")]
+            elif key == "dialogue" and event_fields:
+                cue = build_ass_cue(
+                    event_fields,
+                    split_ass_fields(value, len(event_fields)),
+                    styles,
+                    play_res_x,
+                    play_res_y,
+                )
+                if cue:
+                    cues.append(cue)
+    return cues
+
+
+def parse_subtitle_file(path: Path) -> list[SubtitleCue]:
+    suffix = path.suffix.lower()
+    if suffix in {".ass", ".ssa"}:
+        return parse_ass(path)
+    return parse_srt(path)
+
+
 def ffprobe_path() -> Path | None:
     ffmpeg_path = Path(imageio_ffmpeg.get_ffmpeg_exe())
     candidate_names = ["ffprobe.exe", "ffprobe"]
@@ -233,6 +473,17 @@ def subtitle_track_display_name(ordinal: int, language: str | None, title: str |
     if not parts:
         return f"Subtitle {ordinal + 1}"
     return " - ".join(part for part in parts if part)
+
+
+def subtitle_track_debug_label(track: EmbeddedSubtitleTrackInfo) -> str:
+    return f"{track.ordinal}: {track.name} [{track.codec_name}]"
+
+
+def ffmpeg_filter_escape_path(path: Path) -> str:
+    escaped = path.resolve().as_posix()
+    for char in ("\\", ":", "'", "[", "]", ",", ";"):
+        escaped = escaped.replace(char, f"\\{char}")
+    return escaped
 
 
 def is_text_subtitle_codec(codec_name: str | None) -> bool:
@@ -334,6 +585,55 @@ def extract_embedded_subtitle_track(input_path: Path, output_path: Path, track_i
     return output_path
 
 
+def subtitle_extract_suffix(codec_name: str | None) -> str:
+    codec = (codec_name or "").strip().lower()
+    if codec == "ass":
+        return ".ass"
+    if codec == "ssa":
+        return ".ssa"
+    return ".srt"
+
+
+def resolve_burn_subtitle_source(
+    input_path: Path,
+    subtitle_arg: str | None,
+    selected_tracks: list[int] | None,
+) -> BurnSubtitleSource:
+    if not subtitle_arg:
+        raise RuntimeError("--burn-subtitles requires --subtitle.")
+
+    if subtitle_arg != "embedded":
+        subtitle_path = Path(subtitle_arg).resolve()
+        return BurnSubtitleSource(
+            kind="text_file",
+            label=subtitle_path.name,
+            path=subtitle_path,
+        )
+
+    available_tracks = probe_embedded_subtitle_tracks(input_path)
+    if not available_tracks:
+        raise RuntimeError("No embedded subtitle tracks were found.")
+
+    if selected_tracks:
+        wanted_tracks = list(dict.fromkeys(selected_tracks))
+        if len(wanted_tracks) != 1:
+            raise RuntimeError("--burn-subtitles only supports one embedded subtitle track. Pass exactly one --subtitle-track.")
+        track_index = wanted_tracks[0]
+        track_info_map = {track.ordinal: track for track in available_tracks}
+        track_info = track_info_map.get(track_index)
+        if track_info is None:
+            raise RuntimeError(f"Embedded subtitle track {track_index} is not available.")
+    else:
+        track_info = available_tracks[0]
+
+    return BurnSubtitleSource(
+        kind="embedded_text" if track_info.text_supported else "embedded_bitmap",
+        label=subtitle_track_debug_label(track_info),
+        path=input_path.resolve(),
+        stream_index=track_info.ordinal,
+    )
+
+
 def load_subtitle_tracks(
     input_path: Path,
     output_path: Path,
@@ -344,10 +644,11 @@ def load_subtitle_tracks(
         return []
 
     if subtitle_arg != "embedded":
-        cues = parse_srt(Path(subtitle_arg))
+        subtitle_path = Path(subtitle_arg)
+        cues = parse_subtitle_file(subtitle_path)
         if not cues:
             return []
-        return [SubtitleTrack(name=Path(subtitle_arg).stem or "Subtitles", cues=cues)]
+        return [SubtitleTrack(name=subtitle_path.stem or "Subtitles", cues=cues)]
 
     available_tracks = probe_embedded_subtitle_tracks(input_path)
     if not available_tracks:
@@ -358,7 +659,11 @@ def load_subtitle_tracks(
     else:
         wanted_tracks = [track.ordinal for track in available_tracks if track.text_supported]
         if not wanted_tracks:
-            raise RuntimeError("No supported text embedded subtitle tracks were found.")
+            raise RuntimeError(
+                "No supported text embedded subtitle tracks were found. "
+                f"Available embedded subtitle tracks: {', '.join(subtitle_track_debug_label(track) for track in available_tracks)}. "
+                "Use --burn-subtitles to hardcode bitmap subtitle tracks into the video."
+            )
     track_info_map = {track.ordinal: track for track in available_tracks}
     subtitle_tracks: list[SubtitleTrack] = []
 
@@ -371,10 +676,10 @@ def load_subtitle_tracks(
                 f"Embedded subtitle track {track_index} ({track_info.name}) uses unsupported bitmap codec "
                 f"'{track_info.codec_name}'. Select a text subtitle track instead."
             )
-        extracted = output_path.parent / f"{output_path.stem}.track{track_index}.srt"
+        extracted = output_path.parent / f"{output_path.stem}.track{track_index}{subtitle_extract_suffix(track_info.codec_name)}"
         try:
             extract_embedded_subtitle_track(input_path, extracted, track_index)
-            cues = parse_srt(extracted)
+            cues = parse_subtitle_file(extracted)
             if cues:
                 subtitle_tracks.append(SubtitleTrack(name=track_info.name, cues=cues))
         finally:
@@ -669,9 +974,10 @@ def build_ffmpeg_command(
     stream_profile: str,
     start: float,
     duration: float | None,
+    burn_subtitle: BurnSubtitleSource | None,
 ) -> list[str]:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    vf = f"fps={format_fps_value(fps)},scale={width}:{height}:flags=lanczos,setsar=1"
+    post_vf = f"fps={format_fps_value(fps)},scale={width}:{height}:flags=lanczos,setsar=1"
     tune, x264_params, bitstream_filters = h264_stream_profile_options(idr_frames, stream_profile)
     command = [ffmpeg, "-y"]
     if start > 0:
@@ -679,14 +985,44 @@ def build_ffmpeg_command(
     command += ["-i", str(input_path)]
     if duration is not None:
         command += ["-t", f"{duration:.3f}"]
+    if burn_subtitle is None:
+        command += [
+            "-vf",
+            post_vf,
+            "-r",
+            format_fps_value(fps),
+            "-an",
+            "-sn",
+            "-dn",
+        ]
+    elif burn_subtitle.kind in {"text_file", "embedded_text"}:
+        filter_parts = [f"subtitles=filename='{ffmpeg_filter_escape_path(burn_subtitle.path or input_path)}'"]
+        if burn_subtitle.kind == "embedded_text" and burn_subtitle.stream_index is not None:
+            filter_parts[0] += f":si={burn_subtitle.stream_index}"
+        command += [
+            "-vf",
+            ",".join(filter_parts + [post_vf]),
+            "-r",
+            format_fps_value(fps),
+            "-an",
+            "-dn",
+        ]
+    elif burn_subtitle.kind == "embedded_bitmap":
+        if burn_subtitle.stream_index is None:
+            raise RuntimeError("Embedded bitmap subtitle burn requested without a subtitle stream index.")
+        command += [
+            "-filter_complex",
+            f"[0:v][0:s:{burn_subtitle.stream_index}]overlay=eof_action=pass,{post_vf}[vout]",
+            "-map",
+            "[vout]",
+            "-r",
+            format_fps_value(fps),
+            "-an",
+            "-dn",
+        ]
+    else:
+        raise RuntimeError(f"Unsupported burn subtitle mode: {burn_subtitle.kind}")
     command += [
-        "-vf",
-        vf,
-        "-r",
-        format_fps_value(fps),
-        "-an",
-        "-sn",
-        "-dn",
         "-threads",
         "1",
         "-c:v",
@@ -744,6 +1080,7 @@ def encode_h264_bitstream(
     start: float,
     duration: float | None,
     encode_duration: float | None,
+    burn_subtitle: BurnSubtitleSource | None,
     quiet: bool,
 ) -> bytes:
     with tempfile.TemporaryDirectory(prefix="nvp-h264-") as temp_dir:
@@ -761,6 +1098,7 @@ def encode_h264_bitstream(
             stream_profile=stream_profile,
             start=start,
             duration=duration,
+            burn_subtitle=burn_subtitle,
         )
         command = command[:1] + ["-hide_banner", "-loglevel", "error", "-progress", "pipe:2", "-nostats"] + command[1:]
         process = subprocess.Popen(
@@ -1009,10 +1347,13 @@ def encode(args: argparse.Namespace) -> EncodeStats:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path = output_path.with_suffix(".json")
 
-    subtitle_tracks = load_subtitle_tracks(input_path, output_path, args.subtitle, args.subtitle_track)
+    burn_subtitle = resolve_burn_subtitle_source(input_path, args.subtitle, args.subtitle_track) if args.burn_subtitles else None
+    subtitle_tracks = [] if args.burn_subtitles else load_subtitle_tracks(input_path, output_path, args.subtitle, args.subtitle_track)
     subtitle_count = sum(len(track.cues) for track in subtitle_tracks)
     if subtitle_tracks and args.subtitle == "embedded":
         log(f"Embedding {len(subtitle_tracks)} subtitle track(s).", quiet=args.quiet)
+    if burn_subtitle is not None:
+        log(f"Burning subtitles into video: {burn_subtitle.label}", quiet=args.quiet)
 
     video_probe = probe_video(input_path)
     source_width = video_probe.display_width or video_probe.storage_width
@@ -1052,6 +1393,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         start=args.start,
         duration=args.duration,
         encode_duration=args.duration if args.duration is not None else max(0.0, video_probe.duration - args.start),
+        burn_subtitle=burn_subtitle,
         quiet=args.quiet,
     )
     log(
@@ -1127,7 +1469,21 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         for track in subtitle_tracks:
             for cue in track.cues:
                 encoded = sanitize_subtitle_text(cue.text).encode("ascii", "replace")
-                output_handle.write(struct.pack("<IIH", cue.start_ms, cue.end_ms, len(encoded)))
+                output_handle.write(
+                    struct.pack(
+                        "<IIHBBHHHHH",
+                        cue.start_ms,
+                        cue.end_ms,
+                        len(encoded),
+                        cue.position_mode,
+                        cue.align,
+                        cue.pos_x,
+                        cue.pos_y,
+                        cue.margin_l,
+                        cue.margin_r,
+                        cue.margin_v,
+                    )
+                )
                 output_handle.write(encoded)
 
     write_header(
@@ -1177,7 +1533,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", help="Input video file")
     parser.add_argument("--output", required=True, help="Output .nvp.tns file")
-    parser.add_argument("--subtitle", help="Optional .srt path or 'embedded'")
+    parser.add_argument("--subtitle", help="Optional subtitle source path or 'embedded'")
+    parser.add_argument("--burn-subtitles", action="store_true", help="Render the selected subtitles directly into the video instead of storing subtitle tracks in the container")
     parser.add_argument("--subtitle-track", dest="subtitle_track", action="append", type=int, help="Embedded subtitle track index to include; repeat to keep multiple tracks")
     parser.add_argument("--fps", default="12", help="Target framerate or 'source'")
     parser.add_argument("--max-width", type=int, default=SCREEN_W, help="Fit width")
