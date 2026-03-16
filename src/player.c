@@ -5592,58 +5592,77 @@ static void draw_memory_badge(
     }
 }
 
-static void draw_help_row(SDL_Surface *screen, const Fonts *fonts, int x, int y, int panel_w, const char *shortcut, const char *description)
+static void draw_help_row(SDL_Surface *screen, const Fonts *fonts, int shortcut_x, int description_x, int y, const char *shortcut, const char *description)
 {
-    nSDL_DrawString(screen, fonts->white, x + 6, y, "%s", shortcut);
-    nSDL_DrawString(screen, fonts->white, x + 80, y, "%s", description);
+    nSDL_DrawString(screen, fonts->white, shortcut_x, y, "%s", shortcut);
+    nSDL_DrawString(screen, fonts->white, description_x, y, "%s", description);
 }
 
 static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
 {
-    SDL_Rect border = {15, 11, 282, 190};
-    SDL_Rect panel = {16, 12, 280, 188};
-    SDL_Rect header = {16, 12, 280, 24};
-    SDL_Rect accent = {16, 36, 280, 2};
+    const int menu_w = 296;
+    const int menu_h = 200;
+    const int safe_h = SCREEN_H - UI_BAR_H;
+    SDL_Rect border = {(SCREEN_W - menu_w) / 2, (safe_h - menu_h) / 2, menu_w, menu_h};
+    SDL_Rect panel = {border.x + 1, border.y + 1, border.w - 2, border.h - 2};
+    SDL_Rect header = {panel.x, panel.y, panel.w, 24};
+    SDL_Rect accent = {panel.x, panel.y + header.h, panel.w, 2};
     const char *close_text = "CAT close";
-    int y = 48;
+    const char *title_text = "Playback Controls";
+    const struct {
+        const char *shortcut;
+        const char *description;
+    } rows[] = {
+        {"ENTER", "Play or pause"},
+        {"CLICK", "Toggle or seek bar"},
+        {"L / R", "Seek -/+5s"},
+        {"TAB", "Step one frame"},
+        {"/", "Scale mode"},
+        {"{ / }", "Playback speed"},
+        {"^", "Subtitle position"},
+        {"+ / -", "Subtitle size"},
+        {"F", "Cycle subtitle font"},
+        {"T", "Switch subtitle track"},
+        {"M", "Memory overlay"},
+        {"D", "Toggle debug logging"},
+        {"S", "Save BMP screenshot"},
+        {"TOUCHPAD", "Move cursor / show UI"},
+        {"ESC", "Close menu or exit"},
+    };
+    int max_shortcut_w = 0;
+    int shortcut_x;
+    int description_x;
+    int y;
+    size_t index;
 
     SDL_FillRect(screen, &border, SDL_MapRGB(screen->format, 0, 0, 0));
     SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 8, 10, 14));
     SDL_FillRect(screen, &header, SDL_MapRGB(screen->format, 12, 18, 28));
     SDL_FillRect(screen, &accent, SDL_MapRGB(screen->format, 32, 182, 255));
 
-    nSDL_DrawString(screen, fonts->white, panel.x + 10, panel.y + 6, "Playback Controls");
-    nSDL_DrawString(screen, fonts->white, panel.x + panel.w - 10 - nSDL_GetStringWidth(fonts->white, close_text), panel.y + 6, "%s", close_text);
+    nSDL_DrawString(screen, fonts->white, panel.x + 10, panel.y + 6, "%s", title_text);
+    nSDL_DrawString(
+        screen,
+        fonts->white,
+        panel.x + panel.w - 10 - nSDL_GetStringWidth(fonts->white, close_text),
+        panel.y + 6,
+        "%s",
+        close_text
+    );
 
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "ENTER", "Play or pause");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "CLICK", "Toggle or seek bar");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "L / R", "Seek -/+5s");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "TAB", "Step one frame");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "/", "Scale mode");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "{ / }", "Playback speed");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "^", "Subtitle position");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "+ / -", "Subtitle size");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "F", "Cycle subtitle font");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "T", "Switch subtitle track");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "M", "Memory overlay");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "D", "Toggle debug logging");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "S", "Save BMP screenshot");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "TOUCHPAD", "Move cursor / show UI");
-    y += 11;
-    draw_help_row(screen, fonts, panel.x + 10, y, panel.w - 20, "ESC", "Close menu or exit");
+    for (index = 0; index < sizeof(rows) / sizeof(rows[0]); ++index) {
+        int width = nSDL_GetStringWidth(fonts->white, rows[index].shortcut);
+        if (width > max_shortcut_w) {
+            max_shortcut_w = width;
+        }
+    }
+    shortcut_x = panel.x + 12;
+    description_x = shortcut_x + max_shortcut_w + 16;
+    y = accent.y + 10;
+    for (index = 0; index < sizeof(rows) / sizeof(rows[0]); ++index) {
+        draw_help_row(screen, fonts, shortcut_x, description_x, y, rows[index].shortcut, rows[index].description);
+        y += 11;
+    }
 }
 
 static void draw_progress(
@@ -6986,15 +7005,17 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             show_ui = true;
         }
         if (!pointer_click) {
+            bool allow_seek_preview = paused && show_ui && !help_menu_open;
             int previous_preview_chunk = seek_preview.decoded_chunk_index;
-            if (update_seek_bar_preview(&movie, &seek_preview, &pointer, show_ui && !help_menu_open, now_ms) &&
+            if (allow_seek_preview &&
+                update_seek_bar_preview(&movie, &seek_preview, &pointer, allow_seek_preview, now_ms) &&
                 seek_preview.surface &&
                 seek_preview.decoded_chunk_index != previous_preview_chunk) {
-                if (paused) {
-                    hover_preview_needs_rebuffer = true;
-                } else {
-                    begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
-                }
+                hover_preview_needs_rebuffer = true;
+            } else if (!allow_seek_preview) {
+                seek_preview.over_bar = false;
+                seek_preview.tracking = false;
+                seek_preview.last_pointer_x = -1;
             }
         } else {
             seek_preview.over_bar = false;
