@@ -23,6 +23,8 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define UI_BAR_H 28
 #define SEEK_STEP_MS 5000
 #define SEEK_STACK_DELAY_MS 450U
+#define TAB_HOLD_FRAME_REPEAT_DELAY_MS 250U
+#define TAB_HOLD_FRAME_REPEAT_FALLBACK_INTERVAL_MS 80U
 #define PICKER_MAX_FILES 128
 #define PICKER_VISIBLE_ROWS 9
 #define MAX_PATH_LEN 512
@@ -1263,6 +1265,24 @@ static uint64_t movie_frame_interval_ticks(const Movie *movie)
     return (((uint64_t) monotonic_clock_ticks_per_second()) * movie->header.fps_den) / movie->header.fps_num;
 }
 
+static uint32_t tab_hold_frame_repeat_interval_ms(const Movie *movie)
+{
+    uint64_t interval_ms;
+
+    if (!movie || !movie->header.fps_num || !movie->header.fps_den) {
+        return TAB_HOLD_FRAME_REPEAT_FALLBACK_INTERVAL_MS;
+    }
+
+    interval_ms = (2000ULL * movie->header.fps_den + (movie->header.fps_num - 1U)) / movie->header.fps_num;
+    if (interval_ms == 0ULL) {
+        interval_ms = 1ULL;
+    }
+    if (interval_ms > UINT32_MAX) {
+        interval_ms = UINT32_MAX;
+    }
+    return (uint32_t) interval_ms;
+}
+
 static const PlaybackRate *playback_rate_for_index(size_t rate_index)
 {
     if (rate_index >= PLAYBACK_RATE_COUNT) {
@@ -1316,6 +1336,20 @@ static void reset_playback_timeline(const Movie *movie, const PlaybackRate *play
     *anchor_ticks = now_ticks;
     *anchor_frame = movie->current_frame;
     *next_frame_due_ticks = now_ticks + movie_frame_time_scaled_ticks(movie, 1, playback_rate);
+}
+
+static bool step_movie_forward_one_frame(Movie *movie, bool *hover_preview_needs_rebuffer)
+{
+    if (!movie || movie->current_frame + 1 >= movie->header.frame_count) {
+        return true;
+    }
+    if (!decode_to_frame(movie, movie->current_frame + 1)) {
+        return false;
+    }
+    if (hover_preview_needs_rebuffer) {
+        *hover_preview_needs_rebuffer = false;
+    }
+    return true;
 }
 
 static uint16_t rolling_u16_average(uint16_t current, uint32_t sample_ms)
@@ -7083,6 +7117,8 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     uint64_t next_frame_due_ticks;
     uint64_t playback_anchor_ticks;
     uint32_t playback_anchor_frame;
+    uint32_t tab_hold_repeat_interval_ms;
+    uint32_t tab_repeat_next_ms = 0;
     uint32_t ui_visible_until;
     uint32_t subtitle_font_overlay_until = 0;
     int result = 0;
@@ -7192,6 +7228,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     debug_set_metrics_collection(debug_is_runtime_logging_enabled());
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
+    tab_hold_repeat_interval_ms = tab_hold_frame_repeat_interval_ms(&movie);
     last_history_saved_ms = movie_frame_time_ms(&movie, movie.current_frame);
     {
         prefetch_tick(&movie, true, 1000);
@@ -7228,6 +7265,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         bool show_ui = help_menu_open || paused || (now_ms <= ui_visible_until);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
         bool tab_edge = key_pressed_edge(KEY_NSPIRE_TAB, &prev_tab);
+        bool tab_down = prev_tab;
         bool cat_edge = key_pressed_edge(KEY_NSPIRE_CAT, &prev_cat);
         bool divide_edge = key_pressed_edge(KEY_NSPIRE_DIVIDE, &prev_divide);
         bool exp_edge = key_pressed_edge(KEY_NSPIRE_EXP, &prev_exp);
@@ -7247,6 +7285,21 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool click_edge = key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click);
         bool take_screenshot = false;
+        bool tab_repeat_step = false;
+
+        if (tab_edge) {
+            tab_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
+        } else if (!tab_down) {
+            tab_repeat_next_ms = 0;
+        } else if (tab_repeat_next_ms != 0U &&
+                   paused &&
+                   !help_menu_open &&
+                   !seek_preroll_active &&
+                   pending_seek_ms == 0 &&
+                   (int32_t) (now_ms - tab_repeat_next_ms) >= 0) {
+            tab_repeat_step = true;
+            tab_repeat_next_ms = now_ms + tab_hold_repeat_interval_ms;
+        }
 
         if (pointer.moved || pointer_click) {
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
@@ -7525,13 +7578,19 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         if (tab_edge) {
             if (!paused) {
                 paused = true;
-            } else if (movie.current_frame + 1 < movie.header.frame_count) {
-                if (!decode_to_frame(&movie, movie.current_frame + 1)) {
-                    report_movie_decode_failure(&movie, path, "tab step");
-                    result = -1;
-                    break;
-                }
-                hover_preview_needs_rebuffer = false;
+            } else if (!step_movie_forward_one_frame(&movie, &hover_preview_needs_rebuffer)) {
+                report_movie_decode_failure(&movie, path, "tab step");
+                result = -1;
+                break;
+            }
+            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (tab_repeat_step && paused) {
+            if (!step_movie_forward_one_frame(&movie, &hover_preview_needs_rebuffer)) {
+                report_movie_decode_failure(&movie, path, "tab hold step");
+                result = -1;
+                break;
             }
             reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
