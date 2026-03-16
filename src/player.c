@@ -43,6 +43,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define POINTER_DECISIVE_SUM_THRESHOLD 5
 #define POINTER_AXIS_LOCK_RATIO_NUM 2
 #define POINTER_AXIS_LOCK_RATIO_DEN 1
+#define POINTER_SPIKE_DELTA_DIVISOR 3
 #define PREFETCH_FILE_BLOCK_SIZE 32768U
 #define PREFETCH_ACTIVE_FILE_BLOCK_SIZE 2048U
 #define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
@@ -251,6 +252,8 @@ typedef struct {
     int y;
     int fx;
     int fy;
+    int max_touch_dx;
+    int max_touch_dy;
     int last_touch_x;
     int last_touch_y;
     bool visible;
@@ -1102,6 +1105,16 @@ static void pointer_init(PointerState *pointer)
     pointer->y = SCREEN_H / 2;
     pointer->fx = pointer->x << POINTER_FIXED_SHIFT;
     pointer->fy = pointer->y << POINTER_FIXED_SHIFT;
+    if (pointer->info) {
+        pointer->max_touch_dx = pointer->info->width / POINTER_SPIKE_DELTA_DIVISOR;
+        pointer->max_touch_dy = pointer->info->height / POINTER_SPIKE_DELTA_DIVISOR;
+        if (pointer->max_touch_dx <= POINTER_JITTER_THRESHOLD) {
+            pointer->max_touch_dx = POINTER_JITTER_THRESHOLD + 1;
+        }
+        if (pointer->max_touch_dy <= POINTER_JITTER_THRESHOLD) {
+            pointer->max_touch_dy = POINTER_JITTER_THRESHOLD + 1;
+        }
+    }
     pointer->visible = pointer->info != NULL;
 }
 
@@ -1110,11 +1123,17 @@ static bool pointer_update(PointerState *pointer)
     touchpad_report_t report;
     bool click_edge = false;
     bool current_down = false;
+    bool has_touch_position;
     if (!pointer->info || touchpad_scan(&report) != 0) {
         return false;
     }
     pointer->moved = false;
-    if (report.contact || report.proximity || report.pressed) {
+    current_down = (report.pressed && report.arrow == TPAD_ARROW_CLICK) ? true : false;
+    has_touch_position =
+        (report.contact || report.proximity) &&
+        report.x < pointer->info->width &&
+        report.y < pointer->info->height;
+    if (has_touch_position) {
         if (!pointer->tracking) {
             pointer->last_touch_x = report.x;
             pointer->last_touch_y = report.y;
@@ -1124,11 +1143,11 @@ static bool pointer_update(PointerState *pointer)
             int dy = (int) report.y - pointer->last_touch_y;
             int abs_dx;
             int abs_dy;
-            pointer->last_touch_x = report.x;
-            pointer->last_touch_y = report.y;
             abs_dx = dx < 0 ? -dx : dx;
             abs_dy = dy < 0 ? -dy : dy;
-            if (abs_dx <= POINTER_JITTER_THRESHOLD && abs_dy <= POINTER_JITTER_THRESHOLD) {
+            if (abs_dx > pointer->max_touch_dx || abs_dy > pointer->max_touch_dy) {
+                pointer->tracking = false;
+            } else if (abs_dx <= POINTER_JITTER_THRESHOLD && abs_dy <= POINTER_JITTER_THRESHOLD) {
                 dx = 0;
                 dy = 0;
             } else {
@@ -1141,7 +1160,7 @@ static bool pointer_update(PointerState *pointer)
                     dy = 0;
                 }
             }
-            if (dx != 0 || dy != 0) {
+            if (pointer->tracking && (dx != 0 || dy != 0)) {
                 pointer->fx += (dx * SCREEN_W * POINTER_GAIN_NUM << POINTER_FIXED_SHIFT) / ((int) pointer->info->width * POINTER_GAIN_DEN);
                 pointer->fy -= (dy * SCREEN_H * POINTER_GAIN_NUM << POINTER_FIXED_SHIFT) / ((int) pointer->info->height * POINTER_GAIN_DEN);
                 pointer->x = clamp_int(pointer->fx >> POINTER_FIXED_SHIFT, 0, SCREEN_W - 1);
@@ -1150,15 +1169,21 @@ static bool pointer_update(PointerState *pointer)
                 pointer->fy = pointer->y << POINTER_FIXED_SHIFT;
                 pointer->moved = true;
             }
+            if (pointer->tracking) {
+                pointer->last_touch_x = report.x;
+                pointer->last_touch_y = report.y;
+            }
         }
         pointer->visible = true;
     } else {
         pointer->tracking = false;
+        if (current_down) {
+            pointer->visible = true;
+        }
     }
     /* Treat only the touchpad center click as a pointer activation.
      * Generic "pressed" also fires for directional pad presses, which should
      * not activate UI elements such as progress-bar seeking. */
-    current_down = (report.pressed && report.arrow == TPAD_ARROW_CLICK) ? true : false;
     click_edge = current_down && !pointer->down;
     pointer->down = current_down;
     return click_edge;
@@ -6858,7 +6883,6 @@ static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *direc
 {
     bool prev_up = false;
     bool prev_down = false;
-    bool prev_click = false;
     bool prev_enter = false;
     bool prev_esc = false;
     PointerState pointer;
@@ -6881,9 +6905,6 @@ static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *direc
         }
         if (key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) && selected + 1 < count) {
             selected++;
-        }
-        if (key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click)) {
-            pointer_click = true;
         }
         if (pointer_click && hovered_index >= 0 && (size_t) hovered_index < count) {
             int phase;
@@ -6985,7 +7006,6 @@ static int prompt_resume_position(
     bool prev_right = false;
     bool prev_enter = false;
     bool prev_esc = false;
-    bool prev_click = false;
     PointerState pointer;
     SDL_Rect shadow = {34, 24, 252, 192};
     SDL_Rect panel = {28, 18, 252, 192};
@@ -7061,9 +7081,6 @@ static int prompt_resume_position(
         if (key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right)) {
             selected_button = 1 - selected_button;
         }
-        if (key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click)) {
-            pointer_click = true;
-        }
         if (pointer_click) {
             if (pointer.x >= continue_button.x && pointer.x < continue_button.x + continue_button.w &&
                 pointer.y >= continue_button.y && pointer.y < continue_button.y + continue_button.h) {
@@ -7096,7 +7113,6 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     bool prev_right = false;
     bool prev_tab = false;
     bool prev_esc = false;
-    bool prev_click = false;
     bool prev_cat = false;
     bool prev_divide = false;
     bool prev_exp = false;
@@ -7283,7 +7299,6 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         bool memory_overlay_edge = key_pressed_edge(KEY_NSPIRE_M, &prev_m);
         bool debug_logging_edge = key_pressed_edge(KEY_NSPIRE_D, &prev_d);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
-        bool click_edge = key_pressed_edge(KEY_NSPIRE_CLICK, &prev_click);
         bool take_screenshot = false;
         bool tab_repeat_step = false;
 
@@ -7302,11 +7317,6 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         }
 
         if (pointer.moved || pointer_click) {
-            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
-            show_ui = true;
-        }
-        if (click_edge) {
-            pointer_click = true;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             show_ui = true;
         }
