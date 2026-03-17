@@ -557,6 +557,8 @@ static SDL_Surface *create_scaled_surface_from_surface(SDL_Surface *source, int 
 static const char *filename_from_path(const char *path);
 static bool decode_h264_frame_to_rgb565_buffer(Movie *movie, uint32_t frame_index, uint16_t *dst_pixels, size_t dst_pitch_pixels);
 static bool finish_h264_boundary_warmup(Movie *movie);
+static void invalidate_loaded_chunk_state(Movie *movie);
+static bool recover_failed_h264_playback_state(Movie *movie);
 static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, const PointerState *pointer, bool show_ui, uint32_t now_ms);
 static void clear_seek_bar_preview(SeekBarPreviewState *preview);
 static void clear_screenshot_preview(ScreenshotPreviewState *preview);
@@ -2654,6 +2656,9 @@ static bool prefetch_one_h264_same_chunk_frame(Movie *movie, uint32_t spare_ms, 
     if (find_h264_frame_slot(movie, next_frame)) {
         return false;
     }
+    if (h264_frame_ring_valid_count(movie) >= active_h264_frame_ring_capacity(movie)) {
+        return false;
+    }
 
     decode_guard_ms = h264_prefetch_decode_guard_ms(movie);
     if (deadline_ms != 0) {
@@ -2669,6 +2674,7 @@ static bool prefetch_one_h264_same_chunk_frame(Movie *movie, uint32_t spare_ms, 
             movie->diag_prefetch_frame_decode_fail_count++;
         }
         debug_tracef("prefetch rescue fail frame=%lu chunk=%d", (unsigned long) next_frame, current_chunk);
+        recover_failed_h264_playback_state(movie);
         return false;
     }
     decode_elapsed_ms = monotonic_clock_now_ms() - decode_start_ms;
@@ -4366,12 +4372,16 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
                 break;
             }
         }
+        if (h264_frame_ring_valid_count(movie) >= active_h264_frame_ring_capacity(movie)) {
+            break;
+        }
         decode_start_ms = monotonic_clock_now_ms();
         if (!decode_h264_frame(movie, next_frame, false, true)) {
             if (debug_should_collect_metrics()) {
                 movie->diag_prefetch_frame_decode_fail_count++;
             }
             debug_tracef("h264 predecode fail frame=%lu", (unsigned long) next_frame);
+            recover_failed_h264_playback_state(movie);
             break;
         }
         decode_elapsed_ms = monotonic_clock_now_ms() - decode_start_ms;
@@ -4435,6 +4445,9 @@ static void prefetch_h264_boundary_idr(Movie *movie, bool paused, uint32_t spare
         return;
     }
     if (find_h264_frame_slot(movie, next_frame)) {
+        return;
+    }
+    if (h264_frame_ring_valid_count(movie) + 1U >= active_h264_frame_ring_capacity(movie)) {
         return;
     }
     if (!prepare_h264_boundary_warmup(movie, next_chunk)) {
@@ -4834,6 +4847,37 @@ static void invalidate_loaded_chunk_state(Movie *movie)
     clear_h264_boundary_warmup(movie);
 }
 
+static bool recover_failed_h264_playback_state(Movie *movie)
+{
+    bool had_picture_params;
+    uint32_t full_width;
+    uint32_t full_height;
+    uint32_t crop_left;
+    uint32_t crop_top;
+    uint32_t crop_width;
+    uint32_t crop_height;
+
+    if (!movie || !movie_uses_h264(movie)) {
+        return false;
+    }
+
+    had_picture_params = movie->h264_headers_ready;
+    full_width = movie->h264_full_width;
+    full_height = movie->h264_full_height;
+    crop_left = movie->h264_crop_left;
+    crop_top = movie->h264_crop_top;
+    crop_width = movie->h264_crop_width;
+    crop_height = movie->h264_crop_height;
+    invalidate_loaded_chunk_state(movie);
+    if (!reset_h264_decoder(movie)) {
+        return false;
+    }
+    if (had_picture_params) {
+        store_h264_picture_params(movie, full_width, full_height, crop_left, crop_top, crop_width, crop_height);
+    }
+    return true;
+}
+
 static bool decode_to_frame(Movie *movie, uint32_t frame_index)
 {
     int chunk_index = movie_chunk_for_frame(movie, frame_index);
@@ -4910,6 +4954,13 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
         movie->diag_foreground_direct_decode_count++;
     }
     if (!decode_h264_frame(movie, frame_index, true, false)) {
+        debug_tracef("decode frame=%lu retry after h264 recovery", (unsigned long) frame_index);
+        if (recover_failed_h264_playback_state(movie) &&
+            decode_h264_frame(movie, frame_index, true, false)) {
+            movie->current_frame = frame_index;
+            discard_h264_frame_ring_before(movie, frame_index + 1U);
+            return true;
+        }
         return false;
     }
     movie->current_frame = frame_index;
