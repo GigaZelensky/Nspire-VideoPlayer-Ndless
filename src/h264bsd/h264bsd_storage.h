@@ -57,6 +57,11 @@ typedef struct
     u32 sliceId;
     u32 numDecodedMbs;
     u32 lastMbAddr;
+    u32 decodeInProgress;
+    u32 currMbAddr;
+    u32 skipRun;
+    u32 prevSkipped;
+    i32 qpY;
 } sliceStorage_t;
 
 /* structure to store parameters needed for access unit boundary checking */
@@ -137,6 +142,7 @@ typedef struct storage
     u8 *prevBufPointer;
     u32 prevBytesConsumed;
     strmData_t strm[1];
+    u32 macroblockBudget;
 
     /* macroblock layer structure, there is no need to store this but it
      * would have increased the stack size excessively and needed to be

@@ -46,6 +46,7 @@ enum {
     H264BSD_RDY,
     H264BSD_PIC_RDY,
     H264BSD_HDRS_RDY,
+    H264BSD_PENDING,
     H264BSD_ERROR,
     H264BSD_PARAM_SET_ERROR,
     H264BSD_MEMALLOC_ERROR
@@ -64,6 +65,7 @@ enum {
 u32 h264bsdInit(storage_t *pStorage, u32 noOutputReordering);
 u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
     u32 *readBytes);
+void h264bsdSetMacroblockBudget(storage_t *pStorage, u32 macroblockBudget);
 void h264bsdShutdown(storage_t *pStorage);
 
 u8* h264bsdNextOutputPicture(storage_t *pStorage, u32 *picId, u32 *isIdrPic, u32 *numErrMbs);

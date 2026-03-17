@@ -96,7 +96,8 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
     u32 prevSkipped;
     u32 currMbAddr;
     u32 moreMbs;
-    u32 mbCount;
+    u32 nextMbAddr;
+    u32 budget_active;
     i32 qpY;
     macroblockLayer_t *mbLayer;
 
@@ -111,23 +112,34 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
     data = (u8*)ALIGN(mbData, 16);
 
     mbLayer = pStorage->mbLayer;
+    budget_active = pStorage->macroblockBudget != 0U ? HANTRO_TRUE : HANTRO_FALSE;
 
-    currMbAddr = pSliceHeader->firstMbInSlice;
-    skipRun = 0;
-    prevSkipped = HANTRO_FALSE;
+    if (!pStorage->slice->decodeInProgress)
+    {
+        currMbAddr = pSliceHeader->firstMbInSlice;
+        skipRun = 0;
+        prevSkipped = HANTRO_FALSE;
 
-    /* increment slice index, will be one for decoding of the first slice of
-     * the picture */
-    pStorage->slice->sliceId++;
+        /* increment slice index, will be one for decoding of the first slice of
+         * the picture */
+        pStorage->slice->sliceId++;
 
-    /* lastMbAddr stores address of the macroblock that was last successfully
-     * decoded, needed for error handling */
-    pStorage->slice->lastMbAddr = 0;
+        /* lastMbAddr stores address of the macroblock that was last successfully
+         * decoded, needed for error handling */
+        pStorage->slice->lastMbAddr = 0;
 
-    mbCount = 0;
-    /* initial quantization parameter for the slice is obtained as the sum of
-     * initial QP for the picture and sliceQpDelta for the current slice */
-    qpY = (i32)pStorage->activePps->picInitQp + pSliceHeader->sliceQpDelta;
+        /* initial quantization parameter for the slice is obtained as the sum of
+         * initial QP for the picture and sliceQpDelta for the current slice */
+        qpY = (i32)pStorage->activePps->picInitQp + pSliceHeader->sliceQpDelta;
+        pStorage->slice->decodeInProgress = HANTRO_TRUE;
+    }
+    else
+    {
+        currMbAddr = pStorage->slice->currMbAddr;
+        skipRun = pStorage->slice->skipRun;
+        prevSkipped = pStorage->slice->prevSkipped;
+        qpY = pStorage->slice->qpY;
+    }
     do
     {
         /* primary picture and already decoded macroblock -> error */
@@ -191,10 +203,17 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
             return(tmp);
         }
 
-        /* increment macroblock count only for macroblocks that were decoded
-         * for the first time (redundant slices) */
+        /* count macroblocks only when they were decoded for the first time
+         * (redundant slices do not increase the total) */
         if (pStorage->mb[currMbAddr].decoded == 1)
-            mbCount++;
+        {
+            if (pStorage->slice->numDecodedMbs >= pStorage->picSizeInMbs)
+            {
+                EPRINT("Num decoded mbs");
+                return(HANTRO_NOK);
+            }
+            pStorage->slice->numDecodedMbs++;
+        }
 
         /* keep on processing as long as there is stream data left or
          * processing of macroblocks to be skipped based on the last skipRun is
@@ -207,25 +226,36 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
         if (IS_I_SLICE(pSliceHeader->sliceType))
             pStorage->slice->lastMbAddr = currMbAddr;
 
-        currMbAddr = h264bsdNextMbAddress(pStorage->sliceGroupMap,
-            pStorage->picSizeInMbs, currMbAddr);
-        /* data left in the buffer but no more macroblocks for current slice
-         * group -> error */
-        if (moreMbs && !currMbAddr)
+        if (budget_active)
         {
-            EPRINT("Next mb address");
-            return(HANTRO_NOK);
+            pStorage->macroblockBudget--;
         }
 
+        nextMbAddr = currMbAddr;
+        if (moreMbs)
+        {
+            nextMbAddr = h264bsdNextMbAddress(pStorage->sliceGroupMap,
+                pStorage->picSizeInMbs, currMbAddr);
+            /* data left in the buffer but no more macroblocks for current slice
+             * group -> error */
+            if (!nextMbAddr)
+            {
+                EPRINT("Next mb address");
+                return(HANTRO_NOK);
+            }
+            if (budget_active && pStorage->macroblockBudget == 0)
+            {
+                pStorage->slice->currMbAddr = nextMbAddr;
+                pStorage->slice->skipRun = skipRun;
+                pStorage->slice->prevSkipped = prevSkipped;
+                pStorage->slice->qpY = qpY;
+                return(HANTRO_PENDING);
+            }
+        }
+        currMbAddr = nextMbAddr;
+
     } while (moreMbs);
-
-    if ((pStorage->slice->numDecodedMbs + mbCount) > pStorage->picSizeInMbs)
-    {
-        EPRINT("Num decoded mbs");
-        return(HANTRO_NOK);
-    }
-
-    pStorage->slice->numDecodedMbs += mbCount;
+    pStorage->slice->decodeInProgress = HANTRO_FALSE;
 
     return(HANTRO_OK);
 

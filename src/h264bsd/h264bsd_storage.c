@@ -97,6 +97,7 @@ void h264bsdInitStorage(storage_t *pStorage)
 
     pStorage->activeSpsId = MAX_NUM_SEQ_PARAM_SETS;
     pStorage->activePpsId = MAX_NUM_PIC_PARAM_SETS;
+    pStorage->macroblockBudget = 0;
 
     pStorage->aub->firstCallFlag = HANTRO_TRUE;
 }
@@ -451,6 +452,12 @@ void h264bsdResetStorage(storage_t *pStorage)
 
     pStorage->slice->numDecodedMbs = 0;
     pStorage->slice->sliceId = 0;
+    pStorage->slice->decodeInProgress = HANTRO_FALSE;
+    pStorage->slice->currMbAddr = 0;
+    pStorage->slice->skipRun = 0;
+    pStorage->slice->prevSkipped = HANTRO_FALSE;
+    pStorage->slice->qpY = 0;
+    pStorage->macroblockBudget = 0;
 
     for (i = 0; i < pStorage->picSizeInMbs; i++)
     {

@@ -79,6 +79,8 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define H264_PREFETCH_NEXT_CHUNK_BRIDGE_FRAMES 6U
 #define H264_BOUNDARY_MISS_WINDOW_FRAMES 4U
 #define H264_PREFETCH_IO_PRIORITY_SLICE_MS 4U
+#define H264_PREFETCH_NEXT_CHUNK_IO_CATCHUP_FRAMES 20U
+#define H264_PREFETCH_SECOND_NEXT_CHUNK_WINDOW_FRAMES 32U
 #define H264_PREFETCH_DECODE_GUARD_DEFAULT_MS 16U
 #define H264_PREFETCH_DECODE_GUARD_MIN_MS 10U
 #define H264_PREFETCH_DECODE_GUARD_MAX_MS 22U
@@ -87,6 +89,9 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define H264_ACTIVE_PREFETCH_BACKOFF_LIGHT 0U
 #define H264_ACTIVE_PREFETCH_BACKOFF_HEAVY 1U
 #define H264_SAME_CHUNK_RESCUE_MIN_SPARE_MS 10U
+#define H264_NEXT_CHUNK_IDR_MIN_SPARE_MS 4U
+#define H264_NEXT_CHUNK_IDR_BUDGET_GUARD_MS 3U
+#define H264_NEXT_CHUNK_IDR_DEFAULT_MBS_PER_MS_Q8 640U
 #define FRAME_PACING_SPIN_MS 2U
 #define MONOTONIC_TIMER_VALUE_ADDR 0x900C0004U
 #define MONOTONIC_TIMER_CONTROL_ADDR 0x900C0008U
@@ -284,6 +289,23 @@ typedef struct {
 } H264FrameSlot;
 
 typedef struct {
+    storage_t *decoder;
+    bool decoder_initialized;
+    int chunk_index;
+    int decoded_local_frame;
+    bool chunk_dirty;
+    bool frame_ready;
+    const uint8_t *chunk_storage;
+    size_t chunk_storage_size;
+    uint8_t *chunk_bytes;
+    size_t chunk_size;
+    uint32_t *frame_offsets;
+    size_t consumed_bytes;
+    unsigned zero_advance_retries;
+    uint16_t avg_mbs_per_ms_q8;
+} H264BoundaryWarmup;
+
+typedef struct {
     FILE *file;
     long current_file_pos;
     MovieHeader header;
@@ -358,6 +380,7 @@ typedef struct {
     size_t h264_frame_bytes;
     size_t h264_frame_ring_capacity;
     H264FrameSlot h264_frame_ring[H264_FRAME_RING_MAX_COUNT];
+    H264BoundaryWarmup h264_boundary_warmup;
 } Movie;
 
 typedef struct {
@@ -481,18 +504,32 @@ static bool decode_h264_frame(
 static bool load_chunk(Movie *movie, int chunk_index);
 static bool prefetch_chunk(Movie *movie, int chunk_index);
 static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks, int max_new_distance);
+static PrefetchedChunk *find_prefetched_chunk(Movie *movie, int chunk_index);
 static void clear_prefetched_chunk(PrefetchedChunk *chunk);
 static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk);
 static void prefetch_do_work(Movie *movie, int current_chunk, int max_work_distance, uint32_t deadline_ms, bool single_step);
 static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, uint32_t deadline_ms);
+static void prefetch_h264_boundary_idr(Movie *movie, bool paused, uint32_t spare_ms, uint32_t deadline_ms);
 static bool prefetch_one_h264_same_chunk_frame(Movie *movie, uint32_t spare_ms, uint32_t deadline_ms) __attribute__((unused));
 static int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index);
 static int64_t h264_decoded_global_frame(const Movie *movie);
 static bool next_chunk_needs_prefetch(const Movie *movie, int current_chunk);
+static bool next_chunk_prefetched_ready(Movie *movie, int current_chunk);
 static uint32_t next_chunk_prefetch_guard_frames(const Movie *movie, int current_chunk);
+static bool should_run_h264_boundary_warmup(Movie *movie, int current_chunk);
+static bool should_prioritize_h264_boundary_warmup(Movie *movie, int current_chunk);
+static bool should_accelerate_next_chunk_io(Movie *movie, int current_chunk);
+static bool should_prefetch_second_next_chunk(Movie *movie, int current_chunk);
 static size_t active_h264_frame_ring_capacity(const Movie *movie);
 static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spare_ms);
 static void discard_h264_frame_ring_before(Movie *movie, uint32_t first_frame_to_keep);
+static uint32_t h264_boundary_total_mbs(const Movie *movie, const H264BoundaryWarmup *warmup);
+static void update_h264_boundary_warmup_rate(H264BoundaryWarmup *warmup, uint32_t elapsed_ms, uint32_t decoded_mbs);
+static uint32_t h264_boundary_warmup_budget(const Movie *movie, const H264BoundaryWarmup *warmup, uint32_t spare_ms);
+static void clear_h264_boundary_warmup(Movie *movie);
+static bool prepare_h264_boundary_warmup(Movie *movie, int chunk_index);
+static bool step_h264_boundary_warmup(Movie *movie, uint32_t macroblock_budget, uint32_t *out_elapsed_ms, uint32_t *out_decoded_mbs);
+static bool activate_h264_boundary_warmup(Movie *movie);
 static void free_fonts(Fonts *fonts);
 static uint32_t monotonic_clock_now_ms(void);
 static void debug_dump_session(const char *path, const Movie *movie, const char *reason);
@@ -519,6 +556,7 @@ static SDL_Surface *create_rgb565_surface(int width, int height);
 static SDL_Surface *create_scaled_surface_from_surface(SDL_Surface *source, int max_width, int max_height);
 static const char *filename_from_path(const char *path);
 static bool decode_h264_frame_to_rgb565_buffer(Movie *movie, uint32_t frame_index, uint16_t *dst_pixels, size_t dst_pitch_pixels);
+static bool finish_h264_boundary_warmup(Movie *movie);
 static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, const PointerState *pointer, bool show_ui, uint32_t now_ms);
 static void clear_seek_bar_preview(SeekBarPreviewState *preview);
 static void clear_screenshot_preview(ScreenshotPreviewState *preview);
@@ -700,6 +738,7 @@ static void clear_all_prefetched_chunks(Movie *movie)
     if (!movie) {
         return;
     }
+    clear_h264_boundary_warmup(movie);
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
         clear_prefetched_chunk(&movie->prefetched[index]);
     }
@@ -752,6 +791,9 @@ static bool ensure_prefetch_budget(Movie *movie, int requested_chunk, size_t req
             (unsigned long) total_bytes,
             (unsigned long) required_bytes
         );
+        if (movie->h264_boundary_warmup.chunk_index == victim->chunk_index) {
+            clear_h264_boundary_warmup(movie);
+        }
         clear_prefetched_chunk(victim);
         total_bytes = total_prefetched_chunk_bytes(movie);
     }
@@ -1552,11 +1594,18 @@ static void destroy_movie(Movie *movie)
     free(movie->framebuffer);
     free(movie->chunk_storage);
     free(movie->frame_offsets);
+    free(movie->h264_boundary_warmup.frame_offsets);
     if (movie->h264_decoder) {
         if (movie->h264_decoder_initialized) {
             h264bsdShutdown(movie->h264_decoder);
         }
         h264bsdFree(movie->h264_decoder);
+    }
+    if (movie->h264_boundary_warmup.decoder) {
+        if (movie->h264_boundary_warmup.decoder_initialized) {
+            h264bsdShutdown(movie->h264_boundary_warmup.decoder);
+        }
+        h264bsdFree(movie->h264_boundary_warmup.decoder);
     }
     for (h264_ring_index = 0; h264_ring_index < H264_FRAME_RING_MAX_COUNT; ++h264_ring_index) {
         free(movie->h264_frame_ring[h264_ring_index].allocation);
@@ -1573,6 +1622,8 @@ static void destroy_movie(Movie *movie)
         movie->h264_frame_ring[h264_ring_index].frame_index = UINT32_MAX;
     }
     movie->decoded_local_frame = -1;
+    movie->h264_boundary_warmup.chunk_index = -1;
+    movie->h264_boundary_warmup.decoded_local_frame = -1;
 }
 
 static bool init_fonts(Fonts *fonts)
@@ -2656,22 +2707,141 @@ static int64_t h264_decoded_global_frame(const Movie *movie)
     return (int64_t) movie->chunk_index[movie->loaded_chunk].first_frame + movie->decoded_local_frame;
 }
 
+static bool reset_h264_storage_decoder(storage_t *decoder, bool *initialized)
+{
+    if (!decoder || !initialized) {
+        debug_failf("h264 decoder reset failed: decoder missing");
+        return false;
+    }
+    if (*initialized) {
+        h264bsdShutdown(decoder);
+    }
+    if (h264bsdInit(decoder, HANTRO_TRUE) != HANTRO_OK) {
+        *initialized = false;
+        debug_failf("h264 decoder init failed");
+        return false;
+    }
+    *initialized = true;
+    return true;
+}
+
+static bool read_h264_picture_params(
+    const Movie *movie,
+    storage_t *decoder,
+    uint32_t *full_width,
+    uint32_t *full_height,
+    uint32_t *crop_left,
+    uint32_t *crop_top,
+    uint32_t *crop_width,
+    uint32_t *crop_height
+)
+{
+    u32 cropping_flag = 0;
+    u32 out_crop_left = 0;
+    u32 out_crop_width = 0;
+    u32 out_crop_top = 0;
+    u32 out_crop_height = 0;
+    u32 out_full_width;
+    u32 out_full_height;
+
+    if (!movie || !decoder || !full_width || !full_height ||
+        !crop_left || !crop_top || !crop_width || !crop_height) {
+        debug_failf("h264 picture params failed: decoder missing");
+        return false;
+    }
+
+    out_full_width = h264bsdPicWidth(decoder) * 16U;
+    out_full_height = h264bsdPicHeight(decoder) * 16U;
+    h264bsdCroppingParams(decoder, &cropping_flag, &out_crop_left, &out_crop_width, &out_crop_top, &out_crop_height);
+    if (!cropping_flag) {
+        out_crop_left = 0;
+        out_crop_top = 0;
+        out_crop_width = out_full_width;
+        out_crop_height = out_full_height;
+    }
+    if (out_crop_width != movie->header.video_width || out_crop_height != movie->header.video_height) {
+        debug_failf(
+            "h264 size mismatch crop=%lux%lu header=%ux%u",
+            (unsigned long) out_crop_width,
+            (unsigned long) out_crop_height,
+            (unsigned) movie->header.video_width,
+            (unsigned) movie->header.video_height
+        );
+        return false;
+    }
+
+    *full_width = out_full_width;
+    *full_height = out_full_height;
+    *crop_left = out_crop_left;
+    *crop_top = out_crop_top;
+    *crop_width = out_crop_width;
+    *crop_height = out_crop_height;
+    return true;
+}
+
+static void store_h264_picture_params(
+    Movie *movie,
+    uint32_t full_width,
+    uint32_t full_height,
+    uint32_t crop_left,
+    uint32_t crop_top,
+    uint32_t crop_width,
+    uint32_t crop_height
+)
+{
+    if (!movie) {
+        return;
+    }
+
+    movie->h264_full_width = full_width;
+    movie->h264_full_height = full_height;
+    movie->h264_crop_left = crop_left;
+    movie->h264_crop_top = crop_top;
+    movie->h264_crop_width = crop_width;
+    movie->h264_crop_height = crop_height;
+    movie->h264_headers_ready = true;
+}
+
+static bool sync_h264_picture_params(Movie *movie, storage_t *decoder, bool force_commit)
+{
+    uint32_t full_width = 0;
+    uint32_t full_height = 0;
+    uint32_t crop_left = 0;
+    uint32_t crop_top = 0;
+    uint32_t crop_width = 0;
+    uint32_t crop_height = 0;
+
+    if (!movie || !decoder) {
+        debug_failf("h264 picture params failed: decoder missing");
+        return false;
+    }
+    if (!read_h264_picture_params(
+            movie,
+            decoder,
+            &full_width,
+            &full_height,
+            &crop_left,
+            &crop_top,
+            &crop_width,
+            &crop_height)) {
+        return false;
+    }
+    if (force_commit || !movie->h264_headers_ready) {
+        store_h264_picture_params(movie, full_width, full_height, crop_left, crop_top, crop_width, crop_height);
+    }
+    return true;
+}
+
 static bool reset_h264_decoder(Movie *movie)
 {
     if (!movie || !movie->h264_decoder) {
         debug_failf("h264 decoder reset failed: decoder missing");
         return false;
     }
-    if (movie->h264_decoder_initialized) {
-        h264bsdShutdown(movie->h264_decoder);
-    }
-    if (h264bsdInit(movie->h264_decoder, HANTRO_TRUE) != HANTRO_OK) {
-        movie->h264_decoder_initialized = false;
-        debug_failf("h264 decoder init failed");
+    if (!reset_h264_storage_decoder(movie->h264_decoder, &movie->h264_decoder_initialized)) {
         return false;
     }
     movie->h264_headers_ready = false;
-    movie->h264_decoder_initialized = true;
     movie->h264_full_width = 0;
     movie->h264_full_height = 0;
     movie->h264_crop_left = 0;
@@ -2679,46 +2849,6 @@ static bool reset_h264_decoder(Movie *movie)
     movie->h264_crop_width = 0;
     movie->h264_crop_height = 0;
     movie->h264_chunk_dirty = false;
-    return true;
-}
-
-static bool refresh_h264_picture_params(Movie *movie)
-{
-    u32 cropping_flag = 0;
-    u32 crop_left = 0;
-    u32 crop_width = 0;
-    u32 crop_top = 0;
-    u32 crop_height = 0;
-
-    if (!movie || !movie->h264_decoder) {
-        debug_failf("h264 picture params failed: decoder missing");
-        return false;
-    }
-
-    movie->h264_full_width = h264bsdPicWidth(movie->h264_decoder) * 16U;
-    movie->h264_full_height = h264bsdPicHeight(movie->h264_decoder) * 16U;
-    h264bsdCroppingParams(movie->h264_decoder, &cropping_flag, &crop_left, &crop_width, &crop_top, &crop_height);
-    if (!cropping_flag) {
-        crop_left = 0;
-        crop_top = 0;
-        crop_width = movie->h264_full_width;
-        crop_height = movie->h264_full_height;
-    }
-    if (crop_width != movie->header.video_width || crop_height != movie->header.video_height) {
-        debug_failf(
-            "h264 size mismatch crop=%lux%lu header=%ux%u",
-            (unsigned long) crop_width,
-            (unsigned long) crop_height,
-            (unsigned) movie->header.video_width,
-            (unsigned) movie->header.video_height
-        );
-        return false;
-    }
-    movie->h264_crop_left = crop_left;
-    movie->h264_crop_top = crop_top;
-    movie->h264_crop_width = crop_width;
-    movie->h264_crop_height = crop_height;
-    movie->h264_headers_ready = true;
     return true;
 }
 
@@ -3160,6 +3290,155 @@ static bool blit_h264_frame_slot(Movie *movie, const H264FrameSlot *slot)
     );
 }
 
+static uint8_t *take_h264_output_picture(storage_t *decoder, const char *context)
+{
+    const char *label = context ? context : "h264";
+    u32 pic_id = 0;
+    u32 is_idr_pic = 0;
+    u32 num_err_mbs = 0;
+    uint8_t *picture;
+
+    if (!decoder) {
+        debug_failf("%s decoder missing", label);
+        return NULL;
+    }
+
+    picture = h264bsdNextOutputPicture(decoder, &pic_id, &is_idr_pic, &num_err_mbs);
+    if (!picture) {
+        debug_failf("%s picture ready but no output picture", label);
+        return NULL;
+    }
+    return picture;
+}
+
+static bool cache_h264_picture(Movie *movie, uint32_t frame_index, const uint8_t *picture, const char *context)
+{
+    const char *label = context ? context : "h264";
+    H264FrameSlot *slot;
+
+    if (!movie || !picture) {
+        debug_failf("%s frame cache invalid input frame=%lu", label, (unsigned long) frame_index);
+        return false;
+    }
+
+    slot = reserve_h264_frame_slot(movie, frame_index);
+    if (!slot) {
+        debug_tracef("%s frame ring full frame=%lu", label, (unsigned long) frame_index);
+        return false;
+    }
+    if (!copy_h264_picture_to_slot(movie, slot, picture)) {
+        debug_failf("%s frame copy failed frame=%lu", label, (unsigned long) frame_index);
+        return false;
+    }
+    return true;
+}
+
+static bool pump_h264_access_unit(
+    Movie *movie,
+    storage_t *decoder,
+    uint8_t *frame_data,
+    size_t frame_size,
+    size_t *inout_consumed,
+    unsigned *inout_zero_advance_retries,
+    uint32_t macroblock_budget,
+    bool force_commit_picture_params,
+    const char *context,
+    bool *out_picture_ready,
+    bool *out_pending,
+    uint8_t **out_picture
+)
+{
+    const char *label = context ? context : "h264";
+
+    if (out_picture_ready) {
+        *out_picture_ready = false;
+    }
+    if (out_pending) {
+        *out_pending = false;
+    }
+    if (out_picture) {
+        *out_picture = NULL;
+    }
+    if (!movie || !decoder || !frame_data || frame_size == 0 ||
+        !inout_consumed || !inout_zero_advance_retries ||
+        !out_picture_ready || !out_pending || !out_picture) {
+        debug_failf("%s access-unit decode invalid input size=%lu", label, (unsigned long) frame_size);
+        return false;
+    }
+
+    h264bsdSetMacroblockBudget(decoder, macroblock_budget);
+
+    while (*inout_consumed < frame_size) {
+        u32 read_bytes = 0;
+        u32 result = h264bsdDecode(
+            decoder,
+            frame_data + *inout_consumed,
+            (u32) (frame_size - *inout_consumed),
+            0,
+            &read_bytes
+        );
+
+        if (result == H264BSD_HDRS_RDY) {
+            if (!sync_h264_picture_params(movie, decoder, force_commit_picture_params)) {
+                return false;
+            }
+        } else if (result == H264BSD_PIC_RDY) {
+            if (!movie->h264_headers_ready && !sync_h264_picture_params(movie, decoder, false)) {
+                return false;
+            }
+            *out_picture = take_h264_output_picture(decoder, label);
+            if (!(*out_picture)) {
+                return false;
+            }
+            *out_picture_ready = true;
+        } else if (result == H264BSD_PENDING) {
+            *out_pending = true;
+        } else if (result != H264BSD_RDY) {
+            debug_failf("%s decode error result=%lu read=%lu", label, (unsigned long) result, (unsigned long) read_bytes);
+            return false;
+        }
+
+        if (read_bytes == 0U) {
+            if (result == H264BSD_HDRS_RDY && *inout_zero_advance_retries < 8U) {
+                (*inout_zero_advance_retries)++;
+                debug_tracef(
+                    "%s hdrs ready retry=%u consumed=%lu size=%lu",
+                    label,
+                    *inout_zero_advance_retries,
+                    (unsigned long) *inout_consumed,
+                    (unsigned long) frame_size
+                );
+                continue;
+            }
+            if (!(*out_picture_ready) && !(*out_pending)) {
+                debug_failf(
+                    "%s decode stalled with zero-byte advance result=%lu retries=%u consumed=%lu size=%lu",
+                    label,
+                    (unsigned long) result,
+                    *inout_zero_advance_retries,
+                    (unsigned long) *inout_consumed,
+                    (unsigned long) frame_size
+                );
+                return false;
+            }
+            return true;
+        }
+
+        *inout_zero_advance_retries = 0U;
+        *inout_consumed += read_bytes;
+
+        if (*out_picture_ready || *out_pending) {
+            return true;
+        }
+        if (macroblock_budget > 0U && decoder->macroblockBudget == 0U) {
+            *out_pending = true;
+            return true;
+        }
+    }
+
+    return *out_picture_ready;
+}
+
 static bool decode_h264_access_unit_to_target(
     Movie *movie,
     uint8_t *frame_data,
@@ -3172,81 +3451,44 @@ static bool decode_h264_access_unit_to_target(
 {
     size_t consumed = 0;
     bool picture_ready = false;
+    bool pending = false;
     unsigned zero_advance_retries = 0;
+    uint8_t *picture = NULL;
 
-    if (!movie || !movie->h264_decoder || !frame_data || frame_size == 0) {
-        debug_failf("h264 access-unit decode invalid input size=%lu", (unsigned long) frame_size);
+    if (!movie || !movie->h264_decoder) {
+        debug_failf("h264 access-unit decode invalid decoder");
         return false;
     }
-
-    while (consumed < frame_size) {
-        u32 read_bytes = 0;
-        u32 result = h264bsdDecode(movie->h264_decoder, frame_data + consumed, (u32) (frame_size - consumed), 0, &read_bytes);
-
-        if (result == H264BSD_HDRS_RDY) {
-            if (!refresh_h264_picture_params(movie)) {
-                return false;
-            }
-        } else if (result == H264BSD_PIC_RDY) {
-            u32 pic_id = 0;
-            u32 is_idr_pic = 0;
-            u32 num_err_mbs = 0;
-            uint8_t *picture = h264bsdNextOutputPicture(movie->h264_decoder, &pic_id, &is_idr_pic, &num_err_mbs);
-            if (!picture) {
-                debug_failf("h264 picture ready but no output picture");
-                return false;
-            }
-            if (!movie->h264_headers_ready && !refresh_h264_picture_params(movie)) {
-                return false;
-            }
-            if (store_prefetched) {
-                H264FrameSlot *slot = reserve_h264_frame_slot(movie, frame_index);
-                if (!slot) {
-                    debug_tracef("h264 frame ring full frame=%lu", (unsigned long) frame_index);
-                    return false;
-                }
-                if (!copy_h264_picture_to_slot(movie, slot, picture)) {
-                    debug_failf("h264 frame ring copy failed");
-                    return false;
-                }
-            }
-            if (dst_pixels && !blit_h264_picture_to_target(movie, picture, dst_pixels, dst_pitch_pixels)) {
-                debug_failf("h264 blit failed");
-                return false;
-            }
-            picture_ready = true;
-        } else if (result != H264BSD_RDY) {
-            debug_failf("h264 decode error result=%lu read=%lu", (unsigned long) result, (unsigned long) read_bytes);
-            return false;
-        }
-
-        if (read_bytes == 0) {
-            if (result == H264BSD_HDRS_RDY && zero_advance_retries < 8U) {
-                zero_advance_retries++;
-                debug_tracef(
-                    "h264 hdrs ready retry=%u consumed=%lu size=%lu",
-                    zero_advance_retries,
-                    (unsigned long) consumed,
-                    (unsigned long) frame_size
-                );
-                continue;
-            }
-            if (!picture_ready) {
-                debug_failf(
-                    "h264 decode stalled with zero-byte advance result=%lu retries=%u consumed=%lu size=%lu",
-                    (unsigned long) result,
-                    zero_advance_retries,
-                    (unsigned long) consumed,
-                    (unsigned long) frame_size
-                );
-            }
-            return picture_ready;
-        }
-        zero_advance_retries = 0;
-        consumed += read_bytes;
+    if (!pump_h264_access_unit(
+            movie,
+            movie->h264_decoder,
+            frame_data,
+            frame_size,
+            &consumed,
+            &zero_advance_retries,
+            0U,
+            true,
+            "h264",
+            &picture_ready,
+            &pending,
+            &picture)) {
+        return false;
     }
-
-    return picture_ready;
+    if (pending) {
+        debug_failf("h264 decode yielded unexpectedly");
+        return false;
+    }
+    if (!picture_ready || !picture) {
+        return false;
+    }
+    if (store_prefetched && !cache_h264_picture(movie, frame_index, picture, "h264")) {
+        return false;
+    }
+    if (dst_pixels && !blit_h264_picture_to_target(movie, picture, dst_pixels, dst_pitch_pixels)) {
+        debug_failf("h264 blit failed");
+        return false;
+    }
+    return true;
 }
 
 static bool decode_h264_access_unit(
@@ -3269,47 +3511,92 @@ static bool decode_h264_access_unit(
     );
 }
 
+static bool configure_chunk_view_from_storage(
+    const Movie *movie,
+    int chunk_index,
+    const uint8_t *chunk_storage,
+    size_t chunk_storage_size,
+    uint32_t **out_frame_offsets,
+    uint8_t **out_chunk_bytes,
+    size_t *out_chunk_size
+)
+{
+    const ChunkIndexEntry *entry;
+    size_t local_offset;
+    size_t table_bytes;
+    size_t header_size;
+    uint32_t *frame_offsets = NULL;
+    uint8_t *chunk_bytes = NULL;
+    size_t chunk_size = 0;
+    uint32_t payload_size;
+
+    if (!movie || !chunk_storage || !out_frame_offsets || !out_chunk_bytes || !out_chunk_size ||
+        chunk_index < 0 || (uint32_t) chunk_index >= movie->header.chunk_count) {
+        return false;
+    }
+    entry = movie->chunk_index + chunk_index;
+    local_offset = (size_t) entry->frame_table_offset;
+    table_bytes = (size_t) entry->frame_count * sizeof(uint32_t);
+    header_size = 4U + table_bytes;
+
+    if (local_offset + header_size > chunk_storage_size) {
+        debug_failf(
+            "chunk view invalid table chunk=%d table=%lu storage=%lu",
+            chunk_index,
+            (unsigned long) entry->frame_table_offset,
+            (unsigned long) chunk_storage_size
+        );
+        return false;
+    }
+    payload_size = read_le32(chunk_storage + local_offset);
+    if (local_offset + header_size + payload_size > chunk_storage_size) {
+        debug_failf(
+            "chunk view payload overflow chunk=%d payload=%lu table=%lu storage=%lu",
+            chunk_index,
+            (unsigned long) payload_size,
+            (unsigned long) entry->frame_table_offset,
+            (unsigned long) chunk_storage_size
+        );
+        return false;
+    }
+    frame_offsets = (uint32_t *) calloc((size_t) entry->frame_count, sizeof(uint32_t));
+    if (!frame_offsets) {
+        debug_failf("chunk view frame offset alloc failed chunk=%d count=%u", chunk_index, (unsigned) entry->frame_count);
+        return false;
+    }
+    memcpy(frame_offsets, chunk_storage + local_offset + 4U, table_bytes);
+    chunk_bytes = (uint8_t *) chunk_storage + local_offset + header_size;
+    chunk_size = payload_size;
+    *out_frame_offsets = frame_offsets;
+    *out_chunk_bytes = chunk_bytes;
+    *out_chunk_size = chunk_size;
+    return true;
+}
+
 static bool configure_chunk_view(Movie *movie, int chunk_index)
 {
-    const ChunkIndexEntry *entry = movie->chunk_index + chunk_index;
-    size_t local_offset = (size_t) entry->frame_table_offset;
-    size_t table_bytes = (size_t) entry->frame_count * sizeof(uint32_t);
-    size_t header_size = 4U + table_bytes;
-    uint32_t payload_size;
+    uint32_t *frame_offsets = NULL;
+    uint8_t *chunk_bytes = NULL;
+    size_t chunk_size = 0;
 
     free(movie->frame_offsets);
     movie->frame_offsets = NULL;
     movie->chunk_bytes = NULL;
     movie->chunk_size = 0;
 
-    if (!movie->chunk_storage || local_offset + header_size > movie->chunk_storage_size) {
-        debug_failf(
-            "chunk view invalid table chunk=%d table=%lu storage=%lu",
+    if (!configure_chunk_view_from_storage(
+            movie,
             chunk_index,
-            (unsigned long) entry->frame_table_offset,
-            (unsigned long) movie->chunk_storage_size
-        );
+            movie->chunk_storage,
+            movie->chunk_storage_size,
+            &frame_offsets,
+            &chunk_bytes,
+            &chunk_size)) {
         return false;
     }
-    payload_size = read_le32(movie->chunk_storage + local_offset);
-    if (local_offset + header_size + payload_size > movie->chunk_storage_size) {
-        debug_failf(
-            "chunk view payload overflow chunk=%d payload=%lu table=%lu storage=%lu",
-            chunk_index,
-            (unsigned long) payload_size,
-            (unsigned long) entry->frame_table_offset,
-            (unsigned long) movie->chunk_storage_size
-        );
-        return false;
-    }
-    movie->frame_offsets = (uint32_t *) calloc((size_t) entry->frame_count, sizeof(uint32_t));
-    if (!movie->frame_offsets) {
-        debug_failf("chunk view frame offset alloc failed chunk=%d count=%u", chunk_index, (unsigned) entry->frame_count);
-        return false;
-    }
-    memcpy(movie->frame_offsets, movie->chunk_storage + local_offset + 4U, table_bytes);
-    movie->chunk_bytes = movie->chunk_storage + local_offset + header_size;
-    movie->chunk_size = payload_size;
+    movie->frame_offsets = frame_offsets;
+    movie->chunk_bytes = chunk_bytes;
+    movie->chunk_size = chunk_size;
     return true;
 }
 
@@ -3493,6 +3780,10 @@ static bool load_chunk_from_file(Movie *movie, int chunk_index, bool allow_prefe
 {
     const ChunkIndexEntry *entry = movie->chunk_index + chunk_index;
 
+    if (movie && movie->h264_boundary_warmup.chunk_index == chunk_index) {
+        clear_h264_boundary_warmup(movie);
+    }
+
 retry:
     free(movie->chunk_storage);
     movie->chunk_storage = NULL;
@@ -3598,6 +3889,13 @@ static bool load_chunk(Movie *movie, int chunk_index)
     entry = movie->chunk_index + chunk_index;
     prefetched = find_prefetched_chunk(movie, chunk_index);
     if (prefetched) {
+        if (movie->h264_boundary_warmup.chunk_index == chunk_index) {
+            clear_h264_boundary_warmup(movie);
+            prefetched = find_prefetched_chunk(movie, chunk_index);
+            if (!prefetched) {
+                return load_chunk_from_file(movie, chunk_index, true);
+            }
+        }
         if (prefetched->state != PREFETCH_READY) {
             if (!prefetch_finish_chunk(movie, prefetched)) {
                 debug_tracef(
@@ -3675,6 +3973,9 @@ static bool prefetch_chunk(Movie *movie, int chunk_index)
                 slot = &movie->prefetched[index];
             }
         }
+        if (movie->h264_boundary_warmup.chunk_index == slot->chunk_index) {
+            clear_h264_boundary_warmup(movie);
+        }
         clear_prefetched_chunk(slot);
     }
 
@@ -3684,6 +3985,9 @@ static bool prefetch_chunk(Movie *movie, int chunk_index)
     }
     if (!ensure_app_memory_headroom(movie, entry->unpacked_size, H264_PREFETCH_MIN_READY_FRAMES)) {
         return false;
+    }
+    if (movie->h264_boundary_warmup.chunk_index == slot->chunk_index) {
+        clear_h264_boundary_warmup(movie);
     }
     clear_prefetched_chunk(slot);
     slot->chunk_storage = (uint8_t *) malloc(entry->unpacked_size);
@@ -3750,6 +4054,9 @@ static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks, 
         int wanted_max = current_chunk + PREFETCH_CHUNK_COUNT;
         if (movie->prefetched[index].chunk_index >= 0 &&
             (movie->prefetched[index].chunk_index < wanted_min || movie->prefetched[index].chunk_index > wanted_max)) {
+            if (movie->h264_boundary_warmup.chunk_index == movie->prefetched[index].chunk_index) {
+                clear_h264_boundary_warmup(movie);
+            }
             clear_prefetched_chunk(&movie->prefetched[index]);
         }
     }
@@ -3783,6 +4090,9 @@ static void prefetch_do_work(Movie *movie, int current_chunk, int max_work_dista
                 (int) slot->state,
                 (unsigned long) slot->read_offset
             );
+            if (movie->h264_boundary_warmup.chunk_index == slot->chunk_index) {
+                clear_h264_boundary_warmup(movie);
+            }
             clear_prefetched_chunk(slot);
             break;
         }
@@ -3851,6 +4161,22 @@ static bool next_chunk_needs_prefetch(const Movie *movie, int current_chunk)
     return true;
 }
 
+static bool next_chunk_prefetched_ready(Movie *movie, int current_chunk)
+{
+    PrefetchedChunk *prefetched;
+    int next_chunk = current_chunk + 1;
+
+    if (!movie || current_chunk < 0 || (uint32_t) next_chunk >= movie->header.chunk_count) {
+        return false;
+    }
+    if (movie->loaded_chunk == next_chunk) {
+        return false;
+    }
+
+    prefetched = find_prefetched_chunk(movie, next_chunk);
+    return prefetched != NULL && prefetched->state == PREFETCH_READY && prefetched->chunk_storage != NULL;
+}
+
 static uint32_t next_chunk_prefetch_guard_frames(const Movie *movie, int current_chunk)
 {
     const ChunkIndexEntry *entry;
@@ -3870,6 +4196,92 @@ static uint32_t next_chunk_prefetch_guard_frames(const Movie *movie, int current
         guard_frames += 4U;
     }
     return guard_frames;
+}
+
+static bool should_run_h264_boundary_warmup(Movie *movie, int current_chunk)
+{
+    H264BoundaryWarmup *warmup;
+    int next_chunk = current_chunk + 1;
+
+    if (!movie || !movie_uses_h264(movie) || current_chunk < 0 ||
+        (uint32_t) current_chunk >= movie->header.chunk_count ||
+        (uint32_t) next_chunk >= movie->header.chunk_count) {
+        return false;
+    }
+
+    warmup = &movie->h264_boundary_warmup;
+    if (warmup->chunk_index == next_chunk) {
+        return !warmup->frame_ready;
+    }
+    return next_chunk_prefetched_ready(movie, current_chunk);
+}
+
+static bool should_prioritize_h264_boundary_warmup(Movie *movie, int current_chunk)
+{
+    const ChunkIndexEntry *entry;
+    uint32_t frames_remaining;
+
+    if (!should_run_h264_boundary_warmup(movie, current_chunk)) {
+        return false;
+    }
+
+    entry = movie->chunk_index + current_chunk;
+    if (movie->current_frame < entry->first_frame) {
+        return true;
+    }
+
+    frames_remaining = (entry->first_frame + entry->frame_count) - movie->current_frame;
+    return frames_remaining <= next_chunk_prefetch_guard_frames(movie, current_chunk);
+}
+
+static bool should_accelerate_next_chunk_io(Movie *movie, int current_chunk)
+{
+    const ChunkIndexEntry *entry;
+    PrefetchedChunk *prefetched;
+    uint32_t frames_remaining;
+    uint32_t catchup_window;
+    int next_chunk = current_chunk + 1;
+
+    if (!movie || !movie_uses_h264(movie) || current_chunk < 0 ||
+        (uint32_t) current_chunk >= movie->header.chunk_count ||
+        (uint32_t) next_chunk >= movie->header.chunk_count) {
+        return false;
+    }
+
+    prefetched = find_prefetched_chunk(movie, next_chunk);
+    if (!prefetched || prefetched->state != PREFETCH_READING || prefetched->chunk_storage == NULL) {
+        return false;
+    }
+
+    entry = movie->chunk_index + current_chunk;
+    if (movie->current_frame < entry->first_frame) {
+        return true;
+    }
+
+    frames_remaining = (entry->first_frame + entry->frame_count) - movie->current_frame;
+    catchup_window = next_chunk_prefetch_guard_frames(movie, current_chunk) + H264_PREFETCH_NEXT_CHUNK_IO_CATCHUP_FRAMES;
+    return frames_remaining <= catchup_window;
+}
+
+static bool should_prefetch_second_next_chunk(Movie *movie, int current_chunk)
+{
+    const ChunkIndexEntry *entry;
+    uint32_t frames_remaining;
+    int second_next_chunk = current_chunk + 2;
+
+    if (!movie || !movie_uses_h264(movie) || current_chunk < 0 ||
+        (uint32_t) current_chunk >= movie->header.chunk_count ||
+        (uint32_t) second_next_chunk >= movie->header.chunk_count) {
+        return false;
+    }
+
+    entry = movie->chunk_index + current_chunk;
+    if (movie->current_frame < entry->first_frame) {
+        return true;
+    }
+
+    frames_remaining = (entry->first_frame + entry->frame_count) - movie->current_frame;
+    return frames_remaining <= H264_PREFETCH_SECOND_NEXT_CHUNK_WINDOW_FRAMES;
 }
 
 static bool should_prioritize_next_chunk_io(const Movie *movie, int current_chunk)
@@ -3986,6 +4398,85 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
     }
 }
 
+static void prefetch_h264_boundary_idr(Movie *movie, bool paused, uint32_t spare_ms, uint32_t deadline_ms)
+{
+    H264BoundaryWarmup *warmup;
+    int current_chunk;
+    int next_chunk;
+    uint32_t next_frame;
+    uint32_t remaining_ms;
+    uint32_t budget_mbs;
+    uint32_t elapsed_ms = 0U;
+    uint32_t decoded_mbs = 0U;
+
+    if (!movie || paused || !movie_uses_h264(movie) || spare_ms < H264_NEXT_CHUNK_IDR_MIN_SPARE_MS) {
+        return;
+    }
+
+    warmup = &movie->h264_boundary_warmup;
+    current_chunk = movie_chunk_for_frame(movie, movie->current_frame);
+    if (current_chunk < 0 || (uint32_t) (current_chunk + 1) >= movie->header.chunk_count) {
+        clear_h264_boundary_warmup(movie);
+        return;
+    }
+
+    next_chunk = current_chunk + 1;
+    next_frame = movie->chunk_index[next_chunk].first_frame;
+    if (warmup->chunk_index >= 0 && warmup->chunk_index != next_chunk) {
+        clear_h264_boundary_warmup(movie);
+        warmup = &movie->h264_boundary_warmup;
+    }
+    if (warmup->chunk_index == next_chunk &&
+        (movie->loaded_chunk == next_chunk || h264_decoded_global_frame(movie) >= (int64_t) next_frame)) {
+        clear_h264_boundary_warmup(movie);
+        return;
+    }
+    if (!should_run_h264_boundary_warmup(movie, current_chunk)) {
+        return;
+    }
+    if (find_h264_frame_slot(movie, next_frame)) {
+        return;
+    }
+    if (!prepare_h264_boundary_warmup(movie, next_chunk)) {
+        return;
+    }
+
+    warmup = &movie->h264_boundary_warmup;
+    if (warmup->frame_ready && !find_h264_frame_slot(movie, next_frame)) {
+        clear_h264_boundary_warmup(movie);
+        return;
+    }
+    if (warmup->frame_ready) {
+        return;
+    }
+    remaining_ms = spare_ms;
+    if (deadline_ms != 0U) {
+        uint32_t now_ms = monotonic_clock_now_ms();
+        if ((int32_t) (deadline_ms - now_ms) <= 0) {
+            return;
+        }
+        remaining_ms = deadline_ms - now_ms;
+    }
+    budget_mbs = h264_boundary_warmup_budget(movie, warmup, remaining_ms);
+    if (budget_mbs == 0U) {
+        return;
+    }
+    if (!step_h264_boundary_warmup(movie, budget_mbs, &elapsed_ms, &decoded_mbs)) {
+        debug_tracef("boundary warmup fail chunk=%d frame=%lu", next_chunk, (unsigned long) next_frame);
+        clear_h264_boundary_warmup(movie);
+        return;
+    }
+    update_h264_boundary_warmup_rate(warmup, elapsed_ms, decoded_mbs);
+    if (debug_is_runtime_logging_enabled() && warmup->frame_ready) {
+        debug_tracef(
+            "boundary warmup ready frame=%lu chunk=%d ms=%lu",
+            (unsigned long) next_frame,
+            next_chunk,
+            (unsigned long) elapsed_ms
+        );
+    }
+}
+
 static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
 {
     uint32_t time_slice_ms = paused && spare_ms > PREFETCH_PAUSED_SLICE_MS ? PREFETCH_PAUSED_SLICE_MS : spare_ms;
@@ -3994,6 +4485,8 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
     int budget = prefetch_budget_for_state(movie, paused, spare_ms);
     size_t ring_contig = movie_uses_h264(movie) ? h264_frame_ring_contiguous_ready_count(movie) : 0U;
     bool prioritize_io = false;
+    bool prioritize_boundary_warmup = false;
+    bool accelerate_next_chunk_io = false;
     bool allow_active_h264_prefetch = false;
     bool active_backoff = false;
     int max_new_prefetch_distance = PREFETCH_CHUNK_COUNT;
@@ -4031,14 +4524,22 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
     if (!paused && movie_uses_h264(movie) && current_chunk >= 0) {
         uint32_t io_cushion;
         bool entered_rest = false;
+        bool allow_second_next_chunk = false;
 
         /* Keep active-playback chunk I/O focused on the immediate next chunk.
          * Farther speculative chunks may stay resident, but do not start or
          * advance them on the frame-critical playback path. */
         max_new_prefetch_distance = 1;
         max_work_distance = 1;
+        allow_second_next_chunk = should_prefetch_second_next_chunk(movie, current_chunk);
+        if (allow_second_next_chunk) {
+            max_new_prefetch_distance = 2;
+            max_work_distance = 2;
+        }
+        prioritize_boundary_warmup = should_prioritize_h264_boundary_warmup(movie, current_chunk);
+        accelerate_next_chunk_io = should_accelerate_next_chunk_io(movie, current_chunk);
         prioritize_io = should_prioritize_next_chunk_io(movie, current_chunk);
-        if (prioritize_io) {
+        if (prioritize_io || accelerate_next_chunk_io) {
             if (debug_should_collect_metrics()) {
                 movie->diag_io_priority_count++;
             }
@@ -4092,20 +4593,33 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
         try_grow_h264_frame_ring(movie, ring_growth);
     }
     if (!paused && movie_uses_h264(movie) && !prioritize_io) {
-        uint32_t max_io_slice = (spare_ms > 16U) ? (spare_ms / 2U) : PREFETCH_ACTIVE_H264_SLICE_MS;
+        uint32_t max_io_slice = accelerate_next_chunk_io
+            ? spare_ms
+            : ((spare_ms > 16U) ? (spare_ms / 2U) : PREFETCH_ACTIVE_H264_SLICE_MS);
         if (time_slice_ms > max_io_slice) {
             time_slice_ms = max_io_slice;
         }
     }
-    if (movie_uses_h264(movie) && allow_active_h264_prefetch && !prioritize_io) {
-        prefetch_h264_frames(movie, paused, spare_ms, deadline_ms);
+    if (movie_uses_h264(movie) && allow_active_h264_prefetch && !prioritize_io && !accelerate_next_chunk_io) {
+        if (prioritize_boundary_warmup) {
+            prefetch_h264_boundary_idr(movie, paused, spare_ms, deadline_ms);
+        } else {
+            prefetch_h264_frames(movie, paused, spare_ms, deadline_ms);
+            prefetch_h264_boundary_idr(movie, paused, spare_ms, deadline_ms);
+        }
     }
     if (current_chunk >= 0 && budget > 0 && time_slice_ms > 0) {
         uint32_t io_start_ms = monotonic_clock_now_ms();
         uint32_t io_deadline_ms = io_start_ms + time_slice_ms;
         if (!io_deadline_ms || !prefetch_deadline_reached(io_deadline_ms)) {
             prefetch_ahead(movie, current_chunk, budget, max_new_prefetch_distance);
-            prefetch_do_work(movie, current_chunk, max_work_distance, io_deadline_ms, !paused);
+            prefetch_do_work(
+                movie,
+                current_chunk,
+                max_work_distance,
+                io_deadline_ms,
+                !paused && !prioritize_io && !accelerate_next_chunk_io
+            );
             if (!paused) {
                 uint32_t io_elapsed_ms = monotonic_clock_now_ms() - io_start_ms;
                 if (io_elapsed_ms >= time_slice_ms + 8U) {
@@ -4125,7 +4639,10 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
     if (movie_uses_h264(movie) &&
         allow_active_h264_prefetch &&
         (!deadline_ms || !h264_prefetch_deadline_reached(deadline_ms))) {
-        prefetch_h264_frames(movie, paused, spare_ms, deadline_ms);
+        prefetch_h264_boundary_idr(movie, paused, spare_ms, deadline_ms);
+        if (!prioritize_boundary_warmup || movie->h264_boundary_warmup.frame_ready) {
+            prefetch_h264_frames(movie, paused, spare_ms, deadline_ms);
+        }
     }
 }
 static int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index)
@@ -4314,6 +4831,7 @@ static void invalidate_loaded_chunk_state(Movie *movie)
     movie->loaded_chunk = -1;
     movie->decoded_local_frame = -1;
     movie->h264_chunk_dirty = false;
+    clear_h264_boundary_warmup(movie);
 }
 
 static bool decode_to_frame(Movie *movie, uint32_t frame_index)
@@ -4328,7 +4846,20 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
     }
     if (frame_index > movie->current_frame) {
         int current_chunk = movie_chunk_for_frame(movie, movie->current_frame);
-        prefetched_frame = find_h264_frame_slot(movie, frame_index);
+        if (movie_uses_h264(movie) &&
+            movie->h264_boundary_warmup.chunk_index == chunk_index &&
+            movie->h264_boundary_warmup.chunk_index >= 0 &&
+            movie->chunk_index[chunk_index].first_frame == frame_index) {
+            if ((!movie->h264_boundary_warmup.frame_ready && !finish_h264_boundary_warmup(movie)) ||
+                !movie->h264_boundary_warmup.frame_ready ||
+                !activate_h264_boundary_warmup(movie)) {
+                clear_h264_boundary_warmup(movie);
+            } else {
+                prefetched_frame = find_h264_frame_slot(movie, frame_index);
+            }
+        } else {
+            prefetched_frame = find_h264_frame_slot(movie, frame_index);
+        }
         if (prefetched_frame) {
             if (debug_should_collect_metrics()) {
                 movie->diag_foreground_ring_hit_count++;
@@ -4364,6 +4895,7 @@ static bool decode_to_frame(Movie *movie, uint32_t frame_index)
     }
     if (frame_index < movie->current_frame) {
         clear_h264_frame_ring(movie);
+        clear_h264_boundary_warmup(movie);
     }
     if (!load_chunk(movie, chunk_index)) {
         debug_tracef("decode frame=%lu load chunk=%d fail", (unsigned long) frame_index, chunk_index);
@@ -4593,6 +5125,8 @@ static bool load_movie(const char *path, Movie *movie)
         }
     }
     movie->decoded_local_frame = -1;
+    movie->h264_boundary_warmup.chunk_index = -1;
+    movie->h264_boundary_warmup.decoded_local_frame = -1;
     debug_tracef("open start path=%s", path ? path : "(null)");
 
     movie->file = fopen(path, "rb");
@@ -4646,14 +5180,26 @@ static bool load_movie(const char *path, Movie *movie)
     if (movie->h264_decoder) {
         memset(movie->h264_decoder, 0, sizeof(*movie->h264_decoder));
     }
+    movie->h264_boundary_warmup.decoder = h264bsdAlloc();
+    if (movie->h264_boundary_warmup.decoder) {
+        memset(movie->h264_boundary_warmup.decoder, 0, sizeof(*movie->h264_boundary_warmup.decoder));
+    }
     movie->h264_frame_bytes = h264_cropped_frame_bytes(movie);
     movie->h264_frame_ring_capacity = 0;
     clear_h264_frame_ring(movie);
-    if (!movie->framebuffer || !movie->h264_decoder || !reset_h264_decoder(movie)) {
+    if (!movie->framebuffer ||
+        !movie->h264_decoder ||
+        !movie->h264_boundary_warmup.decoder ||
+        !reset_h264_decoder(movie) ||
+        !reset_h264_storage_decoder(
+            movie->h264_boundary_warmup.decoder,
+            &movie->h264_boundary_warmup.decoder_initialized)) {
         if (!movie->framebuffer) {
             debug_failf("open failed: framebuffer alloc words=%lu", (unsigned long) framebuffer_words);
         } else if (!movie->h264_decoder) {
             debug_failf("open failed: h264 decoder alloc");
+        } else if (!movie->h264_boundary_warmup.decoder) {
+            debug_failf("open failed: h264 boundary decoder alloc");
         }
         return false;
     }
@@ -4787,6 +5333,347 @@ static const SubtitleCue *active_subtitle_cue(const Movie *movie, uint32_t now_m
         }
     }
     return NULL;
+}
+
+static uint32_t h264_boundary_total_mbs(const Movie *movie, const H264BoundaryWarmup *warmup)
+{
+    uint32_t width_mbs;
+    uint32_t height_mbs;
+
+    if (warmup && warmup->decoder && warmup->decoder->picSizeInMbs > 0U) {
+        return warmup->decoder->picSizeInMbs;
+    }
+    if (!movie) {
+        return 0U;
+    }
+    width_mbs = ((uint32_t) movie->header.video_width + 15U) / 16U;
+    height_mbs = ((uint32_t) movie->header.video_height + 15U) / 16U;
+    return width_mbs * height_mbs;
+}
+
+static void update_h264_boundary_warmup_rate(H264BoundaryWarmup *warmup, uint32_t elapsed_ms, uint32_t decoded_mbs)
+{
+    uint32_t sample_q8;
+
+    if (!warmup || elapsed_ms == 0U || decoded_mbs == 0U) {
+        return;
+    }
+
+    sample_q8 = (decoded_mbs << 8) / elapsed_ms;
+    if (sample_q8 == 0U) {
+        sample_q8 = 1U;
+    }
+    if (warmup->avg_mbs_per_ms_q8 == 0U) {
+        warmup->avg_mbs_per_ms_q8 = (uint16_t) sample_q8;
+    } else {
+        warmup->avg_mbs_per_ms_q8 = (uint16_t) (((uint32_t) warmup->avg_mbs_per_ms_q8 * 3U + sample_q8 + 2U) / 4U);
+    }
+}
+
+static uint32_t h264_boundary_warmup_budget(const Movie *movie, const H264BoundaryWarmup *warmup, uint32_t spare_ms)
+{
+    uint32_t rate_q8;
+    uint32_t usable_ms;
+    uint32_t decoded_mbs = 0U;
+    uint32_t total_mbs;
+    uint32_t remaining_mbs;
+    uint32_t budget;
+
+    if (!movie || !warmup || spare_ms < H264_NEXT_CHUNK_IDR_MIN_SPARE_MS) {
+        return 0U;
+    }
+
+    total_mbs = h264_boundary_total_mbs(movie, warmup);
+    if (warmup->decoder) {
+        decoded_mbs = warmup->decoder->slice->numDecodedMbs;
+    }
+    remaining_mbs = total_mbs > decoded_mbs ? (total_mbs - decoded_mbs) : 1U;
+    usable_ms = spare_ms > H264_NEXT_CHUNK_IDR_BUDGET_GUARD_MS
+        ? (spare_ms - H264_NEXT_CHUNK_IDR_BUDGET_GUARD_MS)
+        : 1U;
+    rate_q8 = warmup->avg_mbs_per_ms_q8 > 0U
+        ? (uint32_t) warmup->avg_mbs_per_ms_q8
+        : H264_NEXT_CHUNK_IDR_DEFAULT_MBS_PER_MS_Q8;
+    budget = (usable_ms * rate_q8) >> 8;
+    if (budget == 0U) {
+        budget = 1U;
+    }
+    if (budget > remaining_mbs) {
+        budget = remaining_mbs;
+    }
+    return budget;
+}
+
+static void clear_h264_boundary_warmup(Movie *movie)
+{
+    H264BoundaryWarmup *warmup;
+    uint16_t avg_mbs_per_ms_q8;
+    storage_t *decoder;
+    bool decoder_initialized;
+
+    if (!movie) {
+        return;
+    }
+    warmup = &movie->h264_boundary_warmup;
+    avg_mbs_per_ms_q8 = warmup->avg_mbs_per_ms_q8;
+    decoder = warmup->decoder;
+    decoder_initialized = warmup->decoder_initialized;
+    free(warmup->frame_offsets);
+    memset(warmup, 0, sizeof(*warmup));
+    warmup->decoder = decoder;
+    warmup->decoder_initialized = decoder_initialized;
+    warmup->avg_mbs_per_ms_q8 = avg_mbs_per_ms_q8;
+    warmup->chunk_index = -1;
+    warmup->decoded_local_frame = -1;
+}
+
+static bool prepare_h264_boundary_warmup(Movie *movie, int chunk_index)
+{
+    H264BoundaryWarmup *warmup;
+    PrefetchedChunk *prefetched;
+    uint32_t *frame_offsets = NULL;
+    uint8_t *chunk_bytes = NULL;
+    size_t chunk_size = 0;
+
+    if (!movie || !movie_uses_h264(movie) || chunk_index < 0 ||
+        (uint32_t) chunk_index >= movie->header.chunk_count) {
+        return false;
+    }
+
+    warmup = &movie->h264_boundary_warmup;
+    prefetched = find_prefetched_chunk(movie, chunk_index);
+    if (!prefetched || prefetched->state != PREFETCH_READY || !prefetched->chunk_storage) {
+        return false;
+    }
+
+    if (warmup->chunk_index == chunk_index &&
+        warmup->chunk_storage == prefetched->chunk_storage &&
+        warmup->frame_offsets != NULL) {
+        return true;
+    }
+
+    clear_h264_boundary_warmup(movie);
+    warmup = &movie->h264_boundary_warmup;
+    if (!warmup->decoder || !reset_h264_storage_decoder(warmup->decoder, &warmup->decoder_initialized)) {
+        return false;
+    }
+    if (!configure_chunk_view_from_storage(
+            movie,
+            chunk_index,
+            prefetched->chunk_storage,
+            prefetched->chunk_storage_size,
+            &frame_offsets,
+            &chunk_bytes,
+            &chunk_size)) {
+        return false;
+    }
+
+    warmup->chunk_index = chunk_index;
+    warmup->decoded_local_frame = -1;
+    warmup->chunk_dirty = false;
+    warmup->frame_ready = false;
+    warmup->chunk_storage = prefetched->chunk_storage;
+    warmup->chunk_storage_size = prefetched->chunk_storage_size;
+    warmup->chunk_bytes = chunk_bytes;
+    warmup->chunk_size = chunk_size;
+    warmup->frame_offsets = frame_offsets;
+    warmup->consumed_bytes = 0U;
+    warmup->zero_advance_retries = 0U;
+    return true;
+}
+
+static bool step_h264_boundary_warmup(Movie *movie, uint32_t macroblock_budget, uint32_t *out_elapsed_ms, uint32_t *out_decoded_mbs)
+{
+    H264BoundaryWarmup *warmup;
+    const ChunkIndexEntry *entry;
+    uint32_t frame_index;
+    uint8_t *frame_data;
+    size_t start;
+    size_t end;
+    size_t frame_size;
+    uint32_t start_ms;
+    uint32_t start_decoded_mbs;
+    size_t start_consumed_bytes;
+    uint32_t total_mbs;
+    bool picture_ready = false;
+    bool pending = false;
+    uint8_t *picture = NULL;
+
+    if (out_elapsed_ms) {
+        *out_elapsed_ms = 0U;
+    }
+    if (out_decoded_mbs) {
+        *out_decoded_mbs = 0U;
+    }
+    if (!movie) {
+        return false;
+    }
+
+    warmup = &movie->h264_boundary_warmup;
+    if (!warmup->decoder || warmup->chunk_index < 0 || !warmup->frame_offsets || warmup->frame_ready) {
+        return warmup->frame_ready;
+    }
+
+    entry = movie->chunk_index + warmup->chunk_index;
+    if (entry->frame_count == 0U) {
+        debug_failf("boundary warmup empty chunk=%d", warmup->chunk_index);
+        return false;
+    }
+
+    start = warmup->frame_offsets[0];
+    end = (entry->frame_count > 1U) ? warmup->frame_offsets[1] : warmup->chunk_size;
+    if (end <= start || end > warmup->chunk_size) {
+        debug_failf(
+            "boundary warmup invalid frame bounds chunk=%d start=%lu end=%lu size=%lu",
+            warmup->chunk_index,
+            (unsigned long) start,
+            (unsigned long) end,
+            (unsigned long) warmup->chunk_size
+        );
+        return false;
+    }
+
+    frame_index = entry->first_frame;
+    frame_data = warmup->chunk_bytes + start;
+    frame_size = end - start;
+    start_ms = monotonic_clock_now_ms();
+    start_consumed_bytes = warmup->consumed_bytes;
+    start_decoded_mbs = warmup->decoder->slice->numDecodedMbs;
+    total_mbs = h264_boundary_total_mbs(movie, warmup);
+    if (!pump_h264_access_unit(
+            movie,
+            warmup->decoder,
+            frame_data,
+            frame_size,
+            &warmup->consumed_bytes,
+            &warmup->zero_advance_retries,
+            macroblock_budget,
+            false,
+            "boundary warmup",
+            &picture_ready,
+            &pending,
+            &picture)) {
+        return false;
+    }
+
+    if (warmup->consumed_bytes != start_consumed_bytes ||
+        warmup->decoder->slice->numDecodedMbs != start_decoded_mbs) {
+        warmup->chunk_dirty = true;
+    }
+
+    if (picture_ready) {
+        if (!picture || !cache_h264_picture(movie, frame_index, picture, "boundary warmup")) {
+            return false;
+        }
+        warmup->frame_ready = true;
+        warmup->decoded_local_frame = 0;
+        warmup->consumed_bytes = frame_size;
+        if (out_elapsed_ms) {
+            *out_elapsed_ms = monotonic_clock_now_ms() - start_ms;
+        }
+        if (out_decoded_mbs) {
+            *out_decoded_mbs = total_mbs > start_decoded_mbs ? (total_mbs - start_decoded_mbs) : 0U;
+        }
+        return true;
+    }
+
+    if (pending) {
+        if (out_elapsed_ms) {
+            *out_elapsed_ms = monotonic_clock_now_ms() - start_ms;
+        }
+        if (out_decoded_mbs) {
+            *out_decoded_mbs = warmup->decoder->slice->numDecodedMbs - start_decoded_mbs;
+        }
+        return true;
+    }
+
+    if (out_elapsed_ms) {
+        *out_elapsed_ms = monotonic_clock_now_ms() - start_ms;
+    }
+    if (out_decoded_mbs) {
+        *out_decoded_mbs = warmup->decoder->slice->numDecodedMbs - start_decoded_mbs;
+    }
+    return warmup->frame_ready;
+}
+
+static bool finish_h264_boundary_warmup(Movie *movie)
+{
+    uint32_t elapsed_ms = 0U;
+    uint32_t decoded_mbs = 0U;
+
+    if (!movie || movie->h264_boundary_warmup.chunk_index < 0) {
+        return false;
+    }
+    if (movie->h264_boundary_warmup.frame_ready) {
+        return true;
+    }
+    if (!step_h264_boundary_warmup(movie, 0U, &elapsed_ms, &decoded_mbs)) {
+        return false;
+    }
+    update_h264_boundary_warmup_rate(&movie->h264_boundary_warmup, elapsed_ms, decoded_mbs);
+    return movie->h264_boundary_warmup.frame_ready;
+}
+
+static bool activate_h264_boundary_warmup(Movie *movie)
+{
+    H264BoundaryWarmup *warmup;
+    PrefetchedChunk *prefetched;
+    storage_t *decoder;
+    bool decoder_initialized;
+    uint32_t frame_index;
+
+    if (!movie) {
+        return false;
+    }
+
+    warmup = &movie->h264_boundary_warmup;
+    if (warmup->chunk_index < 0 || !warmup->frame_ready || !warmup->frame_offsets) {
+        return false;
+    }
+    frame_index = movie->chunk_index[warmup->chunk_index].first_frame;
+    if (!find_h264_frame_slot(movie, frame_index)) {
+        return false;
+    }
+
+    prefetched = find_prefetched_chunk(movie, warmup->chunk_index);
+    if (!prefetched || prefetched->state != PREFETCH_READY || prefetched->chunk_storage != warmup->chunk_storage) {
+        return false;
+    }
+
+    free(movie->chunk_storage);
+    movie->chunk_storage = prefetched->chunk_storage;
+    movie->chunk_storage_size = prefetched->chunk_storage_size;
+    prefetched->chunk_storage = NULL;
+    reset_prefetched_chunk(prefetched);
+
+    free(movie->frame_offsets);
+    movie->frame_offsets = warmup->frame_offsets;
+    movie->chunk_bytes = warmup->chunk_bytes;
+    movie->chunk_size = warmup->chunk_size;
+    movie->loaded_chunk = warmup->chunk_index;
+    movie->decoded_local_frame = warmup->decoded_local_frame;
+    movie->h264_chunk_dirty = warmup->chunk_dirty;
+
+    decoder = movie->h264_decoder;
+    decoder_initialized = movie->h264_decoder_initialized;
+    movie->h264_decoder = warmup->decoder;
+    movie->h264_decoder_initialized = warmup->decoder_initialized;
+    warmup->decoder = decoder;
+    warmup->decoder_initialized = decoder_initialized;
+
+    warmup->frame_offsets = NULL;
+    if (debug_should_collect_metrics()) {
+        movie->diag_chunk_load_prefetched_count++;
+    }
+    debug_tracef(
+        "load chunk=%d boundary prefetched packed=%lu unpacked=%lu prefetched=%lu",
+        movie->loaded_chunk,
+        (unsigned long) movie->chunk_storage_size,
+        (unsigned long) movie->chunk_storage_size,
+        (unsigned long) total_prefetched_chunk_bytes(movie)
+    );
+    clear_h264_boundary_warmup(movie);
+    return true;
 }
 
 static const char *active_subtitle_track_name(const Movie *movie)

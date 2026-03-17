@@ -53,6 +53,7 @@
 
 #define HANTRO_OK   0
 #define HANTRO_NOK  1
+#define HANTRO_PENDING 2
 
 #define HANTRO_TRUE     (1)
 #define HANTRO_FALSE    (0)
