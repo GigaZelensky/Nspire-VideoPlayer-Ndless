@@ -3283,7 +3283,7 @@ static inline uint32_t h264_pack_rgb565_pair(uint16_t left_pixel, uint16_t right
     return ((uint32_t) right_pixel << 16) | left_pixel;
 }
 
-static bool blit_h264_planes_to_rgb565_target(
+static bool blit_h264_planes_to_rgb565_target_with_crop(
     const Movie *movie,
     const uint8_t *restrict y_plane,
     const uint8_t *restrict u_plane,
@@ -3291,7 +3291,9 @@ static bool blit_h264_planes_to_rgb565_target(
     size_t luma_stride,
     size_t chroma_stride,
     uint16_t *restrict dst_pixels,
-    size_t dst_pitch_pixels
+    size_t dst_pitch_pixels,
+    size_t crop_width,
+    size_t crop_height
 )
 {
     const int32_t *restrict y_base = g_h264_color_tables->y_base;
@@ -3300,11 +3302,11 @@ static bool blit_h264_planes_to_rgb565_target(
     const uint16_t *restrict blue565 = g_h264_color_tables->blue565;
     size_t y;
 
-    if (!movie || !y_plane || !u_plane || !v_plane || !dst_pixels || !movie->h264_headers_ready) {
+    if (!movie || !y_plane || !u_plane || !v_plane || !dst_pixels || crop_width == 0 || crop_height == 0) {
         return false;
     }
 
-    for (y = 0; y < movie->h264_crop_height; y += 2U) {
+    for (y = 0; y < crop_height; y += 2U) {
         const uint8_t *restrict y_row0 = y_plane + ((size_t) y * luma_stride);
         const uint8_t *restrict y_row1 = y_row0 + luma_stride;
         const uint8_t *restrict u_row = u_plane + ((size_t) (y / 2U) * chroma_stride);
@@ -3312,7 +3314,7 @@ static bool blit_h264_planes_to_rgb565_target(
         uint16_t *restrict dst_row0_16 = dst_pixels + ((size_t) y * dst_pitch_pixels);
         uint16_t *restrict dst_row1_16 = dst_row0_16 + dst_pitch_pixels;
         const bool packed_writes = ((((uintptr_t) dst_row0_16) | ((uintptr_t) dst_row1_16)) & (sizeof(uint32_t) - 1U)) == 0U;
-        const size_t main_width = movie->h264_crop_width & ~(size_t) 3U;
+        const size_t main_width = crop_width & ~(size_t) 3U;
         size_t x;
 
         if (packed_writes) {
@@ -3405,7 +3407,7 @@ static bool blit_h264_planes_to_rgb565_target(
                 dst_row1[dst_index + 1U] = h264_pack_rgb565_pair(p2, p3);
             }
 
-            for (; x < movie->h264_crop_width; x += 2U) {
+            for (; x < crop_width; x += 2U) {
                 const size_t chroma_index = x / 2U;
                 const size_t dst_index = x / 2U;
                 int32_t chroma_red;
@@ -3542,7 +3544,7 @@ static bool blit_h264_planes_to_rgb565_target(
                 dst_row1_16[x + 3U] = p3;
             }
 
-            for (; x < movie->h264_crop_width; x += 2U) {
+            for (; x < crop_width; x += 2U) {
                 const size_t chroma_index = x / 2U;
                 int32_t chroma_red;
                 int32_t chroma_green;
@@ -3594,6 +3596,35 @@ static bool blit_h264_planes_to_rgb565_target(
     }
 
     return true;
+}
+
+static bool blit_h264_planes_to_rgb565_target(
+    const Movie *movie,
+    const uint8_t *restrict y_plane,
+    const uint8_t *restrict u_plane,
+    const uint8_t *restrict v_plane,
+    size_t luma_stride,
+    size_t chroma_stride,
+    uint16_t *restrict dst_pixels,
+    size_t dst_pitch_pixels
+)
+{
+    if (!movie || !y_plane || !u_plane || !v_plane || !dst_pixels || !movie->h264_headers_ready) {
+        return false;
+    }
+
+    return blit_h264_planes_to_rgb565_target_with_crop(
+        movie,
+        y_plane,
+        u_plane,
+        v_plane,
+        luma_stride,
+        chroma_stride,
+        dst_pixels,
+        dst_pitch_pixels,
+        movie->h264_crop_width,
+        movie->h264_crop_height
+    );
 }
 
 static bool copy_h264_picture_to_slot(Movie *movie, H264FrameSlot *slot, const uint8_t *picture)
@@ -3704,7 +3735,7 @@ static bool blit_h264_frame_slot(Movie *movie, const H264FrameSlot *slot)
         return false;
     }
 
-    return blit_h264_planes_to_rgb565_target(
+    return blit_h264_planes_to_rgb565_target_with_crop(
         movie,
         slot->data,
         slot->data + luma_plane_size,
@@ -3712,7 +3743,9 @@ static bool blit_h264_frame_slot(Movie *movie, const H264FrameSlot *slot)
         movie->header.video_width,
         movie->header.video_width / 2U,
         movie->framebuffer,
-        movie->header.video_width
+        movie->header.video_width,
+        movie->header.video_width,
+        movie->header.video_height
     );
 }
 
