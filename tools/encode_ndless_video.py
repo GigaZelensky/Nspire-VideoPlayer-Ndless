@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import html
 import json
 import re
@@ -36,6 +37,14 @@ ASS_MOVE_RE = re.compile(
 )
 ASS_AN_RE = re.compile(r"\\an(\d)")
 ASS_A_RE = re.compile(r"\\a(\d+)")
+BBOX_TIME_RE = re.compile(r"pts_time:(?P<time>-?\d+(?:\.\d+)?)")
+BBOX_VALUES_RE = re.compile(
+    r"x1:(?P<x1>\d+)\s+x2:(?P<x2>\d+)\s+y1:(?P<y1>\d+)\s+y2:(?P<y2>\d+)\s+w:(?P<w>\d+)\s+h:(?P<h>\d+)"
+)
+DEFAULT_BURN_SUBTITLE_SIZE = 1.0
+DEFAULT_BURN_SUBTITLE_HEIGHT_RATIO = 0.10
+BITMAP_SUBTITLE_BBOX_PADDING = 4
+FILTER_COMPLEX_SCRIPT_PLACEHOLDER = "__NVP_FILTER_COMPLEX_SCRIPT__"
 
 NAL_IDR = 5
 NAL_SEI = 6
@@ -73,6 +82,16 @@ class SubtitleCue:
 class SubtitleTrack:
     name: str
     cues: list[SubtitleCue]
+
+
+@dataclass(slots=True)
+class BitmapSubtitleSegment:
+    start_s: float
+    end_s: float
+    x: int
+    y: int
+    w: int
+    h: int
 
 
 @dataclass(slots=True)
@@ -168,12 +187,125 @@ def parse_ffmpeg_time(value: str) -> float:
     return (hours * 3600.0) + (minutes * 60.0) + seconds
 
 
+def parse_ffmpeg_speed(value: str | None) -> float:
+    if not value:
+        return 0.0
+    text = value.strip().lower()
+    if text.endswith("x"):
+        text = text[:-1]
+    try:
+        speed = float(text)
+    except ValueError:
+        return 0.0
+    return speed if speed > 0.0 else 0.0
+
+
 def format_duration_hms(seconds: float) -> str:
     total_seconds = max(0, int(round(seconds)))
     hours = total_seconds // 3600
     minutes = (total_seconds % 3600) // 60
     secs = total_seconds % 60
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def format_binary_size(byte_count: int) -> str:
+    if byte_count < 1024:
+        return f"{byte_count} B"
+    if byte_count < 1024 * 1024:
+        return f"{byte_count / 1024:.1f} KiB"
+    if byte_count < 10 * 1024 * 1024:
+        return f"{byte_count / (1024 * 1024):.3f} MiB"
+    return f"{byte_count / (1024 * 1024):.2f} MiB"
+
+
+class ProgressEstimator:
+    def __init__(
+        self,
+        *,
+        recent_window_seconds: float = 120.0,
+        speed_alpha: float = 0.15,
+        size_alpha: float = 0.10,
+    ) -> None:
+        self.recent_window_seconds = recent_window_seconds
+        self.speed_alpha = speed_alpha
+        self.size_alpha = size_alpha
+        self.samples: deque[tuple[float, float, int]] = deque()
+        self.smoothed_speed = 0.0
+        self.smoothed_size_rate = 0.0
+
+    @staticmethod
+    def _smooth(previous: float, current: float, alpha: float) -> float:
+        if current <= 0.0:
+            return previous
+        if previous <= 0.0:
+            return current
+        return (alpha * current) + ((1.0 - alpha) * previous)
+
+    def update(
+        self,
+        *,
+        real_time: float,
+        media_time: float,
+        total_media_time: float | None,
+        byte_count: int,
+        reported_speed: float,
+    ) -> tuple[float, int | None]:
+        self.samples.append((real_time, media_time, byte_count))
+        while len(self.samples) > 1 and real_time - self.samples[0][0] > self.recent_window_seconds:
+            self.samples.popleft()
+
+        cumulative_speed = (media_time / real_time) if real_time > 0.0 and media_time > 0.0 else 0.0
+        recent_speed = 0.0
+        recent_size_rate = 0.0
+        if len(self.samples) >= 2:
+            base_real, base_media, base_bytes = self.samples[0]
+            delta_real = real_time - base_real
+            delta_media = media_time - base_media
+            delta_bytes = byte_count - base_bytes
+            if delta_real >= 15.0 and delta_media > 0.0:
+                recent_speed = delta_media / delta_real
+            if delta_media >= 30.0 and delta_bytes > 0:
+                recent_size_rate = delta_bytes / delta_media
+
+        if reported_speed > 0.0 and media_time < 30.0:
+            effective_speed = reported_speed
+        else:
+            effective_speed = cumulative_speed or recent_speed or reported_speed
+            if cumulative_speed > 0.0 and recent_speed > 0.0:
+                effective_speed = (cumulative_speed * 0.8) + (recent_speed * 0.2)
+            if reported_speed > 0.0:
+                if effective_speed > 0.0 and media_time < 120.0:
+                    effective_speed = (effective_speed * 0.8) + (reported_speed * 0.2)
+                elif effective_speed <= 0.0:
+                    effective_speed = reported_speed
+        self.smoothed_speed = self._smooth(self.smoothed_speed, effective_speed, self.speed_alpha)
+
+        eta = 0.0
+        if total_media_time and total_media_time > 0.0 and self.smoothed_speed > 0.0:
+            eta = max(0.0, total_media_time - media_time) / self.smoothed_speed
+
+        expected_size = None
+        cumulative_size_rate = (byte_count / media_time) if media_time > 0.0 and byte_count > 0 else 0.0
+        effective_size_rate = cumulative_size_rate or recent_size_rate
+        if cumulative_size_rate > 0.0 and recent_size_rate > 0.0:
+            effective_size_rate = (cumulative_size_rate * 0.85) + (recent_size_rate * 0.15)
+        self.smoothed_size_rate = self._smooth(self.smoothed_size_rate, effective_size_rate, self.size_alpha)
+        if total_media_time and total_media_time > 0.0 and media_time > 0.0:
+            projected_size_rate = 0.0
+            if media_time < 30.0 and cumulative_size_rate > 0.0:
+                # Show a useful projection immediately, then hand off to the smoothed model.
+                projected_size_rate = cumulative_size_rate
+                if self.smoothed_size_rate > 0.0:
+                    projected_size_rate = (cumulative_size_rate * 0.75) + (self.smoothed_size_rate * 0.25)
+            elif self.smoothed_size_rate > 0.0:
+                projected_size_rate = self.smoothed_size_rate
+            elif cumulative_size_rate > 0.0:
+                projected_size_rate = cumulative_size_rate
+
+            if projected_size_rate > 0.0:
+                expected_size = max(byte_count, int(round(projected_size_rate * total_media_time)))
+
+        return eta, expected_size
 
 
 def normalize_output_path(output_arg: str) -> Path:
@@ -484,6 +616,248 @@ def ffmpeg_filter_escape_path(path: Path) -> str:
     for char in ("\\", ":", "'", "[", "]", ",", ";"):
         escaped = escaped.replace(char, f"\\{char}")
     return escaped
+
+
+def ffmpeg_filter_escape_value(text: str) -> str:
+    escaped = text
+    for char in ("\\", "'"):
+        escaped = escaped.replace(char, f"\\{char}")
+    return escaped
+
+
+def compute_burn_subtitle_metrics(height: int, size_scale: float) -> tuple[int, int, int]:
+    clamped_scale = max(0.25, min(size_scale, 4.0))
+    font_size = max(10, int(round(height * DEFAULT_BURN_SUBTITLE_HEIGHT_RATIO * clamped_scale)))
+    margin_v = max(4, int(round(font_size * 0.6)))
+    outline = max(1, int(round(font_size * 0.08)))
+    return font_size, margin_v, outline
+
+
+def analyze_bitmap_subtitle_segments(
+    *,
+    input_path: Path,
+    stream_index: int,
+    start: float,
+    duration: float | None,
+    fallback_end: float,
+) -> list[BitmapSubtitleSegment]:
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    command = [ffmpeg, "-hide_banner", "-loglevel", "info"]
+    if start > 0:
+        command += ["-ss", f"{start:.3f}"]
+    command += ["-i", str(input_path)]
+    if duration is not None:
+        command += ["-t", f"{duration:.3f}"]
+    command += [
+        "-filter_complex",
+        f"[0:s:{stream_index}]bbox",
+        "-an",
+        "-f",
+        "null",
+        "-",
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "bitmap subtitle analysis failed")
+
+    segments: list[BitmapSubtitleSegment] = []
+    active_start: float | None = None
+    active_bounds: tuple[int, int, int, int] | None = None
+    for line in completed.stderr.splitlines():
+        if "Parsed_bbox" not in line:
+            continue
+        time_match = BBOX_TIME_RE.search(line)
+        if time_match is None:
+            continue
+        pts_time = float(time_match.group("time"))
+        bbox_match = BBOX_VALUES_RE.search(line)
+        if bbox_match is None:
+            if active_start is not None and active_bounds is not None and pts_time > active_start:
+                segments.append(BitmapSubtitleSegment(
+                    start_s=active_start,
+                    end_s=pts_time,
+                    x=active_bounds[0],
+                    y=active_bounds[1],
+                    w=active_bounds[2] - active_bounds[0],
+                    h=active_bounds[3] - active_bounds[1],
+                ))
+            active_start = None
+            active_bounds = None
+            continue
+
+        x1 = int(bbox_match.group("x1"))
+        y1 = int(bbox_match.group("y1"))
+        x2 = x1 + int(bbox_match.group("w"))
+        y2 = y1 + int(bbox_match.group("h"))
+        bounds = (
+            int(bbox_match.group("x1")),
+            int(bbox_match.group("y1")),
+            x2,
+            y2,
+        )
+        if active_start is None:
+            active_start = pts_time
+            active_bounds = bounds
+            continue
+        if active_bounds is None:
+            active_bounds = bounds
+            continue
+        active_bounds = (
+            min(active_bounds[0], bounds[0]),
+            min(active_bounds[1], bounds[1]),
+            max(active_bounds[2], bounds[2]),
+            max(active_bounds[3], bounds[3]),
+        )
+
+    if active_start is not None and active_bounds is not None and fallback_end > active_start:
+        segments.append(BitmapSubtitleSegment(
+            start_s=active_start,
+            end_s=fallback_end,
+            x=active_bounds[0],
+            y=active_bounds[1],
+            w=active_bounds[2] - active_bounds[0],
+            h=active_bounds[3] - active_bounds[1],
+        ))
+
+    return [segment for segment in segments if segment.w > 0 and segment.h > 0 and segment.end_s > segment.start_s]
+
+
+def scaled_bitmap_segment_rect(
+    segment: BitmapSubtitleSegment,
+    *,
+    size_scale: float,
+    frame_width: int,
+    frame_height: int,
+    subtitle_width: int,
+    subtitle_height: int,
+) -> tuple[int, int, int, int]:
+    base_w = segment.w * frame_width / subtitle_width
+    base_h = segment.h * frame_height / subtitle_height
+    base_x = segment.x * frame_width / subtitle_width
+    base_y = segment.y * frame_height / subtitle_height
+    scaled_w = max(1, min(frame_width, int(round(base_w * size_scale))))
+    scaled_h = max(1, min(frame_height, int(round(base_h * size_scale))))
+    x = int(round(base_x - ((scaled_w - base_w) / 2.0)))
+    y = int(round(base_y - ((scaled_h - base_h) / 2.0)))
+    x = max(0, min(frame_width - scaled_w, x))
+    y = max(0, min(frame_height - scaled_h, y))
+    return scaled_w, scaled_h, x, y
+
+
+def padded_bitmap_segment(
+    segment: BitmapSubtitleSegment,
+    *,
+    subtitle_width: int,
+    subtitle_height: int,
+    padding: int = BITMAP_SUBTITLE_BBOX_PADDING,
+) -> BitmapSubtitleSegment:
+    if padding <= 0:
+        return segment
+    x1 = max(0, segment.x - padding)
+    y1 = max(0, segment.y - padding)
+    x2 = min(subtitle_width, segment.x + segment.w + padding)
+    y2 = min(subtitle_height, segment.y + segment.h + padding)
+    return BitmapSubtitleSegment(
+        start_s=segment.start_s,
+        end_s=segment.end_s,
+        x=x1,
+        y=y1,
+        w=max(1, x2 - x1),
+        h=max(1, y2 - y1),
+    )
+
+
+def merge_bitmap_subtitle_regions(
+    segments: list[BitmapSubtitleSegment],
+    *,
+    subtitle_width: int,
+    subtitle_height: int,
+) -> list[BitmapSubtitleSegment]:
+    regions: list[list[int]] = []
+    for segment in segments:
+        padded = padded_bitmap_segment(
+            segment,
+            subtitle_width=subtitle_width,
+            subtitle_height=subtitle_height,
+        )
+        x1 = padded.x
+        y1 = padded.y
+        x2 = padded.x + padded.w
+        y2 = padded.y + padded.h
+        merged = False
+        for region in regions:
+            rx1, ry1, rx2, ry2 = region
+            if not (x2 < rx1 or rx2 < x1 or y2 < ry1 or ry2 < y1):
+                region[0] = min(rx1, x1)
+                region[1] = min(ry1, y1)
+                region[2] = max(rx2, x2)
+                region[3] = max(ry2, y2)
+                merged = True
+                break
+        if not merged:
+            regions.append([x1, y1, x2, y2])
+
+    changed = True
+    while changed:
+        changed = False
+        next_regions: list[list[int]] = []
+        while regions:
+            current = regions.pop()
+            merged_any = False
+            for other in regions:
+                if not (current[2] < other[0] or other[2] < current[0] or current[3] < other[1] or other[3] < current[1]):
+                    other[0] = min(other[0], current[0])
+                    other[1] = min(other[1], current[1])
+                    other[2] = max(other[2], current[2])
+                    other[3] = max(other[3], current[3])
+                    merged_any = True
+                    changed = True
+                    break
+            if not merged_any:
+                next_regions.append(current)
+        regions = next_regions
+
+    merged_segments = [
+        BitmapSubtitleSegment(
+            start_s=0.0,
+            end_s=0.0,
+            x=x1,
+            y=y1,
+            w=max(1, x2 - x1),
+            h=max(1, y2 - y1),
+        )
+        for x1, y1, x2, y2 in sorted(regions, key=lambda rect: (rect[1], rect[0]))
+    ]
+    return merged_segments
+
+
+def preview_mp4_path_for_output(output_path: Path) -> Path:
+    return output_path.with_suffix(".preview.mp4")
+
+
+def write_preview_mp4(bitstream_path: Path, preview_path: Path, fps: float) -> None:
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-framerate",
+            format_fps_value(fps),
+            "-i",
+            str(bitstream_path),
+            "-c:v",
+            "copy",
+            "-an",
+            "-movflags",
+            "+faststart",
+            str(preview_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or f"failed to write preview mp4: {preview_path}")
 
 
 def is_text_subtitle_codec(codec_name: str | None) -> bool:
@@ -964,6 +1338,8 @@ def build_ffmpeg_command(
     *,
     input_path: Path,
     output_path: Path,
+    source_width: int,
+    source_height: int,
     width: int,
     height: int,
     fps: float,
@@ -975,11 +1351,14 @@ def build_ffmpeg_command(
     start: float,
     duration: float | None,
     burn_subtitle: BurnSubtitleSource | None,
-) -> list[str]:
+    burn_subtitle_size: float,
+) -> tuple[list[str], str | None]:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     post_vf = f"fps={format_fps_value(fps)},scale={width}:{height}:flags=lanczos,setsar=1"
     tune, x264_params, bitstream_filters = h264_stream_profile_options(idr_frames, stream_profile)
+    subtitle_font_size, subtitle_margin_v, subtitle_outline = compute_burn_subtitle_metrics(height, burn_subtitle_size)
     command = [ffmpeg, "-y"]
+    filter_complex_script: str | None = None
     if start > 0:
         command += ["-ss", f"{start:.3f}"]
     command += ["-i", str(input_path)]
@@ -999,9 +1378,17 @@ def build_ffmpeg_command(
         filter_parts = [f"subtitles=filename='{ffmpeg_filter_escape_path(burn_subtitle.path or input_path)}'"]
         if burn_subtitle.kind == "embedded_text" and burn_subtitle.stream_index is not None:
             filter_parts[0] += f":si={burn_subtitle.stream_index}"
+        force_style = (
+            f"FontSize={subtitle_font_size},"
+            f"MarginV={subtitle_margin_v},"
+            f"Alignment=2,"
+            f"Outline={subtitle_outline},"
+            "Shadow=0"
+        )
+        filter_parts[0] += f":force_style='{ffmpeg_filter_escape_value(force_style)}'"
         command += [
             "-vf",
-            ",".join(filter_parts + [post_vf]),
+            ",".join([post_vf] + filter_parts),
             "-r",
             format_fps_value(fps),
             "-an",
@@ -1010,9 +1397,64 @@ def build_ffmpeg_command(
     elif burn_subtitle.kind == "embedded_bitmap":
         if burn_subtitle.stream_index is None:
             raise RuntimeError("Embedded bitmap subtitle burn requested without a subtitle stream index.")
+        if source_width <= 0 or source_height <= 0:
+            raise RuntimeError("Bitmap subtitle burn requested without valid source dimensions.")
+        if abs(burn_subtitle_size - 1.0) < 1e-6:
+            bitmap_filter = (
+                f"[0:s:{burn_subtitle.stream_index}]scale={width}:{height}:flags=lanczos,format=rgba[subfit];"
+                f"[base][subfit]overlay=x=0:y=0:eof_action=pass[vout]"
+            )
+        else:
+            segment_end = duration if duration is not None else 24.0 * 60.0 * 60.0
+            analyzed_segments = analyze_bitmap_subtitle_segments(
+                input_path=input_path,
+                stream_index=burn_subtitle.stream_index,
+                start=start,
+                duration=duration,
+                fallback_end=segment_end,
+            )
+            if not analyzed_segments:
+                bitmap_filter = (
+                    f"[0:s:{burn_subtitle.stream_index}]scale={width}:{height}:flags=lanczos,format=rgba[subfit];"
+                    f"[base][subfit]overlay=x=0:y=0:eof_action=pass[vout]"
+                )
+            else:
+                regions = merge_bitmap_subtitle_regions(
+                    analyzed_segments,
+                    subtitle_width=source_width,
+                    subtitle_height=source_height,
+                )
+                split_labels = [f"[subsrc{i}]" for i in range(len(regions))]
+                bitmap_filter = (
+                    f"[0:v]{post_vf}[base];"
+                    f"[0:s:{burn_subtitle.stream_index}]format=rgba,"
+                    f"split={len(regions)}{''.join(split_labels)};"
+                )
+                current_base = "[base]"
+                for index, region in enumerate(regions):
+                    scaled_w, scaled_h, overlay_x, overlay_y = scaled_bitmap_segment_rect(
+                        region,
+                        size_scale=burn_subtitle_size,
+                        frame_width=width,
+                        frame_height=height,
+                        subtitle_width=source_width,
+                        subtitle_height=source_height,
+                    )
+                    cropped_label = f"[subcrop{index}]"
+                    next_base = "[vout]" if index == len(regions) - 1 else f"[base{index + 1}]"
+                    bitmap_filter += (
+                        f"{split_labels[index]}crop=w={region.w}:h={region.h}:x={region.x}:y={region.y}:exact=1,"
+                        f"scale=w={scaled_w}:h={scaled_h}:flags=lanczos{cropped_label};"
+                        f"{current_base}{cropped_label}overlay="
+                        f"x={overlay_x}:y={overlay_y}:eof_action=pass{next_base};"
+                    )
+                    current_base = next_base
+                filter_complex_script = bitmap_filter
+        if filter_complex_script is None:
+            filter_complex_script = f"[0:v]{post_vf}[base];" + bitmap_filter
         command += [
-            "-filter_complex",
-            f"[0:v][0:s:{burn_subtitle.stream_index}]overlay=eof_action=pass,{post_vf}[vout]",
+            "-filter_complex_script",
+            FILTER_COMPLEX_SCRIPT_PLACEHOLDER,
             "-map",
             "[vout]",
             "-r",
@@ -1063,12 +1505,14 @@ def build_ffmpeg_command(
         "h264",
         str(output_path),
     ]
-    return command
+    return command, filter_complex_script
 
 
 def encode_h264_bitstream(
     *,
     input_path: Path,
+    source_width: int,
+    source_height: int,
     width: int,
     height: int,
     fps: float,
@@ -1081,13 +1525,17 @@ def encode_h264_bitstream(
     duration: float | None,
     encode_duration: float | None,
     burn_subtitle: BurnSubtitleSource | None,
+    burn_subtitle_size: float,
+    preview_output_path: Path | None,
     quiet: bool,
 ) -> bytes:
     with tempfile.TemporaryDirectory(prefix="nvp-h264-") as temp_dir:
         bitstream_path = Path(temp_dir) / "video.264"
-        command = build_ffmpeg_command(
+        command, filter_complex_script = build_ffmpeg_command(
             input_path=input_path,
             output_path=bitstream_path,
+            source_width=source_width,
+            source_height=source_height,
             width=width,
             height=height,
             fps=fps,
@@ -1099,7 +1547,15 @@ def encode_h264_bitstream(
             start=start,
             duration=duration,
             burn_subtitle=burn_subtitle,
+            burn_subtitle_size=burn_subtitle_size,
         )
+        if filter_complex_script is not None:
+            filter_complex_script_path = Path(temp_dir) / "filter_complex.ffscript"
+            filter_complex_script_path.write_text(filter_complex_script, encoding="utf-8")
+            command = [
+                str(filter_complex_script_path) if part == FILTER_COMPLEX_SCRIPT_PLACEHOLDER else part
+                for part in command
+            ]
         command = command[:1] + ["-hide_banner", "-loglevel", "error", "-progress", "pipe:2", "-nostats"] + command[1:]
         process = subprocess.Popen(
             command,
@@ -1116,6 +1572,7 @@ def encode_h264_bitstream(
         progress_state: dict[str, str] = {}
         stderr_lines: list[str] = []
         encode_start = time.time()
+        progress_estimator = ProgressEstimator()
         for raw_line in process.stderr:
             line = raw_line.strip()
             if not line:
@@ -1134,12 +1591,23 @@ def encode_h264_bitstream(
                 ratio = (out_time / encode_duration) if encode_duration and encode_duration > 0 else 0.0
                 ratio = min(max(ratio, 0.0), 1.0)
                 elapsed = time.time() - encode_start
-                eta = (elapsed * (1.0 - ratio) / ratio) if ratio > 0.0 else 0.0
                 total_size = int(progress_state.get("total_size", "0") or "0")
                 speed = progress_state.get("speed", "?")
+                speed_factor = parse_ffmpeg_speed(speed)
+                eta, expected_size = progress_estimator.update(
+                    real_time=elapsed,
+                    media_time=out_time,
+                    total_media_time=encode_duration,
+                    byte_count=total_size,
+                    reported_speed=speed_factor,
+                )
+                if eta <= 0.0 and ratio > 0.0:
+                    eta = elapsed * (1.0 - ratio) / ratio
+                expected_size_text = format_binary_size(expected_size) if expected_size is not None else "?"
                 log(
                     f"FFmpeg {ratio * 100.0:5.1f}% | ETA {format_duration_hms(eta)} | "
-                    f"time {format_duration_hms(out_time)} | size {total_size / (1024 * 1024):.2f} MiB | "
+                    f"time {format_duration_hms(out_time)} | real {format_duration_hms(elapsed)} | "
+                    f"size {format_binary_size(total_size)} | expect {expected_size_text} | "
                     f"speed {speed}",
                     quiet=False,
                 )
@@ -1147,6 +1615,8 @@ def encode_h264_bitstream(
         return_code = process.wait()
         if return_code != 0:
             raise RuntimeError("\n".join(stderr_lines[-20:]).strip() or "ffmpeg H.264 encoding failed")
+        if preview_output_path is not None:
+            write_preview_mp4(bitstream_path, preview_output_path, fps)
         return bitstream_path.read_bytes()
 
 
@@ -1226,6 +1696,31 @@ def estimate_chunk_blob_size(access_units: list[AccessUnit], stream_profile: str
             keep_parameter_sets=(index == 0 or stream_profile != "intra"),
         )
     return align4(4 + (len(access_units) * 4) + payload_size)
+
+
+def estimate_subtitle_storage_size(subtitle_tracks: list[SubtitleTrack]) -> int:
+    if not subtitle_tracks:
+        return 0
+
+    size = 2
+    for track in subtitle_tracks:
+        encoded_name = sanitize_subtitle_text(track.name).encode("ascii", "replace")
+        size += struct.calcsize("<HI") + len(encoded_name)
+    for track in subtitle_tracks:
+        for cue in track.cues:
+            encoded = sanitize_subtitle_text(cue.text).encode("ascii", "replace")
+            size += struct.calcsize("<IIHBBHHHHH") + len(encoded)
+    return size
+
+
+def estimate_total_output_size(
+    chunks: list[list[AccessUnit]],
+    *,
+    stream_profile: str,
+    subtitle_tracks: list[SubtitleTrack],
+) -> int:
+    chunk_bytes = sum(estimate_chunk_blob_size(chunk, stream_profile) for chunk in chunks)
+    return HEADER_STRUCT.size + chunk_bytes + (len(chunks) * CHUNK_INDEX_STRUCT.size) + estimate_subtitle_storage_size(subtitle_tracks)
 
 
 def split_access_units_into_segments(access_units: list[AccessUnit], stream_profile: str) -> list[ChunkSegment]:
@@ -1364,6 +1859,8 @@ def encode(args: argparse.Namespace) -> EncodeStats:
     fps = video_probe.fps if isinstance(args.fps, str) and args.fps.lower() == "source" else float(args.fps)
     if fps <= 0:
         raise RuntimeError("Target fps must be greater than zero.")
+    if args.burn_subtitle_size <= 0:
+        raise RuntimeError("--burn-subtitle-size must be greater than zero.")
 
     target_width, target_height, video_x, video_y = fit_dimensions(
         source_width,
@@ -1380,8 +1877,11 @@ def encode(args: argparse.Namespace) -> EncodeStats:
 
     start_time = time.time()
     idr_frames = resolve_idr_frames(args.chunk_frames, args.idr_frames, args.stream_profile)
+    preview_output_path = preview_mp4_path_for_output(output_path) if args.preview_mp4 else None
     bitstream = encode_h264_bitstream(
         input_path=input_path,
+        source_width=video_probe.storage_width,
+        source_height=video_probe.storage_height,
         width=target_width,
         height=target_height,
         fps=fps,
@@ -1394,6 +1894,8 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         duration=args.duration,
         encode_duration=args.duration if args.duration is not None else max(0.0, video_probe.duration - args.start),
         burn_subtitle=burn_subtitle,
+        burn_subtitle_size=args.burn_subtitle_size,
+        preview_output_path=preview_output_path,
         quiet=args.quiet,
     )
     log(
@@ -1414,11 +1916,23 @@ def encode(args: argparse.Namespace) -> EncodeStats:
     if not access_units:
         raise RuntimeError("No frames were found in the encoded H.264 bitstream.")
 
+    expected_output_size = estimate_total_output_size(
+        chunks,
+        stream_profile=args.stream_profile,
+        subtitle_tracks=subtitle_tracks,
+    )
+    log(
+        f"Expected output size {format_binary_size(expected_output_size)} "
+        f"({len(chunks)} chunks, {len(access_units)} frames).",
+        quiet=args.quiet,
+    )
+
     output_handle = output_path.open("wb")
     output_handle.write(b"\0" * HEADER_STRUCT.size)
 
     chunk_index: list[tuple[int, int, int, int, int, int]] = []
     frame_cursor = 0
+    pack_start_time = time.time()
     for chunk_number, access_unit_chunk in enumerate(chunks, start=1):
         chunk_payload, frame_offsets = build_chunk_blob(access_unit_chunk, args.stream_profile)
         stored_chunk_blob = bytearray()
@@ -1442,15 +1956,18 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         ))
 
         elapsed = time.time() - start_time
-        fps_done = frame_cursor / elapsed if elapsed > 0 else 0.0
+        pack_elapsed = time.time() - pack_start_time
         frame_end = frame_cursor + len(access_unit_chunk) - 1
         progress = (chunk_number / len(chunks)) * 100.0
-        eta_chunks = len(chunks) - chunk_number
-        eta = (eta_chunks * args.chunk_frames / fps_done) if fps_done > 0 and eta_chunks > 0 else 0.0
+        written_size = output_handle.tell()
+        remaining_size = max(0, expected_output_size - written_size)
+        pack_rate = ((written_size - HEADER_STRUCT.size) / pack_elapsed) if pack_elapsed > 0.0 else 0.0
+        eta = (remaining_size / pack_rate) if pack_rate > 0.0 and remaining_size > 0 else 0.0
         log(
             f"Chunk {chunk_number:03d}: {progress:5.1f}% | ETA {format_duration_hms(eta)} | "
-            f"frames {frame_cursor}-{frame_end} | size {len(stored_blob) / 1024:.1f} KiB | "
-            f"total size {output_handle.tell() / (1024 * 1024):.2f} MiB",
+            f"frames {frame_cursor}-{frame_end} | real {format_duration_hms(elapsed)} | "
+            f"size {format_binary_size(len(stored_blob))} | "
+            f"total size {format_binary_size(written_size)}/{format_binary_size(expected_output_size)}",
             quiet=args.quiet,
         )
         frame_cursor += len(access_unit_chunk)
@@ -1526,6 +2043,8 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         f"{len(access_units)} frames | {len(chunks)} chunks | raw H.264 {len(bitstream) / 1024:.1f} KiB",
         quiet=args.quiet,
     )
+    if preview_output_path is not None:
+        log(f"Wrote {preview_output_path.name} for preview.", quiet=args.quiet)
     return stats
 
 
@@ -1535,6 +2054,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Output .nvp.tns file")
     parser.add_argument("--subtitle", help="Optional subtitle source path or 'embedded'")
     parser.add_argument("--burn-subtitles", action="store_true", help="Render the selected subtitles directly into the video instead of storing subtitle tracks in the container")
+    parser.add_argument("--burn-subtitle-size", type=float, default=DEFAULT_BURN_SUBTITLE_SIZE, help="Relative size multiplier for burned subtitles (1.0 = default output-safe size)")
     parser.add_argument("--subtitle-track", dest="subtitle_track", action="append", type=int, help="Embedded subtitle track index to include; repeat to keep multiple tracks")
     parser.add_argument("--fps", default="12", help="Target framerate or 'source'")
     parser.add_argument("--max-width", type=int, default=SCREEN_W, help="Fit width")
@@ -1549,6 +2069,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--start", type=float, default=0.0, help="Optional clip start offset in seconds")
     parser.add_argument("--duration", type=float, help="Optional clip duration in seconds")
     parser.add_argument("--quiet", action="store_true", help="Silence progress logging")
+    parser.add_argument("--preview-mp4", action="store_true", help="Also write a video-only .preview.mp4 alongside the .nvp.tns output for quick inspection")
     return parser.parse_args(argv)
 
 

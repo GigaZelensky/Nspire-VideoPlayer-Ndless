@@ -142,6 +142,22 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded
 python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --burn-subtitles --output ".\dist\video.nvp.tns"
 ```
 
+### Burn Larger Subtitles Into Video
+
+```powershell
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --burn-subtitles --burn-subtitle-size 1.5 --output ".\dist\video.nvp.tns"
+```
+
+`--burn-subtitle-size` scales burned subtitles relative to the default output-safe size. It works for text subtitle burns and embedded bitmap subtitle burns.
+
+### Write a Preview MP4
+
+```powershell
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --burn-subtitles --preview-mp4 --output ".\dist\video.nvp.tns"
+```
+
+`--preview-mp4` also writes a video-only `.preview.mp4` next to the `.nvp.tns` output so you can quickly inspect subtitle burn, framing, and quality on PC before copying the movie to the calculator.
+
 ### Preserve Source Framerate
 
 ```powershell
@@ -159,6 +175,7 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded
 - `--output`
 - `--subtitle`
 - `--burn-subtitles`
+- `--burn-subtitle-size`
 - `--subtitle-track`
 - `--fps`
 - `--max-width`
@@ -172,6 +189,7 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded
 - `--stream-profile`
 - `--start`
 - `--duration`
+- `--preview-mp4`
 - `--quiet`
 
 Run `python tools/encode_ndless_video.py --help` for the full CLI.
