@@ -109,6 +109,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define HISTORY_MAX_ENTRIES 5
 #define HISTORY_MAGIC_V1 "NDVH1"
 #define HISTORY_MAGIC_V2 "NDVH2"
+#define HISTORY_MAGIC_V3 "NDVH3"
 #define RESUME_MIN_MS 5000U
 #define RESUME_CLEAR_TAIL_MS 3000U
 #define STATUS_OVERLAY_MS 1200U
@@ -192,6 +193,7 @@ typedef struct {
     bool has_resume;
     uint8_t scale_mode;
     uint8_t playback_rate_index;
+    uint8_t playback_mode;
     uint8_t subtitle_font_index;
     int8_t subtitle_size;
     uint8_t subtitle_placement;
@@ -607,6 +609,7 @@ static void apply_history_entry_settings(
     Movie *movie,
     ScaleMode *scale_mode,
     size_t *playback_rate_index,
+    PlaybackMode *playback_mode,
     size_t *subtitle_font_index,
     int *subtitle_size,
     SubtitlePlacement *subtitle_placement
@@ -8059,6 +8062,7 @@ static void history_entry_init_defaults(HistoryEntry *entry)
     memset(entry, 0, sizeof(*entry));
     entry->scale_mode = (uint8_t) SCALE_FIT;
     entry->playback_rate_index = (uint8_t) PLAYBACK_RATE_DEFAULT_INDEX;
+    entry->playback_mode = (uint8_t) PLAYBACK_MODE_ONCE;
     entry->subtitle_font_index = (uint8_t) SUBTITLE_FONT_DEFAULT_INDEX;
     entry->subtitle_size = 0;
     entry->subtitle_placement = (uint8_t) SUBTITLE_POS_BAR_BOTTOM;
@@ -8069,17 +8073,19 @@ static void apply_history_entry_settings(
     Movie *movie,
     ScaleMode *scale_mode,
     size_t *playback_rate_index,
+    PlaybackMode *playback_mode,
     size_t *subtitle_font_index,
     int *subtitle_size,
     SubtitlePlacement *subtitle_placement
 )
 {
-    if (!entry || !movie || !scale_mode || !playback_rate_index || !subtitle_font_index || !subtitle_size || !subtitle_placement) {
+    if (!entry || !movie || !scale_mode || !playback_rate_index || !playback_mode || !subtitle_font_index || !subtitle_size || !subtitle_placement) {
         return;
     }
 
     *scale_mode = (ScaleMode) clamp_int((int) entry->scale_mode, SCALE_FIT, SCALE_NATIVE);
     *playback_rate_index = (size_t) clamp_int((int) entry->playback_rate_index, 0, (int) (PLAYBACK_RATE_COUNT - 1U));
+    *playback_mode = (PlaybackMode) clamp_int((int) entry->playback_mode, PLAYBACK_MODE_ONCE, PLAYBACK_MODE_COUNT - 1);
     *subtitle_font_index = (size_t) clamp_int((int) entry->subtitle_font_index, 0, (int) (SUBTITLE_FONT_CHOICE_COUNT - 1U));
     *subtitle_size = clamp_int((int) entry->subtitle_size, -1, 3);
 
@@ -8099,7 +8105,7 @@ static bool load_history_store_from_path(const char *history_path, HistoryStore 
 {
     FILE *file;
     char line[MAX_PATH_LEN + 64];
-    bool version2 = false;
+    int version = 1;
 
     memset(history, 0, sizeof(*history));
     file = fopen(history_path, "rb");
@@ -8110,8 +8116,10 @@ static bool load_history_store_from_path(const char *history_path, HistoryStore 
         fclose(file);
         return false;
     }
-    if (strncmp(line, HISTORY_MAGIC_V2, 5) == 0) {
-        version2 = true;
+    if (strncmp(line, HISTORY_MAGIC_V3, 5) == 0) {
+        version = 3;
+    } else if (strncmp(line, HISTORY_MAGIC_V2, 5) == 0) {
+        version = 2;
     } else if (strncmp(line, HISTORY_MAGIC_V1, 5) != 0) {
         fclose(file);
         return false;
@@ -8121,12 +8129,13 @@ static bool load_history_store_from_path(const char *history_path, HistoryStore 
         HistoryEntry entry;
 
         history_entry_init_defaults(&entry);
-        if (version2) {
-            char *fields[9];
+        if (version >= 2) {
+            char *fields[10];
+            size_t expected_field_count = version >= 3 ? 10U : 9U;
             size_t field_index;
 
             fields[0] = line;
-            for (field_index = 1; field_index < 9; ++field_index) {
+            for (field_index = 1; field_index < expected_field_count; ++field_index) {
                 char *separator = strchr(fields[field_index - 1], '\t');
                 if (!separator) {
                     break;
@@ -8134,19 +8143,27 @@ static bool load_history_store_from_path(const char *history_path, HistoryStore 
                 *separator = '\0';
                 fields[field_index] = separator + 1;
             }
-            if (field_index < 9) {
+            if (field_index < expected_field_count) {
                 continue;
             }
 
-            path = fields[8];
+            path = fields[expected_field_count - 1U];
             entry.has_resume = strtoul(fields[0], NULL, 10) != 0;
             entry.frame = (uint32_t) strtoul(fields[1], NULL, 10);
             entry.scale_mode = (uint8_t) strtoul(fields[2], NULL, 10);
             entry.playback_rate_index = (uint8_t) strtoul(fields[3], NULL, 10);
-            entry.subtitle_font_index = (uint8_t) strtoul(fields[4], NULL, 10);
-            entry.subtitle_size = (int8_t) strtol(fields[5], NULL, 10);
-            entry.subtitle_placement = (uint8_t) strtoul(fields[6], NULL, 10);
-            entry.selected_subtitle_track = (uint16_t) strtoul(fields[7], NULL, 10);
+            if (version >= 3) {
+                entry.playback_mode = (uint8_t) strtoul(fields[4], NULL, 10);
+                entry.subtitle_font_index = (uint8_t) strtoul(fields[5], NULL, 10);
+                entry.subtitle_size = (int8_t) strtol(fields[6], NULL, 10);
+                entry.subtitle_placement = (uint8_t) strtoul(fields[7], NULL, 10);
+                entry.selected_subtitle_track = (uint16_t) strtoul(fields[8], NULL, 10);
+            } else {
+                entry.subtitle_font_index = (uint8_t) strtoul(fields[4], NULL, 10);
+                entry.subtitle_size = (int8_t) strtol(fields[5], NULL, 10);
+                entry.subtitle_placement = (uint8_t) strtoul(fields[6], NULL, 10);
+                entry.selected_subtitle_track = (uint16_t) strtoul(fields[7], NULL, 10);
+            }
         } else {
             char *separator = strchr(line, '\t');
             if (!separator) {
@@ -8193,15 +8210,16 @@ static bool save_history_store(const char *movie_path, const HistoryStore *histo
     if (!file) {
         return false;
     }
-    fputs(HISTORY_MAGIC_V2 "\n", file);
+    fputs(HISTORY_MAGIC_V3 "\n", file);
     for (index = 0; index < history->count && index < HISTORY_MAX_ENTRIES; ++index) {
         fprintf(
             file,
-            "%u\t%lu\t%u\t%u\t%u\t%d\t%u\t%u\t%s\n",
+            "%u\t%lu\t%u\t%u\t%u\t%u\t%d\t%u\t%u\t%s\n",
             history->entries[index].has_resume ? 1U : 0U,
             (unsigned long) history->entries[index].frame,
             (unsigned) history->entries[index].scale_mode,
             (unsigned) history->entries[index].playback_rate_index,
+            (unsigned) history->entries[index].playback_mode,
             (unsigned) history->entries[index].subtitle_font_index,
             (int) history->entries[index].subtitle_size,
             (unsigned) history->entries[index].subtitle_placement,
@@ -8247,6 +8265,7 @@ static void history_upsert_entry(
     uint32_t frame,
     ScaleMode scale_mode,
     size_t playback_rate_index,
+    PlaybackMode playback_mode,
     size_t subtitle_font_index,
     int subtitle_size,
     SubtitlePlacement subtitle_placement
@@ -8262,6 +8281,7 @@ static void history_upsert_entry(
     entry.frame = frame;
     entry.scale_mode = (uint8_t) clamp_int((int) scale_mode, SCALE_FIT, SCALE_NATIVE);
     entry.playback_rate_index = (uint8_t) clamp_int((int) playback_rate_index, 0, (int) (PLAYBACK_RATE_COUNT - 1U));
+    entry.playback_mode = (uint8_t) clamp_int((int) playback_mode, PLAYBACK_MODE_ONCE, PLAYBACK_MODE_COUNT - 1);
     entry.subtitle_font_index = (uint8_t) clamp_int((int) subtitle_font_index, 0, (int) (SUBTITLE_FONT_CHOICE_COUNT - 1U));
     entry.subtitle_size = (int8_t) clamp_int(subtitle_size, -1, 3);
     entry.subtitle_placement = (uint8_t) clamp_int((int) subtitle_placement, SUBTITLE_POS_BAR_BOTTOM, SUBTITLE_POS_COUNT - 1);
@@ -8310,6 +8330,7 @@ static void save_history_position_for_movie(
     const Movie *movie,
     ScaleMode scale_mode,
     size_t playback_rate_index,
+    PlaybackMode playback_mode,
     size_t subtitle_font_index,
     int subtitle_size,
     SubtitlePlacement subtitle_placement
@@ -8334,6 +8355,7 @@ static void save_history_position_for_movie(
         frame,
         scale_mode,
         playback_rate_index,
+        playback_mode,
         subtitle_font_index,
         subtitle_size,
         subtitle_placement
@@ -8372,6 +8394,7 @@ static void flush_deferred_history_save(
     bool force,
     ScaleMode scale_mode,
     size_t playback_rate_index,
+    PlaybackMode playback_mode,
     size_t subtitle_font_index,
     int subtitle_size,
     SubtitlePlacement subtitle_placement
@@ -8393,6 +8416,7 @@ static void flush_deferred_history_save(
         movie,
         scale_mode,
         playback_rate_index,
+        playback_mode,
         subtitle_font_index,
         subtitle_size,
         subtitle_placement
@@ -8946,6 +8970,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
                 &movie,
                 &scale_mode,
                 &playback_rate_index,
+                &playback_mode,
                 &subtitle_font_index,
                 &subtitle_size,
                 &subtitle_placement
@@ -9207,6 +9232,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
                 false,
                 scale_mode,
                 playback_rate_index,
+                playback_mode,
                 subtitle_font_index,
                 subtitle_size,
                 subtitle_placement
@@ -9558,6 +9584,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
                 false,
                 scale_mode,
                 playback_rate_index,
+                playback_mode,
                 subtitle_font_index,
                 subtitle_size,
                 subtitle_placement
@@ -9606,6 +9633,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
         true,
         scale_mode,
         playback_rate_index,
+        playback_mode,
         subtitle_font_index,
         subtitle_size,
         subtitle_placement
