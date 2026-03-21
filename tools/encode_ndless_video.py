@@ -51,7 +51,7 @@ DEFAULT_BURN_SUBTITLE_SIZE = 1.0
 DEFAULT_BURN_SUBTITLE_HEIGHT_RATIO = 0.10
 BITMAP_SUBTITLE_BBOX_PADDING = 4
 FILTER_COMPLEX_SCRIPT_PLACEHOLDER = "__NVP_FILTER_COMPLEX_SCRIPT__"
-BITMAP_SUBTITLE_ANALYSIS_CACHE_VERSION = 1
+BITMAP_SUBTITLE_ANALYSIS_CACHE_VERSION = 2
 PGS_SEGMENT_PALETTE = 0x14
 PGS_SEGMENT_OBJECT = 0x15
 PGS_SEGMENT_PRESENTATION = 0x16
@@ -104,6 +104,13 @@ class BitmapSubtitleSegment:
     y: int
     w: int
     h: int
+
+
+@dataclass(slots=True)
+class BitmapSubtitleAnalysis:
+    segments: list[BitmapSubtitleSegment]
+    subtitle_width: int = 0
+    subtitle_height: int = 0
 
 
 @dataclass(slots=True)
@@ -850,7 +857,7 @@ def bitmap_subtitle_analysis_cache_path(
     return Path(tempfile.gettempdir()) / "nvp-subtitle-analysis-cache" / f"{digest}.json"
 
 
-def load_bitmap_subtitle_analysis_cache(cache_path: Path) -> list[BitmapSubtitleSegment] | None:
+def load_bitmap_subtitle_analysis_cache(cache_path: Path) -> BitmapSubtitleAnalysis | None:
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -858,12 +865,16 @@ def load_bitmap_subtitle_analysis_cache(cache_path: Path) -> list[BitmapSubtitle
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         return None
 
-    if not isinstance(payload, list):
+    if not isinstance(payload, dict):
+        return None
+
+    items = payload.get("segments")
+    if not isinstance(items, list):
         return None
 
     segments: list[BitmapSubtitleSegment] = []
     try:
-        for item in payload:
+        for item in items:
             if not isinstance(item, dict):
                 return None
             segments.append(BitmapSubtitleSegment(
@@ -874,26 +885,36 @@ def load_bitmap_subtitle_analysis_cache(cache_path: Path) -> list[BitmapSubtitle
                 w=int(item["w"]),
                 h=int(item["h"]),
             ))
+        subtitle_width = int(payload.get("subtitle_width", 0))
+        subtitle_height = int(payload.get("subtitle_height", 0))
     except (KeyError, TypeError, ValueError):
         return None
-    return segments
+    return BitmapSubtitleAnalysis(
+        segments=segments,
+        subtitle_width=max(0, subtitle_width),
+        subtitle_height=max(0, subtitle_height),
+    )
 
 
-def save_bitmap_subtitle_analysis_cache(cache_path: Path, segments: list[BitmapSubtitleSegment]) -> None:
+def save_bitmap_subtitle_analysis_cache(cache_path: Path, analysis: BitmapSubtitleAnalysis) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(
         json.dumps(
-            [
-                {
-                    "start_s": segment.start_s,
-                    "end_s": segment.end_s,
-                    "x": segment.x,
-                    "y": segment.y,
-                    "w": segment.w,
-                    "h": segment.h,
-                }
-                for segment in segments
-            ],
+            {
+                "subtitle_width": analysis.subtitle_width,
+                "subtitle_height": analysis.subtitle_height,
+                "segments": [
+                    {
+                        "start_s": segment.start_s,
+                        "end_s": segment.end_s,
+                        "x": segment.x,
+                        "y": segment.y,
+                        "w": segment.w,
+                        "h": segment.h,
+                    }
+                    for segment in analysis.segments
+                ],
+            },
             separators=(",", ":"),
         ),
         encoding="utf-8",
@@ -1140,7 +1161,7 @@ def analyze_bitmap_subtitle_segments_from_pgs(
     duration: float | None,
     analyze_duration: float | None,
     quiet: bool,
-) -> list[BitmapSubtitleSegment]:
+) -> BitmapSubtitleAnalysis:
     with tempfile.TemporaryDirectory(prefix="nvp-pgs-") as temp_dir:
         data_path = Path(temp_dir) / f"track{stream_index}.bin"
         dump_bitmap_subtitle_stream_data(
@@ -1159,6 +1180,8 @@ def analyze_bitmap_subtitle_segments_from_pgs(
     palettes: dict[int, dict[int, int]] = {}
     presentation: dict[str, object] | None = None
     segments: list[BitmapSubtitleSegment] = []
+    subtitle_width = 0
+    subtitle_height = 0
     cursor = 0
     segment_index = 0
     parse_start = time.time()
@@ -1204,6 +1227,8 @@ def analyze_bitmap_subtitle_segments_from_pgs(
                     object_info["remaining"] = max(0, int(object_info.get("remaining", 0)) - max(0, len(payload) - 4))
         elif segment_type == PGS_SEGMENT_PRESENTATION:
             if len(payload) >= 11:
+                subtitle_width = max(subtitle_width, pgs_segment_be16(payload, 0))
+                subtitle_height = max(subtitle_height, pgs_segment_be16(payload, 2))
                 state = payload[7] >> 6
                 if state != 0:
                     objects.clear()
@@ -1257,7 +1282,11 @@ def analyze_bitmap_subtitle_segments_from_pgs(
             )
             last_log_time = now
 
-    return segments
+    return BitmapSubtitleAnalysis(
+        segments=segments,
+        subtitle_width=subtitle_width,
+        subtitle_height=subtitle_height,
+    )
 
 
 def analyze_bitmap_subtitle_segments_via_ffmpeg_bbox(
@@ -1269,7 +1298,7 @@ def analyze_bitmap_subtitle_segments_via_ffmpeg_bbox(
     analyze_duration: float | None,
     fallback_end: float,
     quiet: bool,
-) -> list[BitmapSubtitleSegment]:
+) -> BitmapSubtitleAnalysis:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     command = [ffmpeg, "-hide_banner", "-loglevel", "info", "-progress", "pipe:2", "-nostats"]
     if start > 0:
@@ -1386,7 +1415,13 @@ def analyze_bitmap_subtitle_segments_via_ffmpeg_bbox(
             h=active_bounds[3] - active_bounds[1],
         ))
 
-    return [segment for segment in segments if segment.w > 0 and segment.h > 0 and segment.end_s > segment.start_s]
+    return BitmapSubtitleAnalysis(
+        segments=[
+            segment
+            for segment in segments
+            if segment.w > 0 and segment.h > 0 and segment.end_s > segment.start_s
+        ],
+    )
 
 
 def analyze_bitmap_subtitle_segments(
@@ -1398,7 +1433,7 @@ def analyze_bitmap_subtitle_segments(
     analyze_duration: float | None,
     fallback_end: float,
     quiet: bool,
-) -> list[BitmapSubtitleSegment]:
+) -> BitmapSubtitleAnalysis:
     cache_path = bitmap_subtitle_analysis_cache_path(
         input_path=input_path,
         stream_index=stream_index,
@@ -1408,7 +1443,7 @@ def analyze_bitmap_subtitle_segments(
     cached_segments = load_bitmap_subtitle_analysis_cache(cache_path)
     if cached_segments is not None:
         log(
-            f"Loaded cached bitmap subtitle analysis ({len(cached_segments)} display set(s)).",
+            f"Loaded cached bitmap subtitle analysis ({len(cached_segments.segments)} display set(s)).",
             quiet=quiet,
         )
         return cached_segments
@@ -1423,7 +1458,7 @@ def analyze_bitmap_subtitle_segments(
             analyze_duration=analyze_duration,
             quiet=quiet,
         )
-        if segments:
+        if segments.segments:
             save_bitmap_subtitle_analysis_cache(cache_path, segments)
         return segments
     except KeyboardInterrupt:
@@ -1443,7 +1478,7 @@ def analyze_bitmap_subtitle_segments(
         fallback_end=fallback_end,
         quiet=quiet,
     )
-    if segments:
+    if segments.segments:
         save_bitmap_subtitle_analysis_cache(cache_path, segments)
     return segments
 
@@ -1483,6 +1518,39 @@ def padded_bitmap_segment(
     y1 = max(0, segment.y - padding)
     x2 = min(subtitle_width, segment.x + segment.w + padding)
     y2 = min(subtitle_height, segment.y + segment.h + padding)
+    return BitmapSubtitleSegment(
+        start_s=segment.start_s,
+        end_s=segment.end_s,
+        x=x1,
+        y=y1,
+        w=max(1, x2 - x1),
+        h=max(1, y2 - y1),
+    )
+
+
+def remap_bitmap_segment(
+    segment: BitmapSubtitleSegment,
+    *,
+    source_width: int,
+    source_height: int,
+    target_width: int,
+    target_height: int,
+) -> BitmapSubtitleSegment:
+    if (
+        source_width <= 0 or source_height <= 0 or
+        target_width <= 0 or target_height <= 0 or
+        (source_width == target_width and source_height == target_height)
+    ):
+        return segment
+
+    x1 = int(round(segment.x * target_width / source_width))
+    y1 = int(round(segment.y * target_height / source_height))
+    x2 = int(round((segment.x + segment.w) * target_width / source_width))
+    y2 = int(round((segment.y + segment.h) * target_height / source_height))
+    x1 = max(0, min(target_width - 1, x1))
+    y1 = max(0, min(target_height - 1, y1))
+    x2 = max(x1 + 1, min(target_width, x2))
+    y2 = max(y1 + 1, min(target_height, y2))
     return BitmapSubtitleSegment(
         start_s=segment.start_s,
         end_s=segment.end_s,
@@ -2145,7 +2213,7 @@ def build_ffmpeg_command(
             )
         else:
             segment_end = duration if duration is not None else 24.0 * 60.0 * 60.0
-            analyzed_segments = analyze_bitmap_subtitle_segments(
+            subtitle_analysis = analyze_bitmap_subtitle_segments(
                 input_path=input_path,
                 stream_index=burn_subtitle.stream_index,
                 start=start,
@@ -2154,14 +2222,26 @@ def build_ffmpeg_command(
                 fallback_end=segment_end,
                 quiet=quiet,
             )
-            if not analyzed_segments:
+            if not subtitle_analysis.segments:
                 bitmap_filter = (
                     f"[0:s:{burn_subtitle.stream_index}]scale={width}:{height}:flags=lanczos,format=rgba[subfit];"
                     f"[base][subfit]overlay=x=0:y=0:eof_action=pass[vout]"
                 )
             else:
+                analysis_segments = subtitle_analysis.segments
+                if subtitle_analysis.subtitle_width > 0 and subtitle_analysis.subtitle_height > 0:
+                    analysis_segments = [
+                        remap_bitmap_segment(
+                            segment,
+                            source_width=subtitle_analysis.subtitle_width,
+                            source_height=subtitle_analysis.subtitle_height,
+                            target_width=source_width,
+                            target_height=source_height,
+                        )
+                        for segment in analysis_segments
+                    ]
                 regions = merge_bitmap_subtitle_regions(
-                    analyzed_segments,
+                    analysis_segments,
                     subtitle_width=source_width,
                     subtitle_height=source_height,
                 )
