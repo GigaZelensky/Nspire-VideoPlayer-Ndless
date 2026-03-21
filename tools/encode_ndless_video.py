@@ -51,7 +51,6 @@ DEFAULT_BURN_SUBTITLE_SIZE = 1.0
 DEFAULT_BURN_SUBTITLE_HEIGHT_RATIO = 0.10
 BITMAP_SUBTITLE_BBOX_PADDING = 4
 FILTER_COMPLEX_SCRIPT_PLACEHOLDER = "__NVP_FILTER_COMPLEX_SCRIPT__"
-BITMAP_SUBTITLE_ANALYSIS_CACHE_VERSION = 2
 PGS_SEGMENT_PALETTE = 0x14
 PGS_SEGMENT_OBJECT = 0x15
 PGS_SEGMENT_PRESENTATION = 0x16
@@ -843,7 +842,6 @@ def bitmap_subtitle_analysis_cache_path(
     stat = input_path.stat()
     cache_key = json.dumps(
         {
-            "version": BITMAP_SUBTITLE_ANALYSIS_CACHE_VERSION,
             "input_path": str(input_path),
             "input_size": stat.st_size,
             "input_mtime_ns": stat.st_mtime_ns,
