@@ -341,6 +341,69 @@ class ProgressEstimator:
         return eta, expected_size
 
 
+class InputScanProgressEstimator:
+    def __init__(
+        self,
+        *,
+        recent_window_seconds: float = 15.0,
+        rate_alpha: float = 0.25,
+        min_eta_elapsed: float = 20.0,
+        min_eta_ratio: float = 0.01,
+    ) -> None:
+        self.recent_window_seconds = recent_window_seconds
+        self.rate_alpha = rate_alpha
+        self.min_eta_elapsed = min_eta_elapsed
+        self.min_eta_ratio = min_eta_ratio
+        self.samples: deque[tuple[float, int]] = deque()
+        self.smoothed_rate = 0.0
+        self.best_read_bytes = 0
+
+    def update(
+        self,
+        *,
+        real_time: float,
+        read_bytes: int,
+        total_bytes: int,
+        completed: bool,
+    ) -> tuple[int, float | None, float | None]:
+        clamped_read_bytes = max(0, int(read_bytes))
+        if total_bytes > 0:
+            clamped_read_bytes = min(clamped_read_bytes, total_bytes)
+        self.best_read_bytes = max(self.best_read_bytes, clamped_read_bytes)
+
+        self.samples.append((real_time, self.best_read_bytes))
+        while len(self.samples) > 1 and real_time - self.samples[0][0] > self.recent_window_seconds:
+            self.samples.popleft()
+
+        cumulative_rate = (self.best_read_bytes / real_time) if real_time > 0.0 and self.best_read_bytes > 0 else 0.0
+        recent_rate = 0.0
+        if len(self.samples) >= 2:
+            base_real, base_bytes = self.samples[0]
+            delta_real = real_time - base_real
+            delta_bytes = self.best_read_bytes - base_bytes
+            if delta_real >= 5.0 and delta_bytes > 0:
+                recent_rate = delta_bytes / delta_real
+
+        effective_rate = recent_rate or cumulative_rate
+        if recent_rate > 0.0 and cumulative_rate > 0.0:
+            effective_rate = (recent_rate * 0.9) + (cumulative_rate * 0.1)
+        self.smoothed_rate = ProgressEstimator._smooth(self.smoothed_rate, effective_rate, self.rate_alpha)
+
+        eta_seconds: float | None = None
+        if completed and total_bytes > 0:
+            eta_seconds = 0.0
+        elif (
+            total_bytes > 0 and
+            self.smoothed_rate > 0.0 and
+            real_time >= self.min_eta_elapsed and
+            (self.best_read_bytes / total_bytes) >= self.min_eta_ratio
+        ):
+            eta_seconds = max(0.0, total_bytes - self.best_read_bytes) / self.smoothed_rate
+
+        rate_bytes_per_second = self.smoothed_rate if self.smoothed_rate > 0.0 else None
+        return self.best_read_bytes, eta_seconds, rate_bytes_per_second
+
+
 def log_ffmpeg_progress(
     *,
     label: str,
@@ -467,6 +530,8 @@ def log_input_scan_progress(
     read_bytes: int,
     dumped_bytes: int,
     total_duration: float | None,
+    eta_seconds: float | None,
+    rate_bytes_per_second: float | None,
     quiet: bool,
 ) -> None:
     if quiet:
@@ -475,8 +540,8 @@ def log_input_scan_progress(
     ratio = min(max(progress_ratio, 0.0), 1.0)
     elapsed = max(0.0, time.time() - start_time)
     eta_text = "?"
-    if 0.001 <= ratio < 1.0:
-        eta_text = format_duration_hms(elapsed * (1.0 - ratio) / ratio)
+    if eta_seconds is not None:
+        eta_text = format_duration_hms(eta_seconds)
     elif ratio >= 1.0:
         eta_text = "00:00:00"
 
@@ -491,8 +556,8 @@ def log_input_scan_progress(
         parts.append("read ?")
     parts.append(f"dumped {format_binary_size(dumped_bytes)}")
     parts.append(f"real {format_duration_hms(elapsed)}")
-    if total_duration and total_duration > 0.0 and elapsed > 0.0 and ratio >= 0.001:
-        parts.append(f"speed {(total_duration * ratio) / elapsed:5.1f}x")
+    if total_duration and total_duration > 0.0 and input_size > 0 and rate_bytes_per_second and rate_bytes_per_second > 0.0:
+        parts.append(f"speed {(total_duration * rate_bytes_per_second) / input_size:5.1f}x")
     log(" | ".join(parts), quiet=False)
 
 
@@ -974,7 +1039,7 @@ def dump_bitmap_subtitle_stream_data(
         except Exception:
             process_info = None
     last_log_time = 0.0
-    best_ratio = 0.0
+    progress_estimator = InputScanProgressEstimator()
 
     try:
         while True:
@@ -983,20 +1048,29 @@ def dump_bitmap_subtitle_stream_data(
             should_log = (return_code is not None) or ((now - last_log_time) >= 1.0)
             if should_log:
                 dumped_bytes = output_path.stat().st_size if output_path.exists() else 0
-                read_bytes = get_process_read_bytes(process_info)
+                elapsed = max(0.0, now - extract_start)
+                read_bytes, eta_seconds, rate_bytes_per_second = progress_estimator.update(
+                    real_time=elapsed,
+                    read_bytes=get_process_read_bytes(process_info),
+                    total_bytes=input_size,
+                    completed=(return_code is not None),
+                )
                 if return_code is not None:
-                    best_ratio = 1.0
+                    progress_ratio = 1.0
                 elif input_size > 0 and read_bytes > 0:
-                    ratio = min(0.999, read_bytes / input_size)
-                    best_ratio = max(best_ratio, ratio)
+                    progress_ratio = min(0.999, read_bytes / input_size)
+                else:
+                    progress_ratio = 0.0
                 log_input_scan_progress(
                     label="Subtitle scan",
                     start_time=extract_start,
-                    progress_ratio=best_ratio,
+                    progress_ratio=progress_ratio,
                     input_size=input_size,
                     read_bytes=read_bytes,
                     dumped_bytes=dumped_bytes,
                     total_duration=analyze_duration,
+                    eta_seconds=eta_seconds,
+                    rate_bytes_per_second=rate_bytes_per_second,
                     quiet=quiet,
                 )
                 last_log_time = now

@@ -239,9 +239,22 @@ typedef struct {
 } PlaybackRate;
 
 typedef enum {
+    PLAYBACK_MODE_ONCE = 0,
+    PLAYBACK_MODE_REPEAT,
+    PLAYBACK_MODE_AUTO_NEXT,
+    PLAYBACK_MODE_COUNT,
+} PlaybackMode;
+
+typedef enum {
     MEMORY_OVERLAY_OFF = 0,
     MEMORY_OVERLAY_ALWAYS,
 } MemoryOverlayMode;
+
+typedef enum {
+    PLAY_MOVIE_RESULT_ERROR = -1,
+    PLAY_MOVIE_RESULT_EXIT = 0,
+    PLAY_MOVIE_RESULT_AUTO_NEXT = 1,
+} PlayMovieResult;
 
 typedef struct {
     bool valid;
@@ -518,6 +531,7 @@ static bool prefetch_chunk(Movie *movie, int chunk_index);
 static void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks, int max_new_distance);
 static PrefetchedChunk *find_prefetched_chunk(Movie *movie, int chunk_index);
 static void clear_prefetched_chunk(PrefetchedChunk *chunk);
+static void strip_filename(char *path);
 static bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk);
 static void prefetch_do_work(Movie *movie, int current_chunk, int max_work_distance, uint32_t deadline_ms, bool single_step);
 static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, uint32_t deadline_ms);
@@ -5979,6 +5993,21 @@ static int compare_movie_files(const void *lhs, const void *rhs)
     return strcmp(a->name, b->name);
 }
 
+static bool strings_equal_ignore_case(const char *lhs, const char *rhs)
+{
+    if (!lhs || !rhs) {
+        return false;
+    }
+    while (*lhs && *rhs) {
+        if (tolower((unsigned char) *lhs) != tolower((unsigned char) *rhs)) {
+            return false;
+        }
+        ++lhs;
+        ++rhs;
+    }
+    return *lhs == '\0' && *rhs == '\0';
+}
+
 static MovieFile *scan_movies(const char *directory, size_t *out_count)
 {
     DIR *dir = opendir(directory);
@@ -6043,6 +6072,42 @@ static MovieFile *scan_movies(const char *directory, size_t *out_count)
     qsort(files, count, sizeof(MovieFile), compare_movie_files);
     *out_count = count;
     return files;
+}
+
+static bool find_next_movie_path(const char *current_path, char *next_path, size_t next_path_size)
+{
+    char directory[MAX_PATH_LEN];
+    const char *current_filename;
+    MovieFile *files;
+    size_t count = 0;
+    size_t index;
+    bool found = false;
+
+    if (!current_path || current_path[0] == '\0' || !next_path || next_path_size == 0) {
+        return false;
+    }
+
+    snprintf(directory, sizeof(directory), "%s", current_path);
+    strip_filename(directory);
+    current_filename = filename_from_path(current_path);
+    files = scan_movies(directory, &count);
+    if (!files || count == 0) {
+        return false;
+    }
+
+    for (index = 0; index < count; ++index) {
+        if (strings_equal_ignore_case(filename_from_path(files[index].path), current_filename)) {
+            if (index + 1 < count) {
+                strncpy(next_path, files[index + 1].path, next_path_size - 1);
+                next_path[next_path_size - 1] = '\0';
+                found = true;
+            }
+            break;
+        }
+    }
+
+    free_movie_files(files, count);
+    return found;
 }
 
 static const SubtitleCue *active_subtitle_cue(const Movie *movie, uint32_t now_ms)
@@ -7274,6 +7339,17 @@ static const char *scale_mode_text(ScaleMode scale_mode)
     return "FIT";
 }
 
+static const char *playback_mode_text(PlaybackMode playback_mode)
+{
+    if (playback_mode == PLAYBACK_MODE_REPEAT) {
+        return "REPLAY";
+    }
+    if (playback_mode == PLAYBACK_MODE_AUTO_NEXT) {
+        return "AUTO NEXT";
+    }
+    return "PLAY ONCE";
+}
+
 static int top_overlay_y_for_rect(const SDL_Rect *video_rect, int overlay_h)
 {
     if (video_rect && video_rect->y > overlay_h) {
@@ -7382,7 +7458,13 @@ static void format_seek_delta(int32_t delta_ms, char *buffer, size_t buffer_size
     snprintf(buffer, buffer_size, "%c%s", delta_ms < 0 ? '-' : '+', time_text);
 }
 
-static int draw_status_badges(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *video_rect, ScaleMode scale_mode, const PlaybackRate *playback_rate)
+static int draw_status_badges(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    const SDL_Rect *video_rect,
+    ScaleMode scale_mode,
+    const PlaybackRate *playback_rate
+)
 {
     int right_x = SCREEN_W - 8;
     int y = top_overlay_y_for_rect(video_rect, 16);
@@ -7539,7 +7621,7 @@ static void draw_help_row(SDL_Surface *screen, const Fonts *fonts, int shortcut_
 static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
 {
     const int menu_w = 296;
-    const int menu_h = 200;
+    const int menu_h = 204;
     const int safe_h = SCREEN_H - UI_BAR_H;
     SDL_Rect border = {(SCREEN_W - menu_w) / 2, (safe_h - menu_h) / 2, menu_w, menu_h};
     SDL_Rect panel = {border.x + 1, border.y + 1, border.w - 2, border.h - 2};
@@ -7555,6 +7637,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
         {"CLICK", "Toggle or seek bar"},
         {"L / R", "Seek -/+5s"},
         {"TAB", "Step one frame"},
+        {"P", "Playback mode"},
         {"/", "Scale mode"},
         {"{ / }", "Playback speed"},
         {"^", "Subtitle position"},
@@ -7596,10 +7679,10 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     }
     shortcut_x = panel.x + 12;
     description_x = shortcut_x + max_shortcut_w + 16;
-    y = accent.y + 10;
+    y = accent.y + 8;
     for (index = 0; index < sizeof(rows) / sizeof(rows[0]); ++index) {
         draw_help_row(screen, fonts, shortcut_x, description_x, y, rows[index].shortcut, rows[index].description);
-        y += 11;
+        y += 10;
     }
 }
 
@@ -8764,7 +8847,7 @@ static int prompt_resume_position(
     }
 }
 
-static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
+static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path, char *next_path, size_t next_path_size)
 {
     static Movie movie;
     bool prev_enter = false;
@@ -8785,6 +8868,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     bool prev_m = false;
     bool prev_d = false;
     bool prev_s = false;
+    bool prev_p = false;
     bool prev_plus = false;
     bool prev_minus = false;
     bool paused = false;
@@ -8800,6 +8884,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     ScaleMode scale_mode = SCALE_FIT;
     size_t playback_rate_index = PLAYBACK_RATE_DEFAULT_INDEX;
     size_t subtitle_font_index = SUBTITLE_FONT_DEFAULT_INDEX;
+    PlaybackMode playback_mode = PLAYBACK_MODE_ONCE;
     MemoryOverlayMode memory_overlay_mode = MEMORY_OVERLAY_OFF;
     int subtitle_size = 0;
     SubtitlePlacement subtitle_placement = SUBTITLE_POS_BAR_BOTTOM;
@@ -8901,6 +8986,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     prev_m = isKeyPressed(KEY_NSPIRE_M);
     prev_d = isKeyPressed(KEY_NSPIRE_D);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
+    prev_p = isKeyPressed(KEY_NSPIRE_P);
     debug_set_metrics_collection(debug_is_runtime_logging_enabled());
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
     tab_hold_repeat_interval_ms = tab_hold_frame_repeat_interval_ms(&movie);
@@ -8958,6 +9044,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
         bool memory_overlay_edge = key_pressed_edge(KEY_NSPIRE_M, &prev_m);
         bool debug_logging_edge = key_pressed_edge(KEY_NSPIRE_D, &prev_d);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
+        bool playback_mode_edge = key_pressed_edge(KEY_NSPIRE_P, &prev_p);
         bool take_screenshot = false;
         bool tab_repeat_step = false;
 
@@ -9124,6 +9211,12 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
             prefetch_tick(&movie, true, 1000);
             msleep(16);
             continue;
+        }
+        if (playback_mode_edge) {
+            playback_mode = (PlaybackMode) ((playback_mode + 1) % PLAYBACK_MODE_COUNT);
+            snprintf(status_overlay_text, sizeof(status_overlay_text), "MODE %s", playback_mode_text(playback_mode));
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (enter_edge) {
             if (movie.current_frame + 1 >= movie.header.frame_count) {
@@ -9349,15 +9442,34 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
                 }
 
                 if (target_frame >= movie.header.frame_count) {
-                    if (movie.current_frame + 1 < movie.header.frame_count) {
-                        if (!decode_to_frame(&movie, movie.header.frame_count - 1)) {
-                            report_movie_decode_failure(&movie, path, "final frame");
-                            result = -1;
+                    if (playback_mode == PLAYBACK_MODE_REPEAT) {
+                        if (!decode_to_frame(&movie, 0)) {
+                            report_movie_decode_failure(&movie, path, "auto replay");
+                            result = PLAY_MOVIE_RESULT_ERROR;
                             break;
                         }
+                        hover_preview_needs_rebuffer = false;
+                        reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                        ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+                    } else if (playback_mode == PLAYBACK_MODE_AUTO_NEXT &&
+                               find_next_movie_path(path, next_path, next_path_size)) {
+                        result = PLAY_MOVIE_RESULT_AUTO_NEXT;
+                        break;
+                    } else {
+                        if (movie.current_frame + 1 < movie.header.frame_count) {
+                            if (!decode_to_frame(&movie, movie.header.frame_count - 1)) {
+                                report_movie_decode_failure(&movie, path, "final frame");
+                                result = PLAY_MOVIE_RESULT_ERROR;
+                                break;
+                            }
+                        }
+                        paused = true;
+                        if (playback_mode == PLAYBACK_MODE_AUTO_NEXT) {
+                            snprintf(status_overlay_text, sizeof(status_overlay_text), "END OF LIST");
+                            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+                        }
+                        ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
                     }
-                    paused = true;
-                    ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
                 } else {
                     if (target_frame > movie.current_frame) {
                         uint32_t decode_start_ms = monotonic_clock_now_ms();
@@ -9497,8 +9609,15 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path)
     );
     if (debug_is_runtime_logging_enabled() || result != 0) {
         char log_path[MAX_PATH_LEN];
+        const char *exit_reason = "normal-exit";
+
+        if (result == PLAY_MOVIE_RESULT_AUTO_NEXT) {
+            exit_reason = "auto-next";
+        } else if (result != PLAY_MOVIE_RESULT_EXIT) {
+            exit_reason = "aborted";
+        }
         debug_log_path_for_movie(path, log_path, sizeof(log_path));
-        debug_dump_session(log_path, &movie, result == 0 ? "normal-exit" : "aborted");
+        debug_dump_session(log_path, &movie, exit_reason);
     }
     free_subtitle_surface_cache(&subtitle_cache);
     clear_screenshot_preview(&screenshot_preview);
@@ -9512,8 +9631,10 @@ int main(int argc, char **argv)
     SDL_Surface *screen;
     Fonts fonts;
     char movie_path[MAX_PATH_LEN];
+    char queued_movie_path[MAX_PATH_LEN] = {0};
     char directory[MAX_PATH_LEN];
     int result = 0;
+    bool have_queued_movie = false;
 
     if (argc < 1) {
         show_msgbox("ND Video Player", "Ndless did not provide argv[0].");
@@ -9549,7 +9670,11 @@ int main(int argc, char **argv)
     strip_filename(directory);
 
     while (1) {
-        if (argc > 1) {
+        if (have_queued_movie) {
+            strncpy(movie_path, queued_movie_path, sizeof(movie_path) - 1);
+            movie_path[sizeof(movie_path) - 1] = '\0';
+            have_queued_movie = false;
+        } else if (argc > 1) {
             strncpy(movie_path, argv[1], sizeof(movie_path) - 1);
             movie_path[sizeof(movie_path) - 1] = '\0';
         } else {
@@ -9557,9 +9682,13 @@ int main(int argc, char **argv)
                 break;
             }
         }
-        result = play_movie(screen, &fonts, movie_path);
+        result = play_movie(screen, &fonts, movie_path, queued_movie_path, sizeof(queued_movie_path));
         argc = 1;
-        if (result != 0) {
+        if (result == PLAY_MOVIE_RESULT_AUTO_NEXT) {
+            have_queued_movie = true;
+            continue;
+        }
+        if (result != PLAY_MOVIE_RESULT_EXIT) {
             break;
         }
     }
