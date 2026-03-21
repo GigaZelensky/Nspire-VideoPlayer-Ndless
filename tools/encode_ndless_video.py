@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import hashlib
 import html
 import json
 import re
@@ -12,12 +13,17 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import imageio_ffmpeg
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 
 MAGIC = b"NVP1"
@@ -45,6 +51,12 @@ DEFAULT_BURN_SUBTITLE_SIZE = 1.0
 DEFAULT_BURN_SUBTITLE_HEIGHT_RATIO = 0.10
 BITMAP_SUBTITLE_BBOX_PADDING = 4
 FILTER_COMPLEX_SCRIPT_PLACEHOLDER = "__NVP_FILTER_COMPLEX_SCRIPT__"
+BITMAP_SUBTITLE_ANALYSIS_CACHE_VERSION = 1
+PGS_SEGMENT_PALETTE = 0x14
+PGS_SEGMENT_OBJECT = 0x15
+PGS_SEGMENT_PRESENTATION = 0x16
+PGS_SEGMENT_WINDOW = 0x17
+PGS_SEGMENT_DISPLAY = 0x80
 
 NAL_IDR = 5
 NAL_SEI = 6
@@ -200,6 +212,15 @@ def parse_ffmpeg_speed(value: str | None) -> float:
     return speed if speed > 0.0 else 0.0
 
 
+def parse_ffmpeg_int(value: str | None) -> int:
+    if not value:
+        return 0
+    try:
+        return int(value.strip())
+    except ValueError:
+        return 0
+
+
 def format_duration_hms(seconds: float) -> str:
     total_seconds = max(0, int(round(seconds)))
     hours = total_seconds // 3600
@@ -215,7 +236,13 @@ def format_binary_size(byte_count: int) -> str:
         return f"{byte_count / 1024:.1f} KiB"
     if byte_count < 10 * 1024 * 1024:
         return f"{byte_count / (1024 * 1024):.3f} MiB"
-    return f"{byte_count / (1024 * 1024):.2f} MiB"
+    if byte_count < 1024 * 1024 * 1024:
+        return f"{byte_count / (1024 * 1024):.2f} MiB"
+    if byte_count < 10 * 1024 * 1024 * 1024:
+        return f"{byte_count / (1024 * 1024 * 1024):.3f} GiB"
+    if byte_count < 1024 * 1024 * 1024 * 1024:
+        return f"{byte_count / (1024 * 1024 * 1024):.2f} GiB"
+    return f"{byte_count / (1024 * 1024 * 1024 * 1024):.2f} TiB"
 
 
 class ProgressEstimator:
@@ -306,6 +333,172 @@ class ProgressEstimator:
                 expected_size = max(byte_count, int(round(projected_size_rate * total_media_time)))
 
         return eta, expected_size
+
+
+def log_ffmpeg_progress(
+    *,
+    label: str,
+    progress_state: dict[str, str],
+    start_time: float,
+    total_duration: float | None,
+    progress_estimator: ProgressEstimator,
+    quiet: bool,
+    include_size: bool,
+    fallback_fps: float | None = None,
+) -> None:
+    if quiet:
+        return
+
+    out_time = parse_ffmpeg_time(progress_state.get("out_time", "00:00:00.000"))
+    if out_time <= 0.0 and fallback_fps and fallback_fps > 0.0:
+        frame_count = parse_ffmpeg_int(progress_state.get("frame"))
+        if frame_count > 0:
+            out_time = frame_count / fallback_fps
+    ratio = (out_time / total_duration) if total_duration and total_duration > 0.0 else 0.0
+    ratio = min(max(ratio, 0.0), 1.0)
+    elapsed = time.time() - start_time
+    total_size = parse_ffmpeg_int(progress_state.get("total_size")) if include_size else 0
+    speed = progress_state.get("speed", "?")
+    if (not speed or speed == "N/A") and elapsed > 0.0 and out_time > 0.0:
+        speed = f"{out_time / elapsed:.1f}x"
+    speed_factor = parse_ffmpeg_speed(speed)
+    eta, expected_size = progress_estimator.update(
+        real_time=elapsed,
+        media_time=out_time,
+        total_media_time=total_duration,
+        byte_count=total_size,
+        reported_speed=speed_factor,
+    )
+    if eta <= 0.0 and ratio > 0.0:
+        eta = elapsed * (1.0 - ratio) / ratio
+
+    parts = [label]
+    if total_duration and total_duration > 0.0:
+        parts.append(f"{ratio * 100.0:5.1f}%")
+        parts.append(f"ETA {format_duration_hms(eta)}")
+    parts.append(f"time {format_duration_hms(out_time)}")
+    parts.append(f"real {format_duration_hms(elapsed)}")
+    if include_size:
+        expected_size_text = format_binary_size(expected_size) if expected_size is not None else "?"
+        parts.append(f"size {format_binary_size(total_size)}")
+        parts.append(f"expect {expected_size_text}")
+    parts.append(f"speed {speed}")
+    log(" | ".join(parts), quiet=False)
+
+
+def stop_ffmpeg_process(process: subprocess.Popen[str], *, label: str, quiet: bool) -> None:
+    if process.poll() is not None:
+        return
+
+    log(f"{label} interrupted. Stopping FFmpeg...", quiet=quiet)
+
+    if process.stdin is not None:
+        try:
+            process.stdin.write("q\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+
+    try:
+        process.wait(timeout=5.0)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    process.terminate()
+    try:
+        process.wait(timeout=2.0)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    process.kill()
+    process.wait()
+
+
+def start_stderr_collector(
+    process: subprocess.Popen[str],
+    *,
+    sink: list[str],
+) -> threading.Thread | None:
+    if process.stderr is None:
+        return None
+
+    def collect() -> None:
+        assert process.stderr is not None
+        try:
+            for raw_line in process.stderr:
+                line = raw_line.strip()
+                if line:
+                    sink.append(line)
+        finally:
+            process.stderr.close()
+
+    thread = threading.Thread(target=collect, name="nvp-stderr-collector", daemon=True)
+    thread.start()
+    return thread
+
+
+def get_process_read_bytes(process_info: object | None) -> int:
+    if process_info is None:
+        return 0
+    try:
+        counters = process_info.io_counters()
+    except Exception:
+        return 0
+    return max(0, int(getattr(counters, "read_bytes", 0) or 0))
+
+
+def log_input_scan_progress(
+    *,
+    label: str,
+    start_time: float,
+    progress_ratio: float,
+    input_size: int,
+    read_bytes: int,
+    dumped_bytes: int,
+    total_duration: float | None,
+    quiet: bool,
+) -> None:
+    if quiet:
+        return
+
+    ratio = min(max(progress_ratio, 0.0), 1.0)
+    elapsed = max(0.0, time.time() - start_time)
+    eta_text = "?"
+    if 0.001 <= ratio < 1.0:
+        eta_text = format_duration_hms(elapsed * (1.0 - ratio) / ratio)
+    elif ratio >= 1.0:
+        eta_text = "00:00:00"
+
+    parts = [
+        label,
+        f"{ratio * 100.0:5.1f}%",
+        f"ETA {eta_text}",
+    ]
+    if input_size > 0:
+        parts.append(f"read {format_binary_size(min(read_bytes, input_size))} / {format_binary_size(input_size)}")
+    else:
+        parts.append("read ?")
+    parts.append(f"dumped {format_binary_size(dumped_bytes)}")
+    parts.append(f"real {format_duration_hms(elapsed)}")
+    if total_duration and total_duration > 0.0 and elapsed > 0.0 and ratio >= 0.001:
+        parts.append(f"speed {(total_duration * ratio) / elapsed:5.1f}x")
+    log(" | ".join(parts), quiet=False)
+
+
+def cleanup_partial_file(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
 
 
 def normalize_output_path(output_arg: str) -> Path:
@@ -633,16 +826,452 @@ def compute_burn_subtitle_metrics(height: int, size_scale: float) -> tuple[int, 
     return font_size, margin_v, outline
 
 
-def analyze_bitmap_subtitle_segments(
+def bitmap_subtitle_analysis_cache_path(
     *,
     input_path: Path,
     stream_index: int,
     start: float,
     duration: float | None,
+) -> Path:
+    stat = input_path.stat()
+    cache_key = json.dumps(
+        {
+            "version": BITMAP_SUBTITLE_ANALYSIS_CACHE_VERSION,
+            "input_path": str(input_path),
+            "input_size": stat.st_size,
+            "input_mtime_ns": stat.st_mtime_ns,
+            "stream_index": stream_index,
+            "start_ms": int(round(start * 1000.0)),
+            "duration_ms": None if duration is None else int(round(duration * 1000.0)),
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    digest = hashlib.sha256(cache_key).hexdigest()
+    return Path(tempfile.gettempdir()) / "nvp-subtitle-analysis-cache" / f"{digest}.json"
+
+
+def load_bitmap_subtitle_analysis_cache(cache_path: Path) -> list[BitmapSubtitleSegment] | None:
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+    if not isinstance(payload, list):
+        return None
+
+    segments: list[BitmapSubtitleSegment] = []
+    try:
+        for item in payload:
+            if not isinstance(item, dict):
+                return None
+            segments.append(BitmapSubtitleSegment(
+                start_s=float(item["start_s"]),
+                end_s=float(item["end_s"]),
+                x=int(item["x"]),
+                y=int(item["y"]),
+                w=int(item["w"]),
+                h=int(item["h"]),
+            ))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return segments
+
+
+def save_bitmap_subtitle_analysis_cache(cache_path: Path, segments: list[BitmapSubtitleSegment]) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(
+            [
+                {
+                    "start_s": segment.start_s,
+                    "end_s": segment.end_s,
+                    "x": segment.x,
+                    "y": segment.y,
+                    "w": segment.w,
+                    "h": segment.h,
+                }
+                for segment in segments
+            ],
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+
+def dump_bitmap_subtitle_stream_data(
+    *,
+    input_path: Path,
+    output_path: Path,
+    stream_index: int,
+    start: float,
+    duration: float | None,
+    analyze_duration: float | None,
+    quiet: bool,
+) -> None:
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    if start > 0:
+        command += ["-ss", f"{start:.3f}"]
+    if duration is not None:
+        command += ["-t", f"{duration:.3f}"]
+    command += ["-i", str(input_path)]
+    command += [
+        "-map",
+        f"0:s:{stream_index}",
+        "-c",
+        "copy",
+        "-f",
+        "data",
+        str(output_path),
+    ]
+
+    log("Dumping bitmap subtitle packets for analysis...", quiet=quiet)
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    if process.stderr is None:
+        raise RuntimeError("Failed to capture FFmpeg bitmap subtitle dump output.")
+
+    stderr_lines: list[str] = []
+    stderr_thread = start_stderr_collector(process, sink=stderr_lines)
+    extract_start = time.time()
+    try:
+        input_size = input_path.stat().st_size
+    except OSError:
+        input_size = 0
+    process_info = None
+    if psutil is not None:
+        try:
+            process_info = psutil.Process(process.pid)
+        except Exception:
+            process_info = None
+    last_log_time = 0.0
+    best_ratio = 0.0
+
+    try:
+        while True:
+            return_code = process.poll()
+            now = time.time()
+            should_log = (return_code is not None) or ((now - last_log_time) >= 1.0)
+            if should_log:
+                dumped_bytes = output_path.stat().st_size if output_path.exists() else 0
+                read_bytes = get_process_read_bytes(process_info)
+                if return_code is not None:
+                    best_ratio = 1.0
+                elif input_size > 0 and read_bytes > 0:
+                    ratio = min(0.999, read_bytes / input_size)
+                    best_ratio = max(best_ratio, ratio)
+                log_input_scan_progress(
+                    label="Subtitle scan",
+                    start_time=extract_start,
+                    progress_ratio=best_ratio,
+                    input_size=input_size,
+                    read_bytes=read_bytes,
+                    dumped_bytes=dumped_bytes,
+                    total_duration=analyze_duration,
+                    quiet=quiet,
+                )
+                last_log_time = now
+            if return_code is not None:
+                break
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        stop_ffmpeg_process(process, label="Subtitle packet dump", quiet=quiet)
+        cleanup_partial_file(output_path)
+        raise
+    finally:
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=1.0)
+
+    return_code = process.wait()
+    if return_code != 0:
+        cleanup_partial_file(output_path)
+        raise RuntimeError("\n".join(stderr_lines[-20:]).strip() or "bitmap subtitle packet dump failed")
+
+
+def pgs_segment_be16(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset:offset + 2], "big")
+
+
+def pgs_segment_be24(data: bytes, offset: int) -> int:
+    return int.from_bytes(data[offset:offset + 3], "big")
+
+
+def parse_pgs_object_visible_bounds(
+    *,
+    width: int,
+    height: int,
+    rle_data: bytes,
+    palette_alpha: dict[int, int],
+) -> tuple[int, int, int, int] | None:
+    if width <= 0 or height <= 0 or not rle_data:
+        return None
+
+    total_pixels = width * height
+    pixel_count = 0
+    cursor = 0
+    min_x = width
+    min_y = height
+    max_x = -1
+    max_y = -1
+
+    while cursor < len(rle_data) and pixel_count < total_pixels:
+        color = rle_data[cursor]
+        cursor += 1
+        run = 1
+
+        if color == 0:
+            if cursor >= len(rle_data):
+                break
+            flags = rle_data[cursor]
+            cursor += 1
+            run = flags & 0x3F
+            if flags & 0x40:
+                if cursor >= len(rle_data):
+                    break
+                run = (run << 8) + rle_data[cursor]
+                cursor += 1
+            if flags & 0x80:
+                if cursor >= len(rle_data):
+                    break
+                color = rle_data[cursor]
+                cursor += 1
+            else:
+                color = 0
+
+        if run <= 0:
+            continue
+
+        run = min(run, total_pixels - pixel_count)
+        alpha = palette_alpha.get(color, 255 if color != 0 else 0)
+        if alpha > 0:
+            remaining = run
+            while remaining > 0:
+                row = pixel_count // width
+                col = pixel_count % width
+                span = min(remaining, width - col)
+                min_x = min(min_x, col)
+                min_y = min(min_y, row)
+                max_x = max(max_x, col + span - 1)
+                max_y = max(max_y, row)
+                pixel_count += span
+                remaining -= span
+        else:
+            pixel_count += run
+
+    if max_x < 0 or max_y < 0:
+        return None
+    return min_x, min_y, max_x + 1, max_y + 1
+
+
+def current_pgs_display_bounds(
+    *,
+    presentation: dict[str, object] | None,
+    objects: dict[int, dict[str, object]],
+    palettes: dict[int, dict[int, int]],
+) -> tuple[int, int, int, int] | None:
+    if presentation is None:
+        return None
+
+    object_refs = presentation.get("objects")
+    if not isinstance(object_refs, list) or not object_refs:
+        return None
+
+    palette_id = int(presentation.get("palette_id", 0))
+    palette_alpha = palettes.get(palette_id, {})
+    bounds: tuple[int, int, int, int] | None = None
+
+    for object_ref in object_refs:
+        if not isinstance(object_ref, dict):
+            continue
+        object_id = int(object_ref.get("id", -1))
+        object_x = int(object_ref.get("x", 0))
+        object_y = int(object_ref.get("y", 0))
+        object_info = objects.get(object_id)
+        if not object_info:
+            continue
+
+        width = int(object_info.get("w", 0))
+        height = int(object_info.get("h", 0))
+        rle_data = bytes(object_info.get("rle", b""))
+        remaining = int(object_info.get("remaining", 0))
+        local_bounds = parse_pgs_object_visible_bounds(
+            width=width,
+            height=height,
+            rle_data=rle_data,
+            palette_alpha=palette_alpha,
+        )
+        if local_bounds is None and width > 0 and height > 0 and remaining > 0:
+            local_bounds = (0, 0, width, height)
+        if local_bounds is None:
+            continue
+
+        x1 = object_x + local_bounds[0]
+        y1 = object_y + local_bounds[1]
+        x2 = object_x + local_bounds[2]
+        y2 = object_y + local_bounds[3]
+        if bounds is None:
+            bounds = (x1, y1, x2, y2)
+        else:
+            bounds = (
+                min(bounds[0], x1),
+                min(bounds[1], y1),
+                max(bounds[2], x2),
+                max(bounds[3], y2),
+            )
+
+    return bounds
+
+
+def analyze_bitmap_subtitle_segments_from_pgs(
+    *,
+    input_path: Path,
+    stream_index: int,
+    start: float,
+    duration: float | None,
+    analyze_duration: float | None,
+    quiet: bool,
+) -> list[BitmapSubtitleSegment]:
+    with tempfile.TemporaryDirectory(prefix="nvp-pgs-") as temp_dir:
+        data_path = Path(temp_dir) / f"track{stream_index}.bin"
+        dump_bitmap_subtitle_stream_data(
+            input_path=input_path,
+            output_path=data_path,
+            stream_index=stream_index,
+            start=start,
+            duration=duration,
+            analyze_duration=analyze_duration,
+            quiet=quiet,
+        )
+        data = data_path.read_bytes()
+
+    log("Parsing bitmap subtitle placements...", quiet=quiet)
+    objects: dict[int, dict[str, object]] = {}
+    palettes: dict[int, dict[int, int]] = {}
+    presentation: dict[str, object] | None = None
+    segments: list[BitmapSubtitleSegment] = []
+    cursor = 0
+    segment_index = 0
+    parse_start = time.time()
+    last_log_time = parse_start
+
+    while cursor + 3 <= len(data):
+        segment_type = data[cursor]
+        segment_length = pgs_segment_be16(data, cursor + 1)
+        payload_start = cursor + 3
+        payload_end = payload_start + segment_length
+        if payload_end > len(data):
+            raise RuntimeError("Truncated PGS segment while parsing extracted subtitle data.")
+        payload = data[payload_start:payload_end]
+
+        if segment_type == PGS_SEGMENT_PALETTE:
+            if len(payload) >= 2:
+                palette_id = payload[0]
+                palette = palettes.setdefault(palette_id, {})
+                for entry_offset in range(2, len(payload), 5):
+                    if entry_offset + 5 > len(payload):
+                        break
+                    palette[payload[entry_offset]] = payload[entry_offset + 4]
+        elif segment_type == PGS_SEGMENT_OBJECT:
+            if len(payload) >= 4:
+                object_id = pgs_segment_be16(payload, 0)
+                sequence_desc = payload[3]
+                object_info = objects.setdefault(object_id, {"w": 0, "h": 0, "rle": bytearray(), "remaining": 0})
+                if sequence_desc & 0x80:
+                    if len(payload) >= 11:
+                        object_data_length = pgs_segment_be24(payload, 4)
+                        object_width = pgs_segment_be16(payload, 7)
+                        object_height = pgs_segment_be16(payload, 9)
+                        rle_fragment = payload[11:]
+                        object_info["w"] = object_width
+                        object_info["h"] = object_height
+                        object_info["rle"] = bytearray(rle_fragment)
+                        expected_rle = max(0, object_data_length - 4)
+                        object_info["remaining"] = max(0, expected_rle - len(rle_fragment))
+                else:
+                    object_rle = object_info.setdefault("rle", bytearray())
+                    if isinstance(object_rle, bytearray):
+                        object_rle.extend(payload[4:])
+                    object_info["remaining"] = max(0, int(object_info.get("remaining", 0)) - max(0, len(payload) - 4))
+        elif segment_type == PGS_SEGMENT_PRESENTATION:
+            if len(payload) >= 11:
+                state = payload[7] >> 6
+                if state != 0:
+                    objects.clear()
+                    palettes.clear()
+                object_count = payload[10]
+                refs: list[dict[str, int]] = []
+                offset = 11
+                for _ in range(object_count):
+                    if offset + 8 > len(payload):
+                        break
+                    composition_flag = payload[offset + 3]
+                    refs.append({
+                        "id": pgs_segment_be16(payload, offset),
+                        "x": pgs_segment_be16(payload, offset + 4),
+                        "y": pgs_segment_be16(payload, offset + 6),
+                    })
+                    offset += 8
+                    if composition_flag & 0x80:
+                        if offset + 8 > len(payload):
+                            break
+                        offset += 8
+                presentation = {
+                    "palette_id": payload[9],
+                    "objects": refs,
+                }
+        elif segment_type == PGS_SEGMENT_DISPLAY:
+            bounds = current_pgs_display_bounds(
+                presentation=presentation,
+                objects=objects,
+                palettes=palettes,
+            )
+            if bounds is not None:
+                segment_index += 1
+                segments.append(BitmapSubtitleSegment(
+                    start_s=float(segment_index),
+                    end_s=float(segment_index + 1),
+                    x=bounds[0],
+                    y=bounds[1],
+                    w=max(1, bounds[2] - bounds[0]),
+                    h=max(1, bounds[3] - bounds[1]),
+                ))
+
+        cursor = payload_end
+        now = time.time()
+        if not quiet and (now - last_log_time >= 1.0 or cursor >= len(data)):
+            ratio = (cursor / len(data)) if data else 1.0
+            log(
+                f"Subtitle parse {ratio * 100.0:5.1f}% | display sets {len(segments)} | "
+                f"real {format_duration_hms(now - parse_start)}",
+                quiet=False,
+            )
+            last_log_time = now
+
+    return segments
+
+
+def analyze_bitmap_subtitle_segments_via_ffmpeg_bbox(
+    *,
+    input_path: Path,
+    stream_index: int,
+    start: float,
+    duration: float | None,
+    analyze_duration: float | None,
     fallback_end: float,
+    quiet: bool,
 ) -> list[BitmapSubtitleSegment]:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    command = [ffmpeg, "-hide_banner", "-loglevel", "info"]
+    command = [ffmpeg, "-hide_banner", "-loglevel", "info", "-progress", "pipe:2", "-nostats"]
     if start > 0:
         command += ["-ss", f"{start:.3f}"]
     command += ["-i", str(input_path)]
@@ -656,58 +1285,96 @@ def analyze_bitmap_subtitle_segments(
         "null",
         "-",
     ]
-    completed = subprocess.run(command, capture_output=True, text=True)
-    if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.strip() or "bitmap subtitle analysis failed")
-
     segments: list[BitmapSubtitleSegment] = []
     active_start: float | None = None
     active_bounds: tuple[int, int, int, int] | None = None
-    for line in completed.stderr.splitlines():
-        if "Parsed_bbox" not in line:
-            continue
-        time_match = BBOX_TIME_RE.search(line)
-        if time_match is None:
-            continue
-        pts_time = float(time_match.group("time"))
-        bbox_match = BBOX_VALUES_RE.search(line)
-        if bbox_match is None:
-            if active_start is not None and active_bounds is not None and pts_time > active_start:
-                segments.append(BitmapSubtitleSegment(
-                    start_s=active_start,
-                    end_s=pts_time,
-                    x=active_bounds[0],
-                    y=active_bounds[1],
-                    w=active_bounds[2] - active_bounds[0],
-                    h=active_bounds[3] - active_bounds[1],
-                ))
-            active_start = None
-            active_bounds = None
-            continue
+    log("Analyzing bitmap subtitle regions for scaled burn-in...", quiet=quiet)
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    if process.stderr is None:
+        raise RuntimeError("Failed to capture FFmpeg subtitle analysis output.")
 
-        x1 = int(bbox_match.group("x1"))
-        y1 = int(bbox_match.group("y1"))
-        x2 = x1 + int(bbox_match.group("w"))
-        y2 = y1 + int(bbox_match.group("h"))
-        bounds = (
-            int(bbox_match.group("x1")),
-            int(bbox_match.group("y1")),
-            x2,
-            y2,
-        )
-        if active_start is None:
-            active_start = pts_time
-            active_bounds = bounds
-            continue
-        if active_bounds is None:
-            active_bounds = bounds
-            continue
-        active_bounds = (
-            min(active_bounds[0], bounds[0]),
-            min(active_bounds[1], bounds[1]),
-            max(active_bounds[2], bounds[2]),
-            max(active_bounds[3], bounds[3]),
-        )
+    stderr_lines: list[str] = []
+    progress_state: dict[str, str] = {}
+    analysis_start = time.time()
+    progress_estimator = ProgressEstimator()
+
+    try:
+        for raw_line in process.stderr:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if "Parsed_bbox" in line:
+                time_match = BBOX_TIME_RE.search(line)
+                if time_match is not None:
+                    pts_time = float(time_match.group("time"))
+                    bbox_match = BBOX_VALUES_RE.search(line)
+                    if bbox_match is None:
+                        if active_start is not None and active_bounds is not None and pts_time > active_start:
+                            segments.append(BitmapSubtitleSegment(
+                                start_s=active_start,
+                                end_s=pts_time,
+                                x=active_bounds[0],
+                                y=active_bounds[1],
+                                w=active_bounds[2] - active_bounds[0],
+                                h=active_bounds[3] - active_bounds[1],
+                            ))
+                        active_start = None
+                        active_bounds = None
+                    else:
+                        x1 = int(bbox_match.group("x1"))
+                        y1 = int(bbox_match.group("y1"))
+                        x2 = x1 + int(bbox_match.group("w"))
+                        y2 = y1 + int(bbox_match.group("h"))
+                        bounds = (x1, y1, x2, y2)
+                        if active_start is None:
+                            active_start = pts_time
+                            active_bounds = bounds
+                        elif active_bounds is None:
+                            active_bounds = bounds
+                        else:
+                            active_bounds = (
+                                min(active_bounds[0], bounds[0]),
+                                min(active_bounds[1], bounds[1]),
+                                max(active_bounds[2], bounds[2]),
+                                max(active_bounds[3], bounds[3]),
+                            )
+
+            if "=" not in line:
+                stderr_lines.append(line)
+                continue
+
+            key, value = line.split("=", 1)
+            progress_state[key] = value
+            if key == "progress" and value in {"continue", "end"}:
+                log_ffmpeg_progress(
+                    label="Subtitle analysis",
+                    progress_state=progress_state,
+                    start_time=analysis_start,
+                    total_duration=analyze_duration,
+                    progress_estimator=progress_estimator,
+                    quiet=quiet,
+                    include_size=False,
+                )
+    except KeyboardInterrupt:
+        stop_ffmpeg_process(process, label="Subtitle analysis", quiet=quiet)
+        raise
+    finally:
+        if process.stderr is not None:
+            process.stderr.close()
+
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError("\n".join(stderr_lines[-20:]).strip() or "bitmap subtitle analysis failed")
 
     if active_start is not None and active_bounds is not None and fallback_end > active_start:
         segments.append(BitmapSubtitleSegment(
@@ -720,6 +1387,65 @@ def analyze_bitmap_subtitle_segments(
         ))
 
     return [segment for segment in segments if segment.w > 0 and segment.h > 0 and segment.end_s > segment.start_s]
+
+
+def analyze_bitmap_subtitle_segments(
+    *,
+    input_path: Path,
+    stream_index: int,
+    start: float,
+    duration: float | None,
+    analyze_duration: float | None,
+    fallback_end: float,
+    quiet: bool,
+) -> list[BitmapSubtitleSegment]:
+    cache_path = bitmap_subtitle_analysis_cache_path(
+        input_path=input_path,
+        stream_index=stream_index,
+        start=start,
+        duration=duration,
+    )
+    cached_segments = load_bitmap_subtitle_analysis_cache(cache_path)
+    if cached_segments is not None:
+        log(
+            f"Loaded cached bitmap subtitle analysis ({len(cached_segments)} display set(s)).",
+            quiet=quiet,
+        )
+        return cached_segments
+
+    log("Analyzing bitmap subtitle regions for scaled burn-in...", quiet=quiet)
+    try:
+        segments = analyze_bitmap_subtitle_segments_from_pgs(
+            input_path=input_path,
+            stream_index=stream_index,
+            start=start,
+            duration=duration,
+            analyze_duration=analyze_duration,
+            quiet=quiet,
+        )
+        if segments:
+            save_bitmap_subtitle_analysis_cache(cache_path, segments)
+        return segments
+    except KeyboardInterrupt:
+        raise
+    except Exception as error:
+        log(
+            f"Fast bitmap subtitle analysis failed ({error}). Falling back to FFmpeg bbox scan.",
+            quiet=quiet,
+        )
+
+    segments = analyze_bitmap_subtitle_segments_via_ffmpeg_bbox(
+        input_path=input_path,
+        stream_index=stream_index,
+        start=start,
+        duration=duration,
+        analyze_duration=analyze_duration,
+        fallback_end=fallback_end,
+        quiet=quiet,
+    )
+    if segments:
+        save_bitmap_subtitle_analysis_cache(cache_path, segments)
+    return segments
 
 
 def scaled_bitmap_segment_rect(
@@ -835,10 +1561,10 @@ def preview_mp4_path_for_output(output_path: Path) -> Path:
     return output_path.with_suffix(".preview.mp4")
 
 
-def write_preview_mp4(bitstream_path: Path, preview_path: Path, fps: float) -> None:
+def write_preview_mp4(bitstream_path: Path, preview_path: Path, fps: float, *, quiet: bool) -> None:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     preview_path.parent.mkdir(parents=True, exist_ok=True)
-    completed = subprocess.run(
+    process = subprocess.Popen(
         [
             ffmpeg,
             "-y",
@@ -853,11 +1579,21 @@ def write_preview_mp4(bitstream_path: Path, preview_path: Path, fps: float) -> N
             "+faststart",
             str(preview_path),
         ],
-        capture_output=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
-    if completed.returncode != 0:
-        raise RuntimeError(completed.stderr.strip() or f"failed to write preview mp4: {preview_path}")
+    try:
+        _, stderr = process.communicate()
+    except KeyboardInterrupt:
+        stop_ffmpeg_process(process, label="Preview export", quiet=quiet)
+        cleanup_partial_file(preview_path)
+        raise
+    if process.returncode != 0:
+        raise RuntimeError((stderr or "").strip() or f"failed to write preview mp4: {preview_path}")
 
 
 def is_text_subtitle_codec(codec_name: str | None) -> bool:
@@ -1340,6 +2076,7 @@ def build_ffmpeg_command(
     output_path: Path,
     source_width: int,
     source_height: int,
+    source_fps: float | None,
     width: int,
     height: int,
     fps: float,
@@ -1350,8 +2087,10 @@ def build_ffmpeg_command(
     stream_profile: str,
     start: float,
     duration: float | None,
+    encode_duration: float | None,
     burn_subtitle: BurnSubtitleSource | None,
     burn_subtitle_size: float,
+    quiet: bool,
 ) -> tuple[list[str], str | None]:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     post_vf = f"fps={format_fps_value(fps)},scale={width}:{height}:flags=lanczos,setsar=1"
@@ -1411,7 +2150,9 @@ def build_ffmpeg_command(
                 stream_index=burn_subtitle.stream_index,
                 start=start,
                 duration=duration,
+                analyze_duration=encode_duration,
                 fallback_end=segment_end,
+                quiet=quiet,
             )
             if not analyzed_segments:
                 bitmap_filter = (
@@ -1513,6 +2254,7 @@ def encode_h264_bitstream(
     input_path: Path,
     source_width: int,
     source_height: int,
+    source_fps: float | None,
     width: int,
     height: int,
     fps: float,
@@ -1536,6 +2278,7 @@ def encode_h264_bitstream(
             output_path=bitstream_path,
             source_width=source_width,
             source_height=source_height,
+            source_fps=source_fps,
             width=width,
             height=height,
             fps=fps,
@@ -1546,8 +2289,10 @@ def encode_h264_bitstream(
             stream_profile=stream_profile,
             start=start,
             duration=duration,
+            encode_duration=encode_duration,
             burn_subtitle=burn_subtitle,
             burn_subtitle_size=burn_subtitle_size,
+            quiet=quiet,
         )
         if filter_complex_script is not None:
             filter_complex_script_path = Path(temp_dir) / "filter_complex.ffscript"
@@ -1559,6 +2304,7 @@ def encode_h264_bitstream(
         command = command[:1] + ["-hide_banner", "-loglevel", "error", "-progress", "pipe:2", "-nostats"] + command[1:]
         process = subprocess.Popen(
             command,
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -1573,50 +2319,39 @@ def encode_h264_bitstream(
         stderr_lines: list[str] = []
         encode_start = time.time()
         progress_estimator = ProgressEstimator()
-        for raw_line in process.stderr:
-            line = raw_line.strip()
-            if not line:
-                continue
-            if "=" not in line:
-                stderr_lines.append(line)
-                continue
+        try:
+            for raw_line in process.stderr:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if "=" not in line:
+                    stderr_lines.append(line)
+                    continue
 
-            key, value = line.split("=", 1)
-            progress_state[key] = value
-            if key != "progress":
-                continue
-
-            if value == "continue" and not quiet:
-                out_time = parse_ffmpeg_time(progress_state.get("out_time", "00:00:00.000"))
-                ratio = (out_time / encode_duration) if encode_duration and encode_duration > 0 else 0.0
-                ratio = min(max(ratio, 0.0), 1.0)
-                elapsed = time.time() - encode_start
-                total_size = int(progress_state.get("total_size", "0") or "0")
-                speed = progress_state.get("speed", "?")
-                speed_factor = parse_ffmpeg_speed(speed)
-                eta, expected_size = progress_estimator.update(
-                    real_time=elapsed,
-                    media_time=out_time,
-                    total_media_time=encode_duration,
-                    byte_count=total_size,
-                    reported_speed=speed_factor,
-                )
-                if eta <= 0.0 and ratio > 0.0:
-                    eta = elapsed * (1.0 - ratio) / ratio
-                expected_size_text = format_binary_size(expected_size) if expected_size is not None else "?"
-                log(
-                    f"FFmpeg {ratio * 100.0:5.1f}% | ETA {format_duration_hms(eta)} | "
-                    f"time {format_duration_hms(out_time)} | real {format_duration_hms(elapsed)} | "
-                    f"size {format_binary_size(total_size)} | expect {expected_size_text} | "
-                    f"speed {speed}",
-                    quiet=False,
-                )
+                key, value = line.split("=", 1)
+                progress_state[key] = value
+                if key == "progress" and value in {"continue", "end"}:
+                    log_ffmpeg_progress(
+                        label="FFmpeg",
+                        progress_state=progress_state,
+                        start_time=encode_start,
+                        total_duration=encode_duration,
+                        progress_estimator=progress_estimator,
+                        quiet=quiet,
+                        include_size=True,
+                    )
+        except KeyboardInterrupt:
+            stop_ffmpeg_process(process, label="Encoding", quiet=quiet)
+            raise
+        finally:
+            if process.stderr is not None:
+                process.stderr.close()
 
         return_code = process.wait()
         if return_code != 0:
             raise RuntimeError("\n".join(stderr_lines[-20:]).strip() or "ffmpeg H.264 encoding failed")
         if preview_output_path is not None:
-            write_preview_mp4(bitstream_path, preview_output_path, fps)
+            write_preview_mp4(bitstream_path, preview_output_path, fps, quiet=quiet)
         return bitstream_path.read_bytes()
 
 
@@ -1841,211 +2576,223 @@ def encode(args: argparse.Namespace) -> EncodeStats:
     output_path = normalize_output_path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path = output_path.with_suffix(".json")
-
-    burn_subtitle = resolve_burn_subtitle_source(input_path, args.subtitle, args.subtitle_track) if args.burn_subtitles else None
-    subtitle_tracks = [] if args.burn_subtitles else load_subtitle_tracks(input_path, output_path, args.subtitle, args.subtitle_track)
-    subtitle_count = sum(len(track.cues) for track in subtitle_tracks)
-    if subtitle_tracks and args.subtitle == "embedded":
-        log(f"Embedding {len(subtitle_tracks)} subtitle track(s).", quiet=args.quiet)
-    if burn_subtitle is not None:
-        log(f"Burning subtitles into video: {burn_subtitle.label}", quiet=args.quiet)
-
-    video_probe = probe_video(input_path)
-    source_width = video_probe.display_width or video_probe.storage_width
-    source_height = video_probe.display_height or video_probe.storage_height
-    if source_width <= 0 or source_height <= 0:
-        raise RuntimeError("Failed to determine input video dimensions.")
-
-    fps = video_probe.fps if isinstance(args.fps, str) and args.fps.lower() == "source" else float(args.fps)
-    if fps <= 0:
-        raise RuntimeError("Target fps must be greater than zero.")
-    if args.burn_subtitle_size <= 0:
-        raise RuntimeError("--burn-subtitle-size must be greater than zero.")
-
-    target_width, target_height, video_x, video_y = fit_dimensions(
-        source_width,
-        source_height,
-        args.max_width,
-        args.max_height,
-    )
-
-    log(
-        f"Encoding {input_path.name} -> {target_width}x{target_height} @ {fps:.3f}fps "
-        f"(source {video_probe.storage_width}x{video_probe.storage_height}, display {source_width}x{source_height}, profile {args.stream_profile})",
-        quiet=args.quiet,
-    )
-
-    start_time = time.time()
-    idr_frames = resolve_idr_frames(args.chunk_frames, args.idr_frames, args.stream_profile)
     preview_output_path = preview_mp4_path_for_output(output_path) if args.preview_mp4 else None
-    bitstream = encode_h264_bitstream(
-        input_path=input_path,
-        source_width=video_probe.storage_width,
-        source_height=video_probe.storage_height,
-        width=target_width,
-        height=target_height,
-        fps=fps,
-        idr_frames=idr_frames,
-        crf=args.crf,
-        preset=args.preset,
-        level=args.level,
-        stream_profile=args.stream_profile,
-        start=args.start,
-        duration=args.duration,
-        encode_duration=args.duration if args.duration is not None else max(0.0, video_probe.duration - args.start),
-        burn_subtitle=burn_subtitle,
-        burn_subtitle_size=args.burn_subtitle_size,
-        preview_output_path=preview_output_path,
-        quiet=args.quiet,
-    )
-    log(
-        f"FFmpeg produced {len(bitstream) / 1024:.1f} KiB of Annex B H.264 in {time.time() - start_time:.1f}s "
-        f"(IDR every {idr_frames} frame(s)).",
-        quiet=args.quiet,
-    )
+    output_started = False
+    stats_started = False
 
-    nal_units = parse_annex_b_nalus(bitstream)
-    access_units = group_nals_into_access_units(nal_units)
-    chunks = group_access_units_into_chunks(
-        access_units,
-        args.chunk_frames,
-        (args.max_chunk_kib * 1024) if args.max_chunk_kib > 0 else None,
-        args.stream_profile,
-    )
+    try:
+        burn_subtitle = resolve_burn_subtitle_source(input_path, args.subtitle, args.subtitle_track) if args.burn_subtitles else None
+        subtitle_tracks = [] if args.burn_subtitles else load_subtitle_tracks(input_path, output_path, args.subtitle, args.subtitle_track)
+        subtitle_count = sum(len(track.cues) for track in subtitle_tracks)
+        if subtitle_tracks and args.subtitle == "embedded":
+            log(f"Embedding {len(subtitle_tracks)} subtitle track(s).", quiet=args.quiet)
+        if burn_subtitle is not None:
+            log(f"Burning subtitles into video: {burn_subtitle.label}", quiet=args.quiet)
 
-    if not access_units:
-        raise RuntimeError("No frames were found in the encoded H.264 bitstream.")
+        video_probe = probe_video(input_path)
+        source_width = video_probe.display_width or video_probe.storage_width
+        source_height = video_probe.display_height or video_probe.storage_height
+        if source_width <= 0 or source_height <= 0:
+            raise RuntimeError("Failed to determine input video dimensions.")
 
-    expected_output_size = estimate_total_output_size(
-        chunks,
-        stream_profile=args.stream_profile,
-        subtitle_tracks=subtitle_tracks,
-    )
-    log(
-        f"Expected output size {format_binary_size(expected_output_size)} "
-        f"({len(chunks)} chunks, {len(access_units)} frames).",
-        quiet=args.quiet,
-    )
+        fps = video_probe.fps if isinstance(args.fps, str) and args.fps.lower() == "source" else float(args.fps)
+        if fps <= 0:
+            raise RuntimeError("Target fps must be greater than zero.")
+        if args.burn_subtitle_size <= 0:
+            raise RuntimeError("--burn-subtitle-size must be greater than zero.")
 
-    output_handle = output_path.open("wb")
-    output_handle.write(b"\0" * HEADER_STRUCT.size)
+        target_width, target_height, video_x, video_y = fit_dimensions(
+            source_width,
+            source_height,
+            args.max_width,
+            args.max_height,
+        )
 
-    chunk_index: list[tuple[int, int, int, int, int, int]] = []
-    frame_cursor = 0
-    pack_start_time = time.time()
-    for chunk_number, access_unit_chunk in enumerate(chunks, start=1):
-        chunk_payload, frame_offsets = build_chunk_blob(access_unit_chunk, args.stream_profile)
-        stored_chunk_blob = bytearray()
-        stored_chunk_blob += struct.pack("<I", len(chunk_payload))
-        for frame_offset in frame_offsets:
-            stored_chunk_blob += struct.pack("<I", frame_offset)
-        stored_chunk_blob += chunk_payload
-        while len(stored_chunk_blob) % 4:
-            stored_chunk_blob.append(0)
-
-        stored_blob = bytes(stored_chunk_blob)
-        offset = output_handle.tell()
-        output_handle.write(stored_blob)
-        chunk_index.append((
-            offset,
-            len(stored_blob),
-            len(stored_chunk_blob),
-            frame_cursor,
-            len(access_unit_chunk),
-            0,
-        ))
-
-        elapsed = time.time() - start_time
-        pack_elapsed = time.time() - pack_start_time
-        frame_end = frame_cursor + len(access_unit_chunk) - 1
-        progress = (chunk_number / len(chunks)) * 100.0
-        written_size = output_handle.tell()
-        remaining_size = max(0, expected_output_size - written_size)
-        pack_rate = ((written_size - HEADER_STRUCT.size) / pack_elapsed) if pack_elapsed > 0.0 else 0.0
-        eta = (remaining_size / pack_rate) if pack_rate > 0.0 and remaining_size > 0 else 0.0
         log(
-            f"Chunk {chunk_number:03d}: {progress:5.1f}% | ETA {format_duration_hms(eta)} | "
-            f"frames {frame_cursor}-{frame_end} | real {format_duration_hms(elapsed)} | "
-            f"size {format_binary_size(len(stored_blob))} | "
-            f"total size {format_binary_size(written_size)}/{format_binary_size(expected_output_size)}",
+            f"Encoding {input_path.name} -> {target_width}x{target_height} @ {fps:.3f}fps "
+            f"(source {video_probe.storage_width}x{video_probe.storage_height}, display {source_width}x{source_height}, profile {args.stream_profile})",
             quiet=args.quiet,
         )
-        frame_cursor += len(access_unit_chunk)
 
-    index_offset = output_handle.tell()
-    for entry in chunk_index:
-        output_handle.write(CHUNK_INDEX_STRUCT.pack(*entry))
+        start_time = time.time()
+        idr_frames = resolve_idr_frames(args.chunk_frames, args.idr_frames, args.stream_profile)
+        bitstream = encode_h264_bitstream(
+            input_path=input_path,
+            source_width=video_probe.storage_width,
+            source_height=video_probe.storage_height,
+            source_fps=video_probe.fps,
+            width=target_width,
+            height=target_height,
+            fps=fps,
+            idr_frames=idr_frames,
+            crf=args.crf,
+            preset=args.preset,
+            level=args.level,
+            stream_profile=args.stream_profile,
+            start=args.start,
+            duration=args.duration,
+            encode_duration=args.duration if args.duration is not None else max(0.0, video_probe.duration - args.start),
+            burn_subtitle=burn_subtitle,
+            burn_subtitle_size=args.burn_subtitle_size,
+            preview_output_path=preview_output_path,
+            quiet=args.quiet,
+        )
+        log(
+            f"FFmpeg produced {len(bitstream) / 1024:.1f} KiB of Annex B H.264 in {time.time() - start_time:.1f}s "
+            f"(IDR every {idr_frames} frame(s)).",
+            quiet=args.quiet,
+        )
 
-    subtitle_offset = output_handle.tell()
-    if subtitle_tracks:
-        output_handle.write(struct.pack("<H", len(subtitle_tracks)))
-        for track in subtitle_tracks:
-            encoded_name = sanitize_subtitle_text(track.name).encode("ascii", "replace")
-            output_handle.write(struct.pack("<HI", len(encoded_name), len(track.cues)))
-            output_handle.write(encoded_name)
-        for track in subtitle_tracks:
-            for cue in track.cues:
-                encoded = sanitize_subtitle_text(cue.text).encode("ascii", "replace")
-                output_handle.write(
-                    struct.pack(
-                        "<IIHBBHHHHH",
-                        cue.start_ms,
-                        cue.end_ms,
-                        len(encoded),
-                        cue.position_mode,
-                        cue.align,
-                        cue.pos_x,
-                        cue.pos_y,
-                        cue.margin_l,
-                        cue.margin_r,
-                        cue.margin_v,
-                    )
+        nal_units = parse_annex_b_nalus(bitstream)
+        access_units = group_nals_into_access_units(nal_units)
+        chunks = group_access_units_into_chunks(
+            access_units,
+            args.chunk_frames,
+            (args.max_chunk_kib * 1024) if args.max_chunk_kib > 0 else None,
+            args.stream_profile,
+        )
+
+        if not access_units:
+            raise RuntimeError("No frames were found in the encoded H.264 bitstream.")
+
+        expected_output_size = estimate_total_output_size(
+            chunks,
+            stream_profile=args.stream_profile,
+            subtitle_tracks=subtitle_tracks,
+        )
+        log(
+            f"Expected output size {format_binary_size(expected_output_size)} "
+            f"({len(chunks)} chunks, {len(access_units)} frames).",
+            quiet=args.quiet,
+        )
+
+        with output_path.open("wb") as output_handle:
+            output_started = True
+            output_handle.write(b"\0" * HEADER_STRUCT.size)
+
+            chunk_index: list[tuple[int, int, int, int, int, int]] = []
+            frame_cursor = 0
+            pack_start_time = time.time()
+            for chunk_number, access_unit_chunk in enumerate(chunks, start=1):
+                chunk_payload, frame_offsets = build_chunk_blob(access_unit_chunk, args.stream_profile)
+                stored_chunk_blob = bytearray()
+                stored_chunk_blob += struct.pack("<I", len(chunk_payload))
+                for frame_offset in frame_offsets:
+                    stored_chunk_blob += struct.pack("<I", frame_offset)
+                stored_chunk_blob += chunk_payload
+                while len(stored_chunk_blob) % 4:
+                    stored_chunk_blob.append(0)
+
+                stored_blob = bytes(stored_chunk_blob)
+                offset = output_handle.tell()
+                output_handle.write(stored_blob)
+                chunk_index.append((
+                    offset,
+                    len(stored_blob),
+                    len(stored_chunk_blob),
+                    frame_cursor,
+                    len(access_unit_chunk),
+                    0,
+                ))
+
+                elapsed = time.time() - start_time
+                pack_elapsed = time.time() - pack_start_time
+                frame_end = frame_cursor + len(access_unit_chunk) - 1
+                progress = (chunk_number / len(chunks)) * 100.0
+                written_size = output_handle.tell()
+                remaining_size = max(0, expected_output_size - written_size)
+                pack_rate = ((written_size - HEADER_STRUCT.size) / pack_elapsed) if pack_elapsed > 0.0 else 0.0
+                eta = (remaining_size / pack_rate) if pack_rate > 0.0 and remaining_size > 0 else 0.0
+                log(
+                    f"Chunk {chunk_number:03d}: {progress:5.1f}% | ETA {format_duration_hms(eta)} | "
+                    f"frames {frame_cursor}-{frame_end} | real {format_duration_hms(elapsed)} | "
+                    f"size {format_binary_size(len(stored_blob))} | "
+                    f"total size {format_binary_size(written_size)}/{format_binary_size(expected_output_size)}",
+                    quiet=args.quiet,
                 )
-                output_handle.write(encoded)
+                frame_cursor += len(access_unit_chunk)
 
-    write_header(
-        output_handle,
-        max_width=args.max_width,
-        max_height=args.max_height,
-        video_x=video_x,
-        video_y=video_y,
-        video_width=target_width,
-        video_height=target_height,
-        fps=fps,
-        chunk_frames=args.chunk_frames,
-        frame_count=len(access_units),
-        chunk_count=len(chunks),
-        subtitle_count=subtitle_count,
-        index_offset=index_offset,
-        subtitle_offset=subtitle_offset,
-    )
-    output_handle.close()
+            index_offset = output_handle.tell()
+            for entry in chunk_index:
+                output_handle.write(CHUNK_INDEX_STRUCT.pack(*entry))
 
-    bytes_written = output_path.stat().st_size
-    stats = EncodeStats(
-        input_path=str(input_path),
-        output_path=str(output_path),
-        width=target_width,
-        height=target_height,
-        video_x=video_x,
-        video_y=video_y,
-        fps=fps,
-        frame_count=len(access_units),
-        chunk_count=len(chunks),
-        idr_chunks=len(chunks),
-        raw_h264_bytes=len(bitstream),
-        bytes_written=bytes_written,
-        average_bytes_per_frame=bytes_written / len(access_units),
-    )
-    stats_path.write_text(json.dumps(asdict(stats), indent=2), encoding="utf-8")
-    log(
-        f"Wrote {output_path.name}: {bytes_written / (1024 * 1024):.2f} MiB | "
-        f"{len(access_units)} frames | {len(chunks)} chunks | raw H.264 {len(bitstream) / 1024:.1f} KiB",
-        quiet=args.quiet,
-    )
-    if preview_output_path is not None:
-        log(f"Wrote {preview_output_path.name} for preview.", quiet=args.quiet)
-    return stats
+            subtitle_offset = output_handle.tell()
+            if subtitle_tracks:
+                output_handle.write(struct.pack("<H", len(subtitle_tracks)))
+                for track in subtitle_tracks:
+                    encoded_name = sanitize_subtitle_text(track.name).encode("ascii", "replace")
+                    output_handle.write(struct.pack("<HI", len(encoded_name), len(track.cues)))
+                    output_handle.write(encoded_name)
+                for track in subtitle_tracks:
+                    for cue in track.cues:
+                        encoded = sanitize_subtitle_text(cue.text).encode("ascii", "replace")
+                        output_handle.write(
+                            struct.pack(
+                                "<IIHBBHHHHH",
+                                cue.start_ms,
+                                cue.end_ms,
+                                len(encoded),
+                                cue.position_mode,
+                                cue.align,
+                                cue.pos_x,
+                                cue.pos_y,
+                                cue.margin_l,
+                                cue.margin_r,
+                                cue.margin_v,
+                            )
+                        )
+                        output_handle.write(encoded)
+
+            write_header(
+                output_handle,
+                max_width=args.max_width,
+                max_height=args.max_height,
+                video_x=video_x,
+                video_y=video_y,
+                video_width=target_width,
+                video_height=target_height,
+                fps=fps,
+                chunk_frames=args.chunk_frames,
+                frame_count=len(access_units),
+                chunk_count=len(chunks),
+                subtitle_count=subtitle_count,
+                index_offset=index_offset,
+                subtitle_offset=subtitle_offset,
+            )
+
+        bytes_written = output_path.stat().st_size
+        stats = EncodeStats(
+            input_path=str(input_path),
+            output_path=str(output_path),
+            width=target_width,
+            height=target_height,
+            video_x=video_x,
+            video_y=video_y,
+            fps=fps,
+            frame_count=len(access_units),
+            chunk_count=len(chunks),
+            idr_chunks=len(chunks),
+            raw_h264_bytes=len(bitstream),
+            bytes_written=bytes_written,
+            average_bytes_per_frame=bytes_written / len(access_units),
+        )
+        with stats_path.open("w", encoding="utf-8") as stats_handle:
+            stats_started = True
+            json.dump(asdict(stats), stats_handle, indent=2)
+        log(
+            f"Wrote {output_path.name}: {bytes_written / (1024 * 1024):.2f} MiB | "
+            f"{len(access_units)} frames | {len(chunks)} chunks | raw H.264 {len(bitstream) / 1024:.1f} KiB",
+            quiet=args.quiet,
+        )
+        if preview_output_path is not None:
+            log(f"Wrote {preview_output_path.name} for preview.", quiet=args.quiet)
+        return stats
+    except KeyboardInterrupt:
+        if output_started:
+            cleanup_partial_file(output_path)
+        if stats_started:
+            cleanup_partial_file(stats_path)
+        raise
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -2074,7 +2821,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    encode(parse_args(argv or sys.argv[1:]))
+    try:
+        encode(parse_args(argv or sys.argv[1:]))
+    except KeyboardInterrupt:
+        log("Encoding interrupted by Ctrl+C.", quiet=False)
+        return 130
     return 0
 
 
