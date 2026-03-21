@@ -41,8 +41,6 @@ The `.nvp` format used by the current player is:
 ## Current Limits
 
 - no audio yet
-- subtitle rendering is text-only
-- the runtime is tuned for streamed local playback, not full in-memory decode
 
 ## Controls
 
