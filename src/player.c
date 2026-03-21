@@ -7955,6 +7955,7 @@ static void draw_loading_overlay(SDL_Surface *screen, const Fonts *fonts, const 
 
 static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *files, size_t count, size_t selected, const PointerState *pointer, const char *loading_label, int loading_phase)
 {
+    const char *credit = "Made by GigaZelensky";
     size_t start_index;
     size_t end_index;
     size_t index;
@@ -7966,6 +7967,7 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
     nSDL_DrawString(screen, fonts->white, 10, 24, "ENTER open   UP/DOWN choose   ESC exit");
     if (count == 0) {
         nSDL_DrawString(screen, fonts->white, 10, 54, "No .nvp or .nvp.tns files found");
+        nSDL_DrawString(screen, fonts->white, 10, SCREEN_H - 16, "%s", credit);
         if (pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
@@ -7999,6 +8001,7 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
     }
     {
         char footer[32];
+        nSDL_DrawString(screen, fonts->white, 10, SCREEN_H - 16, "%s", credit);
         snprintf(footer, sizeof(footer), "%lu file(s)", (unsigned long) count);
         nSDL_DrawString(screen, fonts->white, SCREEN_W - 10 - nSDL_GetStringWidth(fonts->white, footer), SCREEN_H - 16, "%s", footer);
     }
