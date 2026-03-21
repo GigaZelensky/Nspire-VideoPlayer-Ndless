@@ -47,24 +47,38 @@ The `.nvp` format used by the current player is:
 ### Picker
 
 - `Up` / `Down`: select movie
+- touchpad: move cursor
+- touchpad click: open highlighted movie
 - `Enter`: open movie
 - `Esc`: exit
 
 ### Playback
 
-- `Enter`: play / pause
-- touchpad click: play / pause, or seek when clicking inside the bottom UI band
+- `Enter`: play / pause, or restart when the movie has ended
+- touchpad: move cursor and show the UI
+- touchpad click: play / pause, restart at end, or seek when clicking inside the bottom UI band
 - `Left` / `Right`: seek `-5s` / `+5s`
-- `Tab`: single-frame step while paused
+- `Tab`: single-frame step while paused, hold to repeat
+- `P`: cycle playback mode: `PLAY ONCE`, `REPLAY`, `AUTO NEXT`
 - `/`: cycle scale mode
 - `{` / `}`: decrease / increase playback speed
 - `^`: cycle subtitle placement
 - `+` / `-`: increase / decrease subtitle size, down to hidden
 - `F`: cycle subtitle font
+- `T`: cycle subtitle track
 - `M`: toggle memory / playback diagnostics overlay
 - `D`: toggle verbose debug logging
+- `S`: save a BMP screenshot
 - `Catalog`: open / close the help overlay
 - `Esc`: close help, or leave the movie if help is not open
+
+### Resume Prompt
+
+- `Left` / `Right`: choose `CONTINUE` or `START OVER`
+- touchpad: move cursor
+- touchpad click: activate the highlighted button
+- `Enter`: confirm the selected button
+- `Esc`: cancel and return
 
 ## Subtitle Fonts
 
