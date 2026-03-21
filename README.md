@@ -91,6 +91,8 @@ The built-in subtitle font cycle currently includes:
 
 ## Build
 
+If you just want to run the player on a calculator, you do not have to build it yourself. The latest GitHub Actions run uploads `ndvideo.tns` as an artifact in the repository's `Actions` tab.
+
 ### Requirements
 
 - Ndless SDK
@@ -215,7 +217,7 @@ The [examples](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless
 
 ## Install On Calculator
 
-1. Build `ndvideo.tns`.
+1. Download `ndvideo.tns` from the latest GitHub Actions artifact, or build it locally.
 2. Encode one or more videos into `.nvp.tns`.
 3. Copy `ndvideo.tns` and the movie files to the calculator.
 4. Launch `ndvideo.tns` through Ndless.
