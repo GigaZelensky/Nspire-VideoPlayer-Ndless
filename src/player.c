@@ -114,6 +114,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define HISTORY_MAGIC_V1 "NDVH1"
 #define HISTORY_MAGIC_V2 "NDVH2"
 #define HISTORY_MAGIC_V3 "NDVH3"
+#define HISTORY_MAGIC_V4 "NDVH4"
 #define RESUME_MIN_MS 5000U
 #define RESUME_CLEAR_TAIL_MS 3000U
 #define STATUS_OVERLAY_MS 1200U
@@ -202,6 +203,8 @@ typedef struct {
     int8_t subtitle_size;
     uint8_t subtitle_placement;
     uint16_t selected_subtitle_track;
+    int8_t video_align_x;
+    int8_t video_align_y;
 } HistoryEntry;
 
 typedef struct {
@@ -222,6 +225,12 @@ typedef enum {
     SCALE_STRETCH = 2,
     SCALE_NATIVE = 3,
 } ScaleMode;
+
+typedef enum {
+    VIDEO_ALIGN_NEGATIVE = -1,
+    VIDEO_ALIGN_CENTER = 0,
+    VIDEO_ALIGN_POSITIVE = 1,
+} VideoAlign;
 
 typedef enum {
     SUBTITLE_POS_BAR_BOTTOM = 0,
@@ -616,7 +625,9 @@ static void apply_history_entry_settings(
     PlaybackMode *playback_mode,
     size_t *subtitle_font_index,
     int *subtitle_size,
-    SubtitlePlacement *subtitle_placement
+    SubtitlePlacement *subtitle_placement,
+    VideoAlign *video_align_x,
+    VideoAlign *video_align_y
 );
 static bool debug_is_runtime_logging_enabled(void);
 static void debug_clear_last_error(void);
@@ -1012,6 +1023,81 @@ static int clamp_int(int value, int min_value, int max_value)
         return max_value;
     }
     return value;
+}
+
+static VideoAlign clamp_video_align(int value)
+{
+    return (VideoAlign) clamp_int(value, (int) VIDEO_ALIGN_NEGATIVE, (int) VIDEO_ALIGN_POSITIVE);
+}
+
+static void apply_video_align_preset(
+    VideoAlign *horizontal,
+    VideoAlign *vertical,
+    VideoAlign target_horizontal,
+    VideoAlign target_vertical
+)
+{
+    if (!horizontal || !vertical) {
+        return;
+    }
+
+    if (*horizontal == target_horizontal && *vertical == target_vertical) {
+        *horizontal = VIDEO_ALIGN_CENTER;
+        *vertical = VIDEO_ALIGN_CENTER;
+        return;
+    }
+
+    *horizontal = target_horizontal;
+    *vertical = target_vertical;
+}
+
+static int aligned_axis_position(int container_size, int content_size, VideoAlign align)
+{
+    int slack = container_size - content_size;
+
+    if (align <= VIDEO_ALIGN_NEGATIVE) {
+        return 0;
+    }
+    if (align >= VIDEO_ALIGN_POSITIVE) {
+        return slack;
+    }
+    return slack / 2;
+}
+
+static void format_video_align_status(
+    VideoAlign horizontal,
+    VideoAlign vertical,
+    char *buffer,
+    size_t buffer_size
+)
+{
+    const char *vertical_label = NULL;
+    const char *horizontal_label = NULL;
+
+    if (!buffer || buffer_size == 0) {
+        return;
+    }
+
+    if (vertical < VIDEO_ALIGN_CENTER) {
+        vertical_label = "TOP";
+    } else if (vertical > VIDEO_ALIGN_CENTER) {
+        vertical_label = "BOTTOM";
+    }
+    if (horizontal < VIDEO_ALIGN_CENTER) {
+        horizontal_label = "LEFT";
+    } else if (horizontal > VIDEO_ALIGN_CENTER) {
+        horizontal_label = "RIGHT";
+    }
+
+    if (!vertical_label && !horizontal_label) {
+        snprintf(buffer, buffer_size, "VIDEO CENTER");
+    } else if (!vertical_label) {
+        snprintf(buffer, buffer_size, "VIDEO %s", horizontal_label);
+    } else if (!horizontal_label) {
+        snprintf(buffer, buffer_size, "VIDEO %s", vertical_label);
+    } else {
+        snprintf(buffer, buffer_size, "VIDEO %s %s", vertical_label, horizontal_label);
+    }
 }
 
 static uint32_t current_lcd_brightness(void)
@@ -7304,7 +7390,14 @@ static void draw_cursor(SDL_Surface *screen, int x, int y)
     SDL_FillRect(screen, &center, SDL_MapRGB(screen->format, 255, 255, 255));
 }
 
-static void compute_video_rects(const Movie *movie, ScaleMode scale_mode, SDL_Rect *src, SDL_Rect *dst)
+static void compute_video_rects(
+    const Movie *movie,
+    ScaleMode scale_mode,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y,
+    SDL_Rect *src,
+    SDL_Rect *dst
+)
 {
     double video_aspect = (double) movie->header.video_width / movie->header.video_height;
     double screen_aspect = (double) SCREEN_W / SCREEN_H;
@@ -7317,8 +7410,8 @@ static void compute_video_rects(const Movie *movie, ScaleMode scale_mode, SDL_Re
     if (scale_mode == SCALE_NATIVE) {
         dst->w = movie->header.video_width;
         dst->h = movie->header.video_height;
-        dst->x = (SCREEN_W - dst->w) / 2;
-        dst->y = (SCREEN_H - dst->h) / 2;
+        dst->x = aligned_axis_position(SCREEN_W, dst->w, video_align_x);
+        dst->y = aligned_axis_position(SCREEN_H, dst->h, video_align_y);
         return;
     }
 
@@ -7329,10 +7422,10 @@ static void compute_video_rects(const Movie *movie, ScaleMode scale_mode, SDL_Re
         dst->h = SCREEN_H;
         if (video_aspect > screen_aspect) {
             src->w = (Uint16) ((double) movie->header.video_height * screen_aspect);
-            src->x = (movie->header.video_width - src->w) / 2;
+            src->x = (Uint16) aligned_axis_position(movie->header.video_width, src->w, video_align_x);
         } else {
             src->h = (Uint16) ((double) movie->header.video_width / screen_aspect);
-            src->y = (movie->header.video_height - src->h) / 2;
+            src->y = (Uint16) aligned_axis_position(movie->header.video_height, src->h, video_align_y);
         }
         return;
     }
@@ -7348,14 +7441,12 @@ static void compute_video_rects(const Movie *movie, ScaleMode scale_mode, SDL_Re
     if (video_aspect > screen_aspect) {
         dst->w = SCREEN_W;
         dst->h = (Uint16) ((double) SCREEN_W / video_aspect);
-        dst->x = 0;
-        dst->y = (SCREEN_H - dst->h) / 2;
     } else {
         dst->h = SCREEN_H;
         dst->w = (Uint16) ((double) SCREEN_H * video_aspect);
-        dst->x = (SCREEN_W - dst->w) / 2;
-        dst->y = 0;
     }
+    dst->x = aligned_axis_position(SCREEN_W, dst->w, video_align_x);
+    dst->y = aligned_axis_position(SCREEN_H, dst->h, video_align_y);
 }
 
 static const char *scale_mode_text(ScaleMode scale_mode)
@@ -7672,6 +7763,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
         {"TAB", "Step one frame"},
         {"P", "Playback mode"},
         {"/", "Scale mode"},
+        {"NUMPAD", "Align video / center"},
         {"UP / DOWN", "Screen brightness"},
         {"{ / }", "Playback speed"},
         {"^", "Subtitle position"},
@@ -7821,6 +7913,8 @@ static void render_movie(
     bool show_ui,
     bool help_menu_open,
     ScaleMode scale_mode,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y,
     const PlaybackRate *playback_rate,
     MemoryOverlayMode memory_overlay_mode,
     SubtitleSurfaceCache *subtitle_cache,
@@ -7838,6 +7932,10 @@ static void render_movie(
 {
     SDL_Rect src;
     SDL_Rect dst;
+    SDL_Rect top_bar;
+    SDL_Rect bottom_bar;
+    SDL_Rect left_bar;
+    SDL_Rect right_bar;
     Uint32 black = SDL_MapRGB(screen->format, 0, 0, 0);
     int memory_right_limit = SCREEN_W - 8;
     uint32_t current_ms = movie_frame_time_ms(movie, movie->current_frame);
@@ -7850,26 +7948,34 @@ static void render_movie(
     bool playback_badge_visible = show_ui && !help_menu_open;
     bool memory_badge_visible = !help_menu_open && (memory_overlay_mode == MEMORY_OVERLAY_ALWAYS);
 
-    compute_video_rects(movie, scale_mode, &src, &dst);
-    if (dst.y > 0) {
-        SDL_Rect top_bar = {0, 0, SCREEN_W, dst.y};
-        int bottom_y = dst.y + dst.h;
-        SDL_Rect bottom_bar = {0, bottom_y, SCREEN_W, SCREEN_H - bottom_y};
-
+    compute_video_rects(movie, scale_mode, video_align_x, video_align_y, &src, &dst);
+    top_bar.x = 0;
+    top_bar.y = 0;
+    top_bar.w = SCREEN_W;
+    top_bar.h = (Uint16) clamp_int(dst.y, 0, SCREEN_H);
+    if (top_bar.h > 0) {
         SDL_FillRect(screen, &top_bar, black);
-        if (bottom_bar.h > 0) {
-            SDL_FillRect(screen, &bottom_bar, black);
-        }
     }
-    if (dst.x > 0) {
-        SDL_Rect left_bar = {0, dst.y, dst.x, dst.h};
-        int right_x = dst.x + dst.w;
-        SDL_Rect right_bar = {right_x, dst.y, SCREEN_W - right_x, dst.h};
-
+    bottom_bar.x = 0;
+    bottom_bar.y = (Sint16) clamp_int(dst.y + dst.h, 0, SCREEN_H);
+    bottom_bar.w = SCREEN_W;
+    bottom_bar.h = (Uint16) (SCREEN_H - bottom_bar.y);
+    if (bottom_bar.h > 0) {
+        SDL_FillRect(screen, &bottom_bar, black);
+    }
+    left_bar.x = 0;
+    left_bar.y = (Sint16) clamp_int(dst.y, 0, SCREEN_H);
+    left_bar.w = (Uint16) clamp_int(dst.x, 0, SCREEN_W);
+    left_bar.h = (Uint16) clamp_int(dst.h, 0, SCREEN_H - left_bar.y);
+    if (left_bar.w > 0 && left_bar.h > 0) {
         SDL_FillRect(screen, &left_bar, black);
-        if (right_bar.w > 0) {
-            SDL_FillRect(screen, &right_bar, black);
-        }
+    }
+    right_bar.x = (Sint16) clamp_int(dst.x + dst.w, 0, SCREEN_W);
+    right_bar.y = left_bar.y;
+    right_bar.w = (Uint16) (SCREEN_W - right_bar.x);
+    right_bar.h = left_bar.h;
+    if (right_bar.w > 0 && right_bar.h > 0) {
+        SDL_FillRect(screen, &right_bar, black);
     }
     if (dst.w == movie->header.video_width && dst.h == movie->header.video_height) {
         SDL_BlitSurface(movie->frame_surface, NULL, screen, &dst);
@@ -8097,6 +8203,8 @@ static void history_entry_init_defaults(HistoryEntry *entry)
     entry->subtitle_font_index = (uint8_t) SUBTITLE_FONT_DEFAULT_INDEX;
     entry->subtitle_size = 0;
     entry->subtitle_placement = (uint8_t) SUBTITLE_POS_BAR_BOTTOM;
+    entry->video_align_x = (int8_t) VIDEO_ALIGN_CENTER;
+    entry->video_align_y = (int8_t) VIDEO_ALIGN_CENTER;
 }
 
 static void apply_history_entry_settings(
@@ -8107,10 +8215,13 @@ static void apply_history_entry_settings(
     PlaybackMode *playback_mode,
     size_t *subtitle_font_index,
     int *subtitle_size,
-    SubtitlePlacement *subtitle_placement
+    SubtitlePlacement *subtitle_placement,
+    VideoAlign *video_align_x,
+    VideoAlign *video_align_y
 )
 {
-    if (!entry || !movie || !scale_mode || !playback_rate_index || !playback_mode || !subtitle_font_index || !subtitle_size || !subtitle_placement) {
+    if (!entry || !movie || !scale_mode || !playback_rate_index || !playback_mode ||
+        !subtitle_font_index || !subtitle_size || !subtitle_placement || !video_align_x || !video_align_y) {
         return;
     }
 
@@ -8119,6 +8230,8 @@ static void apply_history_entry_settings(
     *playback_mode = (PlaybackMode) clamp_int((int) entry->playback_mode, PLAYBACK_MODE_ONCE, PLAYBACK_MODE_COUNT - 1);
     *subtitle_font_index = (size_t) clamp_int((int) entry->subtitle_font_index, 0, (int) (SUBTITLE_FONT_CHOICE_COUNT - 1U));
     *subtitle_size = clamp_int((int) entry->subtitle_size, -1, 3);
+    *video_align_x = clamp_video_align((int) entry->video_align_x);
+    *video_align_y = clamp_video_align((int) entry->video_align_y);
 
     if (movie->subtitle_track_count == 0) {
         movie->selected_subtitle_track = 0;
@@ -8135,7 +8248,7 @@ static void apply_history_entry_settings(
 static bool load_history_store_from_path(const char *history_path, HistoryStore *history)
 {
     FILE *file;
-    char line[MAX_PATH_LEN + 64];
+    char line[MAX_PATH_LEN + 96];
     int version = 1;
 
     memset(history, 0, sizeof(*history));
@@ -8147,7 +8260,9 @@ static bool load_history_store_from_path(const char *history_path, HistoryStore 
         fclose(file);
         return false;
     }
-    if (strncmp(line, HISTORY_MAGIC_V3, 5) == 0) {
+    if (strncmp(line, HISTORY_MAGIC_V4, 5) == 0) {
+        version = 4;
+    } else if (strncmp(line, HISTORY_MAGIC_V3, 5) == 0) {
         version = 3;
     } else if (strncmp(line, HISTORY_MAGIC_V2, 5) == 0) {
         version = 2;
@@ -8161,8 +8276,8 @@ static bool load_history_store_from_path(const char *history_path, HistoryStore 
 
         history_entry_init_defaults(&entry);
         if (version >= 2) {
-            char *fields[10];
-            size_t expected_field_count = version >= 3 ? 10U : 9U;
+            char *fields[12];
+            size_t expected_field_count = version >= 4 ? 12U : (version >= 3 ? 10U : 9U);
             size_t field_index;
 
             fields[0] = line;
@@ -8183,7 +8298,15 @@ static bool load_history_store_from_path(const char *history_path, HistoryStore 
             entry.frame = (uint32_t) strtoul(fields[1], NULL, 10);
             entry.scale_mode = (uint8_t) strtoul(fields[2], NULL, 10);
             entry.playback_rate_index = (uint8_t) strtoul(fields[3], NULL, 10);
-            if (version >= 3) {
+            if (version >= 4) {
+                entry.playback_mode = (uint8_t) strtoul(fields[4], NULL, 10);
+                entry.subtitle_font_index = (uint8_t) strtoul(fields[5], NULL, 10);
+                entry.subtitle_size = (int8_t) strtol(fields[6], NULL, 10);
+                entry.subtitle_placement = (uint8_t) strtoul(fields[7], NULL, 10);
+                entry.selected_subtitle_track = (uint16_t) strtoul(fields[8], NULL, 10);
+                entry.video_align_x = (int8_t) clamp_video_align((int) strtol(fields[9], NULL, 10));
+                entry.video_align_y = (int8_t) clamp_video_align((int) strtol(fields[10], NULL, 10));
+            } else if (version >= 3) {
                 entry.playback_mode = (uint8_t) strtoul(fields[4], NULL, 10);
                 entry.subtitle_font_index = (uint8_t) strtoul(fields[5], NULL, 10);
                 entry.subtitle_size = (int8_t) strtol(fields[6], NULL, 10);
@@ -8194,6 +8317,13 @@ static bool load_history_store_from_path(const char *history_path, HistoryStore 
                 entry.subtitle_size = (int8_t) strtol(fields[5], NULL, 10);
                 entry.subtitle_placement = (uint8_t) strtoul(fields[6], NULL, 10);
                 entry.selected_subtitle_track = (uint16_t) strtoul(fields[7], NULL, 10);
+            }
+            if (version >= 4) {
+                path = fields[11];
+            } else if (version >= 3) {
+                path = fields[9];
+            } else {
+                path = fields[8];
             }
         } else {
             char *separator = strchr(line, '\t');
@@ -8241,11 +8371,11 @@ static bool save_history_store(const char *movie_path, const HistoryStore *histo
     if (!file) {
         return false;
     }
-    fputs(HISTORY_MAGIC_V3 "\n", file);
+    fputs(HISTORY_MAGIC_V4 "\n", file);
     for (index = 0; index < history->count && index < HISTORY_MAX_ENTRIES; ++index) {
         fprintf(
             file,
-            "%u\t%lu\t%u\t%u\t%u\t%u\t%d\t%u\t%u\t%s\n",
+            "%u\t%lu\t%u\t%u\t%u\t%u\t%d\t%u\t%u\t%d\t%d\t%s\n",
             history->entries[index].has_resume ? 1U : 0U,
             (unsigned long) history->entries[index].frame,
             (unsigned) history->entries[index].scale_mode,
@@ -8255,6 +8385,8 @@ static bool save_history_store(const char *movie_path, const HistoryStore *histo
             (int) history->entries[index].subtitle_size,
             (unsigned) history->entries[index].subtitle_placement,
             (unsigned) history->entries[index].selected_subtitle_track,
+            (int) history->entries[index].video_align_x,
+            (int) history->entries[index].video_align_y,
             history->entries[index].path
         );
     }
@@ -8299,7 +8431,9 @@ static void history_upsert_entry(
     PlaybackMode playback_mode,
     size_t subtitle_font_index,
     int subtitle_size,
-    SubtitlePlacement subtitle_placement
+    SubtitlePlacement subtitle_placement,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y
 )
 {
     HistoryEntry entry;
@@ -8316,6 +8450,8 @@ static void history_upsert_entry(
     entry.subtitle_font_index = (uint8_t) clamp_int((int) subtitle_font_index, 0, (int) (SUBTITLE_FONT_CHOICE_COUNT - 1U));
     entry.subtitle_size = (int8_t) clamp_int(subtitle_size, -1, 3);
     entry.subtitle_placement = (uint8_t) clamp_int((int) subtitle_placement, SUBTITLE_POS_BAR_BOTTOM, SUBTITLE_POS_COUNT - 1);
+    entry.video_align_x = (int8_t) clamp_video_align((int) video_align_x);
+    entry.video_align_y = (int8_t) clamp_video_align((int) video_align_y);
     entry.selected_subtitle_track = movie ? movie->selected_subtitle_track : 0;
     if (!entry.path) {
         return;
@@ -8364,7 +8500,9 @@ static void save_history_position_for_movie(
     PlaybackMode playback_mode,
     size_t subtitle_font_index,
     int subtitle_size,
-    SubtitlePlacement subtitle_placement
+    SubtitlePlacement subtitle_placement,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y
 )
 {
     HistoryStore history;
@@ -8389,7 +8527,9 @@ static void save_history_position_for_movie(
         playback_mode,
         subtitle_font_index,
         subtitle_size,
-        subtitle_placement
+        subtitle_placement,
+        video_align_x,
+        video_align_y
     );
     save_history_store(movie_path, &history);
     free_history_store(&history);
@@ -8428,7 +8568,9 @@ static void flush_deferred_history_save(
     PlaybackMode playback_mode,
     size_t subtitle_font_index,
     int subtitle_size,
-    SubtitlePlacement subtitle_placement
+    SubtitlePlacement subtitle_placement,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y
 )
 {
     uint32_t start_ms;
@@ -8450,7 +8592,9 @@ static void flush_deferred_history_save(
         playback_mode,
         subtitle_font_index,
         subtitle_size,
-        subtitle_placement
+        subtitle_placement,
+        video_align_x,
+        video_align_y
     );
     elapsed_ms = monotonic_clock_now_ms() - start_ms;
     debug_tracef(
@@ -8913,6 +9057,15 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
     bool prev_right = false;
     bool prev_up = false;
     bool prev_down = false;
+    bool prev_1 = false;
+    bool prev_2 = false;
+    bool prev_3 = false;
+    bool prev_4 = false;
+    bool prev_5 = false;
+    bool prev_6 = false;
+    bool prev_7 = false;
+    bool prev_8 = false;
+    bool prev_9 = false;
     bool prev_tab = false;
     bool prev_esc = false;
     bool prev_cat = false;
@@ -8952,6 +9105,8 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
     MemoryOverlayMode memory_overlay_mode = MEMORY_OVERLAY_OFF;
     int subtitle_size = 0;
     SubtitlePlacement subtitle_placement = SUBTITLE_POS_BAR_BOTTOM;
+    VideoAlign video_align_x = VIDEO_ALIGN_CENTER;
+    VideoAlign video_align_y = VIDEO_ALIGN_CENTER;
     char status_overlay_text[64] = {0};
     uint32_t status_overlay_until = 0;
     SubtitleSurfaceCache subtitle_cache;
@@ -9010,7 +9165,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
                 &playback_mode,
                 &subtitle_font_index,
                 &subtitle_size,
-                &subtitle_placement
+                &subtitle_placement,
+                &video_align_x,
+                &video_align_y
             );
             if (startup_history.entries[startup_history_index].has_resume) {
                 startup_has_resume = true;
@@ -9049,6 +9206,15 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
     prev_tab = isKeyPressed(KEY_NSPIRE_TAB);
     prev_up = isKeyPressed(KEY_NSPIRE_UP);
     prev_down = isKeyPressed(KEY_NSPIRE_DOWN);
+    prev_1 = isKeyPressed(KEY_NSPIRE_1);
+    prev_2 = isKeyPressed(KEY_NSPIRE_2);
+    prev_3 = isKeyPressed(KEY_NSPIRE_3);
+    prev_4 = isKeyPressed(KEY_NSPIRE_4);
+    prev_5 = isKeyPressed(KEY_NSPIRE_5);
+    prev_6 = isKeyPressed(KEY_NSPIRE_6);
+    prev_7 = isKeyPressed(KEY_NSPIRE_7);
+    prev_8 = isKeyPressed(KEY_NSPIRE_8);
+    prev_9 = isKeyPressed(KEY_NSPIRE_9);
     prev_t = isKeyPressed(KEY_NSPIRE_T);
     prev_m = isKeyPressed(KEY_NSPIRE_M);
     prev_d = isKeyPressed(KEY_NSPIRE_D);
@@ -9112,6 +9278,15 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
         bool brightness_down_edge = key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down);
         bool brightness_up_down = prev_up;
         bool brightness_down_down = prev_down;
+        bool video_down_left_edge = key_pressed_edge(KEY_NSPIRE_1, &prev_1);
+        bool video_down_edge = key_pressed_edge(KEY_NSPIRE_2, &prev_2);
+        bool video_down_right_edge = key_pressed_edge(KEY_NSPIRE_3, &prev_3);
+        bool video_left_edge = key_pressed_edge(KEY_NSPIRE_4, &prev_4);
+        bool video_center_edge = key_pressed_edge(KEY_NSPIRE_5, &prev_5);
+        bool video_right_edge = key_pressed_edge(KEY_NSPIRE_6, &prev_6);
+        bool video_up_left_edge = key_pressed_edge(KEY_NSPIRE_7, &prev_7);
+        bool video_up_edge = key_pressed_edge(KEY_NSPIRE_8, &prev_8);
+        bool video_up_right_edge = key_pressed_edge(KEY_NSPIRE_9, &prev_9);
         bool subtitle_font_edge = key_pressed_edge(KEY_NSPIRE_F, &prev_f);
         bool subtitle_track_edge = key_pressed_edge(KEY_NSPIRE_T, &prev_t);
         bool memory_overlay_edge = key_pressed_edge(KEY_NSPIRE_M, &prev_m);
@@ -9272,6 +9447,8 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
                 true,
                 true,
                 scale_mode,
+                video_align_x,
+                video_align_y,
                 playback_rate,
                 memory_overlay_mode,
                 &subtitle_cache,
@@ -9303,7 +9480,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
                 playback_mode,
                 subtitle_font_index,
                 subtitle_size,
-                subtitle_placement
+                subtitle_placement,
+                video_align_x,
+                video_align_y
             );
             prefetch_tick(&movie, true, 1000);
             msleep(16);
@@ -9312,6 +9491,61 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
         if (playback_mode_edge) {
             playback_mode = (PlaybackMode) ((playback_mode + 1) % PLAYBACK_MODE_COUNT);
             snprintf(status_overlay_text, sizeof(status_overlay_text), "MODE %s", playback_mode_text(playback_mode));
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (video_up_left_edge) {
+            apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_NEGATIVE, VIDEO_ALIGN_NEGATIVE);
+            format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (video_up_edge) {
+            apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_CENTER, VIDEO_ALIGN_NEGATIVE);
+            format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (video_up_right_edge) {
+            apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_POSITIVE, VIDEO_ALIGN_NEGATIVE);
+            format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (video_left_edge) {
+            apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_NEGATIVE, VIDEO_ALIGN_CENTER);
+            format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (video_center_edge) {
+            video_align_x = VIDEO_ALIGN_CENTER;
+            video_align_y = VIDEO_ALIGN_CENTER;
+            format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (video_right_edge) {
+            apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_POSITIVE, VIDEO_ALIGN_CENTER);
+            format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (video_down_left_edge) {
+            apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_NEGATIVE, VIDEO_ALIGN_POSITIVE);
+            format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (video_down_edge) {
+            apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_CENTER, VIDEO_ALIGN_POSITIVE);
+            format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (video_down_right_edge) {
+            apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_POSITIVE, VIDEO_ALIGN_POSITIVE);
+            format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
             status_overlay_until = now_ms + STATUS_OVERLAY_MS;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
@@ -9653,6 +9887,8 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
                 show_ui,
                 false,
                 scale_mode,
+                video_align_x,
+                video_align_y,
                 playback_rate,
                 memory_overlay_mode,
                 &subtitle_cache,
@@ -9686,7 +9922,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
                 playback_mode,
                 subtitle_font_index,
                 subtitle_size,
-                subtitle_placement
+                subtitle_placement,
+                video_align_x,
+                video_align_y
             );
             prefetch_tick(&movie, true, 1000);
             if (debug_is_runtime_logging_enabled() &&
@@ -9735,7 +9973,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
         playback_mode,
         subtitle_font_index,
         subtitle_size,
-        subtitle_placement
+        subtitle_placement,
+        video_align_x,
+        video_align_y
     );
     if (debug_is_runtime_logging_enabled() || result != 0) {
         char log_path[MAX_PATH_LEN];
