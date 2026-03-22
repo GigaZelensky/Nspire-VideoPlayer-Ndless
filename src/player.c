@@ -2036,6 +2036,145 @@ static size_t target_h264_frame_ring_capacity(const Movie *movie)
     return target;
 }
 
+static uint32_t movie_frame_interval_ms_ceil(const Movie *movie)
+{
+    uint32_t fps_num;
+    uint32_t fps_den;
+    uint32_t interval_ms;
+
+    if (!movie || movie->header.fps_num == 0U || movie->header.fps_den == 0U) {
+        return 0U;
+    }
+
+    fps_num = (uint32_t) movie->header.fps_num;
+    fps_den = (uint32_t) movie->header.fps_den;
+    interval_ms = ((1000U * fps_den) + fps_num - 1U) / fps_num;
+    return interval_ms > 0U ? interval_ms : 1U;
+}
+
+static uint32_t h264_prefetch_pressure_level(const Movie *movie)
+{
+    uint32_t frame_budget_ms;
+    uint32_t decode_avg_ms;
+    uint32_t decode_peak_ms;
+    uint32_t effective_decode_ms;
+    uint32_t load_q8 = 0U;
+    size_t capacity;
+    size_t useful_floor;
+
+    if (!movie || !movie_uses_h264(movie)) {
+        return 0U;
+    }
+
+    frame_budget_ms = movie_frame_interval_ms_ceil(movie);
+    decode_avg_ms = movie->h264_foreground_decode_avg_ms;
+    if (movie->h264_prefetch_decode_avg_ms > decode_avg_ms) {
+        decode_avg_ms = movie->h264_prefetch_decode_avg_ms;
+    }
+    decode_peak_ms = movie->h264_foreground_decode_peak_ms;
+    if (movie->h264_prefetch_decode_peak_ms > decode_peak_ms) {
+        decode_peak_ms = movie->h264_prefetch_decode_peak_ms;
+    }
+    effective_decode_ms = decode_avg_ms;
+    if (decode_peak_ms > effective_decode_ms) {
+        effective_decode_ms = (effective_decode_ms + decode_peak_ms + 1U) / 2U;
+    }
+
+    if (frame_budget_ms > 0U && effective_decode_ms > 0U) {
+        load_q8 = (effective_decode_ms << 8) / frame_budget_ms;
+    }
+    if (movie->diag_lag_event_count > 0U) {
+        load_q8 += 48U;
+    }
+
+    capacity = active_h264_frame_ring_capacity(movie);
+    useful_floor = H264_PREFETCH_MIN_READY_FRAMES + H264_PREFETCH_NEXT_CHUNK_BRIDGE_FRAMES;
+    if (capacity < useful_floor) {
+        load_q8 += 48U;
+    }
+
+    if (load_q8 >= 192U) {
+        return 2U;
+    }
+    if (load_q8 >= 128U) {
+        return 1U;
+    }
+    return 0U;
+}
+
+static uint32_t h264_active_prefetch_min_spare_ms(const Movie *movie)
+{
+    uint32_t pressure = h264_prefetch_pressure_level(movie);
+
+    if (pressure >= 2U) {
+        return 10U;
+    }
+    if (pressure == 1U) {
+        return 12U;
+    }
+    return H264_PREFETCH_ACTIVE_MIN_SPARE_MS;
+}
+
+static uint32_t h264_prefetch_io_min_spare_ms(const Movie *movie)
+{
+    uint32_t pressure = h264_prefetch_pressure_level(movie);
+
+    if (pressure >= 2U) {
+        return 10U;
+    }
+    if (pressure == 1U) {
+        return 11U;
+    }
+    return PREFETCH_ACTIVE_H264_MIN_SPARE_MS;
+}
+
+static size_t h264_active_ring_growth_slots(const Movie *movie, bool paused, uint32_t spare_ms)
+{
+    size_t capacity;
+    size_t target_capacity;
+    size_t useful_floor;
+    uint32_t pressure;
+
+    if (!movie || !movie_uses_h264(movie)) {
+        return 0U;
+    }
+
+    if (paused) {
+        return 8U;
+    }
+
+    capacity = active_h264_frame_ring_capacity(movie);
+    target_capacity = target_h264_frame_ring_capacity(movie);
+    useful_floor = H264_PREFETCH_MIN_READY_FRAMES + H264_PREFETCH_NEXT_CHUNK_BRIDGE_FRAMES;
+    pressure = h264_prefetch_pressure_level(movie);
+    if (capacity >= target_capacity) {
+        return 0U;
+    }
+
+    if (capacity < useful_floor && spare_ms >= 10U) {
+        return 8U;
+    }
+    if (pressure >= 2U) {
+        if (spare_ms >= 20U) {
+            return 6U;
+        }
+        if (spare_ms >= 12U) {
+            return 3U;
+        }
+    } else if (pressure == 1U) {
+        if (spare_ms >= 20U) {
+            return 4U;
+        }
+        if (spare_ms >= 14U) {
+            return 2U;
+        }
+    } else if (spare_ms >= 24U) {
+        return 4U;
+    }
+
+    return 0U;
+}
+
 static void release_h264_frame_ring_slot(Movie *movie, size_t slot_index)
 {
     size_t last_index;
@@ -2624,24 +2763,40 @@ static uint32_t estimate_h264_frame_bytes(const Movie *movie, uint32_t frame_ind
     return estimate_h264_chunk_average_frame_bytes(movie, entry);
 }
 
-static uint32_t h264_prefetch_active_scan_frames(uint32_t spare_ms)
+static uint32_t h264_prefetch_active_scan_frames(const Movie *movie, uint32_t spare_ms)
 {
+    uint32_t scan_frames;
+    uint32_t pressure = h264_prefetch_pressure_level(movie);
+
     if (spare_ms >= 28U) {
-        return H264_PREFETCH_ACTIVE_SCAN_MAX_FRAMES;
+        scan_frames = H264_PREFETCH_ACTIVE_SCAN_MAX_FRAMES;
+    } else if (spare_ms >= 20U) {
+        scan_frames = H264_PREFETCH_ACTIVE_SCAN_MID_FRAMES;
+    } else {
+        scan_frames = H264_PREFETCH_ACTIVE_SCAN_MIN_FRAMES;
     }
-    if (spare_ms >= 20U) {
-        return H264_PREFETCH_ACTIVE_SCAN_MID_FRAMES;
+
+    if (pressure >= 1U) {
+        scan_frames += 16U;
     }
-    return H264_PREFETCH_ACTIVE_SCAN_MIN_FRAMES;
+    if (pressure >= 2U) {
+        scan_frames += 16U;
+    }
+    if (scan_frames > H264_PREFETCH_LOOKAHEAD_FRAMES) {
+        scan_frames = H264_PREFETCH_LOOKAHEAD_FRAMES;
+    }
+    return scan_frames;
 }
 
 static size_t h264_prefetch_active_ready_cap(const Movie *movie, uint32_t spare_ms)
 {
     size_t cap = H264_PREFETCH_ACTIVE_READY_BASE;
+    uint32_t pressure;
 
     if (!movie) {
         return 0;
     }
+    pressure = h264_prefetch_pressure_level(movie);
 
     if (spare_ms >= 18U) {
         cap = H264_PREFETCH_ACTIVE_READY_MID;
@@ -2652,16 +2807,44 @@ static size_t h264_prefetch_active_ready_cap(const Movie *movie, uint32_t spare_
     if (spare_ms >= 32U) {
         cap = H264_PREFETCH_ACTIVE_READY_MAX;
     }
+    if (pressure >= 1U) {
+        cap += 4U;
+    }
+    if (pressure >= 2U) {
+        cap += 4U;
+    }
     if (cap > active_h264_frame_ring_capacity(movie)) {
         cap = active_h264_frame_ring_capacity(movie);
     }
     return cap;
 }
 
-static uint32_t h264_prefetch_active_decode_limit(size_t contiguous_ready, size_t target_ready_count, uint32_t spare_ms)
+static uint32_t h264_prefetch_active_decode_limit(
+    const Movie *movie,
+    size_t contiguous_ready,
+    size_t target_ready_count,
+    uint32_t spare_ms
+)
 {
+    uint32_t pressure = h264_prefetch_pressure_level(movie);
+
     if (contiguous_ready >= target_ready_count) {
         return 0U;
+    }
+    if (pressure >= 2U) {
+        if (contiguous_ready < H264_PREFETCH_ACTIVE_LOW_WATERMARK && spare_ms >= 16U) {
+            return 4U;
+        }
+        if (spare_ms >= 12U) {
+            return 3U;
+        }
+    } else if (pressure == 1U) {
+        if (contiguous_ready < H264_PREFETCH_ACTIVE_LOW_WATERMARK && spare_ms >= 16U) {
+            return 4U;
+        }
+        if (spare_ms >= 14U) {
+            return 3U;
+        }
     }
     if (contiguous_ready < H264_PREFETCH_ACTIVE_LOW_WATERMARK && spare_ms >= 14U) {
         return 3U;
@@ -2671,7 +2854,22 @@ static uint32_t h264_prefetch_active_decode_limit(size_t contiguous_ready, size_
 
 static bool h264_should_allow_active_prefetch(const Movie *movie, uint32_t spare_ms)
 {
-    if (spare_ms >= 16U) {
+    uint32_t eager_allow_spare_ms = 16U;
+    uint32_t hard_block_spare_ms = 28U;
+    uint32_t soft_block_spare_ms = 22U;
+    uint32_t pressure = h264_prefetch_pressure_level(movie);
+
+    if (pressure >= 2U) {
+        eager_allow_spare_ms = 12U;
+        hard_block_spare_ms = 22U;
+        soft_block_spare_ms = 16U;
+    } else if (pressure == 1U) {
+        eager_allow_spare_ms = 14U;
+        hard_block_spare_ms = 24U;
+        soft_block_spare_ms = 18U;
+    }
+
+    if (spare_ms >= eager_allow_spare_ms) {
         return true;
     }
     if (!movie) {
@@ -2681,10 +2879,10 @@ static bool h264_should_allow_active_prefetch(const Movie *movie, uint32_t spare
     if (movie->h264_active_prefetch_backoff > 0) {
         return false;
     }
-    if (movie->h264_foreground_decode_peak_ms >= H264_FOREGROUND_DECODE_HARD_MS && spare_ms < 28U) {
+    if (movie->h264_foreground_decode_peak_ms >= H264_FOREGROUND_DECODE_HARD_MS && spare_ms < hard_block_spare_ms) {
         return false;
     }
-    if (movie->h264_foreground_decode_avg_ms >= H264_FOREGROUND_DECODE_SOFT_MS && spare_ms < 22U) {
+    if (movie->h264_foreground_decode_avg_ms >= H264_FOREGROUND_DECODE_SOFT_MS && spare_ms < soft_block_spare_ms) {
         return false;
     }
     return true;
@@ -2706,6 +2904,7 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
     uint32_t frame_index;
     uint32_t limit;
     uint32_t scan_frames;
+    uint32_t pressure;
 
     if (!movie || movie->current_frame + 1U >= movie->header.frame_count) {
         return 0;
@@ -2716,7 +2915,14 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
         return 0;
     }
 
+    pressure = h264_prefetch_pressure_level(movie);
     target = H264_PREFETCH_MIN_READY_FRAMES;
+    if (pressure >= 1U) {
+        target += 2U;
+    }
+    if (pressure >= 2U) {
+        target += 2U;
+    }
     if (target > capacity) {
         target = capacity;
     }
@@ -2727,7 +2933,7 @@ static size_t h264_prefetch_target_ready_count(const Movie *movie, uint32_t spar
         active_cap = target;
     }
 
-    scan_frames = h264_prefetch_active_scan_frames(spare_ms);
+    scan_frames = h264_prefetch_active_scan_frames(movie, spare_ms);
     if (contiguous_ready + 8U < target && scan_frames < H264_PREFETCH_ACTIVE_SCAN_MID_FRAMES) {
         scan_frames = H264_PREFETCH_ACTIVE_SCAN_MID_FRAMES;
     }
@@ -4701,7 +4907,7 @@ static int prefetch_budget_for_state(const Movie *movie, bool paused, uint32_t s
     if (paused) {
         return PREFETCH_CHUNK_COUNT;
     }
-    if (movie_uses_h264(movie) && spare_ms < PREFETCH_ACTIVE_H264_MIN_SPARE_MS) {
+    if (movie_uses_h264(movie) && spare_ms < h264_prefetch_io_min_spare_ms(movie)) {
         return 0;
     }
     if (spare_ms >= 24U) {
@@ -5017,13 +5223,13 @@ static void prefetch_h264_frames(Movie *movie, bool paused, uint32_t spare_ms, u
     discard_h264_frame_ring_before(movie, movie->current_frame + 1U);
     target_ready_count = paused ? active_h264_frame_ring_capacity(movie) : h264_prefetch_target_ready_count(movie, spare_ms);
     contiguous_ready_count = h264_frame_ring_contiguous_ready_count(movie);
-    if (!paused && spare_ms < H264_PREFETCH_ACTIVE_MIN_SPARE_MS) {
+    if (!paused && spare_ms < h264_active_prefetch_min_spare_ms(movie)) {
         return;
     }
     current_chunk = movie_chunk_for_frame(movie, movie->current_frame);
     max_decodes_this_tick = paused
         ? UINT32_MAX
-        : h264_prefetch_active_decode_limit(contiguous_ready_count, target_ready_count, spare_ms);
+        : h264_prefetch_active_decode_limit(movie, contiguous_ready_count, target_ready_count, spare_ms);
     decode_guard_ms = h264_prefetch_decode_guard_ms(movie);
 
     while (contiguous_ready_count < target_ready_count && decoded_this_tick < max_decodes_this_tick) {
@@ -5198,7 +5404,7 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms)
     bool same_chunk_recovered = false;
     int max_new_prefetch_distance = PREFETCH_CHUNK_COUNT;
     int max_work_distance = PREFETCH_CHUNK_COUNT;
-    size_t ring_growth = paused ? 8U : 0U;
+    size_t ring_growth = h264_active_ring_growth_slots(movie, paused, spare_ms);
 
     if (movie_uses_h264(movie)) {
         /* Let decoded-frame H.264 prefetch run whenever the cooperative
@@ -6091,6 +6297,14 @@ static bool load_movie(const char *path, Movie *movie)
         return false;
     }
     debug_tracef("open first frame ok");
+    if (movie_uses_h264(movie)) {
+        size_t warm_start_slots = H264_PREFETCH_MIN_READY_FRAMES + H264_PREFETCH_NEXT_CHUNK_BRIDGE_FRAMES;
+        size_t max_slots = target_h264_frame_ring_capacity(movie);
+        if (warm_start_slots > max_slots) {
+            warm_start_slots = max_slots;
+        }
+        try_grow_h264_frame_ring(movie, warm_start_slots);
+    }
     if (!load_subtitles(movie, movie->file, &movie->header, &movie->subtitles, &movie->subtitle_tracks, &movie->subtitle_track_count)) {
         debug_tracef("open subtitles disabled after alloc/read failure");
     }
