@@ -100,6 +100,10 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define MONOTONIC_TIMER_CLOCK_SOURCE_32768HZ 0x0AU
 #define MONOTONIC_TIMER_CONTROL_ENABLE_32BIT 0x82U
 #define MONOTONIC_TIMER_MAX_DELTA_TICKS (TIMER_TICKS_PER_SEC * 10U)
+#define LCD_BRIGHTNESS_ADDR ((volatile uint32_t *) 0x90130014U)
+#define LCD_BRIGHTNESS_MIN 0
+#define LCD_BRIGHTNESS_MAX 225
+#define LCD_BRIGHTNESS_STEP 25
 #define DEBUG_RING_SIZE 2048
 #define DEBUG_LINE_LEN 160
 #define DEBUG_SNAPSHOT_INTERVAL_MS 1000U
@@ -1008,6 +1012,32 @@ static int clamp_int(int value, int min_value, int max_value)
         return max_value;
     }
     return value;
+}
+
+static uint32_t current_lcd_brightness(void)
+{
+    return (uint32_t) clamp_int((int) *LCD_BRIGHTNESS_ADDR, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
+}
+
+static uint32_t set_lcd_brightness(int value)
+{
+    int clamped = clamp_int(value, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
+
+    *LCD_BRIGHTNESS_ADDR = (uint32_t) clamped;
+    return (uint32_t) clamped;
+}
+
+static uint32_t adjust_lcd_brightness(int delta)
+{
+    return set_lcd_brightness((int) current_lcd_brightness() + delta);
+}
+
+static unsigned lcd_brightness_percent(uint32_t raw_value)
+{
+    uint32_t clamped = (uint32_t) clamp_int((int) raw_value, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
+
+    return (unsigned) ((((uint32_t) LCD_BRIGHTNESS_MAX - clamped) * 100U) +
+        ((uint32_t) LCD_BRIGHTNESS_MAX / 2U)) / (uint32_t) LCD_BRIGHTNESS_MAX;
 }
 
 static const char *filename_from_path(const char *path)
@@ -7642,6 +7672,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
         {"TAB", "Step one frame"},
         {"P", "Playback mode"},
         {"/", "Scale mode"},
+        {"UP / DOWN", "Screen brightness"},
         {"{ / }", "Playback speed"},
         {"^", "Subtitle position"},
         {"+ / -", "Subtitle size"},
@@ -8880,6 +8911,8 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
     bool prev_enter = false;
     bool prev_left = false;
     bool prev_right = false;
+    bool prev_up = false;
+    bool prev_down = false;
     bool prev_tab = false;
     bool prev_esc = false;
     bool prev_cat = false;
@@ -8905,9 +8938,13 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
     uint32_t playback_anchor_frame;
     uint32_t tab_hold_repeat_interval_ms;
     uint32_t tab_repeat_next_ms = 0;
+    uint32_t seek_repeat_next_ms = 0;
+    uint32_t brightness_repeat_next_ms = 0;
     uint32_t ui_visible_until;
     uint32_t subtitle_font_overlay_until = 0;
     int result = 0;
+    int seek_repeat_direction = 0;
+    int brightness_repeat_direction = 0;
     ScaleMode scale_mode = SCALE_FIT;
     size_t playback_rate_index = PLAYBACK_RATE_DEFAULT_INDEX;
     size_t subtitle_font_index = SUBTITLE_FONT_DEFAULT_INDEX;
@@ -9010,6 +9047,8 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
     }
     pointer_init(&pointer);
     prev_tab = isKeyPressed(KEY_NSPIRE_TAB);
+    prev_up = isKeyPressed(KEY_NSPIRE_UP);
+    prev_down = isKeyPressed(KEY_NSPIRE_DOWN);
     prev_t = isKeyPressed(KEY_NSPIRE_T);
     prev_m = isKeyPressed(KEY_NSPIRE_M);
     prev_d = isKeyPressed(KEY_NSPIRE_D);
@@ -9067,6 +9106,12 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
         bool speed_up_edge = rp_edge || gthan_edge;
         bool seek_left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left);
         bool seek_right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right);
+        bool seek_left_down = prev_left;
+        bool seek_right_down = prev_right;
+        bool brightness_up_edge = key_pressed_edge(KEY_NSPIRE_UP, &prev_up);
+        bool brightness_down_edge = key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down);
+        bool brightness_up_down = prev_up;
+        bool brightness_down_down = prev_down;
         bool subtitle_font_edge = key_pressed_edge(KEY_NSPIRE_F, &prev_f);
         bool subtitle_track_edge = key_pressed_edge(KEY_NSPIRE_T, &prev_t);
         bool memory_overlay_edge = key_pressed_edge(KEY_NSPIRE_M, &prev_m);
@@ -9075,6 +9120,8 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
         bool playback_mode_edge = key_pressed_edge(KEY_NSPIRE_P, &prev_p);
         bool take_screenshot = false;
         bool tab_repeat_step = false;
+        int seek_delta_ms = 0;
+        int brightness_delta = 0;
 
         if (tab_edge) {
             tab_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
@@ -9110,8 +9157,28 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
         } else {
             seek_preview.over_bar = false;
         }
-        if (seek_left_edge || seek_right_edge) {
-            int64_t next_seek_ms = (int64_t) pending_seek_ms + (seek_left_edge ? -SEEK_STEP_MS : SEEK_STEP_MS);
+        if (seek_left_edge) {
+            seek_delta_ms = -SEEK_STEP_MS;
+            seek_repeat_direction = -1;
+            seek_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
+        } else if (seek_right_edge) {
+            seek_delta_ms = SEEK_STEP_MS;
+            seek_repeat_direction = 1;
+            seek_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
+        } else if ((seek_repeat_direction < 0 && !seek_left_down) ||
+                   (seek_repeat_direction > 0 && !seek_right_down) ||
+                   (seek_left_down && seek_right_down)) {
+            seek_repeat_direction = 0;
+            seek_repeat_next_ms = 0;
+        } else if (seek_repeat_direction != 0 &&
+                   seek_repeat_next_ms != 0U &&
+                   !help_menu_open &&
+                   (int32_t) (now_ms - seek_repeat_next_ms) >= 0) {
+            seek_delta_ms = seek_repeat_direction * SEEK_STEP_MS;
+            seek_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_FALLBACK_INTERVAL_MS;
+        }
+        if (seek_delta_ms != 0) {
+            int64_t next_seek_ms = (int64_t) pending_seek_ms + seek_delta_ms;
             int64_t seek_limit_ms = (int64_t) movie_duration_ms(&movie);
 
             if (!paused) {
@@ -9129,8 +9196,9 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (pending_seek_ms != 0 &&
-            !seek_left_edge &&
-            !seek_right_edge &&
+            seek_delta_ms == 0 &&
+            !seek_left_down &&
+            !seek_right_down &&
             (now_ms >= pending_seek_commit_at_ms || enter_edge || tab_edge || pointer_click)) {
             pending_seek_consumed_click = pointer_click;
             if (!clamp_seek(&movie, pending_seek_ms)) {
@@ -9244,6 +9312,37 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
         if (playback_mode_edge) {
             playback_mode = (PlaybackMode) ((playback_mode + 1) % PLAYBACK_MODE_COUNT);
             snprintf(status_overlay_text, sizeof(status_overlay_text), "MODE %s", playback_mode_text(playback_mode));
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (brightness_up_edge) {
+            brightness_delta = -LCD_BRIGHTNESS_STEP;
+            brightness_repeat_direction = -1;
+            brightness_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
+        } else if (brightness_down_edge) {
+            brightness_delta = LCD_BRIGHTNESS_STEP;
+            brightness_repeat_direction = 1;
+            brightness_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
+        } else if ((brightness_repeat_direction < 0 && !brightness_up_down) ||
+                   (brightness_repeat_direction > 0 && !brightness_down_down) ||
+                   (brightness_up_down && brightness_down_down)) {
+            brightness_repeat_direction = 0;
+            brightness_repeat_next_ms = 0;
+        } else if (brightness_repeat_direction != 0 &&
+                   brightness_repeat_next_ms != 0U &&
+                   (int32_t) (now_ms - brightness_repeat_next_ms) >= 0) {
+            brightness_delta = brightness_repeat_direction * LCD_BRIGHTNESS_STEP;
+            brightness_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_FALLBACK_INTERVAL_MS;
+        }
+        if (brightness_delta != 0) {
+            uint32_t brightness_raw = adjust_lcd_brightness(brightness_delta);
+
+            snprintf(
+                status_overlay_text,
+                sizeof(status_overlay_text),
+                "BRIGHT %u%%",
+                lcd_brightness_percent(brightness_raw)
+            );
             status_overlay_until = now_ms + STATUS_OVERLAY_MS;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }

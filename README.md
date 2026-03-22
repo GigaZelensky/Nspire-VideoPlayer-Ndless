@@ -34,6 +34,7 @@ The `.nvp` format used by the current player is:
 - built-in subtitle font cycling
 - scale modes: `FIT`, `FILL`, `STRETCH`, `1:1`
 - playback speed control from `0.25x` to `2.0x`
+- screen brightness control with `Up` / `Down` and an on-screen percentage overlay
 - picker UI for multiple `.nvp` / `.nvp.tns` files
 - per-video resume history with saved playback and subtitle settings
 - debug log output and in-player memory/playback overlay
@@ -41,6 +42,10 @@ The `.nvp` format used by the current player is:
 ## Current Limits
 
 - no audio yet
+
+## Battery Life
+
+Battery Life: ~9.5 hours of continuous H.264 playback at 100% brightness.
 
 ## Controls
 
@@ -58,6 +63,7 @@ The `.nvp` format used by the current player is:
 - touchpad: move cursor and show the UI
 - touchpad click: play / pause, restart at end, or seek when clicking inside the bottom UI band
 - `Left` / `Right`: seek `-5s` / `+5s`
+- `Up` / `Down`: increase / decrease screen brightness
 - `Tab`: single-frame step while paused, hold to repeat
 - `P`: cycle playback mode: `PLAY ONCE`, `REPLAY`, `AUTO NEXT`
 - `/`: cycle scale mode
