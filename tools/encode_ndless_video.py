@@ -1844,16 +1844,40 @@ def subtitle_extract_suffix(codec_name: str | None) -> str:
     return ".srt"
 
 
+def normalize_subtitle_sources(subtitle_arg: str | list[str] | None) -> list[str]:
+    if subtitle_arg is None:
+        return []
+    if isinstance(subtitle_arg, str):
+        return [subtitle_arg]
+
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for source in subtitle_arg:
+        if not source:
+            continue
+        source_key = source if source == "embedded" else str(Path(source).resolve())
+        if source_key in seen:
+            continue
+        seen.add(source_key)
+        normalized.append(source)
+    return normalized
+
+
 def resolve_burn_subtitle_source(
     input_path: Path,
-    subtitle_arg: str | None,
+    subtitle_arg: str | list[str] | None,
     selected_tracks: list[int] | None,
 ) -> BurnSubtitleSource:
-    if not subtitle_arg:
-        raise RuntimeError("--burn-subtitles requires --subtitle.")
+    subtitle_sources = normalize_subtitle_sources(subtitle_arg)
 
-    if subtitle_arg != "embedded":
-        subtitle_path = Path(subtitle_arg).resolve()
+    if not subtitle_sources:
+        raise RuntimeError("--burn-subtitles requires --subtitle.")
+    if len(subtitle_sources) != 1:
+        raise RuntimeError("--burn-subtitles only supports a single subtitle source.")
+
+    subtitle_source = subtitle_sources[0]
+    if subtitle_source != "embedded":
+        subtitle_path = Path(subtitle_source).resolve()
         return BurnSubtitleSource(
             kind="text_file",
             label=subtitle_path.name,
@@ -1887,56 +1911,64 @@ def resolve_burn_subtitle_source(
 def load_subtitle_tracks(
     input_path: Path,
     output_path: Path,
-    subtitle_arg: str | None,
+    subtitle_arg: str | list[str] | None,
     selected_tracks: list[int] | None,
 ) -> list[SubtitleTrack]:
-    if not subtitle_arg:
-        return []
-
-    if subtitle_arg != "embedded":
-        subtitle_path = Path(subtitle_arg)
-        cues = parse_subtitle_file(subtitle_path)
-        if not cues:
-            return []
-        return [SubtitleTrack(name=subtitle_path.stem or "Subtitles", cues=cues)]
-
-    available_tracks = probe_embedded_subtitle_tracks(input_path)
-    if not available_tracks:
-        raise RuntimeError("No embedded subtitle tracks were found.")
-
-    if selected_tracks:
-        wanted_tracks = list(dict.fromkeys(selected_tracks))
-    else:
-        wanted_tracks = [track.ordinal for track in available_tracks if track.text_supported]
-        if not wanted_tracks:
-            raise RuntimeError(
-                "No supported text embedded subtitle tracks were found. "
-                f"Available embedded subtitle tracks: {', '.join(subtitle_track_debug_label(track) for track in available_tracks)}. "
-                "Use --burn-subtitles to hardcode bitmap subtitle tracks into the video."
-            )
-    track_info_map = {track.ordinal: track for track in available_tracks}
     subtitle_tracks: list[SubtitleTrack] = []
+    subtitle_sources = normalize_subtitle_sources(subtitle_arg)
+    embedded_requested = False
 
-    for track_index in wanted_tracks:
-        track_info = track_info_map.get(track_index)
-        if track_info is None:
-            raise RuntimeError(f"Embedded subtitle track {track_index} is not available.")
-        if not track_info.text_supported:
-            raise RuntimeError(
-                f"Embedded subtitle track {track_index} ({track_info.name}) uses unsupported bitmap codec "
-                f"'{track_info.codec_name}'. Select a text subtitle track instead."
-            )
-        extracted = output_path.parent / f"{output_path.stem}.track{track_index}{subtitle_extract_suffix(track_info.codec_name)}"
-        try:
-            extract_embedded_subtitle_track(input_path, extracted, track_index)
-            cues = parse_subtitle_file(extracted)
+    if not subtitle_sources:
+        return subtitle_tracks
+
+    for subtitle_source in subtitle_sources:
+        if subtitle_source != "embedded":
+            subtitle_path = Path(subtitle_source)
+            cues = parse_subtitle_file(subtitle_path)
             if cues:
-                subtitle_tracks.append(SubtitleTrack(name=track_info.name, cues=cues))
-        finally:
+                subtitle_tracks.append(SubtitleTrack(name=subtitle_path.stem or "Subtitles", cues=cues))
+            continue
+
+        if embedded_requested:
+            continue
+        embedded_requested = True
+
+        available_tracks = probe_embedded_subtitle_tracks(input_path)
+        if not available_tracks:
+            raise RuntimeError("No embedded subtitle tracks were found.")
+
+        if selected_tracks:
+            wanted_tracks = list(dict.fromkeys(selected_tracks))
+        else:
+            wanted_tracks = [track.ordinal for track in available_tracks if track.text_supported]
+            if not wanted_tracks:
+                raise RuntimeError(
+                    "No supported text embedded subtitle tracks were found. "
+                    f"Available embedded subtitle tracks: {', '.join(subtitle_track_debug_label(track) for track in available_tracks)}. "
+                    "Use --burn-subtitles to hardcode bitmap subtitle tracks into the video."
+                )
+        track_info_map = {track.ordinal: track for track in available_tracks}
+
+        for track_index in wanted_tracks:
+            track_info = track_info_map.get(track_index)
+            if track_info is None:
+                raise RuntimeError(f"Embedded subtitle track {track_index} is not available.")
+            if not track_info.text_supported:
+                raise RuntimeError(
+                    f"Embedded subtitle track {track_index} ({track_info.name}) uses unsupported bitmap codec "
+                    f"'{track_info.codec_name}'. Select a text subtitle track instead."
+                )
+            extracted = output_path.parent / f"{output_path.stem}.track{track_index}{subtitle_extract_suffix(track_info.codec_name)}"
             try:
-                extracted.unlink()
-            except FileNotFoundError:
-                pass
+                extract_embedded_subtitle_track(input_path, extracted, track_index)
+                cues = parse_subtitle_file(extracted)
+                if cues:
+                    subtitle_tracks.append(SubtitleTrack(name=track_info.name, cues=cues))
+            finally:
+                try:
+                    extracted.unlink()
+                except FileNotFoundError:
+                    pass
     return subtitle_tracks
 
 
@@ -2736,7 +2768,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         burn_subtitle = resolve_burn_subtitle_source(input_path, args.subtitle, args.subtitle_track) if args.burn_subtitles else None
         subtitle_tracks = [] if args.burn_subtitles else load_subtitle_tracks(input_path, output_path, args.subtitle, args.subtitle_track)
         subtitle_count = sum(len(track.cues) for track in subtitle_tracks)
-        if subtitle_tracks and args.subtitle == "embedded":
+        if subtitle_tracks:
             log(f"Embedding {len(subtitle_tracks)} subtitle track(s).", quiet=args.quiet)
         if burn_subtitle is not None:
             log(f"Burning subtitles into video: {burn_subtitle.label}", quiet=args.quiet)
@@ -2951,10 +2983,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", help="Input video file")
     parser.add_argument("--output", required=True, help="Output .nvp.tns file")
-    parser.add_argument("--subtitle", help="Optional subtitle source path or 'embedded'")
+    parser.add_argument("--subtitle", action="append", help="Optional subtitle source path or 'embedded'; repeat to mix multiple subtitle sources")
     parser.add_argument("--burn-subtitles", action="store_true", help="Render the selected subtitles directly into the video instead of storing subtitle tracks in the container")
     parser.add_argument("--burn-subtitle-size", type=float, default=DEFAULT_BURN_SUBTITLE_SIZE, help="Relative size multiplier for burned subtitles (1.0 = default output-safe size)")
-    parser.add_argument("--subtitle-track", dest="subtitle_track", action="append", type=int, help="Embedded subtitle track index to include; repeat to keep multiple tracks")
+    parser.add_argument("--subtitle-track", dest="subtitle_track", action="append", type=int, help="Embedded subtitle track index to include when using --subtitle embedded; repeat to keep multiple tracks")
     parser.add_argument("--fps", default="12", help="Target framerate or 'source'")
     parser.add_argument("--max-width", type=int, default=SCREEN_W, help="Fit width")
     parser.add_argument("--max-height", type=int, default=SCREEN_H, help="Fit height")
