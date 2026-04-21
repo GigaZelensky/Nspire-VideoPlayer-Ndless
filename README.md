@@ -190,6 +190,14 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded
 python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --output ".\dist\video.nvp.tns" --fps 16 --max-width 320 --max-height 180 --chunk-frames 72 --stream-profile quality --crf 14.5 --preset veryslow --level 1.3
 ```
 
+### Target A Specific Size With 2-Pass ABR
+
+```powershell
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --output ".\dist\video.nvp.tns" --fps 16 --max-width 320 --max-height 180 --chunk-frames 72 --stream-profile quality --bitrate-kbps 140 --two-pass --preset veryslow --level 1.3
+```
+
+Use CRF when you want the best quality-per-bit without caring about the exact final size. Use `--bitrate-kbps ... --two-pass` when you need a tighter size target.
+
 ### Main Encoder Options
 
 - `--output`
@@ -204,6 +212,8 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded
 - `--idr-frames`
 - `--max-chunk-kib`
 - `--crf`
+- `--bitrate-kbps`
+- `--two-pass`
 - `--preset`
 - `--level`
 - `--stream-profile`

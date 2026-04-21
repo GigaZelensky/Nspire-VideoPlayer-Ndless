@@ -2195,8 +2195,6 @@ def h264_stream_profile_options(idr_frames: int, stream_profile: str) -> tuple[s
         "weightp=0",
         "no-deblock=1",
         "partitions=none",
-        "me=dia",
-        "subme=0",
         "no-8x8dct=1",
     ]
 
@@ -2208,6 +2206,8 @@ def h264_stream_profile_options(idr_frames: int, stream_profile: str) -> tuple[s
             "rc-lookahead=8",
             "sync-lookahead=8",
             "trellis=0",
+            "me=dia",
+            "subme=0",
         ]
     elif stream_profile == "balanced":
         tune = None
@@ -2216,7 +2216,7 @@ def h264_stream_profile_options(idr_frames: int, stream_profile: str) -> tuple[s
             "mbtree=1",
             "rc-lookahead=12",
             "sync-lookahead=12",
-            "trellis=0",
+            "trellis=1",
         ]
     elif stream_profile == "quality":
         tune = None
@@ -2225,7 +2225,6 @@ def h264_stream_profile_options(idr_frames: int, stream_profile: str) -> tuple[s
             "mbtree=1",
             "rc-lookahead=20",
             "sync-lookahead=20",
-            "trellis=1",
         ]
     elif stream_profile == "intra":
         tune = None
@@ -2242,6 +2241,14 @@ def h264_stream_profile_options(idr_frames: int, stream_profile: str) -> tuple[s
     return tune, ":".join(base_params + extra_params), ["filter_units=remove_types=6"]
 
 
+def format_rate_control_label(*, crf: float, bitrate_kbps: int | None, two_pass: bool) -> str:
+    if bitrate_kbps is None:
+        return f"CRF {crf:g}"
+    if two_pass:
+        return f"2-pass ABR {bitrate_kbps} kb/s"
+    return f"1-pass ABR {bitrate_kbps} kb/s"
+
+
 def build_ffmpeg_command(
     *,
     input_path: Path,
@@ -2253,7 +2260,8 @@ def build_ffmpeg_command(
     height: int,
     fps: float,
     idr_frames: int,
-    crf: float,
+    crf: float | None,
+    bitrate_kbps: int | None,
     preset: str,
     level: str,
     stream_profile: str,
@@ -2262,6 +2270,8 @@ def build_ffmpeg_command(
     encode_duration: float | None,
     burn_subtitle: BurnSubtitleSource | None,
     burn_subtitle_size: float,
+    pass_number: int | None,
+    passlog_path: Path | None,
     quiet: bool,
 ) -> tuple[list[str], str | None]:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
@@ -2421,16 +2431,98 @@ def build_ffmpeg_command(
         "-x264-params",
         x264_params,
     ]
+    if pass_number is not None:
+        if bitrate_kbps is None or passlog_path is None:
+            raise RuntimeError("Two-pass encoding requires both bitrate_kbps and passlog_path.")
+        command += [
+            "-pass",
+            str(pass_number),
+            "-passlogfile",
+            str(passlog_path),
+        ]
     for bitstream_filter in bitstream_filters:
         command += ["-bsf:v", bitstream_filter]
-    command += [
-        "-crf",
-        str(crf),
-        "-f",
-        "h264",
-        str(output_path),
-    ]
+    if bitrate_kbps is not None:
+        command += ["-b:v", f"{bitrate_kbps}k"]
+    else:
+        if crf is None:
+            raise RuntimeError("CRF rate control selected without a CRF value.")
+        command += ["-crf", str(crf)]
+    command += ["-f", "h264", str(output_path)]
     return command, filter_complex_script
+
+
+def materialize_filter_complex_script(
+    command: list[str],
+    filter_complex_script: str | None,
+    temp_dir: Path,
+) -> list[str]:
+    if filter_complex_script is None:
+        return command
+    filter_complex_script_path = temp_dir / "filter_complex.ffscript"
+    filter_complex_script_path.write_text(filter_complex_script, encoding="utf-8")
+    return [
+        str(filter_complex_script_path) if part == FILTER_COMPLEX_SCRIPT_PLACEHOLDER else part
+        for part in command
+    ]
+
+
+def run_ffmpeg_encode(
+    command: list[str],
+    *,
+    label: str,
+    total_duration: float | None,
+    quiet: bool,
+) -> None:
+    progress_command = command[:1] + ["-hide_banner", "-loglevel", "error", "-progress", "pipe:2", "-nostats"] + command[1:]
+    process = subprocess.Popen(
+        progress_command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    if process.stderr is None:
+        raise RuntimeError("Failed to capture FFmpeg progress output.")
+
+    progress_state: dict[str, str] = {}
+    stderr_lines: list[str] = []
+    encode_start = time.time()
+    progress_estimator = ProgressEstimator()
+    try:
+        for raw_line in process.stderr:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if "=" not in line:
+                stderr_lines.append(line)
+                continue
+
+            key, value = line.split("=", 1)
+            progress_state[key] = value
+            if key == "progress" and value in {"continue", "end"}:
+                log_ffmpeg_progress(
+                    label=label,
+                    progress_state=progress_state,
+                    start_time=encode_start,
+                    total_duration=total_duration,
+                    progress_estimator=progress_estimator,
+                    quiet=quiet,
+                    include_size=True,
+                )
+    except KeyboardInterrupt:
+        stop_ffmpeg_process(process, label=label, quiet=quiet)
+        raise
+    finally:
+        if process.stderr is not None:
+            process.stderr.close()
+
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError("\n".join(stderr_lines[-20:]).strip() or f"{label} failed")
 
 
 def encode_h264_bitstream(
@@ -2444,6 +2536,8 @@ def encode_h264_bitstream(
     fps: float,
     idr_frames: int,
     crf: float,
+    bitrate_kbps: int | None,
+    two_pass: bool,
     preset: str,
     level: str,
     stream_profile: str,
@@ -2456,7 +2550,8 @@ def encode_h264_bitstream(
     quiet: bool,
 ) -> bytes:
     with tempfile.TemporaryDirectory(prefix="nvp-h264-") as temp_dir:
-        bitstream_path = Path(temp_dir) / "video.264"
+        temp_dir_path = Path(temp_dir)
+        bitstream_path = temp_dir_path / "video.264"
         command, filter_complex_script = build_ffmpeg_command(
             input_path=input_path,
             output_path=bitstream_path,
@@ -2467,7 +2562,8 @@ def encode_h264_bitstream(
             height=height,
             fps=fps,
             idr_frames=idr_frames,
-            crf=crf,
+            crf=crf if bitrate_kbps is None else None,
+            bitrate_kbps=bitrate_kbps,
             preset=preset,
             level=level,
             stream_profile=stream_profile,
@@ -2476,64 +2572,84 @@ def encode_h264_bitstream(
             encode_duration=encode_duration,
             burn_subtitle=burn_subtitle,
             burn_subtitle_size=burn_subtitle_size,
+            pass_number=None,
+            passlog_path=None,
             quiet=quiet,
         )
-        if filter_complex_script is not None:
-            filter_complex_script_path = Path(temp_dir) / "filter_complex.ffscript"
-            filter_complex_script_path.write_text(filter_complex_script, encoding="utf-8")
-            command = [
-                str(filter_complex_script_path) if part == FILTER_COMPLEX_SCRIPT_PLACEHOLDER else part
-                for part in command
-            ]
-        command = command[:1] + ["-hide_banner", "-loglevel", "error", "-progress", "pipe:2", "-nostats"] + command[1:]
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        if process.stderr is None:
-            raise RuntimeError("Failed to capture FFmpeg progress output.")
+        if two_pass:
+            passlog_path = temp_dir_path / "x264-passlog"
+            pass1_output_path = temp_dir_path / "pass1.264"
+            pass1_command, pass1_filter_script = build_ffmpeg_command(
+                input_path=input_path,
+                output_path=pass1_output_path,
+                source_width=source_width,
+                source_height=source_height,
+                source_fps=source_fps,
+                width=width,
+                height=height,
+                fps=fps,
+                idr_frames=idr_frames,
+                crf=None,
+                bitrate_kbps=bitrate_kbps,
+                preset=preset,
+                level=level,
+                stream_profile=stream_profile,
+                start=start,
+                duration=duration,
+                encode_duration=encode_duration,
+                burn_subtitle=burn_subtitle,
+                burn_subtitle_size=burn_subtitle_size,
+                pass_number=1,
+                passlog_path=passlog_path,
+                quiet=quiet,
+            )
+            run_ffmpeg_encode(
+                materialize_filter_complex_script(pass1_command, pass1_filter_script, temp_dir_path),
+                label="FFmpeg pass 1/2",
+                total_duration=encode_duration,
+                quiet=quiet,
+            )
+            pass1_output_path.unlink(missing_ok=True)
 
-        progress_state: dict[str, str] = {}
-        stderr_lines: list[str] = []
-        encode_start = time.time()
-        progress_estimator = ProgressEstimator()
-        try:
-            for raw_line in process.stderr:
-                line = raw_line.strip()
-                if not line:
-                    continue
-                if "=" not in line:
-                    stderr_lines.append(line)
-                    continue
-
-                key, value = line.split("=", 1)
-                progress_state[key] = value
-                if key == "progress" and value in {"continue", "end"}:
-                    log_ffmpeg_progress(
-                        label="FFmpeg",
-                        progress_state=progress_state,
-                        start_time=encode_start,
-                        total_duration=encode_duration,
-                        progress_estimator=progress_estimator,
-                        quiet=quiet,
-                        include_size=True,
-                    )
-        except KeyboardInterrupt:
-            stop_ffmpeg_process(process, label="Encoding", quiet=quiet)
-            raise
-        finally:
-            if process.stderr is not None:
-                process.stderr.close()
-
-        return_code = process.wait()
-        if return_code != 0:
-            raise RuntimeError("\n".join(stderr_lines[-20:]).strip() or "ffmpeg H.264 encoding failed")
+            pass2_command, pass2_filter_script = build_ffmpeg_command(
+                input_path=input_path,
+                output_path=bitstream_path,
+                source_width=source_width,
+                source_height=source_height,
+                source_fps=source_fps,
+                width=width,
+                height=height,
+                fps=fps,
+                idr_frames=idr_frames,
+                crf=None,
+                bitrate_kbps=bitrate_kbps,
+                preset=preset,
+                level=level,
+                stream_profile=stream_profile,
+                start=start,
+                duration=duration,
+                encode_duration=encode_duration,
+                burn_subtitle=burn_subtitle,
+                burn_subtitle_size=burn_subtitle_size,
+                pass_number=2,
+                passlog_path=passlog_path,
+                quiet=quiet,
+            )
+            run_ffmpeg_encode(
+                materialize_filter_complex_script(pass2_command, pass2_filter_script, temp_dir_path),
+                label="FFmpeg pass 2/2",
+                total_duration=encode_duration,
+                quiet=quiet,
+            )
+            for passlog_candidate in temp_dir_path.glob("x264-passlog*"):
+                passlog_candidate.unlink(missing_ok=True)
+        else:
+            run_ffmpeg_encode(
+                materialize_filter_complex_script(command, filter_complex_script, temp_dir_path),
+                label="FFmpeg",
+                total_duration=encode_duration,
+                quiet=quiet,
+            )
         if preview_output_path is not None:
             write_preview_mp4(bitstream_path, preview_output_path, fps, quiet=quiet)
         return bitstream_path.read_bytes()
@@ -2794,7 +2910,8 @@ def encode(args: argparse.Namespace) -> EncodeStats:
 
         log(
             f"Encoding {input_path.name} -> {target_width}x{target_height} @ {fps:.3f}fps "
-            f"(source {video_probe.storage_width}x{video_probe.storage_height}, display {source_width}x{source_height}, profile {args.stream_profile})",
+            f"(source {video_probe.storage_width}x{video_probe.storage_height}, display {source_width}x{source_height}, "
+            f"profile {args.stream_profile}, {format_rate_control_label(crf=args.crf, bitrate_kbps=args.bitrate_kbps, two_pass=args.two_pass)})",
             quiet=args.quiet,
         )
 
@@ -2810,6 +2927,8 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             fps=fps,
             idr_frames=idr_frames,
             crf=args.crf,
+            bitrate_kbps=args.bitrate_kbps,
+            two_pass=args.two_pass,
             preset=args.preset,
             level=args.level,
             stream_profile=args.stream_profile,
@@ -2993,7 +3112,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--chunk-frames", type=int, default=48, help="Maximum frames per streamed chunk")
     parser.add_argument("--idr-frames", type=int, help="Maximum frames between forced IDR access units; defaults to min(chunk-frames, 24)")
     parser.add_argument("--max-chunk-kib", type=int, default=DEFAULT_MAX_CHUNK_KIB, help="Maximum stored chunk size target in KiB; 0 disables the byte cap")
-    parser.add_argument("--crf", type=float, default=24.0, help="libx264 CRF quality target (fractional values allowed)")
+    parser.add_argument("--crf", type=float, default=24.0, help="libx264 CRF quality target (fractional values allowed, ignored when --bitrate-kbps is set)")
+    parser.add_argument("--bitrate-kbps", type=int, help="Target average video bitrate in kb/s for ABR mode")
+    parser.add_argument("--two-pass", action="store_true", help="Run libx264 in 2-pass ABR mode; requires --bitrate-kbps")
     parser.add_argument("--preset", default="slow", help="libx264 preset")
     parser.add_argument("--level", default="1.3", help="Target H.264 level")
     parser.add_argument("--stream-profile", choices=STREAM_PROFILES, default="fast", help="Decoder-complexity profile: fast is smoothest, balanced/quality trade more CPU for better image quality")
@@ -3001,7 +3122,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--duration", type=float, help="Optional clip duration in seconds")
     parser.add_argument("--quiet", action="store_true", help="Silence progress logging")
     parser.add_argument("--preview-mp4", action="store_true", help="Also write a video-only .preview.mp4 alongside the .nvp.tns output for quick inspection")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.bitrate_kbps is not None and args.bitrate_kbps <= 0:
+        parser.error("--bitrate-kbps must be greater than zero.")
+    if args.two_pass and args.bitrate_kbps is None:
+        parser.error("--two-pass requires --bitrate-kbps.")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
