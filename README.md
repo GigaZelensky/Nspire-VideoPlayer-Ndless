@@ -187,16 +187,17 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded
 ### Recommended Full-Episode Example
 
 ```powershell
-python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --output ".\dist\video.nvp.tns" --fps 16 --max-width 320 --max-height 180 --chunk-frames 72 --stream-profile quality --crf 14.5 --preset veryslow --level 1.3
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded --output ".\dist\video.nvp.tns" --fps 16 --max-width 320 --max-height 180 --max-chunk-kib 64 --stream-profile quality --crf 14.5 --preset veryslow --level 1.3
 ```
 
 ### Target A Specific Size With 2-Pass ABR
 
 ```powershell
-python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --output ".\dist\video.nvp.tns" --fps 16 --max-width 320 --max-height 180 --chunk-frames 72 --stream-profile quality --bitrate-kbps 140 --two-pass --preset veryslow --level 1.3
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --output ".\dist\video.nvp.tns" --fps 16 --max-width 320 --max-height 180 --max-chunk-kib 64 --stream-profile quality --bitrate-kbps 140 --two-pass --preset veryslow --level 1.3
 ```
 
 Use CRF when you want the best quality-per-bit without caring about the exact final size. Use `--bitrate-kbps ... --two-pass` when you need a tighter size target.
+By default, chunks are packed by `--max-chunk-kib`; `64` is the recommended starting point for smooth on-device playback. `--chunk-frames` can still be set as an extra frame-count ceiling, and `--chunk-frames 0` leaves that ceiling disabled. `--idr-frames auto` is also the default; in bitrate mode it derives the keyframe spacing from the chunk byte cap so chunk boundaries follow the KiB budget instead of a hardcoded frame rhythm.
 
 ### Main Encoder Options
 
@@ -208,6 +209,8 @@ Use CRF when you want the best quality-per-bit without caring about the exact fi
 - `--fps`
 - `--max-width`
 - `--max-height`
+- `--active-aspect`
+- `--crop`
 - `--chunk-frames`
 - `--idr-frames`
 - `--max-chunk-kib`

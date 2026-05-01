@@ -9,6 +9,7 @@ import hashlib
 import html
 import json
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -65,8 +66,11 @@ NAL_AUD = 9
 VCL_NAL_TYPES = {1, NAL_IDR}
 CHUNK_BOUNDARY_NAL_TYPES = {NAL_SPS, NAL_PPS, NAL_IDR}
 STREAM_PROFILES = ("fast", "balanced", "quality", "intra")
-DEFAULT_MAX_CHUNK_KIB = 1024
+DEFAULT_MAX_CHUNK_KIB = 256
 DEFAULT_MAX_IDR_FRAMES = 24
+AUTO_IDR_CHUNK_SHARE = 0.25
+AUTO_IDR_MIN_FRAMES = 12
+AUTO_IDR_MAX_FRAMES = 192
 SUBTITLE_COORD_SCALE = 10000
 SUBTITLE_CUE_POSITION_NONE = 0
 SUBTITLE_CUE_POSITION_MARGIN = 1
@@ -161,6 +165,14 @@ class VideoProbe:
     display_height: int
     fps: float
     duration: float
+
+
+@dataclass(slots=True)
+class CropRect:
+    width: int
+    height: int
+    x: int
+    y: int
 
 
 @dataclass(slots=True)
@@ -857,6 +869,10 @@ def ffprobe_path() -> Path | None:
         candidate = ffmpeg_path.with_name(name)
         if candidate.exists():
             return candidate
+    for name in candidate_names:
+        system_candidate = shutil.which(name)
+        if system_candidate:
+            return Path(system_candidate)
     return None
 
 
@@ -1981,6 +1997,60 @@ def force_even(value: int, maximum: int) -> int:
     return value - 1
 
 
+def floor_even(value: int, minimum: int = 0) -> int:
+    value = max(minimum, value)
+    return value if value % 2 == 0 else value - 1
+
+
+def parse_aspect_ratio(value: str) -> float:
+    text = value.strip().lower()
+    if not text:
+        raise ValueError("Aspect ratio cannot be empty.")
+    if ":" in text:
+        numerator_text, denominator_text = text.split(":", 1)
+        numerator = float(numerator_text)
+        denominator = float(denominator_text)
+        if denominator == 0:
+            raise ValueError("Aspect ratio denominator cannot be zero.")
+        ratio = numerator / denominator
+    else:
+        ratio = float(text)
+    if ratio <= 0:
+        raise ValueError("Aspect ratio must be greater than zero.")
+    return ratio
+
+
+def parse_crop_rect(value: str, source_width: int, source_height: int) -> CropRect:
+    text = value.strip().lower()
+    match = re.fullmatch(r"(\d+)[:x](\d+)(?::|\+)(\d+)(?::|\+)(\d+)", text)
+    if not match:
+        raise ValueError("Crop must look like WIDTH:HEIGHT:X:Y or WIDTHxHEIGHT+X+Y.")
+    width = force_even(int(match.group(1)), source_width)
+    height = force_even(int(match.group(2)), source_height)
+    x = floor_even(int(match.group(3)))
+    y = floor_even(int(match.group(4)))
+    if x + width > source_width or y + height > source_height:
+        raise ValueError(
+            f"Crop {width}x{height}+{x}+{y} exceeds source frame {source_width}x{source_height}."
+        )
+    return CropRect(width=width, height=height, x=x, y=y)
+
+
+def center_crop_for_aspect(source_width: int, source_height: int, aspect_ratio: float) -> CropRect:
+    source_aspect = source_width / source_height
+    if aspect_ratio >= source_aspect:
+        width = source_width
+        height = force_even(int(round(source_width / aspect_ratio)), source_height)
+        x = 0
+        y = floor_even((source_height - height) // 2)
+    else:
+        width = force_even(int(round(source_height * aspect_ratio)), source_width)
+        height = source_height
+        x = floor_even((source_width - width) // 2)
+        y = 0
+    return CropRect(width=width, height=height, x=x, y=y)
+
+
 def fit_dimensions(source_width: int, source_height: int, max_width: int, max_height: int) -> tuple[int, int, int, int]:
     scale = min(max_width / source_width, max_height / source_height)
     width = force_even(int(round(source_width * scale)), max_width)
@@ -2005,6 +2075,7 @@ def parse_fraction(value: str | None) -> float:
 
 def probe_video(input_path: Path) -> VideoProbe:
     ffprobe = ffprobe_path()
+    probe_errors: list[str] = []
     if ffprobe is not None:
         completed = subprocess.run(
             [
@@ -2061,6 +2132,9 @@ def probe_video(input_path: Path) -> VideoProbe:
                         fps=fps,
                         duration=duration,
                     )
+            probe_errors.append("ffprobe did not report a usable video stream.")
+        else:
+            probe_errors.append((completed.stderr or completed.stdout or "ffprobe failed").strip())
 
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     completed = subprocess.run(
@@ -2111,6 +2185,15 @@ def probe_video(input_path: Path) -> VideoProbe:
             fps = float(fps_match.group("fps"))
         if width and height and fps > 0:
             break
+
+    if width <= 0 or height <= 0 or fps <= 0:
+        details = (completed.stderr or completed.stdout or "").strip()
+        if details:
+            probe_errors.append(details)
+        tail_lines = "\n".join("\n".join(probe_errors).splitlines()[-12:])
+        if tail_lines:
+            raise RuntimeError(f"Failed to determine input video dimensions/fps. FFmpeg said:\n{tail_lines}")
+        raise RuntimeError("Failed to determine input video dimensions/fps.")
 
     return VideoProbe(
         storage_width=width,
@@ -2167,16 +2250,60 @@ def format_fps_value(fps: float) -> str:
     return f"{fps:.6f}".rstrip("0").rstrip(".")
 
 
-def resolve_idr_frames(chunk_frames: int, requested_idr_frames: int | None, stream_profile: str) -> int:
+def clamp_int(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def auto_idr_frames_for_chunk_budget(
+    *,
+    fps: float,
+    max_chunk_bytes: int | None,
+    bitrate_kbps: int | None,
+    chunk_frames: int,
+) -> tuple[int, str]:
+    if max_chunk_bytes and bitrate_kbps and fps > 0:
+        bytes_per_frame = (bitrate_kbps * 1000.0) / (8.0 * fps)
+        target_gop_bytes = max_chunk_bytes * AUTO_IDR_CHUNK_SHARE
+        frames = int(round(target_gop_bytes / bytes_per_frame))
+        frames = clamp_int(frames, AUTO_IDR_MIN_FRAMES, AUTO_IDR_MAX_FRAMES)
+        if chunk_frames > 0:
+            frames = min(frames, chunk_frames)
+        return max(1, frames), (
+            f"auto from {format_binary_size(max_chunk_bytes)} chunk cap, "
+            f"{bitrate_kbps} kb/s, {AUTO_IDR_CHUNK_SHARE:.0%} GOP share"
+        )
+
+    frames = min(chunk_frames, DEFAULT_MAX_IDR_FRAMES) if chunk_frames > 0 else DEFAULT_MAX_IDR_FRAMES
+    return frames, "auto fallback; bitrate and byte cap are needed for budget-derived IDR spacing"
+
+
+def resolve_idr_frames(
+    chunk_frames: int,
+    requested_idr_frames: str | None,
+    stream_profile: str,
+    *,
+    fps: float,
+    max_chunk_bytes: int | None,
+    bitrate_kbps: int | None,
+) -> tuple[int, str]:
     if stream_profile == "intra":
-        return 1
-    if chunk_frames <= 0:
-        raise ValueError("chunk_frames must be greater than zero.")
-    if requested_idr_frames is None:
-        return min(chunk_frames, DEFAULT_MAX_IDR_FRAMES)
-    if requested_idr_frames <= 0:
+        return 1, "intra profile"
+    if requested_idr_frames is None or requested_idr_frames.lower() == "auto":
+        return auto_idr_frames_for_chunk_budget(
+            fps=fps,
+            max_chunk_bytes=max_chunk_bytes,
+            bitrate_kbps=bitrate_kbps,
+            chunk_frames=chunk_frames,
+        )
+    try:
+        frames = int(requested_idr_frames)
+    except ValueError as exc:
+        raise ValueError("--idr-frames must be a positive integer or 'auto'.") from exc
+    if frames <= 0:
         raise ValueError("idr_frames must be greater than zero.")
-    return min(chunk_frames, requested_idr_frames)
+    if chunk_frames > 0:
+        frames = min(chunk_frames, frames)
+    return frames, "manual"
 
 
 def h264_stream_profile_options(idr_frames: int, stream_profile: str) -> tuple[str | None, str, list[str]]:
@@ -2259,6 +2386,7 @@ def build_ffmpeg_command(
     width: int,
     height: int,
     fps: float,
+    crop_rect: CropRect | None,
     idr_frames: int,
     crf: float | None,
     bitrate_kbps: int | None,
@@ -2275,7 +2403,11 @@ def build_ffmpeg_command(
     quiet: bool,
 ) -> tuple[list[str], str | None]:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    post_vf = f"fps={format_fps_value(fps)},scale={width}:{height}:flags=lanczos,setsar=1"
+    video_filters: list[str] = []
+    if crop_rect is not None:
+        video_filters.append(f"crop={crop_rect.width}:{crop_rect.height}:{crop_rect.x}:{crop_rect.y}:exact=1")
+    video_filters += [f"fps={format_fps_value(fps)}", f"scale={width}:{height}:flags=lanczos", "setsar=1"]
+    post_vf = ",".join(video_filters)
     tune, x264_params, bitstream_filters = h264_stream_profile_options(idr_frames, stream_profile)
     subtitle_font_size, subtitle_margin_v, subtitle_outline = compute_burn_subtitle_metrics(height, burn_subtitle_size)
     command = [ffmpeg, "-y"]
@@ -2534,6 +2666,7 @@ def encode_h264_bitstream(
     width: int,
     height: int,
     fps: float,
+    crop_rect: CropRect | None,
     idr_frames: int,
     crf: float,
     bitrate_kbps: int | None,
@@ -2561,6 +2694,7 @@ def encode_h264_bitstream(
             width=width,
             height=height,
             fps=fps,
+            crop_rect=crop_rect,
             idr_frames=idr_frames,
             crf=crf if bitrate_kbps is None else None,
             bitrate_kbps=bitrate_kbps,
@@ -2588,6 +2722,7 @@ def encode_h264_bitstream(
                 width=width,
                 height=height,
                 fps=fps,
+                crop_rect=crop_rect,
                 idr_frames=idr_frames,
                 crf=None,
                 bitrate_kbps=bitrate_kbps,
@@ -2620,6 +2755,7 @@ def encode_h264_bitstream(
                 width=width,
                 height=height,
                 fps=fps,
+                crop_rect=crop_rect,
                 idr_frames=idr_frames,
                 crf=None,
                 bitrate_kbps=bitrate_kbps,
@@ -2794,16 +2930,19 @@ def group_access_units_into_chunks(
 ) -> list[list[AccessUnit]]:
     chunks: list[list[AccessUnit]] = []
     current: list[AccessUnit] = []
+    frame_cap = chunk_frames if chunk_frames > 0 else None
     segments = split_access_units_into_segments(access_units, stream_profile)
 
     if not segments:
         raise RuntimeError("The H.264 bitstream did not produce any `.nvp` chunks.")
+    if frame_cap is None and max_chunk_bytes is None:
+        raise RuntimeError("Chunk grouping needs --max-chunk-kib > 0 or --chunk-frames > 0.")
 
     for segment in segments:
-        if len(segment.access_units) > chunk_frames:
+        if frame_cap is not None and len(segment.access_units) > frame_cap:
             raise RuntimeError(
                 f"GOP starting at frame {segment.first_frame} spans {len(segment.access_units)} frames, "
-                f"which exceeds --chunk-frames={chunk_frames}. Lower --idr-frames or raise the chunk frame limit."
+                f"which exceeds --chunk-frames={frame_cap}. Lower --idr-frames or raise the chunk frame limit."
             )
         if max_chunk_bytes and segment.blob_size > max_chunk_bytes:
             raise RuntimeError(
@@ -2813,7 +2952,9 @@ def group_access_units_into_chunks(
         if current:
             candidate = current + segment.access_units
             candidate_size = estimate_chunk_blob_size(candidate, stream_profile)
-            if len(candidate) > chunk_frames or (max_chunk_bytes and candidate_size > max_chunk_bytes):
+            exceeds_frame_cap = frame_cap is not None and len(candidate) > frame_cap
+            exceeds_byte_cap = max_chunk_bytes is not None and candidate_size > max_chunk_bytes
+            if exceeds_frame_cap or exceeds_byte_cap:
                 chunks.append(current)
                 current = list(segment.access_units)
             else:
@@ -2835,9 +2976,9 @@ def group_access_units_into_chunks(
                 f"Chunk {index} does not start with SPS/PPS/IDR. "
                 "Check the FFmpeg keyframe and repeat-headers settings."
             )
-        if len(chunk) > chunk_frames:
+        if frame_cap is not None and len(chunk) > frame_cap:
             raise RuntimeError(
-                f"Chunk {index} has {len(chunk)} frames, which exceeds chunk_frames={chunk_frames}."
+                f"Chunk {index} has {len(chunk)} frames, which exceeds --chunk-frames={frame_cap}."
             )
         if max_chunk_bytes and estimate_chunk_blob_size(chunk, stream_profile) > max_chunk_bytes:
             raise RuntimeError(
@@ -2873,6 +3014,8 @@ def build_chunk_blob(access_units: list[AccessUnit], stream_profile: str) -> tup
 
 def encode(args: argparse.Namespace) -> EncodeStats:
     input_path = Path(args.input).resolve()
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Input video not found: {input_path}")
     output_path = normalize_output_path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path = output_path.with_suffix(".json")
@@ -2892,8 +3035,18 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         video_probe = probe_video(input_path)
         source_width = video_probe.display_width or video_probe.storage_width
         source_height = video_probe.display_height or video_probe.storage_height
+        crop_rect: CropRect | None = None
         if source_width <= 0 or source_height <= 0:
             raise RuntimeError("Failed to determine input video dimensions.")
+        if args.crop:
+            crop_rect = parse_crop_rect(args.crop, video_probe.storage_width, video_probe.storage_height)
+            source_width = crop_rect.width
+            source_height = crop_rect.height
+        elif args.active_aspect:
+            active_aspect = parse_aspect_ratio(args.active_aspect)
+            crop_rect = center_crop_for_aspect(video_probe.storage_width, video_probe.storage_height, active_aspect)
+            source_width = crop_rect.width
+            source_height = crop_rect.height
 
         fps = video_probe.fps if isinstance(args.fps, str) and args.fps.lower() == "source" else float(args.fps)
         if fps <= 0:
@@ -2914,9 +3067,23 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             f"profile {args.stream_profile}, {format_rate_control_label(crf=args.crf, bitrate_kbps=args.bitrate_kbps, two_pass=args.two_pass)})",
             quiet=args.quiet,
         )
+        if crop_rect is not None:
+            log(
+                f"Cropping active video to {crop_rect.width}x{crop_rect.height}+{crop_rect.x}+{crop_rect.y} before scaling.",
+                quiet=args.quiet,
+            )
 
+        max_chunk_bytes = (args.max_chunk_kib * 1024) if args.max_chunk_kib > 0 else None
         start_time = time.time()
-        idr_frames = resolve_idr_frames(args.chunk_frames, args.idr_frames, args.stream_profile)
+        idr_frames, idr_frame_reason = resolve_idr_frames(
+            args.chunk_frames,
+            args.idr_frames,
+            args.stream_profile,
+            fps=fps,
+            max_chunk_bytes=max_chunk_bytes,
+            bitrate_kbps=args.bitrate_kbps,
+        )
+        log(f"IDR cadence: every {idr_frames} frame(s) ({idr_frame_reason}).", quiet=args.quiet)
         bitstream = encode_h264_bitstream(
             input_path=input_path,
             source_width=video_probe.storage_width,
@@ -2925,6 +3092,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             width=target_width,
             height=target_height,
             fps=fps,
+            crop_rect=crop_rect,
             idr_frames=idr_frames,
             crf=args.crf,
             bitrate_kbps=args.bitrate_kbps,
@@ -2951,9 +3119,15 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         chunks = group_access_units_into_chunks(
             access_units,
             args.chunk_frames,
-            (args.max_chunk_kib * 1024) if args.max_chunk_kib > 0 else None,
+            max_chunk_bytes,
             args.stream_profile,
         )
+        chunk_frame_counts = [len(chunk) for chunk in chunks]
+        chunk_blob_sizes = [estimate_chunk_blob_size(chunk, args.stream_profile) for chunk in chunks]
+        max_observed_chunk_frames = max(chunk_frame_counts) if chunk_frame_counts else 0
+        header_chunk_frames = min(max_observed_chunk_frames, 0xFFFF)
+        chunk_frame_cap_label = str(args.chunk_frames) if args.chunk_frames > 0 else "off"
+        chunk_byte_cap_label = f"{args.max_chunk_kib} KiB" if args.max_chunk_kib > 0 else "off"
 
         if not access_units:
             raise RuntimeError("No frames were found in the encoded H.264 bitstream.")
@@ -2966,6 +3140,13 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         log(
             f"Expected output size {format_binary_size(expected_output_size)} "
             f"({len(chunks)} chunks, {len(access_units)} frames).",
+            quiet=args.quiet,
+        )
+        log(
+            f"Chunk plan: byte cap {chunk_byte_cap_label}, frame cap {chunk_frame_cap_label}, "
+            f"frames/chunk avg {sum(chunk_frame_counts) / len(chunk_frame_counts):.1f} max {max_observed_chunk_frames}, "
+            f"stored/chunk avg {format_binary_size(sum(chunk_blob_sizes) / len(chunk_blob_sizes))} "
+            f"max {format_binary_size(max(chunk_blob_sizes))}.",
             quiet=args.quiet,
         )
 
@@ -3055,7 +3236,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                 video_width=target_width,
                 video_height=target_height,
                 fps=fps,
-                chunk_frames=args.chunk_frames,
+                chunk_frames=header_chunk_frames,
                 frame_count=len(access_units),
                 chunk_count=len(chunks),
                 subtitle_count=subtitle_count,
@@ -3109,8 +3290,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--fps", default="12", help="Target framerate or 'source'")
     parser.add_argument("--max-width", type=int, default=SCREEN_W, help="Fit width")
     parser.add_argument("--max-height", type=int, default=SCREEN_H, help="Fit height")
-    parser.add_argument("--chunk-frames", type=int, default=48, help="Maximum frames per streamed chunk")
-    parser.add_argument("--idr-frames", type=int, help="Maximum frames between forced IDR access units; defaults to min(chunk-frames, 24)")
+    parser.add_argument("--crop", help="Crop active video before scaling, as WIDTH:HEIGHT:X:Y or WIDTHxHEIGHT+X+Y")
+    parser.add_argument("--active-aspect", help="Center-crop the source to an active-picture aspect ratio before scaling, e.g. 2.39 or 239:100")
+    parser.add_argument("--chunk-frames", type=int, default=0, help="Maximum frames per streamed chunk; 0 disables the frame cap and packs chunks by --max-chunk-kib")
+    parser.add_argument("--idr-frames", default="auto", help="Maximum frames between forced IDR access units, or 'auto' to derive it from --max-chunk-kib and --bitrate-kbps")
     parser.add_argument("--max-chunk-kib", type=int, default=DEFAULT_MAX_CHUNK_KIB, help="Maximum stored chunk size target in KiB; 0 disables the byte cap")
     parser.add_argument("--crf", type=float, default=24.0, help="libx264 CRF quality target (fractional values allowed, ignored when --bitrate-kbps is set)")
     parser.add_argument("--bitrate-kbps", type=int, help="Target average video bitrate in kb/s for ABR mode")
@@ -3123,10 +3306,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--quiet", action="store_true", help="Silence progress logging")
     parser.add_argument("--preview-mp4", action="store_true", help="Also write a video-only .preview.mp4 alongside the .nvp.tns output for quick inspection")
     args = parser.parse_args(argv)
+    if args.chunk_frames < 0:
+        parser.error("--chunk-frames must be zero or greater.")
+    if args.max_chunk_kib < 0:
+        parser.error("--max-chunk-kib must be zero or greater.")
+    if args.chunk_frames == 0 and args.max_chunk_kib == 0:
+        parser.error("--chunk-frames and --max-chunk-kib cannot both be zero.")
+    if args.idr_frames.lower() != "auto":
+        try:
+            idr_frames = int(args.idr_frames)
+        except ValueError:
+            parser.error("--idr-frames must be a positive integer or 'auto'.")
+        if idr_frames <= 0:
+            parser.error("--idr-frames must be greater than zero.")
     if args.bitrate_kbps is not None and args.bitrate_kbps <= 0:
         parser.error("--bitrate-kbps must be greater than zero.")
     if args.two_pass and args.bitrate_kbps is None:
         parser.error("--two-pass requires --bitrate-kbps.")
+    if args.crop and args.active_aspect:
+        parser.error("--crop and --active-aspect are mutually exclusive.")
     return args
 
 
@@ -3136,6 +3334,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         log("Encoding interrupted by Ctrl+C.", quiet=False)
         return 130
+    except Exception as exc:
+        log(f"Error: {exc}", quiet=False)
+        return 1
     return 0
 
 

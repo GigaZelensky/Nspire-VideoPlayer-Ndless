@@ -44,6 +44,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define POINTER_AXIS_LOCK_RATIO_NUM 2
 #define POINTER_AXIS_LOCK_RATIO_DEN 1
 #define POINTER_SPIKE_DELTA_DIVISOR 3
+#define POINTER_HOVER_REARM_PIXELS 8
 #define PREFETCH_FILE_BLOCK_SIZE 32768U
 #define PREFETCH_ACTIVE_FILE_BLOCK_SIZE 2048U
 #define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
@@ -104,8 +105,8 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define LCD_BRIGHTNESS_MIN 0
 #define LCD_BRIGHTNESS_MAX 225
 #define LCD_BRIGHTNESS_STEP 25
-#define DEBUG_RING_SIZE 2048
-#define DEBUG_LINE_LEN 160
+#define DEBUG_RING_SIZE 8192
+#define DEBUG_LINE_LEN 192
 #define DEBUG_SNAPSHOT_INTERVAL_MS 1000U
 #define DEBUG_TRACE_FOREGROUND_MS 12U
 #define DEBUG_TRACE_PREFETCH_MS 10U
@@ -295,6 +296,12 @@ typedef struct {
     bool tracking;
     bool moved;
 } PointerState;
+
+typedef struct {
+    bool locked;
+    int anchor_x;
+    int anchor_y;
+} PointerHoverGuard;
 
 typedef enum {
     PREFETCH_IDLE = 0,
@@ -1415,6 +1422,57 @@ static bool pointer_update(PointerState *pointer)
     click_edge = current_down && !pointer->down;
     pointer->down = current_down;
     return click_edge;
+}
+
+static void pointer_hover_guard_reset(PointerHoverGuard *guard)
+{
+    if (!guard) {
+        return;
+    }
+    guard->locked = false;
+    guard->anchor_x = 0;
+    guard->anchor_y = 0;
+}
+
+static void pointer_hover_guard_lock(PointerHoverGuard *guard, const PointerState *pointer)
+{
+    if (!guard || !pointer || !pointer->visible) {
+        return;
+    }
+    guard->locked = true;
+    guard->anchor_x = pointer->x;
+    guard->anchor_y = pointer->y;
+}
+
+static bool pointer_hover_guard_allows(PointerHoverGuard *guard, const PointerState *pointer, bool pointer_click)
+{
+    int dx;
+    int dy;
+    int distance_squared;
+    int threshold_squared;
+
+    if (!guard || !pointer || !pointer->visible) {
+        return false;
+    }
+    if (!guard->locked) {
+        return true;
+    }
+    if (pointer_click) {
+        pointer_hover_guard_reset(guard);
+        return true;
+    }
+    if (!pointer->moved) {
+        return false;
+    }
+    dx = pointer->x - guard->anchor_x;
+    dy = pointer->y - guard->anchor_y;
+    distance_squared = dx * dx + dy * dy;
+    threshold_squared = POINTER_HOVER_REARM_PIXELS * POINTER_HOVER_REARM_PIXELS;
+    if (distance_squared < threshold_squared) {
+        return false;
+    }
+    pointer_hover_guard_reset(guard);
+    return true;
 }
 
 static void format_clock(uint32_t total_ms, char *buffer, size_t buffer_size)
@@ -9044,15 +9102,18 @@ static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *direc
     bool prev_enter = false;
     bool prev_esc = false;
     PointerState pointer;
+    PointerHoverGuard hover_guard;
     MovieFile *files;
     size_t count = 0;
     size_t selected = 0;
 
     files = scan_movies(directory, &count);
     pointer_init(&pointer);
+    pointer_hover_guard_reset(&hover_guard);
     while (1) {
         bool pointer_click = pointer_update(&pointer);
-        int hovered_index = pointer.visible ? picker_row_index_at(count, selected, pointer.y) : -1;
+        bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
+        int hovered_index = pointer_hover_allowed ? picker_row_index_at(count, selected, pointer.y) : -1;
 
         if (hovered_index >= 0) {
             selected = (size_t) hovered_index;
@@ -9060,9 +9121,11 @@ static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *direc
         render_picker(screen, fonts, files, count, selected, &pointer, NULL, 0);
         if (key_pressed_edge(KEY_NSPIRE_UP, &prev_up) && selected > 0) {
             selected--;
+            pointer_hover_guard_lock(&hover_guard, &pointer);
         }
         if (key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) && selected + 1 < count) {
             selected++;
+            pointer_hover_guard_lock(&hover_guard, &pointer);
         }
         if (pointer_click && hovered_index >= 0 && (size_t) hovered_index < count) {
             int phase;
@@ -9165,6 +9228,7 @@ static int prompt_resume_position(
     bool prev_enter = false;
     bool prev_esc = false;
     PointerState pointer;
+    PointerHoverGuard hover_guard;
     SDL_Rect shadow = {34, 24, 252, 192};
     SDL_Rect panel = {28, 18, 252, 192};
     SDL_Rect header = {28, 18, 252, 26};
@@ -9206,9 +9270,11 @@ static int prompt_resume_position(
     }
     time_label_y = preview.y + preview.h + title_preview_gap;
     pointer_init(&pointer);
+    pointer_hover_guard_reset(&hover_guard);
 
     while (1) {
         bool pointer_click = pointer_update(&pointer);
+        bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
 
         SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
         SDL_FillRect(screen, &shadow, SDL_MapRGB(screen->format, 0, 0, 0));
@@ -9227,7 +9293,7 @@ static int prompt_resume_position(
         }
         present_screen(screen);
 
-        if (pointer.visible) {
+        if (pointer_hover_allowed) {
             if (pointer.x >= continue_button.x && pointer.x < continue_button.x + continue_button.w &&
                 pointer.y >= continue_button.y && pointer.y < continue_button.y + continue_button.h) {
                 selected_button = 0;
@@ -9238,6 +9304,7 @@ static int prompt_resume_position(
         }
         if (key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right)) {
             selected_button = 1 - selected_button;
+            pointer_hover_guard_lock(&hover_guard, &pointer);
         }
         if (pointer_click) {
             if (pointer.x >= continue_button.x && pointer.x < continue_button.x + continue_button.w &&
