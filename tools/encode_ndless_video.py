@@ -68,6 +68,7 @@ CHUNK_BOUNDARY_NAL_TYPES = {NAL_SPS, NAL_PPS, NAL_IDR}
 STREAM_PROFILES = ("fast", "balanced", "quality", "intra")
 DEFAULT_MAX_CHUNK_KIB = 256
 DEFAULT_MAX_IDR_FRAMES = 24
+DEFAULT_MAX_CHUNK_OVERSHOOT_PERCENT = 8.0
 AUTO_IDR_CHUNK_SHARE = 0.25
 AUTO_IDR_MIN_FRAMES = 12
 AUTO_IDR_MAX_FRAMES = 192
@@ -197,6 +198,20 @@ class ChunkSegment:
     first_frame: int
     access_units: list[AccessUnit]
     blob_size: int
+
+
+class ChunkTooLargeError(RuntimeError):
+    def __init__(self, *, first_frame: int, frame_count: int, blob_size: int, max_bytes: int, label: str) -> None:
+        self.first_frame = first_frame
+        self.frame_count = frame_count
+        self.blob_size = blob_size
+        self.max_bytes = max_bytes
+        self.label = label
+        super().__init__(
+            f"{label} starting at frame {first_frame} spans {frame_count} frame(s) and stores to "
+            f"{blob_size / 1024:.1f} KiB, which exceeds the hard chunk limit of {max_bytes / 1024:.1f} KiB. "
+            "Lower --idr-frames, raise --max-chunk-kib, or raise --max-chunk-overshoot-percent."
+        )
 
 
 def log(message: str, *, quiet: bool = False) -> None:
@@ -2926,6 +2941,7 @@ def group_access_units_into_chunks(
     access_units: list[AccessUnit],
     chunk_frames: int,
     max_chunk_bytes: int | None,
+    hard_max_chunk_bytes: int | None,
     stream_profile: str,
 ) -> list[list[AccessUnit]]:
     chunks: list[list[AccessUnit]] = []
@@ -2944,10 +2960,13 @@ def group_access_units_into_chunks(
                 f"GOP starting at frame {segment.first_frame} spans {len(segment.access_units)} frames, "
                 f"which exceeds --chunk-frames={frame_cap}. Lower --idr-frames or raise the chunk frame limit."
             )
-        if max_chunk_bytes and segment.blob_size > max_chunk_bytes:
-            raise RuntimeError(
-                f"GOP starting at frame {segment.first_frame} stores to {segment.blob_size / 1024:.1f} KiB, "
-                f"which exceeds --max-chunk-kib={max_chunk_bytes // 1024}. Lower --idr-frames or raise the chunk size limit."
+        if hard_max_chunk_bytes and segment.blob_size > hard_max_chunk_bytes:
+            raise ChunkTooLargeError(
+                first_frame=segment.first_frame,
+                frame_count=len(segment.access_units),
+                blob_size=segment.blob_size,
+                max_bytes=hard_max_chunk_bytes,
+                label="GOP",
             )
         if current:
             candidate = current + segment.access_units
@@ -2980,10 +2999,14 @@ def group_access_units_into_chunks(
             raise RuntimeError(
                 f"Chunk {index} has {len(chunk)} frames, which exceeds --chunk-frames={frame_cap}."
             )
-        if max_chunk_bytes and estimate_chunk_blob_size(chunk, stream_profile) > max_chunk_bytes:
-            raise RuntimeError(
-                f"Chunk {index} exceeds --max-chunk-kib={max_chunk_bytes // 1024} even after regrouping. "
-                "Lower --idr-frames or increase the chunk size limit."
+        chunk_blob_size = estimate_chunk_blob_size(chunk, stream_profile)
+        if hard_max_chunk_bytes and chunk_blob_size > hard_max_chunk_bytes:
+            raise ChunkTooLargeError(
+                first_frame=sum(len(previous) for previous in chunks[:index]),
+                frame_count=len(chunk),
+                blob_size=chunk_blob_size,
+                max_bytes=hard_max_chunk_bytes,
+                label=f"Chunk {index}",
             )
 
     return chunks
@@ -3074,6 +3097,11 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             )
 
         max_chunk_bytes = (args.max_chunk_kib * 1024) if args.max_chunk_kib > 0 else None
+        hard_max_chunk_bytes = (
+            int(max_chunk_bytes * (1.0 + (args.max_chunk_overshoot_percent / 100.0)))
+            if max_chunk_bytes is not None else None
+        )
+        encode_duration = args.duration if args.duration is not None else max(0.0, video_probe.duration - args.start)
         start_time = time.time()
         idr_frames, idr_frame_reason = resolve_idr_frames(
             args.chunk_frames,
@@ -3102,7 +3130,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             stream_profile=args.stream_profile,
             start=args.start,
             duration=args.duration,
-            encode_duration=args.duration if args.duration is not None else max(0.0, video_probe.duration - args.start),
+            encode_duration=encode_duration,
             burn_subtitle=burn_subtitle,
             burn_subtitle_size=args.burn_subtitle_size,
             preview_output_path=preview_output_path,
@@ -3120,6 +3148,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             access_units,
             args.chunk_frames,
             max_chunk_bytes,
+            hard_max_chunk_bytes,
             args.stream_profile,
         )
         chunk_frame_counts = [len(chunk) for chunk in chunks]
@@ -3128,6 +3157,10 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         header_chunk_frames = min(max_observed_chunk_frames, 0xFFFF)
         chunk_frame_cap_label = str(args.chunk_frames) if args.chunk_frames > 0 else "off"
         chunk_byte_cap_label = f"{args.max_chunk_kib} KiB" if args.max_chunk_kib > 0 else "off"
+        oversize_chunk_count = (
+            sum(1 for blob_size in chunk_blob_sizes if max_chunk_bytes is not None and blob_size > max_chunk_bytes)
+            if max_chunk_bytes is not None else 0
+        )
 
         if not access_units:
             raise RuntimeError("No frames were found in the encoded H.264 bitstream.")
@@ -3149,6 +3182,13 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             f"max {format_binary_size(max(chunk_blob_sizes))}.",
             quiet=args.quiet,
         )
+        if oversize_chunk_count:
+            log(
+                f"Chunk soft-cap warning: {oversize_chunk_count} chunk(s) exceed the "
+                f"{format_binary_size(max_chunk_bytes)} target; max is {format_binary_size(max(chunk_blob_sizes))} "
+                f"with {args.max_chunk_overshoot_percent:.1f}% overshoot tolerance.",
+                quiet=args.quiet,
+            )
 
         with output_path.open("wb") as output_handle:
             output_started = True
@@ -3295,6 +3335,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--chunk-frames", type=int, default=0, help="Maximum frames per streamed chunk; 0 disables the frame cap and packs chunks by --max-chunk-kib")
     parser.add_argument("--idr-frames", default="auto", help="Maximum frames between forced IDR access units, or 'auto' to derive it from --max-chunk-kib and --bitrate-kbps")
     parser.add_argument("--max-chunk-kib", type=int, default=DEFAULT_MAX_CHUNK_KIB, help="Maximum stored chunk size target in KiB; 0 disables the byte cap")
+    parser.add_argument("--max-chunk-overshoot-percent", type=float, default=DEFAULT_MAX_CHUNK_OVERSHOOT_PERCENT, help="Allowed single-GOP chunk overshoot above --max-chunk-kib before failing; set 0 for a hard cap")
     parser.add_argument("--crf", type=float, default=24.0, help="libx264 CRF quality target (fractional values allowed, ignored when --bitrate-kbps is set)")
     parser.add_argument("--bitrate-kbps", type=int, help="Target average video bitrate in kb/s for ABR mode")
     parser.add_argument("--two-pass", action="store_true", help="Run libx264 in 2-pass ABR mode; requires --bitrate-kbps")
@@ -3310,6 +3351,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--chunk-frames must be zero or greater.")
     if args.max_chunk_kib < 0:
         parser.error("--max-chunk-kib must be zero or greater.")
+    if args.max_chunk_overshoot_percent < 0:
+        parser.error("--max-chunk-overshoot-percent must be zero or greater.")
     if args.chunk_frames == 0 and args.max_chunk_kib == 0:
         parser.error("--chunk-frames and --max-chunk-kib cannot both be zero.")
     if args.idr_frames.lower() != "auto":
