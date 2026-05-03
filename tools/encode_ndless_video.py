@@ -149,8 +149,15 @@ class EncodeStats:
     height: int
     video_x: int
     video_y: int
+    source_fps: float
+    source_duration: float
     fps: float
+    target_duration: float
+    encoded_duration: float
+    expected_frame_count: int
     frame_count: int
+    frame_count_delta: int
+    timeline_drift_ms: float
     chunk_count: int
     idr_chunks: int
     raw_h264_bytes: int
@@ -166,6 +173,15 @@ class VideoProbe:
     display_height: int
     fps: float
     duration: float
+
+
+@dataclass(slots=True)
+class FrameTimelineCheck:
+    target_duration: float
+    encoded_duration: float
+    expected_frame_count: int
+    frame_count_delta: int
+    drift_ms: float
 
 
 @dataclass(slots=True)
@@ -2088,6 +2104,15 @@ def parse_fraction(value: str | None) -> float:
     return float(value)
 
 
+def parse_optional_float(value: object) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return float(str(value))
+    except ValueError:
+        return 0.0
+
+
 def probe_video(input_path: Path) -> VideoProbe:
     ffprobe = ffprobe_path()
     probe_errors: list[str] = []
@@ -2100,8 +2125,8 @@ def probe_video(input_path: Path) -> VideoProbe:
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=width,height,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,r_frame_rate:"
-                "format=duration",
+                "stream=width,height,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate,r_frame_rate,start_time,duration:"
+                "format=start_time,duration",
                 "-of",
                 "json",
                 str(input_path),
@@ -2136,8 +2161,15 @@ def probe_video(input_path: Path) -> VideoProbe:
                     if sar_n > 0 and sar_d > 0:
                         display_width = max(1, int(round(width * sar_n / sar_d)))
                 fps = parse_fraction(stream.get("avg_frame_rate") or stream.get("r_frame_rate"))
-                duration_text = payload.get("format", {}).get("duration")
-                duration = float(duration_text) if duration_text else 0.0
+                duration = parse_optional_float(payload.get("format", {}).get("duration"))
+                stream_duration = parse_optional_float(stream.get("duration"))
+                if stream_duration > 0.0:
+                    duration = stream_duration
+                else:
+                    start_time_text = stream.get("start_time") or payload.get("format", {}).get("start_time")
+                    start_time = parse_optional_float(start_time_text)
+                    if start_time > 0.0 and duration > start_time:
+                        duration -= start_time
                 if width > 0 and height > 0 and fps > 0:
                     return VideoProbe(
                         storage_width=width,
@@ -2172,6 +2204,11 @@ def probe_video(input_path: Path) -> VideoProbe:
             + int(duration_match.group(2)) * 60
             + float(duration_match.group(3))
         )
+    start_match = re.search(r"start:\s*(-?\d+(?:\.\d+)?)", stderr)
+    if start_match:
+        start_time = float(start_match.group(1))
+        if start_time > 0.0 and duration > start_time:
+            duration -= start_time
 
     for line in stderr.splitlines():
         if " Video:" not in line:
@@ -2263,6 +2300,46 @@ def write_header(
 
 def format_fps_value(fps: float) -> str:
     return f"{fps:.6f}".rstrip("0").rstrip(".")
+
+
+def fps_filter_expression(fps: float) -> str:
+    return f"fps=fps={format_fps_value(fps)}:round=near:start_time=0"
+
+
+def validate_encoded_timeline(
+    *,
+    frame_count: int,
+    fps: float,
+    target_duration: float,
+    tolerance_ms: float,
+    quiet: bool,
+) -> FrameTimelineCheck:
+    if fps <= 0.0:
+        raise RuntimeError("Cannot validate encoded timeline without a positive target fps.")
+    encoded_duration = frame_count / fps
+    expected_frame_count = max(1, int(round(target_duration * fps))) if target_duration > 0.0 else frame_count
+    frame_count_delta = frame_count - expected_frame_count
+    drift_ms = (encoded_duration - target_duration) * 1000.0 if target_duration > 0.0 else 0.0
+    log(
+        f"Frame timeline: {frame_count} frames @ {fps:.3f}fps = {encoded_duration:.3f}s "
+        f"(target {target_duration:.3f}s, expected {expected_frame_count}, "
+        f"delta {frame_count_delta:+d}, drift {drift_ms:+.1f} ms).",
+        quiet=quiet,
+    )
+    if target_duration > 0.0 and abs(drift_ms) > tolerance_ms:
+        raise RuntimeError(
+            f"Encoded frame timeline drifted by {drift_ms:+.1f} ms, above the "
+            f"{tolerance_ms:.1f} ms tolerance. This usually means the source has irregular "
+            "timestamps or FFmpeg dropped/duplicated more frames than expected; try --fps source "
+            "or raise --timeline-drift-tolerance-ms after checking the preview."
+        )
+    return FrameTimelineCheck(
+        target_duration=target_duration,
+        encoded_duration=encoded_duration,
+        expected_frame_count=expected_frame_count,
+        frame_count_delta=frame_count_delta,
+        drift_ms=drift_ms,
+    )
 
 
 def clamp_int(value: int, minimum: int, maximum: int) -> int:
@@ -2421,7 +2498,7 @@ def build_ffmpeg_command(
     video_filters: list[str] = []
     if crop_rect is not None:
         video_filters.append(f"crop={crop_rect.width}:{crop_rect.height}:{crop_rect.x}:{crop_rect.y}:exact=1")
-    video_filters += [f"fps={format_fps_value(fps)}", f"scale={width}:{height}:flags=lanczos", "setsar=1"]
+    video_filters += [fps_filter_expression(fps), f"scale={width}:{height}:flags=lanczos", "setsar=1"]
     post_vf = ",".join(video_filters)
     tune, x264_params, bitstream_filters = h264_stream_profile_options(idr_frames, stream_profile)
     subtitle_font_size, subtitle_margin_v, subtitle_outline = compute_burn_subtitle_metrics(height, burn_subtitle_size)
@@ -3095,13 +3172,20 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                 f"Cropping active video to {crop_rect.width}x{crop_rect.height}+{crop_rect.x}+{crop_rect.y} before scaling.",
                 quiet=args.quiet,
             )
-
         max_chunk_bytes = (args.max_chunk_kib * 1024) if args.max_chunk_kib > 0 else None
         hard_max_chunk_bytes = (
             int(max_chunk_bytes * (1.0 + (args.max_chunk_overshoot_percent / 100.0)))
             if max_chunk_bytes is not None else None
         )
         encode_duration = args.duration if args.duration is not None else max(0.0, video_probe.duration - args.start)
+        if fps < video_probe.fps * 0.995:
+            source_frames_estimate = max(0, int(round(encode_duration * video_probe.fps)))
+            target_frames_estimate = max(0, int(round(encode_duration * fps)))
+            log(
+                f"Frame pacing: timeline-sampling about {source_frames_estimate} source frames down to "
+                f"{target_frames_estimate} frames; duration is verified after encode.",
+                quiet=args.quiet,
+            )
         start_time = time.time()
         idr_frames, idr_frame_reason = resolve_idr_frames(
             args.chunk_frames,
@@ -3164,6 +3248,14 @@ def encode(args: argparse.Namespace) -> EncodeStats:
 
         if not access_units:
             raise RuntimeError("No frames were found in the encoded H.264 bitstream.")
+
+        timeline_check = validate_encoded_timeline(
+            frame_count=len(access_units),
+            fps=fps,
+            target_duration=encode_duration,
+            tolerance_ms=args.timeline_drift_tolerance_ms,
+            quiet=args.quiet,
+        )
 
         expected_output_size = estimate_total_output_size(
             chunks,
@@ -3292,8 +3384,15 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             height=target_height,
             video_x=video_x,
             video_y=video_y,
+            source_fps=video_probe.fps,
+            source_duration=video_probe.duration,
             fps=fps,
+            target_duration=timeline_check.target_duration,
+            encoded_duration=timeline_check.encoded_duration,
+            expected_frame_count=timeline_check.expected_frame_count,
             frame_count=len(access_units),
+            frame_count_delta=timeline_check.frame_count_delta,
+            timeline_drift_ms=timeline_check.drift_ms,
             chunk_count=len(chunks),
             idr_chunks=len(chunks),
             raw_h264_bytes=len(bitstream),
@@ -3344,6 +3443,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--stream-profile", choices=STREAM_PROFILES, default="fast", help="Decoder-complexity profile: fast is smoothest, balanced/quality trade more CPU for better image quality")
     parser.add_argument("--start", type=float, default=0.0, help="Optional clip start offset in seconds")
     parser.add_argument("--duration", type=float, help="Optional clip duration in seconds")
+    parser.add_argument("--timeline-drift-tolerance-ms", type=float, default=500.0, help="Maximum allowed encoded duration drift before failing")
     parser.add_argument("--quiet", action="store_true", help="Silence progress logging")
     parser.add_argument("--preview-mp4", action="store_true", help="Also write a video-only .preview.mp4 alongside the .nvp.tns output for quick inspection")
     args = parser.parse_args(argv)
@@ -3366,6 +3466,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--bitrate-kbps must be greater than zero.")
     if args.two_pass and args.bitrate_kbps is None:
         parser.error("--two-pass requires --bitrate-kbps.")
+    if args.timeline_drift_tolerance_ms < 0:
+        parser.error("--timeline-drift-tolerance-ms must be zero or greater.")
     if args.crop and args.active_aspect:
         parser.error("--crop and --active-aspect are mutually exclusive.")
     return args

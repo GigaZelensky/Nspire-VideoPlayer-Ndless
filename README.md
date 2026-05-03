@@ -198,6 +198,7 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --output ".\dist\vi
 
 Use CRF when you want the best quality-per-bit without caring about the exact final size. Use `--bitrate-kbps ... --two-pass` when you need a tighter size target.
 By default, chunks are packed by `--max-chunk-kib`; `64` is the recommended starting point for smooth on-device playback. `--chunk-frames` can still be set as an extra frame-count ceiling, and `--chunk-frames 0` leaves that ceiling disabled. `--idr-frames auto` is also the default; in bitrate mode it derives the keyframe spacing from the chunk byte cap so chunk boundaries follow the KiB budget instead of a hardcoded frame rhythm. `--max-chunk-overshoot-percent` allows rare single-GOP near-misses above the target instead of throwing away an otherwise good encode.
+When `--fps` caps or changes the framerate, the encoder timeline-samples frames and then verifies the encoded frame count against the intended duration. The `.json` sidecar records source fps, target fps, expected frames, actual frames, and drift in milliseconds.
 
 ### Main Encoder Options
 
@@ -223,6 +224,7 @@ By default, chunks are packed by `--max-chunk-kib`; `64` is the recommended star
 - `--stream-profile`
 - `--start`
 - `--duration`
+- `--timeline-drift-tolerance-ms`
 - `--preview-mp4`
 - `--quiet`
 

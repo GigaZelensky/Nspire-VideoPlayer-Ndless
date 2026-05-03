@@ -103,7 +103,8 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define MONOTONIC_TIMER_MAX_DELTA_TICKS (TIMER_TICKS_PER_SEC * 10U)
 #define LCD_BRIGHTNESS_ADDR ((volatile uint32_t *) 0x90130014U)
 #define LCD_BRIGHTNESS_MIN 0
-#define LCD_BRIGHTNESS_MAX 225
+#define LCD_BRIGHTNESS_MAX 255
+#define LCD_BRIGHTNESS_LOWEST_NORMAL 225
 #define LCD_BRIGHTNESS_STEP 25
 #define DEBUG_RING_SIZE 8192
 #define DEBUG_LINE_LEN 192
@@ -212,6 +213,12 @@ typedef struct {
     HistoryEntry entries[HISTORY_MAX_ENTRIES];
     size_t count;
 } HistoryStore;
+
+typedef struct {
+    bool off;
+    bool resume_playback_on_wake;
+    uint32_t saved_brightness;
+} DisplayPowerState;
 
 typedef struct {
     nSDL_Font *white;
@@ -712,6 +719,16 @@ static void present_screen(SDL_Surface *screen)
     }
 }
 
+static void present_black_screen(SDL_Surface *screen)
+{
+    if (!screen) {
+        return;
+    }
+
+    SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
+    present_screen(screen);
+}
+
 static void debug_set_metrics_collection(bool enabled)
 {
     g_debug_metrics_enabled = enabled;
@@ -1122,15 +1139,47 @@ static uint32_t set_lcd_brightness(int value)
 
 static uint32_t adjust_lcd_brightness(int delta)
 {
-    return set_lcd_brightness((int) current_lcd_brightness() + delta);
+    uint32_t current = current_lcd_brightness();
+
+    if (delta > 0 && current >= LCD_BRIGHTNESS_LOWEST_NORMAL) {
+        return set_lcd_brightness(LCD_BRIGHTNESS_MAX);
+    }
+    if (delta < 0 && current > LCD_BRIGHTNESS_LOWEST_NORMAL) {
+        return set_lcd_brightness(LCD_BRIGHTNESS_LOWEST_NORMAL);
+    }
+    return set_lcd_brightness((int) current + delta);
 }
 
 static unsigned lcd_brightness_percent(uint32_t raw_value)
 {
     uint32_t clamped = (uint32_t) clamp_int((int) raw_value, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
+    unsigned percent;
 
-    return (unsigned) ((((uint32_t) LCD_BRIGHTNESS_MAX - clamped) * 100U) +
+    percent = (unsigned) ((((uint32_t) LCD_BRIGHTNESS_MAX - clamped) * 100U) +
         ((uint32_t) LCD_BRIGHTNESS_MAX / 2U)) / (uint32_t) LCD_BRIGHTNESS_MAX;
+    return percent == 0U ? 1U : percent;
+}
+
+static void display_power_off(DisplayPowerState *state, bool was_paused)
+{
+    if (!state || state->off) {
+        return;
+    }
+
+    state->resume_playback_on_wake = !was_paused;
+    state->saved_brightness = current_lcd_brightness();
+    set_lcd_brightness(LCD_BRIGHTNESS_MAX);
+    state->off = true;
+}
+
+static void display_power_on(DisplayPowerState *state)
+{
+    if (!state || !state->off) {
+        return;
+    }
+
+    set_lcd_brightness((int) state->saved_brightness);
+    state->off = false;
 }
 
 static const char *filename_from_path(const char *path)
@@ -6377,6 +6426,14 @@ static bool key_pressed_edge(t_key key, bool *previous_state)
     return pressed;
 }
 
+static bool on_key_pressed_edge(bool *previous_state)
+{
+    bool current_state = on_key_pressed() ? true : false;
+    bool pressed = current_state && !(*previous_state);
+    *previous_state = current_state;
+    return pressed;
+}
+
 static int compare_movie_files(const void *lhs, const void *rhs)
 {
     const MovieFile *a = (const MovieFile *) lhs;
@@ -9365,6 +9422,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
     bool prev_p = false;
     bool prev_plus = false;
     bool prev_minus = false;
+    bool prev_on = false;
     bool paused = false;
     uint64_t frame_interval_ticks;
     uint64_t next_frame_due_ticks;
@@ -9394,6 +9452,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
     ScreenshotPreviewState screenshot_preview;
     SeekBarPreviewState seek_preview;
     PointerState pointer;
+    DisplayPowerState display_power_state;
     bool help_menu_open = false;
     bool help_resume_playback = false;
     uint32_t resume_frame = 0;
@@ -9412,6 +9471,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
     memset(&subtitle_cache, 0, sizeof(subtitle_cache));
     memset(&screenshot_preview, 0, sizeof(screenshot_preview));
     memset(&seek_preview, 0, sizeof(seek_preview));
+    memset(&display_power_state, 0, sizeof(display_power_state));
     seek_preview.decoded_chunk_index = -1;
     seek_preview.last_pointer_x = -1;
 
@@ -9501,6 +9561,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
     prev_d = isKeyPressed(KEY_NSPIRE_D);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     prev_p = isKeyPressed(KEY_NSPIRE_P);
+    prev_on = on_key_pressed() ? true : false;
     debug_set_metrics_collection(debug_is_runtime_logging_enabled());
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
     tab_hold_repeat_interval_ms = tab_hold_frame_repeat_interval_ms(&movie);
@@ -9542,6 +9603,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
         bool tab_edge = key_pressed_edge(KEY_NSPIRE_TAB, &prev_tab);
         bool tab_down = prev_tab;
         bool cat_edge = key_pressed_edge(KEY_NSPIRE_CAT, &prev_cat);
+        bool esc_edge = key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc);
         bool divide_edge = key_pressed_edge(KEY_NSPIRE_DIVIDE, &prev_divide);
         bool exp_edge = key_pressed_edge(KEY_NSPIRE_EXP, &prev_exp);
         bool tenx_edge = key_pressed_edge(KEY_NSPIRE_TENX, &prev_tenx);
@@ -9574,10 +9636,73 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
         bool debug_logging_edge = key_pressed_edge(KEY_NSPIRE_D, &prev_d);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool playback_mode_edge = key_pressed_edge(KEY_NSPIRE_P, &prev_p);
+        bool on_edge = on_key_pressed_edge(&prev_on);
         bool take_screenshot = false;
         bool tab_repeat_step = false;
         int seek_delta_ms = 0;
         int brightness_delta = 0;
+
+        if (display_power_state.off) {
+            if (on_edge || brightness_up_edge || esc_edge) {
+                bool resume_playback = display_power_state.resume_playback_on_wake;
+
+                display_power_on(&display_power_state);
+                paused = !resume_playback;
+                if (resume_playback && hover_preview_needs_rebuffer) {
+                    begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+                    hover_preview_needs_rebuffer = false;
+                }
+                if (brightness_up_edge) {
+                    set_lcd_brightness(LCD_BRIGHTNESS_MAX);
+                    snprintf(
+                        status_overlay_text,
+                        sizeof(status_overlay_text),
+                        "BRIGHT %u%%",
+                        lcd_brightness_percent(current_lcd_brightness())
+                    );
+                } else if (resume_playback) {
+                    snprintf(status_overlay_text, sizeof(status_overlay_text), "PLAY");
+                } else {
+                    snprintf(status_overlay_text, sizeof(status_overlay_text), "PAUSED");
+                }
+                now_ms = monotonic_clock_now_ms();
+                status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+                ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+                if (!seek_preroll_active) {
+                    reset_playback_timeline(
+                        &movie,
+                        playback_rate,
+                        &playback_anchor_ticks,
+                        &playback_anchor_frame,
+                        &next_frame_due_ticks
+                    );
+                }
+            }
+            msleep(16);
+            continue;
+        }
+
+        if (on_edge) {
+            bool was_paused = paused;
+
+            paused = true;
+            seek_repeat_direction = 0;
+            seek_repeat_next_ms = 0;
+            brightness_repeat_direction = 0;
+            brightness_repeat_next_ms = 0;
+            if (!seek_preroll_active) {
+                reset_playback_timeline(
+                    &movie,
+                    playback_rate,
+                    &playback_anchor_ticks,
+                    &playback_anchor_frame,
+                    &next_frame_due_ticks
+                );
+            }
+            display_power_off(&display_power_state, was_paused);
+            present_black_screen(screen);
+            continue;
+        }
 
         if (tab_edge) {
             tab_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
@@ -9699,7 +9824,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             show_ui = true;
         }
-        if (key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc)) {
+        if (esc_edge) {
             if (help_menu_open) {
                 help_menu_open = false;
                 if (help_resume_playback) {
@@ -9850,7 +9975,31 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
             brightness_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_FALLBACK_INTERVAL_MS;
         }
         if (brightness_delta != 0) {
-            uint32_t brightness_raw = adjust_lcd_brightness(brightness_delta);
+            uint32_t brightness_raw;
+
+            if (brightness_delta > 0 && current_lcd_brightness() >= LCD_BRIGHTNESS_MAX) {
+                bool was_paused = paused;
+
+                paused = true;
+                brightness_repeat_direction = 0;
+                brightness_repeat_next_ms = 0;
+                seek_repeat_direction = 0;
+                seek_repeat_next_ms = 0;
+                display_power_off(&display_power_state, was_paused);
+                present_black_screen(screen);
+                if (!seek_preroll_active) {
+                    reset_playback_timeline(
+                        &movie,
+                        playback_rate,
+                        &playback_anchor_ticks,
+                        &playback_anchor_frame,
+                        &next_frame_due_ticks
+                    );
+                }
+                continue;
+            }
+
+            brightness_raw = adjust_lcd_brightness(brightness_delta);
 
             snprintf(
                 status_overlay_text,
@@ -10243,6 +10392,7 @@ static int play_movie(SDL_Surface *screen, const Fonts *fonts, const char *path,
         }
     }
 
+    display_power_on(&display_power_state);
     flush_deferred_history_save(
         path,
         &movie,
