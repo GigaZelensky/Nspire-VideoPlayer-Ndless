@@ -36,6 +36,7 @@ The `.nvp` format used by the current player is:
 - playback speed control from `0.25x` to `2.0x`
 - screen brightness control with `Up` / `Down` and an on-screen percentage overlay
 - picker UI for multiple `.nvp` / `.nvp.tns` files
+- picker filename metadata tooltips from bracketed tags
 - per-video resume history with saved playback and subtitle settings
 - debug log output and in-player memory/playback overlay
 
@@ -53,9 +54,22 @@ Battery Life: ~9.5 hours of continuous H.264 playback at 100% brightness.
 
 - `Up` / `Down`: select movie
 - touchpad: move cursor
+- touchpad hover: after a short pause, show filename metadata tooltip when available
 - touchpad click: open highlighted movie
 - `Enter`: open movie
 - `Esc`: exit
+
+### Movie Filename Metadata
+
+The picker hides the full video extension and supports optional bracketed metadata in movie filenames.
+
+Example:
+
+```text
+Rick and Morty S07E03 [English SDH].nvp.tns
+```
+
+The list row shows `Rick and Morty S07E03`. If you hover the row and keep the pointer still briefly, a small tooltip shows the clean title plus `English SDH` underneath. Multiple bracketed tags are joined with ` | ` in the tooltip.
 
 ### Playback
 

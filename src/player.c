@@ -27,6 +27,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define TAB_HOLD_FRAME_REPEAT_FALLBACK_INTERVAL_MS 80U
 #define PICKER_MAX_FILES 128
 #define PICKER_VISIBLE_ROWS 9
+#define PICKER_TOOLTIP_DWELL_MS 450U
 #define MAX_PATH_LEN 512
 #define MAX_SUBTITLE_LINES 3
 #define MAX_SUBTITLE_LINE_LEN 96
@@ -189,6 +190,7 @@ typedef struct {
 
 typedef struct {
     char *name;
+    char *detail;
     char *path;
     uint32_t resume_frame;
     bool has_resume;
@@ -309,6 +311,12 @@ typedef struct {
     int anchor_x;
     int anchor_y;
 } PointerHoverGuard;
+
+typedef struct {
+    int row_index;
+    uint32_t started_ms;
+    bool armed;
+} PickerTooltipHoverState;
 
 typedef enum {
     PREFETCH_IDLE = 0,
@@ -1025,17 +1033,152 @@ static bool has_suffix(const char *value, const char *suffix)
 static char *display_name_for_movie(const char *filename)
 {
     size_t length = strlen(filename);
+    size_t trim_length = length;
     char *copy;
+
     if (length > 8 && has_suffix(filename, ".nvp.tns")) {
-        copy = (char *) malloc(length - 3);
-        if (!copy) {
-            return NULL;
-        }
-        memcpy(copy, filename, length - 4);
-        copy[length - 4] = '\0';
-        return copy;
+        trim_length = length - 8;
+    } else if (length > 4 && has_suffix(filename, ".nvp")) {
+        trim_length = length - 4;
+    } else if (length > 4 && has_suffix(filename, ".tns")) {
+        trim_length = length - 4;
     }
-    return dup_string(filename);
+
+    copy = (char *) malloc(trim_length + 1);
+    if (!copy) {
+        return NULL;
+    }
+    memcpy(copy, filename, trim_length);
+    copy[trim_length] = '\0';
+    return copy;
+}
+
+static void normalize_display_spacing(char *text)
+{
+    char *src;
+    char *dst;
+    bool pending_space = false;
+
+    if (!text) {
+        return;
+    }
+
+    src = text;
+    dst = text;
+    while (*src) {
+        unsigned char ch = (unsigned char) *src++;
+        if (isspace(ch)) {
+            pending_space = dst != text;
+            continue;
+        }
+        if (pending_space) {
+            *dst++ = ' ';
+            pending_space = false;
+        }
+        *dst++ = (char) ch;
+    }
+    *dst = '\0';
+}
+
+static void append_movie_filename_detail(char *detail, size_t detail_size, const char *begin, size_t length)
+{
+    size_t current_length;
+    size_t copy_length;
+
+    if (!detail || detail_size == 0 || !begin) {
+        return;
+    }
+    while (length > 0 && isspace((unsigned char) *begin)) {
+        ++begin;
+        --length;
+    }
+    while (length > 0 && isspace((unsigned char) begin[length - 1])) {
+        --length;
+    }
+    if (length == 0) {
+        return;
+    }
+
+    current_length = strlen(detail);
+    if (current_length > 0 && current_length + 3 < detail_size) {
+        memcpy(detail + current_length, " | ", 3);
+        current_length += 3;
+        detail[current_length] = '\0';
+    }
+
+    if (current_length >= detail_size - 1) {
+        return;
+    }
+    copy_length = length;
+    if (copy_length > detail_size - current_length - 1) {
+        copy_length = detail_size - current_length - 1;
+    }
+    memcpy(detail + current_length, begin, copy_length);
+    detail[current_length + copy_length] = '\0';
+}
+
+static bool movie_display_fields_for_filename(const char *filename, char **out_name, char **out_detail)
+{
+    char *base_name;
+    char *title;
+    char *detail;
+    const char *src;
+    char *dst;
+    size_t base_length;
+
+    if (!out_name || !out_detail) {
+        return false;
+    }
+    *out_name = NULL;
+    *out_detail = NULL;
+
+    base_name = display_name_for_movie(filename ? filename : "");
+    if (!base_name) {
+        return false;
+    }
+
+    base_length = strlen(base_name);
+    title = (char *) calloc(base_length + 1, 1);
+    detail = (char *) calloc(base_length + 1, 1);
+    if (!title || !detail) {
+        free(base_name);
+        free(title);
+        free(detail);
+        return false;
+    }
+
+    src = base_name;
+    dst = title;
+    while (*src) {
+        if (*src == '[') {
+            const char *close = strchr(src + 1, ']');
+            if (close) {
+                append_movie_filename_detail(detail, base_length + 1, src + 1, (size_t) (close - src - 1));
+                src = close + 1;
+                continue;
+            }
+        }
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+
+    normalize_display_spacing(title);
+    normalize_display_spacing(detail);
+    if (title[0] == '\0') {
+        snprintf(title, base_length + 1, "%s", base_name);
+        normalize_display_spacing(title);
+    }
+
+    *out_name = title;
+    if (detail[0] != '\0') {
+        *out_detail = detail;
+    } else {
+        free(detail);
+        *out_detail = NULL;
+    }
+
+    free(base_name);
+    return true;
 }
 
 static int clamp_int(int value, int min_value, int max_value)
@@ -1524,6 +1667,45 @@ static bool pointer_hover_guard_allows(PointerHoverGuard *guard, const PointerSt
     return true;
 }
 
+static void picker_tooltip_hover_reset(PickerTooltipHoverState *state)
+{
+    if (!state) {
+        return;
+    }
+    state->row_index = -1;
+    state->started_ms = 0;
+    state->armed = false;
+}
+
+static int picker_tooltip_hover_update(PickerTooltipHoverState *state, int hovered_index, const PointerState *pointer, bool pointer_click, uint32_t now_ms)
+{
+    if (!state) {
+        return -1;
+    }
+    if (!pointer || !pointer->visible || hovered_index < 0 || pointer_click) {
+        picker_tooltip_hover_reset(state);
+        return -1;
+    }
+    if (pointer->moved) {
+        state->armed = true;
+        state->row_index = hovered_index;
+        state->started_ms = now_ms;
+        return -1;
+    }
+    if (!state->armed) {
+        return -1;
+    }
+    if (state->row_index != hovered_index) {
+        state->row_index = hovered_index;
+        state->started_ms = now_ms;
+        return -1;
+    }
+    if ((uint32_t) (now_ms - state->started_ms) >= PICKER_TOOLTIP_DWELL_MS) {
+        return hovered_index;
+    }
+    return -1;
+}
+
 static void format_clock(uint32_t total_ms, char *buffer, size_t buffer_size)
 {
     uint32_t total_seconds = total_ms / 1000;
@@ -1839,6 +2021,7 @@ static void free_movie_files(MovieFile *files, size_t count)
     }
     for (index = 0; index < count; ++index) {
         free(files[index].name);
+        free(files[index].detail);
         free(files[index].path);
     }
     free(files);
@@ -6438,7 +6621,11 @@ static int compare_movie_files(const void *lhs, const void *rhs)
 {
     const MovieFile *a = (const MovieFile *) lhs;
     const MovieFile *b = (const MovieFile *) rhs;
-    return strcmp(a->name, b->name);
+    int result = strcmp(a->name ? a->name : "", b->name ? b->name : "");
+    if (result != 0) {
+        return result;
+    }
+    return strcmp(a->detail ? a->detail : "", b->detail ? b->detail : "");
 }
 
 static bool strings_equal_ignore_case(const char *lhs, const char *rhs)
@@ -6491,7 +6678,15 @@ static MovieFile *scan_movies(const char *directory, size_t *out_count)
         if (joined_len < 0 || (size_t) joined_len >= sizeof(joined)) {
             continue;
         }
-        files[count].name = display_name_for_movie(entry->d_name);
+        if (!movie_display_fields_for_filename(entry->d_name, &files[count].name, &files[count].detail)) {
+            closedir(dir);
+            if (have_history) {
+                free_history_store(&history);
+            }
+            free_movie_files(files, count + 1);
+            *out_count = 0;
+            return NULL;
+        }
         files[count].path = dup_string(joined);
         if (!files[count].name || !files[count].path) {
             closedir(dir);
@@ -8422,7 +8617,117 @@ static void draw_loading_overlay(SDL_Surface *screen, const Fonts *fonts, const 
     nSDL_DrawString(screen, fonts->white, panel.x + panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), panel.y + 12, "%s", spinner);
 }
 
-static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *files, size_t count, size_t selected, const PointerState *pointer, const char *loading_label, int loading_phase)
+static void copy_fitted_text(nSDL_Font *font, const char *text, char *buffer, size_t buffer_size, int max_width)
+{
+    const char *ellipsis = "...";
+    size_t length;
+
+    if (!buffer || buffer_size == 0) {
+        return;
+    }
+
+    if (!text) {
+        buffer[0] = '\0';
+        return;
+    }
+
+    snprintf(buffer, buffer_size, "%s", text);
+    if (max_width <= 0) {
+        buffer[0] = '\0';
+        return;
+    }
+    if (!font || nSDL_GetStringWidth(font, buffer) <= max_width) {
+        return;
+    }
+
+    if (nSDL_GetStringWidth(font, ellipsis) > max_width || buffer_size < 4) {
+        buffer[0] = '\0';
+        return;
+    }
+
+    length = strlen(buffer);
+    while (length > 0) {
+        --length;
+        buffer[length] = '\0';
+        if (length + 4 <= buffer_size) {
+            memcpy(buffer + length, ellipsis, 4);
+            if (nSDL_GetStringWidth(font, buffer) <= max_width) {
+                return;
+            }
+            buffer[length] = '\0';
+        }
+    }
+
+    snprintf(buffer, buffer_size, "%s", ellipsis);
+}
+
+static void draw_movie_hover_tooltip(SDL_Surface *screen, const Fonts *fonts, const MovieFile *file, const PointerState *pointer)
+{
+    enum {
+        TOOLTIP_MAX_W = 236,
+        TOOLTIP_PAD_X = 6,
+        TOOLTIP_PAD_Y = 4,
+        TOOLTIP_LINE_GAP = 10
+    };
+    char title[128];
+    char detail[128];
+    int text_max_width = TOOLTIP_MAX_W - (TOOLTIP_PAD_X * 2);
+    int title_width;
+    int detail_width;
+    int width;
+    int height = (TOOLTIP_PAD_Y * 2) + TOOLTIP_LINE_GAP + 8;
+    int x;
+    int y;
+    SDL_Rect shadow;
+    SDL_Rect border;
+    SDL_Rect panel;
+
+    if (!screen || !fonts || !file || !pointer || !pointer->visible ||
+        !file->detail || file->detail[0] == '\0') {
+        return;
+    }
+
+    copy_fitted_text(fonts->outline, file->name, title, sizeof(title), text_max_width);
+    copy_fitted_text(fonts->outline, file->detail, detail, sizeof(detail), text_max_width);
+    title_width = nSDL_GetStringWidth(fonts->outline, title);
+    detail_width = nSDL_GetStringWidth(fonts->outline, detail);
+    width = (title_width > detail_width ? title_width : detail_width) + (TOOLTIP_PAD_X * 2);
+    if (width < 72) {
+        width = 72;
+    }
+
+    x = pointer->x + 12;
+    y = pointer->y + 10;
+    if (x + width > SCREEN_W - 4) {
+        x = pointer->x - width - 8;
+    }
+    if (y + height > SCREEN_H - 4) {
+        y = pointer->y - height - 8;
+    }
+    x = clamp_int(x, 4, SCREEN_W - width - 4);
+    y = clamp_int(y, 4, SCREEN_H - height - 4);
+
+    shadow.x = (Sint16) (x + 2);
+    shadow.y = (Sint16) (y + 2);
+    shadow.w = (Uint16) width;
+    shadow.h = (Uint16) height;
+    border.x = (Sint16) x;
+    border.y = (Sint16) y;
+    border.w = (Uint16) width;
+    border.h = (Uint16) height;
+    panel.x = (Sint16) (x + 1);
+    panel.y = (Sint16) (y + 1);
+    panel.w = (Uint16) (width - 2);
+    panel.h = (Uint16) (height - 2);
+
+    SDL_FillRect(screen, &shadow, SDL_MapRGB(screen->format, 0, 0, 0));
+    SDL_FillRect(screen, &border, SDL_MapRGB(screen->format, 42, 42, 42));
+    SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 255, 252, 214));
+    nSDL_DrawString(screen, fonts->outline, x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y, "%s", title);
+    nSDL_DrawString(screen, fonts->outline, x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y + TOOLTIP_LINE_GAP, "%s", detail);
+}
+
+static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *files, size_t count, size_t selected, int hovered_index, const PointerState *pointer, const char *loading_label, int loading_phase)
 {
     const char *credit = "Made by GigaZelensky";
     size_t start_index;
@@ -8452,17 +8757,21 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
         end_index = count;
     }
     for (index = start_index; index < end_index && y < SCREEN_H - 20; ++index) {
-        SDL_Rect row = {8, (Sint16) (y - 4), SCREEN_W - 16, 18};
+        SDL_Rect row = {8, (Sint16) (y - 5), SCREEN_W - 16, 20};
         const char *resume_label = files[index].has_resume ? "RESUME" : NULL;
+        int text_x = index == selected ? 24 : 12;
+        int reserved_right = resume_label ? nSDL_GetStringWidth(fonts->white, resume_label) + 22 : 0;
+        int text_max_width = SCREEN_W - text_x - 16 - reserved_right;
+        char fitted_title[128];
         if (index == selected) {
-            SDL_Rect accent = {8, (Sint16) (y - 4), 4, 18};
+            SDL_Rect accent = {8, (Sint16) (y - 5), 4, 20};
             SDL_FillRect(screen, &row, SDL_MapRGB(screen->format, 26, 118, 180));
             SDL_FillRect(screen, &accent, SDL_MapRGB(screen->format, 32, 182, 255));
-            nSDL_DrawString(screen, fonts->white, 24, y, "%s", files[index].name);
         } else {
             SDL_FillRect(screen, &row, SDL_MapRGB(screen->format, 16, 20, 28));
-            nSDL_DrawString(screen, fonts->white, 12, y, "%s", files[index].name);
         }
+        copy_fitted_text(fonts->white, files[index].name, fitted_title, sizeof(fitted_title), text_max_width);
+        nSDL_DrawString(screen, fonts->white, text_x, y, "%s", fitted_title);
         if (resume_label) {
             draw_text_badge(screen, fonts, SCREEN_W - 16, y - 3, resume_label);
         }
@@ -8476,6 +8785,8 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
     }
     if (loading_label) {
         draw_loading_overlay(screen, fonts, loading_label, loading_phase);
+    } else if (hovered_index >= 0 && (size_t) hovered_index < count) {
+        draw_movie_hover_tooltip(screen, fonts, &files[hovered_index], pointer);
     }
     if (pointer && pointer->visible) {
         draw_cursor(screen, pointer->x, pointer->y);
@@ -9160,6 +9471,7 @@ static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *direc
     bool prev_esc = false;
     PointerState pointer;
     PointerHoverGuard hover_guard;
+    PickerTooltipHoverState tooltip_hover;
     MovieFile *files;
     size_t count = 0;
     size_t selected = 0;
@@ -9167,15 +9479,18 @@ static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *direc
     files = scan_movies(directory, &count);
     pointer_init(&pointer);
     pointer_hover_guard_reset(&hover_guard);
+    picker_tooltip_hover_reset(&tooltip_hover);
     while (1) {
         bool pointer_click = pointer_update(&pointer);
+        uint32_t now_ms = monotonic_clock_now_ms();
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
         int hovered_index = pointer_hover_allowed ? picker_row_index_at(count, selected, pointer.y) : -1;
+        int tooltip_index = picker_tooltip_hover_update(&tooltip_hover, hovered_index, &pointer, pointer_click, now_ms);
 
         if (hovered_index >= 0) {
             selected = (size_t) hovered_index;
         }
-        render_picker(screen, fonts, files, count, selected, &pointer, NULL, 0);
+        render_picker(screen, fonts, files, count, selected, tooltip_index, &pointer, NULL, 0);
         if (key_pressed_edge(KEY_NSPIRE_UP, &prev_up) && selected > 0) {
             selected--;
             pointer_hover_guard_lock(&hover_guard, &pointer);
@@ -9187,7 +9502,7 @@ static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *direc
         if (pointer_click && hovered_index >= 0 && (size_t) hovered_index < count) {
             int phase;
             for (phase = 0; phase < 6; ++phase) {
-                render_picker(screen, fonts, files, count, selected, &pointer, "Loading", phase);
+                render_picker(screen, fonts, files, count, selected, -1, &pointer, "Loading", phase);
                 msleep(30);
             }
             strncpy(selected_path, files[hovered_index].path, selected_size - 1);
@@ -9198,7 +9513,7 @@ static int pick_movie(SDL_Surface *screen, const Fonts *fonts, const char *direc
         if (key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) && count > 0) {
             int phase;
             for (phase = 0; phase < 6; ++phase) {
-                render_picker(screen, fonts, files, count, selected, &pointer, "Loading", phase);
+                render_picker(screen, fonts, files, count, selected, -1, &pointer, "Loading", phase);
                 msleep(30);
             }
             strncpy(selected_path, files[selected].path, selected_size - 1);
