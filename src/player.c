@@ -7905,10 +7905,11 @@ static SDL_Rect progress_bar_rect(void)
 enum {
     UI_COLOR_BLACK = UI_RGB565(0, 0, 0),
     UI_COLOR_WHITE = UI_RGB565(255, 255, 255),
-    UI_COLOR_AERO_CYAN = UI_RGB565(64, 224, 255),
-    UI_COLOR_AERO_BLUE = UI_RGB565(26, 91, 140),
-    UI_COLOR_BG_TOP = UI_RGB565(10, 21, 38),
-    UI_COLOR_BG_BOTTOM = UI_RGB565(2, 5, 10),
+    UI_COLOR_DORF_ORANGE = UI_RGB565(255, 115, 0),
+    UI_COLOR_DORF_RED = UI_RGB565(210, 50, 0),
+    UI_COLOR_CARBON = UI_RGB565(36, 36, 36),
+    UI_COLOR_BG_TOP = UI_RGB565(24, 24, 24),
+    UI_COLOR_BG_BOTTOM = UI_RGB565(8, 8, 8),
     UI_CURSOR_KEY = UI_RGB565(255, 0, 255)
 };
 
@@ -8128,7 +8129,7 @@ static void draw_glass_panel(SDL_Surface *screen, const SDL_Rect *rect, Uint16 b
     fill_rect_rgb565(screen, &line, blend_rgb565(base_color, UI_COLOR_BLACK, 170));
 
     if (is_selected) {
-        draw_rect_outline_rgb565(screen, rect, UI_COLOR_AERO_CYAN);
+        draw_rect_outline_rgb565(screen, rect, UI_COLOR_DORF_ORANGE);
     } else {
         draw_rect_outline_rgb565(screen, rect, blend_rgb565(base_color, UI_COLOR_BLACK, 120));
     }
@@ -8340,6 +8341,17 @@ static int draw_left_text_badge(SDL_Surface *screen, const Fonts *fonts, int lef
     return badge.x + badge.w + 6;
 }
 
+static int draw_text_badge_no_shadow(SDL_Surface *screen, const Fonts *fonts, int right_x, int y, const char *label)
+{
+    int text_w = nSDL_GetStringWidth(fonts->white, label);
+    SDL_Rect badge = {(Sint16) (right_x - text_w - 12), (Sint16) y, (Uint16) (text_w + 12), 16};
+
+    draw_glass_panel(screen, &badge, UI_RGB565(16, 46, 72), false);
+    cut_rect_corners(screen, &badge, UI_COLOR_BLACK);
+    draw_shadow_label(screen, fonts, badge.x + 6, badge.y + 4, label);
+    return badge.x - 6;
+}
+
 static void draw_centered_text_badge(SDL_Surface *screen, const Fonts *fonts, int center_x, int y, const char *label)
 {
     int text_w = nSDL_GetStringWidth(fonts->white, label);
@@ -8405,24 +8417,19 @@ static void draw_seek_preview_panel(SDL_Surface *screen, SDL_Surface *surface, i
         return;
     }
 
-    shadow.x = (Sint16) (x + 3);
-    shadow.y = (Sint16) (y + 3);
-    shadow.w = (Uint16) (surface->w + 6);
-    shadow.h = (Uint16) (surface->h + 6);
     outer.x = (Sint16) x;
     outer.y = (Sint16) y;
     outer.w = (Uint16) (surface->w + 6);
     outer.h = (Uint16) (surface->h + 6);
-    inner.x = (Sint16) (x + 2);
-    inner.y = (Sint16) (y + 2);
-    inner.w = (Uint16) (surface->w + 2);
-    inner.h = (Uint16) (surface->h + 2);
+    inner.x = (Sint16) (x + 1);
+    inner.y = (Sint16) (y + 1);
+    inner.w = (Uint16) (surface->w + 4);
+    inner.h = (Uint16) (surface->h + 4);
     dst.x = (Sint16) (x + 3);
     dst.y = (Sint16) (y + 3);
     dst.w = (Uint16) surface->w;
     dst.h = (Uint16) surface->h;
 
-    fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
     fill_rect_rgb565(screen, &outer, UI_RGB565(18, 20, 24));
     fill_rect_rgb565(screen, &inner, UI_COLOR_WHITE);
     SDL_BlitSurface(surface, NULL, screen, &dst);
@@ -8503,7 +8510,7 @@ static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect,
     SDL_Rect fill = {9, (Sint16) (y + 1), 20, 20};
 
     fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
-    draw_glass_panel(screen, &outer, UI_RGB565(14, 54, 86), true);
+    draw_glass_panel(screen, &outer, UI_COLOR_CARBON, false);
     cut_rect_corners(screen, &outer, UI_COLOR_BLACK);
     if (paused) {
         SDL_Rect left_shadow = {15, (Sint16) (y + 6), 3, 10};
@@ -8709,7 +8716,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     fill_rect_rgb565(screen, &border, UI_RGB565(214, 226, 232));
     draw_glass_panel(screen, &panel, UI_RGB565(18, 20, 24), false);
     draw_glass_panel(screen, &header, UI_RGB565(28, 68, 98), false);
-    draw_vertical_gradient(screen, &accent, UI_RGB565(140, 255, 255), UI_RGB565(0, 136, 255));
+    draw_vertical_gradient(screen, &accent, UI_COLOR_DORF_ORANGE, UI_COLOR_DORF_RED);
 
     draw_shadow_label(screen, fonts, panel.x + 10, panel.y + 6, title_text);
     draw_shadow_label(
@@ -8745,8 +8752,8 @@ static void draw_progress(
     const SeekBarPreviewState *seek_preview
 )
 {
-    SDL_Rect overlay_shadow = {6, SCREEN_H - 32, SCREEN_W - 8, 30};
-    SDL_Rect overlay = {4, SCREEN_H - 34, SCREEN_W - 8, 30};
+    SDL_Rect overlay_shadow = {6, SCREEN_H - 26, SCREEN_W - 8, 24};
+    SDL_Rect overlay = {4, SCREEN_H - 28, SCREEN_W - 8, 24};
     SDL_Rect bar_back = progress_bar_rect();
     SDL_Rect bar_front = bar_back;
     SDL_Rect track_outer = {(Sint16) (bar_back.x - 1), (Sint16) (bar_back.y - 1), (Uint16) (bar_back.w + 2), (Uint16) (bar_back.h + 2)};
@@ -8763,10 +8770,11 @@ static void draw_progress(
     uint32_t duration_ms = movie_duration_ms(movie);
     bool hover_bar = false;
     uint32_t hover_ms = 0;
-    int hover_badge_y = bar_back.y - 20;
+    int preview_y;
+    int hover_badge_y;
 
     fill_rect_rgb565(screen, &overlay_shadow, UI_COLOR_BLACK);
-    draw_glass_panel(screen, &overlay, UI_RGB565(18, 24, 30), false);
+    draw_glass_panel(screen, &overlay, UI_RGB565(32, 32, 32), false);
     cut_rect_corners(screen, &overlay, UI_COLOR_BLACK);
 
     fill_rect_rgb565(screen, &track_outer, UI_COLOR_BLACK);
@@ -8774,23 +8782,43 @@ static void draw_progress(
     fill_rect_rgb565(screen, &track_top_shadow, UI_COLOR_BLACK);
     fill_rect_rgb565(screen, &track_bottom_highlight, UI_RGB565(116, 128, 144));
 
-    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
-        if (movie->prefetched[index].chunk_index >= 0) {
-            const ChunkIndexEntry *entry = movie->chunk_index + movie->prefetched[index].chunk_index;
-            int bar_right = bar_back.x + bar_back.w;
-            SDL_Rect prefetch_rect = bar_back;
-            prefetch_rect.x = bar_back.x + (int) (((uint64_t) bar_back.w * entry->first_frame) / movie->header.frame_count);
-            prefetch_rect.w = (Uint16) (((uint64_t) bar_back.w * entry->frame_count) / movie->header.frame_count);
-            if (prefetch_rect.w <= 0) {
-                prefetch_rect.w = 1;
+    {
+        int chunks_to_draw[PREFETCH_CHUNK_COUNT + 1];
+        int num_chunks_to_draw = 0;
+
+        if (movie->loaded_chunk >= 0) {
+            chunks_to_draw[num_chunks_to_draw++] = movie->loaded_chunk;
+        }
+        for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
+            if (movie->prefetched[index].chunk_index >= 0) {
+                chunks_to_draw[num_chunks_to_draw++] = movie->prefetched[index].chunk_index;
             }
+        }
+
+        for (index = 0; index < num_chunks_to_draw; ++index) {
+            const ChunkIndexEntry *entry = movie->chunk_index + chunks_to_draw[index];
+            int bar_right = bar_back.x + bar_back.w;
+            uint32_t start_frame = entry->first_frame;
+            uint32_t end_frame = start_frame + entry->frame_count;
+
+            int x1 = bar_back.x + (int) (((uint64_t) bar_back.w * start_frame) / movie->header.frame_count);
+            int x2 = bar_back.x + (int) (((uint64_t) bar_back.w * end_frame) / movie->header.frame_count);
+
+            SDL_Rect prefetch_rect = bar_back;
+            prefetch_rect.x = x1;
+            prefetch_rect.w = x2 - x1;
+
+            if (prefetch_rect.w <= 0) prefetch_rect.w = 1;
             if (prefetch_rect.x >= bar_right) {
                 prefetch_rect.w = 0;
             } else if (prefetch_rect.x + prefetch_rect.w > bar_right) {
                 prefetch_rect.w = (Uint16) (bar_right - prefetch_rect.x);
             }
+
             if (prefetch_rect.w > 0) {
-                draw_vertical_gradient(screen, &prefetch_rect, UI_RGB565(144, 154, 164), UI_RGB565(72, 78, 88));
+                draw_vertical_gradient(screen, &prefetch_rect, UI_RGB565(140, 80, 20), UI_RGB565(70, 40, 10));
+                SDL_Rect sep = {prefetch_rect.x + prefetch_rect.w - 1, prefetch_rect.y, 1, prefetch_rect.h};
+                fill_rect_rgb565(screen, &sep, UI_RGB565(30, 15, 5));
             }
         }
     }
@@ -8800,7 +8828,7 @@ static void draw_progress(
     }
     if (bar_front.w > 0) {
         SDL_Rect meniscus = {bar_front.x, bar_front.y, bar_front.w, 1};
-        draw_vertical_gradient(screen, &bar_front, UI_RGB565(0, 255, 255), UI_RGB565(0, 136, 255));
+        draw_vertical_gradient(screen, &bar_front, UI_COLOR_DORF_ORANGE, UI_COLOR_DORF_RED);
         fill_rect_rgb565(screen, &meniscus, UI_COLOR_WHITE);
     }
     if (pointer && pointer->visible) {
@@ -8812,7 +8840,6 @@ static void draw_progress(
         hover_bar = pointer->y >= overlay.y && pointer->y < overlay.y + overlay.h;
         if (hover_bar && duration_ms > 0) {
             int preview_x;
-            int preview_y;
             hover_ms = (uint32_t) (((uint64_t) duration_ms * (uint32_t) (marker_x - bar_back.x)) / (uint32_t) bar_back.w);
             format_clock(hover_ms, hover_text, sizeof(hover_text));
             if (seek_preview && seek_preview->surface && seek_preview->over_bar) {
@@ -8821,14 +8848,15 @@ static void draw_progress(
                     0,
                     SCREEN_W - (seek_preview->surface->w + 6)
                 );
-                preview_y = bar_back.y - seek_preview->surface->h - 34;
+                preview_y = bar_back.y - seek_preview->surface->h - 16;
                 if (preview_y < 0) {
                     preview_y = 0;
                 }
                 draw_seek_preview_panel(screen, seek_preview->surface, preview_x, preview_y, marker_x);
-                hover_badge_y = preview_y + seek_preview->surface->h + 12;
+                hover_badge_y = preview_y + seek_preview->surface->h + 4;
+            } else {
+                hover_badge_y = bar_back.y - 20;
             }
-            draw_centered_text_badge(screen, fonts, marker_x, hover_badge_y, hover_text);
         }
     }
     format_clock(current_ms, current_text, sizeof(current_text));
@@ -8844,6 +8872,9 @@ static void draw_progress(
         overlay.y + 7,
         right_text
     );
+    if (hover_bar && duration_ms > 0) {
+        draw_centered_text_badge(screen, fonts, marker_x, hover_badge_y, hover_text);
+    }
     if (pending_seek_ms != 0) {
         format_seek_delta(pending_seek_ms, seek_text, sizeof(seek_text));
         if (pending_seek_ms < 0) {
@@ -9038,7 +9069,7 @@ static void draw_loading_overlay(SDL_Surface *screen, const Fonts *fonts, const 
     fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
     draw_glass_panel(screen, &panel, UI_RGB565(16, 44, 68), false);
     cut_rect_corners(screen, &panel, UI_COLOR_BLACK);
-    draw_vertical_gradient(screen, &accent, UI_RGB565(140, 255, 255), UI_RGB565(0, 136, 255));
+    draw_vertical_gradient(screen, &accent, UI_COLOR_DORF_ORANGE, UI_COLOR_DORF_RED);
     draw_shadow_label(screen, fonts, panel.x + 12, panel.y + 12, label ? label : "Loading");
     draw_shadow_label(screen, fonts, panel.x + panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), panel.y + 12, spinner);
 }
@@ -9195,7 +9226,7 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
         int text_max_width = SCREEN_W - text_x - 28 - reserved_right;
         char fitted_title[128];
         if (index == selected) {
-            draw_glass_panel(screen, &row, UI_COLOR_AERO_BLUE, true);
+            draw_glass_panel(screen, &row, UI_RGB565(80, 40, 0), true);
             cut_rect_corners(screen, &row, picker_background_color_at_y(row.y));
         } else {
             fill_rect_rgb565(screen, &divider, UI_RGB565(10, 28, 46));
@@ -9203,7 +9234,7 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
         copy_fitted_text(fonts->white, files[index].name, fitted_title, sizeof(fitted_title), text_max_width);
         draw_shadow_label(screen, fonts, text_x, y, fitted_title);
         if (resume_label) {
-            draw_text_badge(screen, fonts, SCREEN_W - 16, y - 3, resume_label);
+            draw_text_badge_no_shadow(screen, fonts, SCREEN_W - 16, y - 3, resume_label);
         }
         y += 20;
     }
@@ -10017,7 +10048,7 @@ static bool seek_to_ratio(Movie *movie, uint32_t numerator, uint32_t denominator
 static void draw_prompt_button(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *button, const char *label, bool selected)
 {
     SDL_Rect shadow = {(Sint16) (button->x + 2), (Sint16) (button->y + 2), button->w, button->h};
-    Uint16 base = selected ? UI_COLOR_AERO_BLUE : UI_RGB565(24, 30, 38);
+    Uint16 base = selected ? UI_RGB565(80, 40, 0) : UI_RGB565(24, 30, 38);
     int text_x = button->x + (button->w - nSDL_GetStringWidth(fonts->white, label)) / 2;
 
     fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
@@ -10048,18 +10079,21 @@ static int prompt_resume_position(
     SDL_Rect accent = {28, 44, 252, 2};
     SDL_Rect preview = {74, 56, 160, 90};
     SDL_Rect preview_shadow = {74, 56, 164, 94};
-    SDL_Rect preview_border = {72, 54, 164, 94};
-    SDL_Rect continue_button = {46, 162, 90, 22};
-    SDL_Rect restart_button = {172, 162, 90, 22};
+    SDL_Rect preview_border = {73, 55, 164, 94};
+    SDL_Rect continue_button = {46, 172, 90, 22};
+    SDL_Rect restart_button = {172, 172, 90, 22};
     char time_label[64];
     char time_value[24];
-    char title[96];
-    char fitted_title[96];
+    char *title_main = NULL;
+    char *title_detail = NULL;
+    char fitted_title_main[96];
+    char fitted_title_detail[96];
     const char *filename = path;
-    char *display_name = NULL;
     int selected_button = 0;
     uint32_t preview_ms;
     const int title_y = panel.y + 28;
+    int title_main_height;
+    int title_detail_height;
     int title_preview_gap;
     int time_label_y;
 
@@ -10077,14 +10111,28 @@ static int prompt_resume_position(
     } else if (strrchr(path, '\\')) {
         filename = strrchr(path, '\\') + 1;
     }
-    display_name = display_name_for_movie(filename);
-    snprintf(title, sizeof(title), "%s", display_name ? display_name : filename);
-    copy_fitted_text(fonts->white, title, fitted_title, sizeof(fitted_title), panel.w - 24);
-    title_preview_gap = preview.y - (title_y + nSDL_GetStringHeight(fonts->white, fitted_title));
+    if (movie_display_fields_for_filename(filename, &title_main, &title_detail)) {
+        copy_fitted_text(fonts->white, title_main, fitted_title_main, sizeof(fitted_title_main), panel.w - 24);
+        if (title_detail) {
+            copy_fitted_text(fonts->white, title_detail, fitted_title_detail, sizeof(fitted_title_detail), panel.w - 24);
+            title_main_height = nSDL_GetStringHeight(fonts->white, fitted_title_main);
+            title_detail_height = nSDL_GetStringHeight(fonts->white, fitted_title_detail);
+            title_preview_gap = preview.y - (title_y + title_main_height + 2 + title_detail_height);
+        } else {
+            title_main_height = nSDL_GetStringHeight(fonts->white, fitted_title_main);
+            title_detail_height = 0;
+            title_preview_gap = preview.y - (title_y + title_main_height);
+        }
+    } else {
+        snprintf(fitted_title_main, sizeof(fitted_title_main), "%s", filename);
+        title_main_height = nSDL_GetStringHeight(fonts->white, fitted_title_main);
+        title_detail_height = 0;
+        title_preview_gap = preview.y - (title_y + title_main_height);
+    }
     if (title_preview_gap < 0) {
         title_preview_gap = 0;
     }
-    time_label_y = preview.y + preview.h + title_preview_gap;
+    time_label_y = preview.y + preview.h + 8;
     pointer_init(&pointer);
     pointer_hover_guard_reset(&hover_guard);
 
@@ -10093,17 +10141,19 @@ static int prompt_resume_position(
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
 
         SDL_SoftStretch(movie->frame_surface, NULL, screen, &full_screen);
-        draw_checker_darken(screen);
         fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
         fill_rect_rgb565(screen, &border, UI_RGB565(214, 226, 232));
         draw_glass_panel(screen, &panel, UI_RGB565(18, 20, 24), false);
         draw_glass_panel(screen, &header, UI_RGB565(28, 68, 98), false);
-        draw_vertical_gradient(screen, &accent, UI_RGB565(140, 255, 255), UI_RGB565(0, 136, 255));
+        draw_vertical_gradient(screen, &accent, UI_COLOR_DORF_ORANGE, UI_COLOR_DORF_RED);
         fill_rect_rgb565(screen, &preview_shadow, UI_COLOR_BLACK);
         fill_rect_rgb565(screen, &preview_border, UI_COLOR_WHITE);
         SDL_SoftStretch(movie->frame_surface, NULL, screen, &preview);
         draw_shadow_label(screen, fonts, panel.x + 12, panel.y + 8, "Continue Watching?");
-        draw_shadow_label(screen, fonts, panel.x + 12, title_y, fitted_title);
+        draw_shadow_label(screen, fonts, panel.x + 12, title_y, fitted_title_main);
+        if (title_detail_height > 0) {
+            draw_shadow_label(screen, fonts, panel.x + 12, title_y + title_main_height + 2, fitted_title_detail);
+        }
         draw_shadow_label(screen, fonts, panel.x + 12, time_label_y, time_label);
         draw_prompt_button(screen, fonts, &continue_button, "CONTINUE", selected_button == 0);
         draw_prompt_button(screen, fonts, &restart_button, "START OVER", selected_button == 1);
@@ -10128,21 +10178,25 @@ static int prompt_resume_position(
         if (pointer_click) {
             if (pointer.x >= continue_button.x && pointer.x < continue_button.x + continue_button.w &&
                 pointer.y >= continue_button.y && pointer.y < continue_button.y + continue_button.h) {
-                free(display_name);
+                free(title_main);
+                free(title_detail);
                 return 1;
             }
             if (pointer.x >= restart_button.x && pointer.x < restart_button.x + restart_button.w &&
                 pointer.y >= restart_button.y && pointer.y < restart_button.y + restart_button.h) {
-                free(display_name);
+                free(title_main);
+                free(title_detail);
                 return 0;
             }
         }
         if (key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter)) {
-            free(display_name);
+            free(title_main);
+            free(title_detail);
             return selected_button == 0 ? 1 : 0;
         }
         if (key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc)) {
-            free(display_name);
+            free(title_main);
+            free(title_detail);
             return -1;
         }
         msleep(16);
