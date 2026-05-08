@@ -39,7 +39,7 @@ The `.nvp` format used by the current player is:
 - scale modes: `FIT`, `FILL`, `STRETCH`, `1:1`
 - playback speed control from `0.25x` to `2.0x`
 - screen brightness control with `Up` / `Down` and an on-screen percentage overlay
-- theme color profiles: `DORFic`, `Blue`, and `Green`
+- theme color profiles: `DORFic`, `Blue`, `Green`, and `Red`
 - picker UI for multiple `.nvp` / `.nvp.tns` files
 - picker filename metadata tooltips from bracketed tags
 - resume history with saved playback, subtitle, and theme settings
