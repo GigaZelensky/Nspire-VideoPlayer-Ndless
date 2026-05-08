@@ -8050,6 +8050,56 @@ static void fill_rect_rgb565(SDL_Surface *screen, const SDL_Rect *rect, Uint16 c
     SDL_FillRect(screen, (SDL_Rect *) rect, map_rgb565(screen, color));
 }
 
+static void dim_rect_rgb565(SDL_Surface *screen, const SDL_Rect *rect, int alpha)
+{
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+    int y;
+    bool locked = false;
+
+    if (!screen || !rect || rect->w == 0 || rect->h == 0 || alpha <= 0) {
+        return;
+    }
+    if (!surface_is_rgb565(screen)) {
+        return;
+    }
+
+    x0 = clamp_int(rect->x, 0, screen->w);
+    y0 = clamp_int(rect->y, 0, screen->h);
+    x1 = clamp_int(rect->x + rect->w, 0, screen->w);
+    y1 = clamp_int(rect->y + rect->h, 0, screen->h);
+    if (x0 >= x1 || y0 >= y1) {
+        return;
+    }
+
+    alpha = clamp_int(alpha, 0, 255);
+    if (SDL_MUSTLOCK(screen)) {
+        if (SDL_LockSurface(screen) != 0) {
+            return;
+        }
+        locked = true;
+    }
+
+    {
+        Uint16 *pixels = (Uint16 *) screen->pixels;
+        int pitch = screen->pitch / 2;
+        for (y = y0; y < y1; ++y) {
+            Uint16 *row = pixels + (y * pitch) + x0;
+            int x;
+            for (x = x0; x < x1; ++x) {
+                *row = blend_rgb565(*row, UI_COLOR_BLACK, alpha);
+                ++row;
+            }
+        }
+    }
+
+    if (locked) {
+        SDL_UnlockSurface(screen);
+    }
+}
+
 static void draw_vertical_gradient(SDL_Surface *screen, const SDL_Rect *rect, Uint16 color_top, Uint16 color_bottom)
 {
     int x0;
@@ -8294,40 +8344,18 @@ static void draw_ui_label(SDL_Surface *screen, const Fonts *fonts, int x, int y,
     nSDL_DrawString(screen, fonts->white, x, y, "%s", label);
 }
 
-static void draw_checker_darken(SDL_Surface *screen)
+static void draw_overlay_backdrop_dim(SDL_Surface *screen)
 {
-    int y;
-    bool locked = false;
+    SDL_Rect veil = {0, 0, SCREEN_W, SCREEN_H};
 
-    if (!screen || !screen->pixels) {
+    if (!screen) {
         return;
     }
-    if (screen->format->BitsPerPixel != 16) {
-        SDL_Rect veil = {0, 0, SCREEN_W, SCREEN_H};
+    if (!surface_is_rgb565(screen)) {
         SDL_FillRect(screen, &veil, SDL_MapRGB(screen->format, 0, 0, 0));
         return;
     }
-    if (SDL_MUSTLOCK(screen)) {
-        if (SDL_LockSurface(screen) != 0) {
-            return;
-        }
-        locked = true;
-    }
-    {
-        Uint16 *pixels = (Uint16 *) screen->pixels;
-        int pitch = screen->pitch / 2;
-        Uint16 black = (Uint16) SDL_MapRGB(screen->format, 0, 0, 0);
-        for (y = 0; y < screen->h; ++y) {
-            Uint16 *row = pixels + (y * pitch);
-            int x;
-            for (x = (y & 1); x < screen->w; x += 2) {
-                row[x] = black;
-            }
-        }
-    }
-    if (locked) {
-        SDL_UnlockSurface(screen);
-    }
+    dim_rect_rgb565(screen, &veil, 112);
 }
 
 static void draw_cursor(SDL_Surface *screen, int x, int y)
@@ -8888,7 +8916,6 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     SDL_Rect panel = {border.x + 1, border.y + 1, border.w - 2, border.h - 2};
     SDL_Rect header = {panel.x, panel.y, panel.w, 24};
     SDL_Rect accent = {panel.x, panel.y + header.h, panel.w, 2};
-    const char *close_text = "CAT close";
     const char *title_text = "Playback Controls";
     const struct {
         const char *shortcut;
@@ -8917,21 +8944,24 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     int shortcut_x;
     int description_x;
     int y;
+    int close_badge_w;
     size_t index;
 
-    draw_checker_darken(screen);
+    draw_overlay_backdrop_dim(screen);
     fill_rect_rgb565(screen, &border, UI_RGB565(224, 210, 190));
     draw_glass_panel(screen, &panel, UI_RGB565(22, 20, 18), false);
     draw_glass_panel(screen, &header, UI_COLOR_GUNMETAL, false);
     draw_vertical_gradient(screen, &accent, UI_COLOR_DORF_ORANGE, UI_COLOR_DORF_RED);
 
     draw_ui_label(screen, fonts, panel.x + 10, panel.y + 6, title_text);
-    draw_ui_label(
+    close_badge_w = header_shortcut_badge_width(fonts, "CAT", "CLOSE");
+    draw_header_shortcut_badge(
         screen,
         fonts,
-        panel.x + panel.w - 10 - nSDL_GetStringWidth(fonts->white, close_text),
-        panel.y + 6,
-        close_text
+        panel.x + panel.w - 10 - close_badge_w,
+        panel.y + 5,
+        "CAT",
+        "CLOSE"
     );
 
     for (index = 0; index < sizeof(rows) / sizeof(rows[0]); ++index) {
@@ -9081,48 +9111,82 @@ static void draw_progress_track(SDL_Surface *screen, const SDL_Rect *bar_back, U
 static void draw_progress_overlay(SDL_Surface *screen, const SDL_Rect *overlay)
 {
     Uint16 base = UI_RGB565(32, 32, 32);
-    Uint16 outer_top = blend_rgb565(base, UI_COLOR_WHITE, 36);
-    Uint16 outer_bottom = blend_rgb565(base, UI_COLOR_BLACK, 120);
-    Uint16 inner_top = blend_rgb565(base, UI_COLOR_WHITE, 96);
-    Uint16 inner_bottom = blend_rgb565(base, UI_COLOR_BLACK, 42);
-    SDL_Rect left_outer;
-    SDL_Rect right_outer;
-    SDL_Rect left_inner;
-    SDL_Rect right_inner;
-    SDL_Rect corner;
+    Uint16 body_top = blend_rgb565(base, UI_COLOR_WHITE, 28);
+    Uint16 body_bottom = blend_rgb565(base, UI_COLOR_BLACK, 92);
+    Uint16 gloss_top = blend_rgb565(base, UI_COLOR_WHITE, 104);
+    Uint16 gloss_bottom = blend_rgb565(base, UI_COLOR_WHITE, 20);
+    Uint16 rim_top = blend_rgb565(base, UI_COLOR_WHITE, 128);
+    Uint16 rim_bottom = blend_rgb565(base, UI_COLOR_BLACK, 120);
+    Uint16 aa_corner = blend_rgb565(base, UI_COLOR_BLACK, 24);
+    Uint16 aa_top = blend_rgb565(rim_top, base, 72);
+    Uint16 aa_side;
+    SDL_Rect line;
+    SDL_Rect pixel;
+    int row;
+    int denominator;
+    int gloss_height;
 
     if (!screen || !overlay || overlay->w < 8 || overlay->h < 8) {
         return;
     }
 
-    draw_glass_panel(screen, overlay, base, false);
+    denominator = overlay->h > 1 ? overlay->h - 1 : 1;
+    for (row = 0; row < overlay->h; ++row) {
+        line.x = overlay->x;
+        line.y = (Sint16) (overlay->y + row);
+        line.w = overlay->w;
+        line.h = 1;
+        fill_rect_rgb565(screen, &line, rgb565_lerp(body_top, body_bottom, row, denominator));
+    }
 
-    left_outer.x = overlay->x;
-    left_outer.y = (Sint16) (overlay->y + 1);
-    left_outer.w = 1;
-    left_outer.h = (Uint16) (overlay->h - 1);
-    right_outer = left_outer;
-    right_outer.x = (Sint16) (overlay->x + overlay->w - 1);
+    gloss_height = (overlay->h / 2) - 1;
+    aa_side = blend_rgb565(rgb565_lerp(rim_top, gloss_bottom, 1, gloss_height), base, 72);
+    for (row = 1; row <= gloss_height; ++row) {
+        line.x = (Sint16) (overlay->x + 1);
+        line.y = (Sint16) (overlay->y + row);
+        line.w = (Uint16) (overlay->w - 2);
+        line.h = 1;
+        fill_rect_rgb565(screen, &line, rgb565_lerp(gloss_top, gloss_bottom, row - 1, gloss_height - 1));
+    }
 
-    left_inner.x = (Sint16) (overlay->x + 1);
-    left_inner.y = (Sint16) (overlay->y + 2);
-    left_inner.w = 1;
-    left_inner.h = (Uint16) (overlay->h - 2);
-    right_inner = left_inner;
-    right_inner.x = (Sint16) (overlay->x + overlay->w - 2);
+    line.x = overlay->x;
+    line.y = overlay->y;
+    line.w = overlay->w;
+    line.h = 1;
+    fill_rect_rgb565(screen, &line, rim_top);
+    line.x = overlay->x;
+    line.y = (Sint16) (overlay->y + overlay->h - 1);
+    line.w = overlay->w;
+    fill_rect_rgb565(screen, &line, rim_bottom);
 
-    draw_vertical_gradient(screen, &left_outer, outer_top, outer_bottom);
-    draw_vertical_gradient(screen, &right_outer, outer_top, outer_bottom);
-    draw_vertical_gradient(screen, &left_inner, inner_top, inner_bottom);
-    draw_vertical_gradient(screen, &right_inner, inner_top, inner_bottom);
+    pixel.w = 1;
+    pixel.h = 1;
+    for (row = 1; row < overlay->h; ++row) {
+        Uint16 edge = row <= gloss_height
+            ? rgb565_lerp(rim_top, gloss_bottom, row, gloss_height)
+            : rgb565_lerp(gloss_bottom, rim_bottom, row - gloss_height, overlay->h - gloss_height);
+        pixel.y = (Sint16) (overlay->y + row);
+        pixel.x = overlay->x;
+        fill_rect_rgb565(screen, &pixel, edge);
+        pixel.x = (Sint16) (overlay->x + overlay->w - 1);
+        fill_rect_rgb565(screen, &pixel, edge);
+    }
 
-    corner.w = 1;
-    corner.h = 1;
-    corner.x = overlay->x;
-    corner.y = overlay->y;
-    fill_rect_rgb565(screen, &corner, UI_COLOR_BLACK);
-    corner.x = (Sint16) (overlay->x + overlay->w - 1);
-    fill_rect_rgb565(screen, &corner, UI_COLOR_BLACK);
+    pixel.y = overlay->y;
+    pixel.x = overlay->x;
+    fill_rect_rgb565(screen, &pixel, aa_corner);
+    pixel.x = (Sint16) (overlay->x + overlay->w - 1);
+    fill_rect_rgb565(screen, &pixel, aa_corner);
+    pixel.y = overlay->y;
+    pixel.x = (Sint16) (overlay->x + 1);
+    fill_rect_rgb565(screen, &pixel, aa_top);
+    pixel.x = (Sint16) (overlay->x + overlay->w - 2);
+    fill_rect_rgb565(screen, &pixel, aa_top);
+    pixel.y = (Sint16) (overlay->y + 1);
+    pixel.x = overlay->x;
+    fill_rect_rgb565(screen, &pixel, aa_side);
+    pixel.x = (Sint16) (overlay->x + overlay->w - 1);
+    fill_rect_rgb565(screen, &pixel, aa_side);
 }
 
 static void draw_progress(
@@ -9474,18 +9538,17 @@ static int picker_resume_badge_index_at(
 
 static void draw_loading_overlay(SDL_Surface *screen, const Fonts *fonts, const char *label, int phase)
 {
-    SDL_Rect panel = {88, 84, 136, 46};
-    SDL_Rect accent = {88, 84, 136, 2};
+    SDL_Rect panel = {88, 92, 136, 30};
+    SDL_Rect accent = {90, 93, 132, 1};
     char spinner[8];
     int dot_count = (phase % 3) + 1;
 
     memset(spinner, '.', (size_t) dot_count);
     spinner[dot_count] = '\0';
-    draw_glass_panel(screen, &panel, UI_COLOR_GUNMETAL, false);
-    cut_rect_corners(screen, &panel, UI_COLOR_BLACK);
+    draw_soft_glass_panel(screen, &panel, UI_COLOR_GUNMETAL, false);
     draw_vertical_gradient(screen, &accent, UI_COLOR_DORF_ORANGE, UI_COLOR_DORF_RED);
-    draw_ui_label(screen, fonts, panel.x + 12, panel.y + 12, label ? label : "Loading");
-    draw_ui_label(screen, fonts, panel.x + panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), panel.y + 12, spinner);
+    draw_ui_label(screen, fonts, panel.x + 12, panel.y + 10, label ? label : "Loading");
+    draw_ui_label(screen, fonts, panel.x + panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), panel.y + 10, spinner);
 }
 
 static void copy_fitted_text(nSDL_Font *font, const char *text, char *buffer, size_t buffer_size, int max_width)
@@ -10706,6 +10769,7 @@ static int prompt_resume_position(
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
 
         SDL_SoftStretch(movie->frame_surface, NULL, screen, &full_screen);
+        dim_rect_rgb565(screen, &full_screen, 112);
         fill_rect_rgb565(screen, &border, UI_RGB565(224, 210, 190));
         draw_glass_panel(screen, &panel, UI_RGB565(34, 28, 22), false);
         cut_rect_corners(screen, &panel, UI_RGB565(224, 210, 190));
