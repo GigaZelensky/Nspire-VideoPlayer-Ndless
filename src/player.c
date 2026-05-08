@@ -9777,7 +9777,7 @@ static void render_movie(
     present_screen(screen);
 }
 
-static int picker_row_index_at(size_t count, size_t selected, int y)
+static int picker_row_index_at(size_t count, size_t selected, int x, int y)
 {
     size_t start_index;
     size_t end_index;
@@ -9796,7 +9796,9 @@ static int picker_row_index_at(size_t count, size_t selected, int y)
         end_index = count;
     }
     for (index = start_index; index < end_index && row_y < SCREEN_H - 20; ++index) {
-        if (y >= row_y - 4 && y < row_y + 14) {
+        SDL_Rect row = {8, (Sint16) (row_y - 5), SCREEN_W - 24, 20};
+
+        if (rect_contains_point(&row, x, y)) {
             return (int) index;
         }
         row_y += 20;
@@ -10958,7 +10960,7 @@ static int pick_movie(
         bool pointer_click = pointer_update(&pointer);
         uint32_t now_ms = monotonic_clock_now_ms();
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
-        int hovered_index = pointer_hover_allowed ? picker_row_index_at(count, selected, pointer.y) : -1;
+        int hovered_index = pointer_hover_allowed ? picker_row_index_at(count, selected, pointer.x, pointer.y) : -1;
         int resume_hovered_index = pointer_hover_allowed
             ? picker_resume_badge_index_at(fonts, files, count, selected, pointer.x, pointer.y)
             : -1;
