@@ -35,9 +35,10 @@ The `.nvp` format used by the current player is:
 - scale modes: `FIT`, `FILL`, `STRETCH`, `1:1`
 - playback speed control from `0.25x` to `2.0x`
 - screen brightness control with `Up` / `Down` and an on-screen percentage overlay
+- theme color profiles: `DORFic`, `Blue`, and `Green`
 - picker UI for multiple `.nvp` / `.nvp.tns` files
 - picker filename metadata tooltips from bracketed tags
-- per-video resume history with saved playback and subtitle settings
+- resume history with saved playback, subtitle, and theme settings
 - debug log output and in-player memory/playback overlay
 
 ## Current Limits
@@ -57,6 +58,7 @@ Battery Life: ~9.5 hours of continuous H.264 playback at 100% brightness.
 - touchpad hover: after a short pause, show filename metadata tooltip when available
 - touchpad click: open highlighted movie
 - `Enter`: open movie
+- `C`: cycle theme color
 - `Esc`: exit
 
 ### Movie Filename Metadata
@@ -87,10 +89,12 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 - `F`: cycle subtitle font
 - `T`: cycle subtitle track
 - `M`: toggle memory / playback diagnostics overlay
+- `C`: cycle theme color
 - `D`: toggle verbose debug logging
 - `S`: save a BMP screenshot
 - `Catalog`: open / close the help overlay
 - `Esc`: close help, or leave the movie if help is not open
+- `On`: turn the display black; while black, `Esc` exits the app after saving history
 
 ### Resume Prompt
 
@@ -98,6 +102,7 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 - touchpad: move cursor
 - touchpad click: activate the highlighted button
 - `Enter`: confirm the selected button
+- `C`: cycle theme color
 - `Esc`: cancel and return
 
 ## Subtitle Fonts

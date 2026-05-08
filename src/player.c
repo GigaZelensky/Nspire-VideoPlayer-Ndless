@@ -119,6 +119,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define HISTORY_MAGIC_V2 "NDVH2"
 #define HISTORY_MAGIC_V3 "NDVH3"
 #define HISTORY_MAGIC_V4 "NDVH4"
+#define HISTORY_MAGIC_V5 "NDVH5"
 #define RESUME_MIN_MS 5000U
 #define RESUME_CLEAR_TAIL_MS 3000U
 #define STATUS_OVERLAY_MS 1200U
@@ -215,9 +216,17 @@ typedef struct {
     int8_t video_align_y;
 } HistoryEntry;
 
+typedef enum {
+    UI_THEME_DORFIC = 0,
+    UI_THEME_BLUE,
+    UI_THEME_GREEN,
+    UI_THEME_COUNT
+} UiThemeId;
+
 typedef struct {
     HistoryEntry entries[HISTORY_MAX_ENTRIES];
     size_t count;
+    UiThemeId theme_id;
 } HistoryStore;
 
 typedef struct {
@@ -283,6 +292,7 @@ typedef enum {
     PLAY_MOVIE_RESULT_ERROR = -1,
     PLAY_MOVIE_RESULT_EXIT = 0,
     PLAY_MOVIE_RESULT_AUTO_NEXT = 1,
+    PLAY_MOVIE_RESULT_APP_EXIT = 2,
 } PlayMovieResult;
 
 typedef struct {
@@ -7967,16 +7977,252 @@ static SDL_Rect progress_bar_rect(void)
 enum {
     UI_COLOR_BLACK = UI_RGB565(0, 0, 0),
     UI_COLOR_WHITE = UI_RGB565(255, 255, 255),
-    UI_COLOR_DORF_ORANGE = UI_RGB565(255, 115, 0),
-    UI_COLOR_DORF_RED = UI_RGB565(210, 50, 0),
-    UI_COLOR_DORF_AMBER = UI_RGB565(255, 176, 48),
-    UI_COLOR_CARBON = UI_RGB565(36, 36, 36),
-    UI_COLOR_GUNMETAL = UI_RGB565(44, 40, 36),
-    UI_COLOR_WARM_WHITE = UI_RGB565(255, 238, 210),
-    UI_COLOR_BG_TOP = UI_RGB565(24, 24, 24),
-    UI_COLOR_BG_BOTTOM = UI_RGB565(8, 8, 8),
     UI_CURSOR_KEY = UI_RGB565(255, 0, 255)
 };
+
+typedef struct {
+    const char *name;
+    Uint16 accent_hot;
+    Uint16 accent_mid;
+    Uint16 accent_deep;
+    Uint16 bg_top;
+    Uint16 bg_bottom;
+    Uint16 carbon;
+    Uint16 gunmetal;
+    Uint16 warm_white;
+    Uint16 shortcut_base;
+    Uint16 shortcut_glint;
+    Uint16 tooltip_base;
+    Uint16 resume_hover;
+    Uint16 row_selected;
+    Uint16 row_divider;
+    Uint16 footer_panel;
+    Uint16 footer_accent_top;
+    Uint16 scroll_track_top;
+    Uint16 scroll_track_bottom;
+    Uint16 scroll_thumb;
+    Uint16 help_key;
+    Uint16 help_key_cut;
+    Uint16 menu_border;
+    Uint16 menu_panel;
+    Uint16 modal_panel;
+    Uint16 modal_cut;
+    Uint16 modal_title_panel;
+    Uint16 progress_track_top;
+    Uint16 progress_track_bottom;
+    Uint16 progress_cap_top;
+    Uint16 progress_cap_bottom;
+    Uint16 progress_edge_top;
+    Uint16 progress_edge_bottom;
+    Uint16 buffer_top;
+    Uint16 buffer_bottom;
+    Uint16 buffer_separator;
+    Uint16 progress_fill_top;
+    Uint16 progress_fill_bottom;
+    Uint16 progress_fill_glow;
+    Uint16 progress_fill_cap;
+    Uint16 progress_overlay_base;
+    Uint16 preview_outer;
+    Uint16 surface_outer;
+    Uint16 cursor_pale;
+    Uint16 cursor_mid;
+    Uint16 cursor_deep;
+    Uint16 cursor_dark;
+    Uint16 cursor_shadow;
+} UiThemePalette;
+
+static const UiThemePalette g_ui_themes[UI_THEME_COUNT] = {
+    {
+        "DORFic",
+        UI_RGB565(255, 176, 48),
+        UI_RGB565(255, 115, 0),
+        UI_RGB565(210, 50, 0),
+        UI_RGB565(24, 24, 24),
+        UI_RGB565(8, 8, 8),
+        UI_RGB565(36, 36, 36),
+        UI_RGB565(44, 40, 36),
+        UI_RGB565(255, 238, 210),
+        UI_RGB565(48, 34, 22),
+        UI_RGB565(224, 164, 84),
+        UI_RGB565(44, 34, 24),
+        UI_RGB565(112, 52, 0),
+        UI_RGB565(80, 40, 0),
+        UI_RGB565(36, 30, 24),
+        UI_RGB565(28, 24, 20),
+        UI_RGB565(224, 164, 84),
+        UI_RGB565(18, 16, 14),
+        UI_RGB565(48, 40, 32),
+        UI_RGB565(220, 198, 166),
+        UI_RGB565(54, 42, 28),
+        UI_RGB565(18, 16, 14),
+        UI_RGB565(224, 210, 190),
+        UI_RGB565(22, 20, 18),
+        UI_RGB565(34, 28, 22),
+        UI_RGB565(34, 28, 22),
+        UI_RGB565(30, 26, 22),
+        UI_RGB565(48, 44, 40),
+        UI_RGB565(16, 14, 12),
+        UI_RGB565(68, 58, 46),
+        UI_RGB565(28, 20, 14),
+        UI_RGB565(86, 74, 58),
+        UI_RGB565(84, 66, 42),
+        UI_RGB565(140, 80, 20),
+        UI_RGB565(70, 40, 10),
+        UI_RGB565(30, 15, 5),
+        UI_RGB565(255, 198, 62),
+        UI_RGB565(210, 50, 0),
+        UI_RGB565(255, 138, 20),
+        UI_RGB565(255, 220, 92),
+        UI_RGB565(32, 32, 32),
+        UI_RGB565(22, 20, 18),
+        UI_RGB565(24, 22, 20),
+        UI_RGB565(255, 226, 170),
+        UI_RGB565(255, 176, 48),
+        UI_RGB565(226, 96, 0),
+        UI_RGB565(112, 48, 0),
+        UI_RGB565(24, 20, 16)
+    },
+    {
+        "Blue",
+        UI_RGB565(184, 246, 255),
+        UI_RGB565(72, 172, 232),
+        UI_RGB565(16, 86, 168),
+        UI_RGB565(20, 24, 28),
+        UI_RGB565(6, 8, 10),
+        UI_RGB565(34, 38, 40),
+        UI_RGB565(42, 46, 48),
+        UI_RGB565(232, 248, 255),
+        UI_RGB565(32, 42, 46),
+        UI_RGB565(156, 226, 245),
+        UI_RGB565(34, 38, 40),
+        UI_RGB565(18, 82, 132),
+        UI_RGB565(28, 88, 130),
+        UI_RGB565(34, 34, 34),
+        UI_RGB565(28, 30, 32),
+        UI_RGB565(156, 226, 245),
+        UI_RGB565(16, 18, 20),
+        UI_RGB565(42, 46, 48),
+        UI_RGB565(210, 228, 236),
+        UI_RGB565(44, 50, 52),
+        UI_RGB565(16, 18, 20),
+        UI_RGB565(210, 226, 232),
+        UI_RGB565(22, 22, 24),
+        UI_RGB565(30, 30, 32),
+        UI_RGB565(30, 30, 32),
+        UI_RGB565(26, 28, 30),
+        UI_RGB565(46, 48, 50),
+        UI_RGB565(14, 16, 18),
+        UI_RGB565(60, 64, 66),
+        UI_RGB565(24, 26, 28),
+        UI_RGB565(88, 108, 118),
+        UI_RGB565(54, 78, 92),
+        UI_RGB565(88, 118, 132),
+        UI_RGB565(44, 58, 70),
+        UI_RGB565(18, 26, 34),
+        UI_RGB565(158, 245, 255),
+        UI_RGB565(42, 148, 218),
+        UI_RGB565(112, 214, 252),
+        UI_RGB565(210, 244, 255),
+        UI_RGB565(32, 32, 34),
+        UI_RGB565(20, 22, 24),
+        UI_RGB565(22, 24, 26),
+        UI_RGB565(198, 238, 255),
+        UI_RGB565(132, 212, 255),
+        UI_RGB565(78, 174, 230),
+        UI_RGB565(42, 112, 176),
+        UI_RGB565(18, 28, 38)
+    },
+    {
+        "Green",
+        UI_RGB565(210, 255, 150),
+        UI_RGB565(112, 210, 92),
+        UI_RGB565(38, 132, 54),
+        UI_RGB565(20, 25, 20),
+        UI_RGB565(6, 9, 6),
+        UI_RGB565(34, 38, 34),
+        UI_RGB565(42, 46, 40),
+        UI_RGB565(236, 255, 220),
+        UI_RGB565(36, 48, 34),
+        UI_RGB565(186, 242, 126),
+        UI_RGB565(34, 40, 34),
+        UI_RGB565(44, 104, 42),
+        UI_RGB565(52, 112, 48),
+        UI_RGB565(34, 36, 32),
+        UI_RGB565(28, 32, 26),
+        UI_RGB565(186, 242, 126),
+        UI_RGB565(14, 18, 14),
+        UI_RGB565(42, 48, 38),
+        UI_RGB565(214, 232, 198),
+        UI_RGB565(46, 54, 42),
+        UI_RGB565(16, 20, 16),
+        UI_RGB565(214, 232, 198),
+        UI_RGB565(22, 24, 20),
+        UI_RGB565(30, 34, 28),
+        UI_RGB565(30, 34, 28),
+        UI_RGB565(26, 30, 24),
+        UI_RGB565(46, 50, 44),
+        UI_RGB565(14, 18, 14),
+        UI_RGB565(60, 68, 54),
+        UI_RGB565(24, 28, 22),
+        UI_RGB565(90, 112, 74),
+        UI_RGB565(60, 86, 52),
+        UI_RGB565(92, 126, 76),
+        UI_RGB565(46, 64, 38),
+        UI_RGB565(18, 26, 14),
+        UI_RGB565(206, 255, 118),
+        UI_RGB565(66, 178, 70),
+        UI_RGB565(134, 230, 80),
+        UI_RGB565(230, 255, 156),
+        UI_RGB565(32, 34, 30),
+        UI_RGB565(20, 22, 18),
+        UI_RGB565(24, 26, 22),
+        UI_RGB565(218, 255, 170),
+        UI_RGB565(154, 230, 92),
+        UI_RGB565(80, 176, 58),
+        UI_RGB565(38, 104, 38),
+        UI_RGB565(18, 30, 18)
+    }
+};
+
+static UiThemeId g_ui_theme_id = UI_THEME_DORFIC;
+
+static UiThemeId ui_theme_clamp(int theme_id)
+{
+    if (theme_id < 0 || theme_id >= UI_THEME_COUNT) {
+        return UI_THEME_DORFIC;
+    }
+    return (UiThemeId) theme_id;
+}
+
+static const UiThemePalette *ui_theme(void)
+{
+    return &g_ui_themes[g_ui_theme_id];
+}
+
+static const char *ui_theme_name(UiThemeId theme_id)
+{
+    return g_ui_themes[ui_theme_clamp((int) theme_id)].name;
+}
+
+static void ui_set_theme(UiThemeId theme_id)
+{
+    g_ui_theme_id = ui_theme_clamp((int) theme_id);
+}
+
+static UiThemeId ui_cycle_theme(void)
+{
+    g_ui_theme_id = (UiThemeId) ((g_ui_theme_id + 1) % UI_THEME_COUNT);
+    return g_ui_theme_id;
+}
+
+#define UI_COLOR_ACCENT (ui_theme()->accent_mid)
+#define UI_COLOR_ACCENT_DEEP (ui_theme()->accent_deep)
+#define UI_COLOR_ACCENT_HOT (ui_theme()->accent_hot)
+#define UI_COLOR_CARBON (ui_theme()->carbon)
+#define UI_COLOR_GUNMETAL (ui_theme()->gunmetal)
+#define UI_COLOR_WARM_WHITE (ui_theme()->warm_white)
+#define UI_COLOR_BG_TOP (ui_theme()->bg_top)
+#define UI_COLOR_BG_BOTTOM (ui_theme()->bg_bottom)
 
 static bool surface_is_rgb565(const SDL_Surface *surface)
 {
@@ -8246,7 +8492,7 @@ static void draw_glass_panel(SDL_Surface *screen, const SDL_Rect *rect, Uint16 b
     fill_rect_rgb565(screen, &line, blend_rgb565(base_color, UI_COLOR_BLACK, 170));
 
     if (is_selected) {
-        draw_rect_outline_rgb565(screen, rect, UI_COLOR_DORF_ORANGE);
+        draw_rect_outline_rgb565(screen, rect, UI_COLOR_ACCENT);
     } else {
         draw_rect_outline_rgb565(screen, rect, blend_rgb565(base_color, UI_COLOR_BLACK, 120));
     }
@@ -8305,7 +8551,7 @@ static void draw_soft_glass_panel(SDL_Surface *screen, const SDL_Rect *rect, Uin
         );
     }
 
-    outline = is_selected ? UI_COLOR_DORF_ORANGE : blend_rgb565(base_color, UI_COLOR_BLACK, 124);
+    outline = is_selected ? UI_COLOR_ACCENT : blend_rgb565(base_color, UI_COLOR_BLACK, 124);
     line.x = (Sint16) (rect->x + 2);
     line.y = rect->y;
     line.w = (Uint16) (rect->w - 4);
@@ -8360,25 +8606,37 @@ static void draw_overlay_backdrop_dim(SDL_Surface *screen)
 
 static void draw_cursor(SDL_Surface *screen, int x, int y)
 {
-    static const Uint16 cursor_pixels[12 * 12] = {
-        UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
-        UI_COLOR_WHITE, UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
-        UI_COLOR_WHITE, UI_RGB565(255, 226, 170), UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
-        UI_COLOR_WHITE, UI_RGB565(255, 226, 170), UI_RGB565(255, 226, 170), UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
-        UI_COLOR_WHITE, UI_RGB565(255, 226, 170), UI_RGB565(255, 176, 48), UI_RGB565(255, 226, 170), UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
-        UI_COLOR_WHITE, UI_RGB565(255, 226, 170), UI_RGB565(255, 176, 48), UI_RGB565(255, 176, 48), UI_RGB565(255, 226, 170), UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
-        UI_COLOR_WHITE, UI_RGB565(255, 226, 170), UI_RGB565(255, 176, 48), UI_RGB565(226, 96, 0), UI_RGB565(226, 96, 0), UI_RGB565(255, 226, 170), UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
-        UI_COLOR_WHITE, UI_RGB565(255, 226, 170), UI_RGB565(255, 176, 48), UI_RGB565(226, 96, 0), UI_RGB565(112, 48, 0), UI_RGB565(112, 48, 0), UI_RGB565(255, 226, 170), UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
-        UI_COLOR_WHITE, UI_RGB565(255, 226, 170), UI_RGB565(255, 176, 48), UI_RGB565(226, 96, 0), UI_RGB565(112, 48, 0), UI_RGB565(24, 20, 16), UI_RGB565(24, 20, 16), UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
-        UI_CURSOR_KEY, UI_RGB565(24, 22, 20), UI_CURSOR_KEY, UI_CURSOR_KEY, UI_RGB565(226, 96, 0), UI_RGB565(24, 20, 16), UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
-        UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_RGB565(24, 22, 20), UI_RGB565(24, 20, 16), UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
-        UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_RGB565(24, 22, 20), UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY
-    };
+    static Uint16 cursor_pixels[12 * 12];
     static SDL_Surface *cursor_surface = NULL;
+    static UiThemeId cursor_theme = UI_THEME_COUNT;
     SDL_Rect dst = {(Sint16) x, (Sint16) y, 12, 12};
 
     if (!screen) {
         return;
+    }
+    if (cursor_theme != g_ui_theme_id) {
+        const Uint16 pale = ui_theme()->cursor_pale;
+        const Uint16 mid = ui_theme()->cursor_mid;
+        const Uint16 deep = ui_theme()->cursor_deep;
+        const Uint16 dark = ui_theme()->cursor_dark;
+        const Uint16 outer = ui_theme()->surface_outer;
+        const Uint16 shadow = ui_theme()->cursor_shadow;
+        const Uint16 themed_pixels[12 * 12] = {
+            UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+            UI_COLOR_WHITE, UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+            UI_COLOR_WHITE, pale, UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+            UI_COLOR_WHITE, pale, pale, UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+            UI_COLOR_WHITE, pale, mid, pale, UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+            UI_COLOR_WHITE, pale, mid, mid, pale, UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+            UI_COLOR_WHITE, pale, mid, deep, deep, pale, UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+            UI_COLOR_WHITE, pale, mid, deep, dark, dark, pale, UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+            UI_COLOR_WHITE, pale, mid, deep, dark, shadow, shadow, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+            UI_CURSOR_KEY, outer, UI_CURSOR_KEY, UI_CURSOR_KEY, deep, shadow, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+            UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, outer, shadow, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+            UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, outer, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY
+        };
+        memcpy(cursor_pixels, themed_pixels, sizeof(cursor_pixels));
+        cursor_theme = g_ui_theme_id;
     }
     if (!cursor_surface) {
         cursor_surface = SDL_CreateRGBSurfaceFrom(
@@ -8569,9 +8827,9 @@ static void draw_header_shortcut_badge(
     dot.w = 2;
     dot.h = 2;
 
-    draw_soft_glass_panel(screen, &badge, UI_RGB565(48, 34, 22), false);
-    fill_rect_rgb565(screen, &glint, UI_RGB565(224, 164, 84));
-    fill_rect_rgb565(screen, &dot, UI_COLOR_DORF_AMBER);
+    draw_soft_glass_panel(screen, &badge, ui_theme()->shortcut_base, false);
+    fill_rect_rgb565(screen, &glint, ui_theme()->shortcut_glint);
+    fill_rect_rgb565(screen, &dot, UI_COLOR_ACCENT_HOT);
     draw_ui_label(screen, fonts, badge.x + 6, badge.y + 3, key);
     draw_ui_label(screen, fonts, dot.x + 5, badge.y + 3, action);
 }
@@ -8602,7 +8860,7 @@ static void draw_header_shortcuts(SDL_Surface *screen, const Fonts *fonts, int y
         widths[index] = header_shortcut_badge_width(fonts, keys[index], actions[index]);
         total_w += widths[index];
     }
-    total_w += gap * 2;
+    total_w += gap * ((int) (sizeof(keys) / sizeof(keys[0])) - 1);
     x = (SCREEN_W - total_w) / 2;
     for (index = 0; index < sizeof(keys) / sizeof(keys[0]); ++index) {
         draw_header_shortcut_badge(screen, fonts, x, y, keys[index], actions[index]);
@@ -8633,7 +8891,7 @@ static void draw_surface_panel(SDL_Surface *screen, SDL_Surface *surface, int x,
     dst.w = (Uint16) surface->w;
     dst.h = (Uint16) surface->h;
 
-    fill_rect_rgb565(screen, &border, UI_RGB565(24, 22, 20));
+    fill_rect_rgb565(screen, &border, ui_theme()->surface_outer);
     fill_rect_rgb565(screen, &inner, UI_COLOR_WARM_WHITE);
     SDL_BlitSurface(surface, NULL, screen, &dst);
 }
@@ -8663,7 +8921,7 @@ static void draw_seek_preview_panel(SDL_Surface *screen, SDL_Surface *surface, i
     dst.w = (Uint16) surface->w;
     dst.h = (Uint16) surface->h;
 
-    fill_rect_rgb565(screen, &outer, UI_RGB565(22, 20, 18));
+    fill_rect_rgb565(screen, &outer, ui_theme()->preview_outer);
     fill_rect_rgb565(screen, &inner, UI_COLOR_WARM_WHITE);
     SDL_BlitSurface(surface, NULL, screen, &dst);
 
@@ -8672,19 +8930,19 @@ static void draw_seek_preview_panel(SDL_Surface *screen, SDL_Surface *surface, i
     triangle.y = (Sint16) (outer.y + outer.h - 1);
     triangle.w = 7;
     triangle.h = 1;
-    fill_rect_rgb565(screen, &triangle, UI_RGB565(22, 20, 18));
+    fill_rect_rgb565(screen, &triangle, ui_theme()->preview_outer);
     triangle.x = (Sint16) (center_x - 2);
     triangle.y = (Sint16) (outer.y + outer.h);
     triangle.w = 5;
-    fill_rect_rgb565(screen, &triangle, UI_RGB565(22, 20, 18));
+    fill_rect_rgb565(screen, &triangle, ui_theme()->preview_outer);
     triangle.x = (Sint16) (center_x - 1);
     triangle.y = (Sint16) (outer.y + outer.h + 1);
     triangle.w = 3;
-    fill_rect_rgb565(screen, &triangle, UI_RGB565(22, 20, 18));
+    fill_rect_rgb565(screen, &triangle, ui_theme()->preview_outer);
     triangle.x = (Sint16) center_x;
     triangle.y = (Sint16) (outer.y + outer.h + 2);
     triangle.w = 1;
-    fill_rect_rgb565(screen, &triangle, UI_RGB565(22, 20, 18));
+    fill_rect_rgb565(screen, &triangle, ui_theme()->preview_outer);
     triangle.x = (Sint16) (center_x - 2);
     triangle.y = (Sint16) (outer.y + outer.h - 1);
     triangle.w = 5;
@@ -8901,8 +9159,8 @@ static void draw_help_row(
 {
     SDL_Rect key = {(Sint16) (shortcut_x - 4), (Sint16) (y - 1), (Uint16) (shortcut_w + 8), 9};
 
-    draw_glass_panel(screen, &key, UI_RGB565(54, 42, 28), false);
-    cut_rect_corners(screen, &key, UI_RGB565(18, 16, 14));
+    draw_glass_panel(screen, &key, ui_theme()->help_key, false);
+    cut_rect_corners(screen, &key, ui_theme()->help_key_cut);
     draw_ui_label(screen, fonts, shortcut_x, y, shortcut);
     draw_ui_label(screen, fonts, description_x, y, description);
 }
@@ -8935,6 +9193,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
         {"F", "Cycle subtitle font"},
         {"T", "Switch subtitle track"},
         {"M", "Memory overlay"},
+        {"C", "Theme color"},
         {"D", "Toggle debug logging"},
         {"S", "Save BMP screenshot"},
         {"TOUCHPAD", "Move cursor / show UI"},
@@ -8948,10 +9207,10 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     size_t index;
 
     draw_overlay_backdrop_dim(screen);
-    fill_rect_rgb565(screen, &border, UI_RGB565(224, 210, 190));
-    draw_glass_panel(screen, &panel, UI_RGB565(22, 20, 18), false);
+    fill_rect_rgb565(screen, &border, ui_theme()->menu_border);
+    draw_glass_panel(screen, &panel, ui_theme()->menu_panel, false);
     draw_glass_panel(screen, &header, UI_COLOR_GUNMETAL, false);
-    draw_vertical_gradient(screen, &accent, UI_COLOR_DORF_ORANGE, UI_COLOR_DORF_RED);
+    draw_vertical_gradient(screen, &accent, UI_COLOR_ACCENT, UI_COLOR_ACCENT_DEEP);
 
     draw_ui_label(screen, fonts, panel.x + 10, panel.y + 6, title_text);
     close_badge_w = header_shortcut_badge_width(fonts, "CAT", "CLOSE");
@@ -9101,16 +9360,16 @@ static void draw_progress_track(SDL_Surface *screen, const SDL_Rect *bar_back, U
     bottom_edge.h = 1;
 
     fill_rect_rgb565(screen, &outer, surrounding_color);
-    draw_vertical_gradient(screen, &body, UI_RGB565(48, 44, 40), UI_RGB565(16, 14, 12));
-    draw_vertical_gradient(screen, &left_cap, UI_RGB565(68, 58, 46), UI_RGB565(28, 20, 14));
-    draw_vertical_gradient(screen, &right_cap, UI_RGB565(68, 58, 46), UI_RGB565(28, 20, 14));
-    fill_rect_rgb565(screen, &top_edge, UI_RGB565(86, 74, 58));
-    fill_rect_rgb565(screen, &bottom_edge, UI_RGB565(84, 66, 42));
+    draw_vertical_gradient(screen, &body, ui_theme()->progress_track_top, ui_theme()->progress_track_bottom);
+    draw_vertical_gradient(screen, &left_cap, ui_theme()->progress_cap_top, ui_theme()->progress_cap_bottom);
+    draw_vertical_gradient(screen, &right_cap, ui_theme()->progress_cap_top, ui_theme()->progress_cap_bottom);
+    fill_rect_rgb565(screen, &top_edge, ui_theme()->progress_edge_top);
+    fill_rect_rgb565(screen, &bottom_edge, ui_theme()->progress_edge_bottom);
 }
 
 static void draw_progress_overlay(SDL_Surface *screen, const SDL_Rect *overlay)
 {
-    Uint16 base = UI_RGB565(32, 32, 32);
+    Uint16 base = ui_theme()->progress_overlay_base;
     Uint16 body_top = blend_rgb565(base, UI_COLOR_WHITE, 28);
     Uint16 body_bottom = blend_rgb565(base, UI_COLOR_BLACK, 92);
     Uint16 gloss_top = blend_rgb565(base, UI_COLOR_WHITE, 104);
@@ -9218,7 +9477,7 @@ static void draw_progress(
 
     draw_progress_overlay(screen, &overlay);
 
-    draw_progress_track(screen, &bar_back, UI_RGB565(32, 32, 32));
+    draw_progress_track(screen, &bar_back, ui_theme()->progress_overlay_base);
 
     if (movie->header.frame_count > 0 && movie->chunk_index) {
         int chunks_to_draw[UI_BUFFER_CHUNK_CACHE_COUNT];
@@ -9250,8 +9509,8 @@ static void draw_progress(
 
             if (prefetch_rect.w > 0) {
                 SDL_Rect sep = {prefetch_rect.x + prefetch_rect.w - 1, prefetch_rect.y, 1, prefetch_rect.h};
-                draw_vertical_gradient(screen, &prefetch_rect, UI_RGB565(140, 80, 20), UI_RGB565(70, 40, 10));
-                fill_rect_rgb565(screen, &sep, UI_RGB565(30, 15, 5));
+                draw_vertical_gradient(screen, &prefetch_rect, ui_theme()->buffer_top, ui_theme()->buffer_bottom);
+                fill_rect_rgb565(screen, &sep, ui_theme()->buffer_separator);
             }
         }
     }
@@ -9262,9 +9521,9 @@ static void draw_progress(
     if (bar_front.w > 0) {
         SDL_Rect glow = {bar_front.x, (Sint16) (bar_front.y + 1), bar_front.w, 1};
         SDL_Rect cap = {(Sint16) (bar_front.x + bar_front.w - 1), bar_front.y, 1, bar_front.h};
-        draw_vertical_gradient(screen, &bar_front, UI_RGB565(255, 198, 62), UI_COLOR_DORF_RED);
-        fill_rect_rgb565(screen, &glow, UI_RGB565(255, 138, 20));
-        fill_rect_rgb565(screen, &cap, UI_RGB565(255, 220, 92));
+        draw_vertical_gradient(screen, &bar_front, ui_theme()->progress_fill_top, ui_theme()->progress_fill_bottom);
+        fill_rect_rgb565(screen, &glow, ui_theme()->progress_fill_glow);
+        fill_rect_rgb565(screen, &cap, ui_theme()->progress_fill_cap);
     }
     if (pointer && pointer->visible) {
         int marker_x = clamp_int(pointer->x, bar_back.x, bar_back.x + bar_back.w - 1);
@@ -9546,7 +9805,7 @@ static void draw_loading_overlay(SDL_Surface *screen, const Fonts *fonts, const 
     memset(spinner, '.', (size_t) dot_count);
     spinner[dot_count] = '\0';
     draw_soft_glass_panel(screen, &panel, UI_COLOR_GUNMETAL, false);
-    draw_vertical_gradient(screen, &accent, UI_COLOR_DORF_ORANGE, UI_COLOR_DORF_RED);
+    draw_vertical_gradient(screen, &accent, UI_COLOR_ACCENT, UI_COLOR_ACCENT_DEEP);
     draw_ui_label(screen, fonts, panel.x + 12, panel.y + 10, label ? label : "Loading");
     draw_ui_label(screen, fonts, panel.x + panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), panel.y + 10, spinner);
 }
@@ -9649,15 +9908,15 @@ static void draw_movie_hover_tooltip(SDL_Surface *screen, const Fonts *fonts, co
     accent.w = panel.w;
     accent.h = 2;
 
-    draw_soft_glass_panel(screen, &panel, UI_RGB565(44, 34, 24), false);
-    draw_vertical_gradient(screen, &accent, UI_COLOR_DORF_AMBER, UI_COLOR_DORF_RED);
+    draw_soft_glass_panel(screen, &panel, ui_theme()->tooltip_base, false);
+    draw_vertical_gradient(screen, &accent, UI_COLOR_ACCENT_HOT, UI_COLOR_ACCENT_DEEP);
     nSDL_DrawString(screen, fonts->white, x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y, "%s", title);
     nSDL_DrawString(screen, fonts->white, x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y + TOOLTIP_LINE_GAP, "%s", detail);
 }
 
 static void draw_resume_badge(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *badge, bool hovered)
 {
-    Uint16 base = hovered ? UI_RGB565(112, 52, 0) : UI_COLOR_GUNMETAL;
+    Uint16 base = hovered ? ui_theme()->resume_hover : UI_COLOR_GUNMETAL;
     SDL_Rect glint;
 
     if (!screen || !fonts || !badge) {
@@ -9669,7 +9928,7 @@ static void draw_resume_badge(SDL_Surface *screen, const Fonts *fonts, const SDL
         glint.y = (Sint16) (badge->y + 2);
         glint.w = (Uint16) (badge->w - 4);
         glint.h = 1;
-        fill_rect_rgb565(screen, &glint, UI_COLOR_DORF_AMBER);
+        fill_rect_rgb565(screen, &glint, UI_COLOR_ACCENT_HOT);
     }
     draw_ui_label(screen, fonts, badge->x + 6, badge->y + 4, "RESUME");
 }
@@ -9731,8 +9990,8 @@ static void draw_resume_hover_tooltip(SDL_Surface *screen, const Fonts *fonts, c
     accent.w = panel.w;
     accent.h = 2;
 
-    draw_soft_glass_panel(screen, &panel, UI_RGB565(44, 34, 24), false);
-    draw_vertical_gradient(screen, &accent, UI_COLOR_DORF_AMBER, UI_COLOR_DORF_RED);
+    draw_soft_glass_panel(screen, &panel, ui_theme()->tooltip_base, false);
+    draw_vertical_gradient(screen, &accent, UI_COLOR_ACCENT_HOT, UI_COLOR_ACCENT_DEEP);
     nSDL_DrawString(screen, fonts->white, x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y, "%s", title);
     nSDL_DrawString(screen, fonts->white, x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y + TOOLTIP_LINE_GAP, "%s", detail);
 }
@@ -9761,7 +10020,7 @@ static void render_picker(
 
     draw_vertical_gradient(screen, &background, UI_COLOR_BG_TOP, UI_COLOR_BG_BOTTOM);
     draw_glass_panel(screen, &header, UI_COLOR_GUNMETAL, false);
-    fill_rect_rgb565(screen, &header_top, UI_COLOR_DORF_AMBER);
+    fill_rect_rgb565(screen, &header_top, UI_COLOR_ACCENT_HOT);
     draw_ui_label(
         screen,
         fonts,
@@ -9775,9 +10034,9 @@ static void render_picker(
         SDL_Rect footer_accent = {8, SCREEN_H - 21, SCREEN_W - 16, 1};
 
         draw_ui_label(screen, fonts, 10, 54, "No .nvp or .nvp.tns files found");
-        draw_glass_panel(screen, &footer_panel, UI_RGB565(28, 24, 20), false);
+        draw_glass_panel(screen, &footer_panel, ui_theme()->footer_panel, false);
         cut_rect_corners(screen, &footer_panel, UI_COLOR_BLACK);
-        draw_vertical_gradient(screen, &footer_accent, UI_RGB565(224, 164, 84), UI_COLOR_DORF_RED);
+        draw_vertical_gradient(screen, &footer_accent, ui_theme()->footer_accent_top, UI_COLOR_ACCENT_DEEP);
         draw_ui_label(screen, fonts, 12, SCREEN_H - 17, credit);
         if (pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
@@ -9804,10 +10063,10 @@ static void render_picker(
         int text_max_width = SCREEN_W - text_x - 28 - reserved_right;
         char fitted_title[128];
         if (index == selected) {
-            draw_glass_panel(screen, &row, UI_RGB565(80, 40, 0), true);
+            draw_glass_panel(screen, &row, ui_theme()->row_selected, true);
             cut_rect_corners(screen, &row, picker_background_color_at_y(row.y));
         } else {
-            fill_rect_rgb565(screen, &divider, UI_RGB565(36, 30, 24));
+            fill_rect_rgb565(screen, &divider, ui_theme()->row_divider);
         }
         copy_fitted_text(fonts->white, files[index].name, fitted_title, sizeof(fitted_title), text_max_width);
         draw_ui_label(screen, fonts, text_x, y, fitted_title);
@@ -9831,8 +10090,8 @@ static void render_picker(
         thumb.y = (Sint16) thumb_y;
         thumb.w = 5;
         thumb.h = (Uint16) thumb_h;
-        draw_vertical_gradient(screen, &track, UI_RGB565(18, 16, 14), UI_RGB565(48, 40, 32));
-        draw_glass_panel(screen, &thumb, UI_RGB565(220, 198, 166), false);
+        draw_vertical_gradient(screen, &track, ui_theme()->scroll_track_top, ui_theme()->scroll_track_bottom);
+        draw_glass_panel(screen, &thumb, ui_theme()->scroll_thumb, false);
         cut_rect_corners(screen, &thumb, picker_background_color_at_y(thumb.y));
     }
     {
@@ -9840,9 +10099,9 @@ static void render_picker(
         SDL_Rect footer_panel = {6, SCREEN_H - 22, SCREEN_W - 12, 18};
         SDL_Rect footer_accent = {8, SCREEN_H - 21, SCREEN_W - 16, 1};
 
-        draw_glass_panel(screen, &footer_panel, UI_RGB565(28, 24, 20), false);
+        draw_glass_panel(screen, &footer_panel, ui_theme()->footer_panel, false);
         cut_rect_corners(screen, &footer_panel, UI_COLOR_BLACK);
-        draw_vertical_gradient(screen, &footer_accent, UI_RGB565(224, 164, 84), UI_COLOR_DORF_RED);
+        draw_vertical_gradient(screen, &footer_accent, ui_theme()->footer_accent_top, UI_COLOR_ACCENT_DEEP);
         draw_ui_label(screen, fonts, 12, SCREEN_H - 17, credit);
         snprintf(footer, sizeof(footer), "%lu %s", (unsigned long) count, count == 1 ? "file" : "files");
         draw_ui_label(screen, fonts, SCREEN_W - 12 - nSDL_GetStringWidth(fonts->white, footer), SCREEN_H - 17, footer);
@@ -9954,10 +10213,11 @@ static void apply_history_entry_settings(
 static bool load_history_store_from_path(const char *history_path, HistoryStore *history)
 {
     FILE *file;
-    char line[MAX_PATH_LEN + 96];
+    char line[MAX_PATH_LEN + 128];
     int version = 1;
 
     memset(history, 0, sizeof(*history));
+    history->theme_id = UI_THEME_DORFIC;
     file = fopen(history_path, "rb");
     if (!file) {
         return true;
@@ -9966,7 +10226,9 @@ static bool load_history_store_from_path(const char *history_path, HistoryStore 
         fclose(file);
         return false;
     }
-    if (strncmp(line, HISTORY_MAGIC_V4, 5) == 0) {
+    if (strncmp(line, HISTORY_MAGIC_V5, 5) == 0) {
+        version = 5;
+    } else if (strncmp(line, HISTORY_MAGIC_V4, 5) == 0) {
         version = 4;
     } else if (strncmp(line, HISTORY_MAGIC_V3, 5) == 0) {
         version = 3;
@@ -9981,6 +10243,10 @@ static bool load_history_store_from_path(const char *history_path, HistoryStore 
         HistoryEntry entry;
 
         history_entry_init_defaults(&entry);
+        if (version >= 5 && strncmp(line, "@theme\t", 7) == 0) {
+            history->theme_id = ui_theme_clamp((int) strtol(line + 7, NULL, 10));
+            continue;
+        }
         if (version >= 2) {
             char *fields[12];
             size_t expected_field_count = version >= 4 ? 12U : (version >= 3 ? 10U : 9U);
@@ -10066,18 +10332,17 @@ static bool load_history_store(const char *movie_path, HistoryStore *history)
     return load_history_store_from_path(history_path, history);
 }
 
-static bool save_history_store(const char *movie_path, const HistoryStore *history)
+static bool save_history_store_to_path(const char *history_path, const HistoryStore *history)
 {
-    char history_path[MAX_PATH_LEN];
     FILE *file;
     size_t index;
 
-    history_path_for_movie(movie_path, history_path, sizeof(history_path));
     file = fopen(history_path, "wb");
     if (!file) {
         return false;
     }
-    fputs(HISTORY_MAGIC_V4 "\n", file);
+    fputs(HISTORY_MAGIC_V5 "\n", file);
+    fprintf(file, "@theme\t%u\n", (unsigned) ui_theme_clamp((int) history->theme_id));
     for (index = 0; index < history->count && index < HISTORY_MAX_ENTRIES; ++index) {
         fprintf(
             file,
@@ -10098,6 +10363,70 @@ static bool save_history_store(const char *movie_path, const HistoryStore *histo
     }
     fclose(file);
     return true;
+}
+
+static bool save_history_store(const char *movie_path, const HistoryStore *history)
+{
+    char history_path[MAX_PATH_LEN];
+
+    history_path_for_movie(movie_path, history_path, sizeof(history_path));
+    return save_history_store_to_path(history_path, history);
+}
+
+static void ui_load_theme_for_directory(const char *directory)
+{
+    char history_path[MAX_PATH_LEN];
+    HistoryStore history;
+
+    history_path_for_directory(directory, history_path, sizeof(history_path));
+    if (load_history_store_from_path(history_path, &history)) {
+        ui_set_theme(history.theme_id);
+        free_history_store(&history);
+    }
+}
+
+static void ui_load_theme_for_movie(const char *movie_path)
+{
+    char directory[MAX_PATH_LEN];
+
+    if (movie_path && movie_path[0] != '\0') {
+        snprintf(directory, sizeof(directory), "%s", movie_path);
+        strip_filename(directory);
+    } else {
+        snprintf(directory, sizeof(directory), ".");
+    }
+    ui_load_theme_for_directory(directory);
+}
+
+static void ui_save_theme_for_directory(const char *directory)
+{
+    char history_path[MAX_PATH_LEN];
+    HistoryStore history;
+
+    history_path_for_directory(directory, history_path, sizeof(history_path));
+    memset(&history, 0, sizeof(history));
+    history.theme_id = g_ui_theme_id;
+    if (load_history_store_from_path(history_path, &history)) {
+        history.theme_id = g_ui_theme_id;
+        save_history_store_to_path(history_path, &history);
+        free_history_store(&history);
+        return;
+    }
+    history.theme_id = g_ui_theme_id;
+    save_history_store_to_path(history_path, &history);
+}
+
+static void ui_save_theme_for_movie(const char *movie_path)
+{
+    char directory[MAX_PATH_LEN];
+
+    if (movie_path && movie_path[0] != '\0') {
+        snprintf(directory, sizeof(directory), "%s", movie_path);
+        strip_filename(directory);
+    } else {
+        snprintf(directory, sizeof(directory), ".");
+    }
+    ui_save_theme_for_directory(directory);
 }
 
 static int history_find_entry_index(const HistoryStore *history, const char *movie_path)
@@ -10222,6 +10551,7 @@ static void save_history_position_for_movie(
         has_resume = true;
         frame = movie->current_frame;
     }
+    history.theme_id = g_ui_theme_id;
     history_upsert_entry(
         &history,
         movie_path,
@@ -10542,6 +10872,7 @@ static int pick_movie(
     bool prev_down = false;
     bool prev_enter = false;
     bool prev_esc = false;
+    bool prev_c = false;
     PointerState pointer;
     PointerHoverGuard hover_guard;
     PickerTooltipHoverState tooltip_hover;
@@ -10570,6 +10901,10 @@ static int pick_movie(
 
         if (hovered_index >= 0) {
             selected = (size_t) hovered_index;
+        }
+        if (key_pressed_edge(KEY_NSPIRE_C, &prev_c)) {
+            ui_cycle_theme();
+            ui_save_theme_for_directory(directory);
         }
         render_picker(screen, fonts, files, count, selected, tooltip_index, resume_hovered_index, &pointer, NULL, 0);
         if (key_pressed_edge(KEY_NSPIRE_UP, &prev_up) && selected > 0) {
@@ -10655,11 +10990,11 @@ static bool seek_to_ratio(Movie *movie, uint32_t numerator, uint32_t denominator
 
 static void draw_prompt_button(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *button, const char *label, bool selected)
 {
-    Uint16 base = selected ? UI_RGB565(80, 40, 0) : UI_COLOR_GUNMETAL;
+    Uint16 base = selected ? ui_theme()->row_selected : UI_COLOR_GUNMETAL;
     int text_x = button->x + (button->w - nSDL_GetStringWidth(fonts->white, label)) / 2;
 
     draw_glass_panel(screen, button, base, selected);
-    cut_rect_corners(screen, button, UI_RGB565(22, 20, 18));
+    cut_rect_corners(screen, button, ui_theme()->menu_panel);
     draw_ui_label(screen, fonts, text_x, button->y + 6, label);
 }
 
@@ -10675,6 +11010,7 @@ static int prompt_resume_position(
     bool prev_right = false;
     bool prev_enter = false;
     bool prev_esc = false;
+    bool prev_c = false;
     PointerState pointer;
     PointerHoverGuard hover_guard;
     SDL_Rect full_screen = {0, 0, SCREEN_W, SCREEN_H};
@@ -10768,16 +11104,20 @@ static int prompt_resume_position(
         bool pointer_click = pointer_update(&pointer);
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
 
+        if (key_pressed_edge(KEY_NSPIRE_C, &prev_c)) {
+            ui_cycle_theme();
+            ui_save_theme_for_movie(path);
+        }
         SDL_SoftStretch(movie->frame_surface, NULL, screen, &full_screen);
         dim_rect_rgb565(screen, &full_screen, 112);
-        fill_rect_rgb565(screen, &border, UI_RGB565(224, 210, 190));
-        draw_glass_panel(screen, &panel, UI_RGB565(34, 28, 22), false);
-        cut_rect_corners(screen, &panel, UI_RGB565(224, 210, 190));
+        fill_rect_rgb565(screen, &border, ui_theme()->menu_border);
+        draw_glass_panel(screen, &panel, ui_theme()->modal_panel, false);
+        cut_rect_corners(screen, &panel, ui_theme()->menu_border);
         draw_glass_panel(screen, &header, UI_COLOR_GUNMETAL, false);
-        cut_rect_corners(screen, &header, UI_RGB565(34, 28, 22));
-        draw_vertical_gradient(screen, &accent, UI_COLOR_DORF_ORANGE, UI_COLOR_DORF_RED);
-        draw_glass_panel(screen, &title_panel, UI_RGB565(30, 26, 22), false);
-        cut_rect_corners(screen, &title_panel, UI_RGB565(34, 28, 22));
+        cut_rect_corners(screen, &header, ui_theme()->modal_cut);
+        draw_vertical_gradient(screen, &accent, UI_COLOR_ACCENT, UI_COLOR_ACCENT_DEEP);
+        draw_glass_panel(screen, &title_panel, ui_theme()->modal_title_panel, false);
+        cut_rect_corners(screen, &title_panel, ui_theme()->modal_cut);
         fill_rect_rgb565(screen, &preview_border, UI_COLOR_WARM_WHITE);
         SDL_SoftStretch(movie->frame_surface, NULL, screen, &preview);
         draw_ui_label(screen, fonts, panel.x + 12, panel.y + 8, "Continue Watching?");
@@ -10874,6 +11214,7 @@ static int play_movie(
     bool prev_d = false;
     bool prev_s = false;
     bool prev_p = false;
+    bool prev_c = false;
     bool prev_plus = false;
     bool prev_minus = false;
     bool prev_on = false;
@@ -11024,6 +11365,7 @@ static int play_movie(
     prev_d = isKeyPressed(KEY_NSPIRE_D);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     prev_p = isKeyPressed(KEY_NSPIRE_P);
+    prev_c = isKeyPressed(KEY_NSPIRE_C);
     prev_on = on_key_pressed() ? true : false;
     debug_set_metrics_collection(debug_is_runtime_logging_enabled());
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
@@ -11099,14 +11441,28 @@ static int play_movie(
         bool debug_logging_edge = key_pressed_edge(KEY_NSPIRE_D, &prev_d);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool playback_mode_edge = key_pressed_edge(KEY_NSPIRE_P, &prev_p);
+        bool theme_edge = key_pressed_edge(KEY_NSPIRE_C, &prev_c);
         bool on_edge = on_key_pressed_edge(&prev_on);
         bool take_screenshot = false;
         bool tab_repeat_step = false;
         int seek_delta_ms = 0;
         int brightness_delta = 0;
 
+        if (theme_edge) {
+            ui_cycle_theme();
+            ui_save_theme_for_movie(path);
+            snprintf(status_overlay_text, sizeof(status_overlay_text), "THEME %s", ui_theme_name(g_ui_theme_id));
+            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+            show_ui = true;
+        }
+
         if (display_power_state.off) {
-            if (on_edge || brightness_up_edge || esc_edge) {
+            if (esc_edge) {
+                result = PLAY_MOVIE_RESULT_APP_EXIT;
+                break;
+            }
+            if (on_edge || brightness_up_edge) {
                 bool resume_playback = display_power_state.resume_playback_on_wake;
 
                 display_power_on(&display_power_state);
@@ -11870,12 +12226,15 @@ static int play_movie(
         video_align_x,
         video_align_y
     );
-    if (debug_is_runtime_logging_enabled() || result != 0) {
+    if (debug_is_runtime_logging_enabled() ||
+        (result != PLAY_MOVIE_RESULT_EXIT && result != PLAY_MOVIE_RESULT_APP_EXIT)) {
         char log_path[MAX_PATH_LEN];
         const char *exit_reason = "normal-exit";
 
         if (result == PLAY_MOVIE_RESULT_AUTO_NEXT) {
             exit_reason = "auto-next";
+        } else if (result == PLAY_MOVIE_RESULT_APP_EXIT) {
+            exit_reason = "app-exit";
         } else if (result != PLAY_MOVIE_RESULT_EXIT) {
             exit_reason = "aborted";
         }
@@ -11932,6 +12291,7 @@ int main(int argc, char **argv)
     strncpy(directory, argv[0], sizeof(directory) - 1);
     directory[sizeof(directory) - 1] = '\0';
     strip_filename(directory);
+    ui_load_theme_for_directory(directory);
 
     while (1) {
         resume_without_prompt = false;
@@ -11947,6 +12307,7 @@ int main(int argc, char **argv)
                 break;
             }
         }
+        ui_load_theme_for_movie(movie_path);
         result = play_movie(
             screen,
             &fonts,
@@ -11960,6 +12321,9 @@ int main(int argc, char **argv)
             have_queued_movie = true;
             continue;
         }
+        if (result == PLAY_MOVIE_RESULT_APP_EXIT) {
+            break;
+        }
         if (result != PLAY_MOVIE_RESULT_EXIT) {
             break;
         }
@@ -11969,5 +12333,5 @@ int main(int argc, char **argv)
     SDL_Quit();
     sram_shutdown();
     monotonic_clock_shutdown();
-    return result == 0 ? 0 : 1;
+    return (result == PLAY_MOVIE_RESULT_EXIT || result == PLAY_MOVIE_RESULT_APP_EXIT) ? 0 : 1;
 }
