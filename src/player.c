@@ -10068,6 +10068,8 @@ static void render_picker(
     int hovered_index,
     int resume_hovered_index,
     const PointerState *pointer,
+    const ScreenshotPreviewState *screenshot_preview,
+    uint32_t now_ms,
     const char *loading_label,
     int loading_phase
 )
@@ -10101,6 +10103,7 @@ static void render_picker(
         cut_rect_corners(screen, &footer_panel, UI_COLOR_BLACK);
         draw_vertical_gradient(screen, &footer_accent, ui_theme()->footer_accent_top, UI_COLOR_ACCENT_DEEP);
         draw_ui_label(screen, fonts, 12, SCREEN_H - 17, credit);
+        draw_screenshot_preview_osd(screen, fonts, screenshot_preview, now_ms);
         if (pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
@@ -10176,6 +10179,7 @@ static void render_picker(
     } else if (hovered_index >= 0 && (size_t) hovered_index < count) {
         draw_movie_hover_tooltip(screen, fonts, &files[hovered_index], pointer);
     }
+    draw_screenshot_preview_osd(screen, fonts, screenshot_preview, now_ms);
     if (pointer && pointer->visible) {
         draw_cursor(screen, pointer->x, pointer->y);
     }
@@ -10705,9 +10709,9 @@ static void flush_deferred_history_save(
     *pending = false;
 }
 
-static bool save_screenshot_bitmap(SDL_Surface *screen, const char *movie_path, char *saved_path, size_t saved_path_size)
+static bool save_screenshot_bitmap_in_directory(SDL_Surface *screen, const char *directory, char *saved_path, size_t saved_path_size)
 {
-    char directory[MAX_PATH_LEN];
+    char screenshot_directory[MAX_PATH_LEN];
     int index;
 
     if (saved_path && saved_path_size > 0) {
@@ -10717,17 +10721,16 @@ static bool save_screenshot_bitmap(SDL_Surface *screen, const char *movie_path, 
         return false;
     }
 
-    if (movie_path && movie_path[0] != '\0') {
-        snprintf(directory, sizeof(directory), "%s", movie_path);
-        strip_filename(directory);
+    if (directory && directory[0] != '\0') {
+        snprintf(screenshot_directory, sizeof(screenshot_directory), "%s", directory);
     } else {
-        snprintf(directory, sizeof(directory), ".");
+        snprintf(screenshot_directory, sizeof(screenshot_directory), ".");
     }
 
     for (index = 1; index <= 9999; ++index) {
         char candidate[MAX_PATH_LEN];
         FILE *existing;
-        int candidate_len = snprintf(candidate, sizeof(candidate), "%s/ndvideo-shot-%04d.bmp", directory, index);
+        int candidate_len = snprintf(candidate, sizeof(candidate), "%s/ndvideo-shot-%04d.bmp", screenshot_directory, index);
 
         if (candidate_len < 0 || (size_t) candidate_len >= sizeof(candidate)) {
             return false;
@@ -10749,6 +10752,19 @@ static bool save_screenshot_bitmap(SDL_Surface *screen, const char *movie_path, 
     }
 
     return false;
+}
+
+static bool save_screenshot_bitmap(SDL_Surface *screen, const char *movie_path, char *saved_path, size_t saved_path_size)
+{
+    char directory[MAX_PATH_LEN];
+
+    if (movie_path && movie_path[0] != '\0') {
+        snprintf(directory, sizeof(directory), "%s", movie_path);
+        strip_filename(directory);
+    } else {
+        snprintf(directory, sizeof(directory), ".");
+    }
+    return save_screenshot_bitmap_in_directory(screen, directory, saved_path, saved_path_size);
 }
 
 static void prepare_screenshot_preview(ScreenshotPreviewState *preview, SDL_Surface *screen, const char *saved_path)
@@ -10936,6 +10952,8 @@ static int pick_movie(
     bool prev_enter = false;
     bool prev_esc = false;
     bool prev_c = false;
+    bool prev_s = false;
+    ScreenshotPreviewState screenshot_preview;
     PointerState pointer;
     PointerHoverGuard hover_guard;
     PickerTooltipHoverState tooltip_hover;
@@ -10943,6 +10961,7 @@ static int pick_movie(
     size_t count = 0;
     size_t selected = 0;
 
+    memset(&screenshot_preview, 0, sizeof(screenshot_preview));
     files = scan_movies(directory, &count);
     if (resume_without_prompt) {
         *resume_without_prompt = false;
@@ -10954,11 +10973,13 @@ static int pick_movie(
     prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
+    prev_s = isKeyPressed(KEY_NSPIRE_S);
     pointer_hover_guard_reset(&hover_guard);
     picker_tooltip_hover_reset(&tooltip_hover);
     while (1) {
         bool pointer_click = pointer_update(&pointer);
         uint32_t now_ms = monotonic_clock_now_ms();
+        bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
         int hovered_index = pointer_hover_allowed ? picker_row_index_at(count, selected, pointer.x, pointer.y) : -1;
         int resume_hovered_index = pointer_hover_allowed
@@ -10975,7 +10996,26 @@ static int pick_movie(
             ui_cycle_theme();
             ui_save_theme_for_directory(directory);
         }
-        render_picker(screen, fonts, files, count, selected, tooltip_index, resume_hovered_index, &pointer, NULL, 0);
+        render_picker(
+            screen,
+            fonts,
+            files,
+            count,
+            selected,
+            tooltip_index,
+            resume_hovered_index,
+            &pointer,
+            &screenshot_preview,
+            now_ms,
+            NULL,
+            0
+        );
+        if (screenshot_edge) {
+            char saved_path[MAX_PATH_LEN];
+            if (save_screenshot_bitmap_in_directory(screen, directory, saved_path, sizeof(saved_path))) {
+                prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
+            }
+        }
         if (key_pressed_edge(KEY_NSPIRE_UP, &prev_up) && selected > 0) {
             selected--;
             pointer_hover_guard_lock(&hover_guard, &pointer);
@@ -10990,7 +11030,20 @@ static int pick_movie(
                 : (hovered_index >= 0 ? hovered_index : (int) selected);
             int phase;
             for (phase = 0; phase < 6; ++phase) {
-                render_picker(screen, fonts, files, count, selected, -1, -1, &pointer, "Loading", phase);
+                render_picker(
+                    screen,
+                    fonts,
+                    files,
+                    count,
+                    selected,
+                    -1,
+                    -1,
+                    &pointer,
+                    &screenshot_preview,
+                    monotonic_clock_now_ms(),
+                    "Loading",
+                    phase
+                );
                 msleep(30);
             }
             strncpy(selected_path, files[activated_index].path, selected_size - 1);
@@ -10999,12 +11052,26 @@ static int pick_movie(
                 *resume_without_prompt = resume_hovered_index >= 0;
             }
             free_movie_files(files, count);
+            clear_screenshot_preview(&screenshot_preview);
             return 0;
         }
         if (key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) && count > 0) {
             int phase;
             for (phase = 0; phase < 6; ++phase) {
-                render_picker(screen, fonts, files, count, selected, -1, -1, &pointer, "Loading", phase);
+                render_picker(
+                    screen,
+                    fonts,
+                    files,
+                    count,
+                    selected,
+                    -1,
+                    -1,
+                    &pointer,
+                    &screenshot_preview,
+                    monotonic_clock_now_ms(),
+                    "Loading",
+                    phase
+                );
                 msleep(30);
             }
             strncpy(selected_path, files[selected].path, selected_size - 1);
@@ -11013,10 +11080,12 @@ static int pick_movie(
                 *resume_without_prompt = false;
             }
             free_movie_files(files, count);
+            clear_screenshot_preview(&screenshot_preview);
             return 0;
         }
         if (key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc)) {
             free_movie_files(files, count);
+            clear_screenshot_preview(&screenshot_preview);
             return -1;
         }
         msleep(16);
@@ -11082,8 +11151,10 @@ static int prompt_resume_position(
     bool prev_enter = false;
     bool prev_esc = false;
     bool prev_c = false;
+    bool prev_s = false;
     PointerState pointer;
     PointerHoverGuard hover_guard;
+    ScreenshotPreviewState screenshot_preview;
     SDL_Rect full_screen = {0, 0, SCREEN_W, SCREEN_H};
     SDL_Rect border = {33, 23, 254, 194};
     SDL_Rect panel = {34, 24, 252, 192};
@@ -11114,6 +11185,7 @@ static int prompt_resume_position(
     int time_label_y;
     int button_y;
 
+    memset(&screenshot_preview, 0, sizeof(screenshot_preview));
     if (resume_frame >= movie->header.frame_count) {
         resume_frame = movie->header.frame_count ? (movie->header.frame_count - 1) : 0;
     }
@@ -11175,11 +11247,14 @@ static int prompt_resume_position(
     prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
+    prev_s = isKeyPressed(KEY_NSPIRE_S);
     pointer_hover_guard_reset(&hover_guard);
 
     while (1) {
         bool pointer_click = pointer_update(&pointer);
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
+        uint32_t now_ms = monotonic_clock_now_ms();
+        bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
 
         if (key_pressed_edge(KEY_NSPIRE_C, &prev_c)) {
             ui_cycle_theme();
@@ -11205,10 +11280,17 @@ static int prompt_resume_position(
         draw_ui_label(screen, fonts, panel.x + 12, time_label_y, time_label);
         draw_prompt_button(screen, fonts, &continue_button, "CONTINUE", selected_button == 0);
         draw_prompt_button(screen, fonts, &restart_button, "START OVER", selected_button == 1);
+        draw_screenshot_preview_osd(screen, fonts, &screenshot_preview, now_ms);
         if (pointer.visible) {
             draw_cursor(screen, pointer.x, pointer.y);
         }
         present_screen(screen);
+        if (screenshot_edge) {
+            char saved_path[MAX_PATH_LEN];
+            if (save_screenshot_bitmap(screen, path, saved_path, sizeof(saved_path))) {
+                prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
+            }
+        }
 
         if (pointer_hover_allowed) {
             if (pointer.x >= continue_button.x && pointer.x < continue_button.x + continue_button.w &&
@@ -11226,16 +11308,19 @@ static int prompt_resume_position(
         if (pointer_click) {
             free(title_main);
             free(title_detail);
+            clear_screenshot_preview(&screenshot_preview);
             return selected_button == 0 ? 1 : 0;
         }
         if (key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter)) {
             free(title_main);
             free(title_detail);
+            clear_screenshot_preview(&screenshot_preview);
             return selected_button == 0 ? 1 : 0;
         }
         if (key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc)) {
             free(title_main);
             free(title_detail);
+            clear_screenshot_preview(&screenshot_preview);
             return -1;
         }
         msleep(16);

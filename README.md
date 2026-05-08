@@ -59,6 +59,7 @@ Battery Life: ~9.5 hours of continuous H.264 playback at 100% brightness.
 - touchpad click: open highlighted movie
 - `Enter`: open movie
 - `C`: cycle theme color
+- `S`: save a BMP screenshot
 - `Esc`: exit
 
 ### Movie Filename Metadata
@@ -103,6 +104,7 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 - touchpad click: activate the highlighted button
 - `Enter`: confirm the selected button
 - `C`: cycle theme color
+- `S`: save a BMP screenshot
 - `Esc`: cancel and return
 
 ## Subtitle Fonts
