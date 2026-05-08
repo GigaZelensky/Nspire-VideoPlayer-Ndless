@@ -6,6 +6,7 @@ Current examples in the working tree include:
 
 - a packaged player binary
 - a short Family Guy sample encode produced with the current H.264 encoder settings
+- screenshot captures used by the root README
 
 Licensing note:
 

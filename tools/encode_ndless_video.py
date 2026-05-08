@@ -72,6 +72,8 @@ DEFAULT_MAX_CHUNK_OVERSHOOT_PERCENT = 8.0
 AUTO_IDR_CHUNK_SHARE = 0.25
 AUTO_IDR_MIN_FRAMES = 12
 AUTO_IDR_MAX_FRAMES = 192
+BYTE_AUTO_IDR_MODE = "byte-auto"
+DEFAULT_BYTE_AUTO_IDR_PASSES = 5
 SUBTITLE_COORD_SCALE = 10000
 SUBTITLE_CUE_POSITION_NONE = 0
 SUBTITLE_CUE_POSITION_MARGIN = 1
@@ -2380,7 +2382,10 @@ def resolve_idr_frames(
 ) -> tuple[int, str]:
     if stream_profile == "intra":
         return 1, "intra profile"
-    if requested_idr_frames is None or requested_idr_frames.lower() == "auto":
+    requested_mode = requested_idr_frames.lower() if requested_idr_frames is not None else "auto"
+    if requested_mode == BYTE_AUTO_IDR_MODE:
+        return AUTO_IDR_MAX_FRAMES, "byte-auto probe; refined from measured chunk byte boundaries"
+    if requested_mode == "auto":
         return auto_idr_frames_for_chunk_budget(
             fps=fps,
             max_chunk_bytes=max_chunk_bytes,
@@ -2398,12 +2403,14 @@ def resolve_idr_frames(
     return frames, "manual"
 
 
-def h264_stream_profile_options(idr_frames: int, stream_profile: str) -> tuple[str | None, str, list[str]]:
+def h264_stream_profile_options(idr_frames: int, stream_profile: str, *, flexible_keyframes: bool = False) -> tuple[str | None, str, list[str]]:
     keyint = 1 if stream_profile == "intra" else idr_frames
+    min_keyint = 1 if flexible_keyframes else keyint
     base_params = [
         f"keyint={keyint}",
-        f"min-keyint={keyint}",
+        f"min-keyint={min_keyint}",
         "scenecut=0",
+        "open-gop=0",
         "repeat-headers=1",
         "aud=1",
         "bframes=0",
@@ -2468,6 +2475,20 @@ def format_rate_control_label(*, crf: float, bitrate_kbps: int | None, two_pass:
     return f"1-pass ABR {bitrate_kbps} kb/s"
 
 
+def forced_keyframe_times_for_frames(frame_indices: list[int], fps: float) -> str:
+    if fps <= 0:
+        raise RuntimeError("Cannot derive forced keyframe timestamps without a valid output fps.")
+    timestamps: list[str] = []
+    for frame_index in frame_indices:
+        if frame_index <= 0:
+            continue
+        # FFmpeg forces the first frame at or after the timestamp. Flooring keeps
+        # the compact value on the desired side of the frame boundary.
+        milliseconds = int((frame_index / fps) * 1000.0)
+        timestamps.append(f"{milliseconds / 1000.0:.3f}".rstrip("0").rstrip("."))
+    return ",".join(timestamps)
+
+
 def build_ffmpeg_command(
     *,
     input_path: Path,
@@ -2493,6 +2514,7 @@ def build_ffmpeg_command(
     pass_number: int | None,
     passlog_path: Path | None,
     quiet: bool,
+    forced_keyframe_frames: list[int] | None,
 ) -> tuple[list[str], str | None]:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     video_filters: list[str] = []
@@ -2500,7 +2522,16 @@ def build_ffmpeg_command(
         video_filters.append(f"crop={crop_rect.width}:{crop_rect.height}:{crop_rect.x}:{crop_rect.y}:exact=1")
     video_filters += [fps_filter_expression(fps), f"scale={width}:{height}:flags=lanczos", "setsar=1"]
     post_vf = ",".join(video_filters)
-    tune, x264_params, bitstream_filters = h264_stream_profile_options(idr_frames, stream_profile)
+    flexible_keyframes = forced_keyframe_frames is not None
+    force_keyframes_value = (
+        forced_keyframe_times_for_frames(forced_keyframe_frames, fps)
+        if forced_keyframe_frames is not None else f"expr:gte(n,n_forced*{idr_frames})"
+    )
+    tune, x264_params, bitstream_filters = h264_stream_profile_options(
+        idr_frames,
+        stream_profile,
+        flexible_keyframes=flexible_keyframes,
+    )
     subtitle_font_size, subtitle_margin_v, subtitle_outline = compute_burn_subtitle_metrics(height, burn_subtitle_size)
     command = [ffmpeg, "-y"]
     filter_complex_script: str | None = None
@@ -2643,18 +2674,20 @@ def build_ffmpeg_command(
         "-g",
         str(idr_frames),
         "-keyint_min",
-        str(idr_frames),
+        "1" if flexible_keyframes else str(idr_frames),
         "-sc_threshold",
         "0",
         "-bf",
         "0",
         "-refs",
         "1",
-        "-force_key_frames",
-        f"expr:gte(n,n_forced*{idr_frames})",
         "-x264-params",
         x264_params,
     ]
+    if force_keyframes_value:
+        command += ["-force_key_frames", force_keyframes_value]
+        if flexible_keyframes:
+            command += ["-forced-idr", "1"]
     if pass_number is not None:
         if bitrate_kbps is None or passlog_path is None:
             raise RuntimeError("Two-pass encoding requires both bitrate_kbps and passlog_path.")
@@ -2773,6 +2806,8 @@ def encode_h264_bitstream(
     burn_subtitle_size: float,
     preview_output_path: Path | None,
     quiet: bool,
+    forced_keyframe_frames: list[int] | None = None,
+    label_prefix: str = "FFmpeg",
 ) -> bytes:
     with tempfile.TemporaryDirectory(prefix="nvp-h264-") as temp_dir:
         temp_dir_path = Path(temp_dir)
@@ -2788,6 +2823,7 @@ def encode_h264_bitstream(
             fps=fps,
             crop_rect=crop_rect,
             idr_frames=idr_frames,
+            forced_keyframe_frames=forced_keyframe_frames,
             crf=crf if bitrate_kbps is None else None,
             bitrate_kbps=bitrate_kbps,
             preset=preset,
@@ -2816,6 +2852,7 @@ def encode_h264_bitstream(
                 fps=fps,
                 crop_rect=crop_rect,
                 idr_frames=idr_frames,
+                forced_keyframe_frames=forced_keyframe_frames,
                 crf=None,
                 bitrate_kbps=bitrate_kbps,
                 preset=preset,
@@ -2832,7 +2869,7 @@ def encode_h264_bitstream(
             )
             run_ffmpeg_encode(
                 materialize_filter_complex_script(pass1_command, pass1_filter_script, temp_dir_path),
-                label="FFmpeg pass 1/2",
+                label=f"{label_prefix} pass 1/2",
                 total_duration=encode_duration,
                 quiet=quiet,
             )
@@ -2849,6 +2886,7 @@ def encode_h264_bitstream(
                 fps=fps,
                 crop_rect=crop_rect,
                 idr_frames=idr_frames,
+                forced_keyframe_frames=forced_keyframe_frames,
                 crf=None,
                 bitrate_kbps=bitrate_kbps,
                 preset=preset,
@@ -2865,7 +2903,7 @@ def encode_h264_bitstream(
             )
             run_ffmpeg_encode(
                 materialize_filter_complex_script(pass2_command, pass2_filter_script, temp_dir_path),
-                label="FFmpeg pass 2/2",
+                label=f"{label_prefix} pass 2/2",
                 total_duration=encode_duration,
                 quiet=quiet,
             )
@@ -2874,7 +2912,7 @@ def encode_h264_bitstream(
         else:
             run_ffmpeg_encode(
                 materialize_filter_complex_script(command, filter_complex_script, temp_dir_path),
-                label="FFmpeg",
+                label=label_prefix,
                 total_duration=encode_duration,
                 quiet=quiet,
             )
@@ -3089,6 +3127,212 @@ def group_access_units_into_chunks(
     return chunks
 
 
+def bitstream_access_units(bitstream: bytes) -> list[AccessUnit]:
+    return group_nals_into_access_units(parse_annex_b_nalus(bitstream))
+
+
+def byte_budget_idr_frames_from_access_units(
+    access_units: list[AccessUnit],
+    *,
+    max_chunk_bytes: int,
+    chunk_frames: int,
+    stream_profile: str,
+) -> list[int]:
+    forced_frames: list[int] = []
+    current_payload_size = 0
+    current_frame_count = 0
+    frame_cap = chunk_frames if chunk_frames > 0 else None
+
+    for frame_index, unit in enumerate(access_units):
+        keep_parameter_sets = current_frame_count == 0 or stream_profile != "intra"
+        unit_payload_size = access_unit_payload_size(unit, keep_parameter_sets=keep_parameter_sets)
+        candidate_frame_count = current_frame_count + 1
+        candidate_payload_size = current_payload_size + unit_payload_size
+        candidate_blob_size = align4(4 + (candidate_frame_count * 4) + candidate_payload_size)
+        exceeds_byte_cap = current_frame_count > 0 and candidate_blob_size > max_chunk_bytes
+        exceeds_frame_cap = current_frame_count > 0 and frame_cap is not None and candidate_frame_count > frame_cap
+
+        if exceeds_byte_cap or exceeds_frame_cap:
+            forced_frames.append(frame_index)
+            current_frame_count = 1
+            current_payload_size = access_unit_payload_size(unit, keep_parameter_sets=True)
+        else:
+            current_frame_count = candidate_frame_count
+            current_payload_size = candidate_payload_size
+
+    return forced_frames
+
+
+def summarize_chunk_oversize(
+    access_units: list[AccessUnit],
+    *,
+    chunk_frames: int,
+    max_chunk_bytes: int,
+    hard_max_chunk_bytes: int | None,
+    stream_profile: str,
+) -> tuple[int, int, int]:
+    chunks = group_access_units_into_chunks(
+        access_units,
+        chunk_frames,
+        max_chunk_bytes,
+        hard_max_chunk_bytes,
+        stream_profile,
+    )
+    chunk_blob_sizes = [estimate_chunk_blob_size(chunk, stream_profile) for chunk in chunks]
+    oversize_count = sum(1 for blob_size in chunk_blob_sizes if blob_size > max_chunk_bytes)
+    return oversize_count, len(chunks), max(chunk_blob_sizes) if chunk_blob_sizes else 0
+
+
+def write_preview_mp4_from_bitstream(bitstream: bytes, preview_output_path: Path, fps: float, *, quiet: bool) -> None:
+    with tempfile.TemporaryDirectory(prefix="nvp-preview-") as temp_dir:
+        bitstream_path = Path(temp_dir) / "video.264"
+        bitstream_path.write_bytes(bitstream)
+        write_preview_mp4(bitstream_path, preview_output_path, fps, quiet=quiet)
+
+
+def encode_h264_bitstream_byte_auto(
+    *,
+    input_path: Path,
+    source_width: int,
+    source_height: int,
+    source_fps: float | None,
+    width: int,
+    height: int,
+    fps: float,
+    crop_rect: CropRect | None,
+    crf: float,
+    bitrate_kbps: int | None,
+    two_pass: bool,
+    preset: str,
+    level: str,
+    stream_profile: str,
+    start: float,
+    duration: float | None,
+    encode_duration: float | None,
+    burn_subtitle: BurnSubtitleSource | None,
+    burn_subtitle_size: float,
+    preview_output_path: Path | None,
+    max_chunk_bytes: int,
+    hard_max_chunk_bytes: int | None,
+    chunk_frames: int,
+    quiet: bool,
+) -> tuple[bytes, int, str]:
+    max_keyint = min(AUTO_IDR_MAX_FRAMES, chunk_frames) if chunk_frames > 0 else AUTO_IDR_MAX_FRAMES
+    previous_forced_frames: list[int] | None = None
+    idr_reason = (
+        f"byte-auto, max keyint {max_keyint}; forced IDRs are refined from measured "
+        f"{format_binary_size(max_chunk_bytes)} chunk boundaries"
+    )
+
+    bitstream = encode_h264_bitstream(
+        input_path=input_path,
+        source_width=source_width,
+        source_height=source_height,
+        source_fps=source_fps,
+        width=width,
+        height=height,
+        fps=fps,
+        crop_rect=crop_rect,
+        idr_frames=max_keyint,
+        crf=crf,
+        bitrate_kbps=bitrate_kbps,
+        two_pass=two_pass,
+        preset=preset,
+        level=level,
+        stream_profile=stream_profile,
+        start=start,
+        duration=duration,
+        encode_duration=encode_duration,
+        burn_subtitle=burn_subtitle,
+        burn_subtitle_size=burn_subtitle_size,
+        preview_output_path=None,
+        quiet=quiet,
+        label_prefix="FFmpeg byte-IDR probe",
+    )
+
+    for pass_index in range(DEFAULT_BYTE_AUTO_IDR_PASSES):
+        access_units = bitstream_access_units(bitstream)
+        forced_frames = byte_budget_idr_frames_from_access_units(
+            access_units,
+            max_chunk_bytes=max_chunk_bytes,
+            chunk_frames=chunk_frames,
+            stream_profile=stream_profile,
+        )
+        if previous_forced_frames:
+            forced_frames = sorted(set(previous_forced_frames).union(forced_frames))
+        if previous_forced_frames == forced_frames:
+            log(
+                f"Byte-auto IDR converged with {len(forced_frames)} forced boundary frame(s).",
+                quiet=quiet,
+            )
+            break
+
+        previous_forced_frames = forced_frames
+        log(
+            f"Byte-auto IDR pass {pass_index + 1}/{DEFAULT_BYTE_AUTO_IDR_PASSES}: "
+            f"forcing {len(forced_frames)} measured chunk boundary frame(s).",
+            quiet=quiet,
+        )
+        bitstream = encode_h264_bitstream(
+            input_path=input_path,
+            source_width=source_width,
+            source_height=source_height,
+            source_fps=source_fps,
+            width=width,
+            height=height,
+            fps=fps,
+            crop_rect=crop_rect,
+            idr_frames=max_keyint,
+            forced_keyframe_frames=forced_frames,
+            crf=crf,
+            bitrate_kbps=bitrate_kbps,
+            two_pass=two_pass,
+            preset=preset,
+            level=level,
+            stream_profile=stream_profile,
+            start=start,
+            duration=duration,
+            encode_duration=encode_duration,
+            burn_subtitle=burn_subtitle,
+            burn_subtitle_size=burn_subtitle_size,
+            preview_output_path=None,
+            quiet=quiet,
+            label_prefix=f"FFmpeg byte-IDR refine {pass_index + 1}/{DEFAULT_BYTE_AUTO_IDR_PASSES}",
+        )
+
+        access_units = bitstream_access_units(bitstream)
+        try:
+            oversize_count, chunk_count, max_blob_size = summarize_chunk_oversize(
+                access_units,
+                chunk_frames=chunk_frames,
+                max_chunk_bytes=max_chunk_bytes,
+                hard_max_chunk_bytes=hard_max_chunk_bytes,
+                stream_profile=stream_profile,
+            )
+        except ChunkTooLargeError as error:
+            log(f"Byte-auto IDR pass {pass_index + 1} still has an oversized {error.label}; refining again.", quiet=quiet)
+            continue
+
+        if oversize_count == 0:
+            log(
+                f"Byte-auto IDR pass {pass_index + 1} hit the byte target cleanly "
+                f"({chunk_count} chunks, max {format_binary_size(max_blob_size)}).",
+                quiet=quiet,
+            )
+            break
+        log(
+            f"Byte-auto IDR pass {pass_index + 1} left {oversize_count} soft-over target chunk(s); "
+            f"max {format_binary_size(max_blob_size)}; keeping this because it is within the hard tolerance.",
+            quiet=quiet,
+        )
+        break
+
+    if preview_output_path is not None:
+        write_preview_mp4_from_bitstream(bitstream, preview_output_path, fps, quiet=quiet)
+
+    return bitstream, max_keyint, idr_reason
+
+
 def build_access_unit_payload(unit: AccessUnit, *, keep_parameter_sets: bool) -> bytes:
     payload = bytearray()
     for nal in unit.nal_units:
@@ -3187,47 +3431,81 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                 quiet=args.quiet,
             )
         start_time = time.time()
-        idr_frames, idr_frame_reason = resolve_idr_frames(
-            args.chunk_frames,
-            args.idr_frames,
-            args.stream_profile,
-            fps=fps,
-            max_chunk_bytes=max_chunk_bytes,
-            bitrate_kbps=args.bitrate_kbps,
-        )
-        log(f"IDR cadence: every {idr_frames} frame(s) ({idr_frame_reason}).", quiet=args.quiet)
-        bitstream = encode_h264_bitstream(
-            input_path=input_path,
-            source_width=video_probe.storage_width,
-            source_height=video_probe.storage_height,
-            source_fps=video_probe.fps,
-            width=target_width,
-            height=target_height,
-            fps=fps,
-            crop_rect=crop_rect,
-            idr_frames=idr_frames,
-            crf=args.crf,
-            bitrate_kbps=args.bitrate_kbps,
-            two_pass=args.two_pass,
-            preset=args.preset,
-            level=args.level,
-            stream_profile=args.stream_profile,
-            start=args.start,
-            duration=args.duration,
-            encode_duration=encode_duration,
-            burn_subtitle=burn_subtitle,
-            burn_subtitle_size=args.burn_subtitle_size,
-            preview_output_path=preview_output_path,
-            quiet=args.quiet,
-        )
+        idr_mode = args.idr_frames.lower()
+        if idr_mode == BYTE_AUTO_IDR_MODE and args.stream_profile != "intra":
+            if max_chunk_bytes is None:
+                raise RuntimeError("--idr-frames byte-auto requires --max-chunk-kib > 0.")
+            log(
+                f"IDR cadence: byte-auto from measured {format_binary_size(max_chunk_bytes)} chunk boundaries.",
+                quiet=args.quiet,
+            )
+            bitstream, idr_frames, idr_frame_reason = encode_h264_bitstream_byte_auto(
+                input_path=input_path,
+                source_width=video_probe.storage_width,
+                source_height=video_probe.storage_height,
+                source_fps=video_probe.fps,
+                width=target_width,
+                height=target_height,
+                fps=fps,
+                crop_rect=crop_rect,
+                crf=args.crf,
+                bitrate_kbps=args.bitrate_kbps,
+                two_pass=args.two_pass,
+                preset=args.preset,
+                level=args.level,
+                stream_profile=args.stream_profile,
+                start=args.start,
+                duration=args.duration,
+                encode_duration=encode_duration,
+                burn_subtitle=burn_subtitle,
+                burn_subtitle_size=args.burn_subtitle_size,
+                preview_output_path=preview_output_path,
+                max_chunk_bytes=max_chunk_bytes,
+                hard_max_chunk_bytes=hard_max_chunk_bytes,
+                chunk_frames=args.chunk_frames,
+                quiet=args.quiet,
+            )
+        else:
+            idr_frames, idr_frame_reason = resolve_idr_frames(
+                args.chunk_frames,
+                args.idr_frames,
+                args.stream_profile,
+                fps=fps,
+                max_chunk_bytes=max_chunk_bytes,
+                bitrate_kbps=args.bitrate_kbps,
+            )
+            log(f"IDR cadence: every {idr_frames} frame(s) ({idr_frame_reason}).", quiet=args.quiet)
+            bitstream = encode_h264_bitstream(
+                input_path=input_path,
+                source_width=video_probe.storage_width,
+                source_height=video_probe.storage_height,
+                source_fps=video_probe.fps,
+                width=target_width,
+                height=target_height,
+                fps=fps,
+                crop_rect=crop_rect,
+                idr_frames=idr_frames,
+                crf=args.crf,
+                bitrate_kbps=args.bitrate_kbps,
+                two_pass=args.two_pass,
+                preset=args.preset,
+                level=args.level,
+                stream_profile=args.stream_profile,
+                start=args.start,
+                duration=args.duration,
+                encode_duration=encode_duration,
+                burn_subtitle=burn_subtitle,
+                burn_subtitle_size=args.burn_subtitle_size,
+                preview_output_path=preview_output_path,
+                quiet=args.quiet,
+            )
         log(
             f"FFmpeg produced {len(bitstream) / 1024:.1f} KiB of Annex B H.264 in {time.time() - start_time:.1f}s "
-            f"(IDR every {idr_frames} frame(s)).",
+            f"({idr_frame_reason}).",
             quiet=args.quiet,
         )
 
-        nal_units = parse_annex_b_nalus(bitstream)
-        access_units = group_nals_into_access_units(nal_units)
+        access_units = bitstream_access_units(bitstream)
         chunks = group_access_units_into_chunks(
             access_units,
             args.chunk_frames,
@@ -3432,7 +3710,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--crop", help="Crop active video before scaling, as WIDTH:HEIGHT:X:Y or WIDTHxHEIGHT+X+Y")
     parser.add_argument("--active-aspect", help="Center-crop the source to an active-picture aspect ratio before scaling, e.g. 2.39 or 239:100")
     parser.add_argument("--chunk-frames", type=int, default=0, help="Maximum frames per streamed chunk; 0 disables the frame cap and packs chunks by --max-chunk-kib")
-    parser.add_argument("--idr-frames", default="auto", help="Maximum frames between forced IDR access units, or 'auto' to derive it from --max-chunk-kib and --bitrate-kbps")
+    parser.add_argument("--idr-frames", default="auto", help="Maximum frames between forced IDR access units; use 'auto' for bitrate-derived cadence or 'byte-auto' to refine IDRs from measured chunk byte boundaries")
     parser.add_argument("--max-chunk-kib", type=int, default=DEFAULT_MAX_CHUNK_KIB, help="Maximum stored chunk size target in KiB; 0 disables the byte cap")
     parser.add_argument("--max-chunk-overshoot-percent", type=float, default=DEFAULT_MAX_CHUNK_OVERSHOOT_PERCENT, help="Allowed single-GOP chunk overshoot above --max-chunk-kib before failing; set 0 for a hard cap")
     parser.add_argument("--crf", type=float, default=24.0, help="libx264 CRF quality target (fractional values allowed, ignored when --bitrate-kbps is set)")
@@ -3455,13 +3733,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--max-chunk-overshoot-percent must be zero or greater.")
     if args.chunk_frames == 0 and args.max_chunk_kib == 0:
         parser.error("--chunk-frames and --max-chunk-kib cannot both be zero.")
-    if args.idr_frames.lower() != "auto":
+    idr_mode = args.idr_frames.lower()
+    if idr_mode not in {"auto", BYTE_AUTO_IDR_MODE}:
         try:
             idr_frames = int(args.idr_frames)
         except ValueError:
-            parser.error("--idr-frames must be a positive integer or 'auto'.")
+            parser.error("--idr-frames must be a positive integer, 'auto', or 'byte-auto'.")
         if idr_frames <= 0:
             parser.error("--idr-frames must be greater than zero.")
+    if idr_mode == BYTE_AUTO_IDR_MODE and args.max_chunk_kib == 0:
+        parser.error("--idr-frames byte-auto requires --max-chunk-kib > 0.")
     if args.bitrate_kbps is not None and args.bitrate_kbps <= 0:
         parser.error("--bitrate-kbps must be greater than zero.")
     if args.two_pass and args.bitrate_kbps is None:

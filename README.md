@@ -9,9 +9,13 @@ This project targets the **TI-Nspire CX II-T** and plays streamed `.nvp` movies 
 
 ## Screenshots
 
-| Subtitle playback | UI overlay | Dialogue scene |
+| Main menu | Continue watching | Playback controls |
 | --- | --- | --- |
-| ![Subtitle playback](./examples/screenshots/subtitles.png) | ![Playback UI overlay](./examples/screenshots/ui-overlay.png) | ![Dialogue scene](./examples/screenshots/dialogue.png) |
+| ![Main menu](./examples/screenshots/main-menu.png) | ![Continue watching](./examples/screenshots/continue-watching.png) | ![Playback controls](./examples/screenshots/playback-controls.png) |
+
+| UI overlay | Dialogue scene | Subtitle playback |
+| --- | --- | --- |
+| ![Playback UI overlay](./examples/screenshots/ui-overlay.png) | ![Dialogue scene](./examples/screenshots/dialogue.png) | ![Subtitle playback](./examples/screenshots/subtitles.png) |
 
 ## Current Format
 
@@ -35,9 +39,10 @@ The `.nvp` format used by the current player is:
 - scale modes: `FIT`, `FILL`, `STRETCH`, `1:1`
 - playback speed control from `0.25x` to `2.0x`
 - screen brightness control with `Up` / `Down` and an on-screen percentage overlay
+- theme color profiles: `DORFic`, `Blue`, and `Green`
 - picker UI for multiple `.nvp` / `.nvp.tns` files
 - picker filename metadata tooltips from bracketed tags
-- per-video resume history with saved playback and subtitle settings
+- resume history with saved playback, subtitle, and theme settings
 - debug log output and in-player memory/playback overlay
 
 ## Current Limits
@@ -57,6 +62,8 @@ Battery Life: ~9.5 hours of continuous H.264 playback at 100% brightness.
 - touchpad hover: after a short pause, show filename metadata tooltip when available
 - touchpad click: open highlighted movie
 - `Enter`: open movie
+- `C`: cycle theme color
+- `S`: save a BMP screenshot
 - `Esc`: exit
 
 ### Movie Filename Metadata
@@ -87,10 +94,12 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 - `F`: cycle subtitle font
 - `T`: cycle subtitle track
 - `M`: toggle memory / playback diagnostics overlay
+- `C`: cycle theme color
 - `D`: toggle verbose debug logging
 - `S`: save a BMP screenshot
 - `Catalog`: open / close the help overlay
 - `Esc`: close help, or leave the movie if help is not open
+- `On`: turn the display black; while black, `Esc` exits the app after saving history
 
 ### Resume Prompt
 
@@ -98,6 +107,8 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 - touchpad: move cursor
 - touchpad click: activate the highlighted button
 - `Enter`: confirm the selected button
+- `C`: cycle theme color
+- `S`: save a BMP screenshot
 - `Esc`: cancel and return
 
 ## Subtitle Fonts
@@ -207,11 +218,11 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --subtitle embedded
 ### Target A Specific Size With 2-Pass ABR
 
 ```powershell
-python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --output ".\dist\video.nvp.tns" --fps 16 --max-width 320 --max-height 180 --max-chunk-kib 64 --stream-profile quality --bitrate-kbps 140 --two-pass --preset veryslow --level 1.3
+python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --output ".\dist\video.nvp.tns" --fps 16 --max-width 320 --max-height 180 --max-chunk-kib 64 --idr-frames byte-auto --stream-profile quality --bitrate-kbps 140 --two-pass --preset veryslow --level 1.3
 ```
 
 Use CRF when you want the best quality-per-bit without caring about the exact final size. Use `--bitrate-kbps ... --two-pass` when you need a tighter size target.
-By default, chunks are packed by `--max-chunk-kib`; `64` is the recommended starting point for smooth on-device playback. `--chunk-frames` can still be set as an extra frame-count ceiling, and `--chunk-frames 0` leaves that ceiling disabled. `--idr-frames auto` is also the default; in bitrate mode it derives the keyframe spacing from the chunk byte cap so chunk boundaries follow the KiB budget instead of a hardcoded frame rhythm. `--max-chunk-overshoot-percent` allows rare single-GOP near-misses above the target instead of throwing away an otherwise good encode.
+By default, chunks are packed by `--max-chunk-kib`; `64` is the recommended starting point for smooth on-device playback. `--chunk-frames` can still be set as an extra frame-count ceiling, and `--chunk-frames 0` leaves that ceiling disabled. `--idr-frames auto` is also the default; in bitrate mode it estimates a fixed keyframe cadence from the chunk byte cap. For higher-quality size-targeted encodes, `--idr-frames byte-auto` runs a probe encode, measures real frame sizes, then re-encodes with IDRs placed at measured chunk byte boundaries. This adds encode time, but avoids shrinking every GOP just because one scene is heavy. `--max-chunk-overshoot-percent` allows rare single-GOP near-misses above the target instead of throwing away an otherwise good encode.
 When `--fps` caps or changes the framerate, the encoder timeline-samples frames and then verifies the encoded frame count against the intended duration. The `.json` sidecar records source fps, target fps, expected frames, actual frames, and drift in milliseconds.
 
 ### Main Encoder Options
