@@ -8406,7 +8406,6 @@ static void draw_surface_panel(SDL_Surface *screen, SDL_Surface *surface, int x,
 
 static void draw_seek_preview_panel(SDL_Surface *screen, SDL_Surface *surface, int x, int y, int marker_x)
 {
-    SDL_Rect shadow;
     SDL_Rect outer;
     SDL_Rect inner;
     SDL_Rect dst;
@@ -8857,6 +8856,7 @@ static void draw_progress(
             } else {
                 hover_badge_y = bar_back.y - 20;
             }
+            draw_centered_text_badge(screen, fonts, marker_x, hover_badge_y, hover_text);
         }
     }
     format_clock(current_ms, current_text, sizeof(current_text));
@@ -8872,9 +8872,6 @@ static void draw_progress(
         overlay.y + 7,
         right_text
     );
-    if (hover_bar && duration_ms > 0) {
-        draw_centered_text_badge(screen, fonts, marker_x, hover_badge_y, hover_text);
-    }
     if (pending_seek_ms != 0) {
         format_seek_delta(pending_seek_ms, seek_text, sizeof(seek_text));
         if (pending_seek_ms < 0) {
