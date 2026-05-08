@@ -1208,6 +1208,18 @@ static int clamp_int(int value, int min_value, int max_value)
     return value;
 }
 
+static bool rect_contains_point(const SDL_Rect *rect, int x, int y)
+{
+    return rect &&
+        x >= rect->x && x < rect->x + rect->w &&
+        y >= rect->y && y < rect->y + rect->h;
+}
+
+static bool pointer_over_rect(const PointerState *pointer, const SDL_Rect *rect)
+{
+    return pointer && pointer->visible && rect_contains_point(rect, pointer->x, pointer->y);
+}
+
 static VideoAlign clamp_video_align(int value)
 {
     return (VideoAlign) clamp_int(value, (int) VIDEO_ALIGN_NEGATIVE, (int) VIDEO_ALIGN_POSITIVE);
@@ -8751,12 +8763,27 @@ static int top_overlay_y_for_rect(const SDL_Rect *video_rect, int overlay_h)
     return 8;
 }
 
-static int draw_text_badge(SDL_Surface *screen, const Fonts *fonts, int right_x, int y, const char *label)
+static SDL_Rect text_badge_rect(const Fonts *fonts, int right_x, int y, const char *label)
 {
     int text_w = nSDL_GetStringWidth(fonts->white, label);
     SDL_Rect badge = {(Sint16) (right_x - text_w - 12), (Sint16) y, (Uint16) (text_w + 12), 16};
 
-    draw_soft_glass_panel(screen, &badge, UI_COLOR_GUNMETAL, false);
+    return badge;
+}
+
+static int draw_text_badge(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    int right_x,
+    int y,
+    const char *label,
+    const PointerState *pointer
+)
+{
+    SDL_Rect badge = text_badge_rect(fonts, right_x, y, label);
+    bool hovered = pointer_over_rect(pointer, &badge);
+
+    draw_soft_glass_panel(screen, &badge, hovered ? ui_theme()->row_selected : UI_COLOR_GUNMETAL, hovered);
     draw_ui_label(screen, fonts, badge.x + 6, badge.y + 4, label);
     return badge.x - 6;
 }
@@ -8996,28 +9023,62 @@ static void format_seek_delta(int32_t delta_ms, char *buffer, size_t buffer_size
     snprintf(buffer, buffer_size, "%c%s", delta_ms < 0 ? '-' : '+', time_text);
 }
 
+static void status_badge_rects(
+    const Fonts *fonts,
+    const SDL_Rect *video_rect,
+    ScaleMode scale_mode,
+    const PlaybackRate *playback_rate,
+    SDL_Rect *scale_badge,
+    SDL_Rect *speed_badge
+)
+{
+    int right_x = SCREEN_W - 8;
+    int y = top_overlay_y_for_rect(video_rect, 16);
+    SDL_Rect speed = text_badge_rect(fonts, right_x, y, playback_rate ? playback_rate->label : "1.0x");
+
+    if (speed_badge) {
+        *speed_badge = speed;
+    }
+    right_x = speed.x - 6;
+    if (scale_badge) {
+        *scale_badge = text_badge_rect(fonts, right_x, y, scale_mode_text(scale_mode));
+    }
+}
+
 static int draw_status_badges(
     SDL_Surface *screen,
     const Fonts *fonts,
     const SDL_Rect *video_rect,
     ScaleMode scale_mode,
-    const PlaybackRate *playback_rate
+    const PlaybackRate *playback_rate,
+    const PointerState *pointer
 )
 {
-    int right_x = SCREEN_W - 8;
-    int y = top_overlay_y_for_rect(video_rect, 16);
+    SDL_Rect scale_badge;
+    SDL_Rect speed_badge;
 
-    right_x = draw_text_badge(screen, fonts, right_x, y, playback_rate ? playback_rate->label : "1.0x");
-    return draw_text_badge(screen, fonts, right_x, y, scale_mode_text(scale_mode));
+    status_badge_rects(fonts, video_rect, scale_mode, playback_rate, &scale_badge, &speed_badge);
+    draw_text_badge(screen, fonts, speed_badge.x + speed_badge.w, speed_badge.y, playback_rate ? playback_rate->label : "1.0x", pointer);
+    draw_text_badge(screen, fonts, scale_badge.x + scale_badge.w, scale_badge.y, scale_mode_text(scale_mode), pointer);
+    return scale_badge.x - 6;
 }
 
-static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect, bool paused)
+static SDL_Rect playback_badge_rect(const SDL_Rect *video_rect)
 {
     int y = top_overlay_y_for_rect(video_rect, 22);
     SDL_Rect outer = {8, (Sint16) y, 22, 22};
-    SDL_Rect fill = {9, (Sint16) (y + 1), 20, 20};
 
-    draw_soft_glass_panel(screen, &outer, UI_COLOR_CARBON, false);
+    return outer;
+}
+
+static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect, bool paused, const PointerState *pointer)
+{
+    SDL_Rect outer = playback_badge_rect(video_rect);
+    int y = outer.y;
+    SDL_Rect fill = {9, (Sint16) (y + 1), 20, 20};
+    bool hovered = pointer_over_rect(pointer, &outer);
+
+    draw_soft_glass_panel(screen, &outer, hovered ? ui_theme()->row_selected : UI_COLOR_CARBON, hovered);
     if (paused) {
         SDL_Rect left_bar = {14, (Sint16) (y + 5), 3, 10};
         SDL_Rect right_bar = {21, (Sint16) (y + 5), 3, 10};
@@ -9567,7 +9628,7 @@ static void draw_progress(
         if (pending_seek_ms < 0) {
             draw_left_text_badge(screen, fonts, 10, (SCREEN_H / 2) - 8, seek_text);
         } else {
-            draw_text_badge(screen, fonts, SCREEN_W - 10, (SCREEN_H / 2) - 8, seek_text);
+            draw_text_badge(screen, fonts, SCREEN_W - 10, (SCREEN_H / 2) - 8, seek_text, NULL);
         }
     }
 }
@@ -9694,9 +9755,9 @@ static void render_movie(
     if (show_ui) {
         if (!help_menu_open) {
             if (playback_badge_visible) {
-                draw_playback_badge(screen, &dst, paused);
+                draw_playback_badge(screen, &dst, paused, pointer);
             }
-            memory_right_limit = draw_status_badges(screen, fonts, &dst, scale_mode, playback_rate);
+            memory_right_limit = draw_status_badges(screen, fonts, &dst, scale_mode, playback_rate, pointer);
             if (status_overlay_text && status_overlay_text[0] != '\0') {
                 draw_left_text_badge(screen, fonts, playback_badge_visible ? 36 : 8, top_overlay_y_for_rect(&dst, 16), status_overlay_text);
             }
@@ -10885,6 +10946,12 @@ static int pick_movie(
         *resume_without_prompt = false;
     }
     pointer_init(&pointer);
+    pointer_update(&pointer);
+    prev_up = isKeyPressed(KEY_NSPIRE_UP);
+    prev_down = isKeyPressed(KEY_NSPIRE_DOWN);
+    prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
+    prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
+    prev_c = isKeyPressed(KEY_NSPIRE_C);
     pointer_hover_guard_reset(&hover_guard);
     picker_tooltip_hover_reset(&tooltip_hover);
     while (1) {
@@ -10915,8 +10982,10 @@ static int pick_movie(
             selected++;
             pointer_hover_guard_lock(&hover_guard, &pointer);
         }
-        if (pointer_click && (hovered_index >= 0 || resume_hovered_index >= 0)) {
-            int activated_index = resume_hovered_index >= 0 ? resume_hovered_index : hovered_index;
+        if (pointer_click && count > 0) {
+            int activated_index = resume_hovered_index >= 0
+                ? resume_hovered_index
+                : (hovered_index >= 0 ? hovered_index : (int) selected);
             int phase;
             for (phase = 0; phase < 6; ++phase) {
                 render_picker(screen, fonts, files, count, selected, -1, -1, &pointer, "Loading", phase);
@@ -11098,6 +11167,12 @@ static int prompt_resume_position(
     continue_button.y = (Sint16) button_y;
     restart_button.y = (Sint16) button_y;
     pointer_init(&pointer);
+    pointer_update(&pointer);
+    prev_left = isKeyPressed(KEY_NSPIRE_LEFT);
+    prev_right = isKeyPressed(KEY_NSPIRE_RIGHT);
+    prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
+    prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
+    prev_c = isKeyPressed(KEY_NSPIRE_C);
     pointer_hover_guard_reset(&hover_guard);
 
     while (1) {
@@ -11147,18 +11222,9 @@ static int prompt_resume_position(
             pointer_hover_guard_lock(&hover_guard, &pointer);
         }
         if (pointer_click) {
-            if (pointer.x >= continue_button.x && pointer.x < continue_button.x + continue_button.w &&
-                pointer.y >= continue_button.y && pointer.y < continue_button.y + continue_button.h) {
-                free(title_main);
-                free(title_detail);
-                return 1;
-            }
-            if (pointer.x >= restart_button.x && pointer.x < restart_button.x + restart_button.w &&
-                pointer.y >= restart_button.y && pointer.y < restart_button.y + restart_button.h) {
-                free(title_main);
-                free(title_detail);
-                return 0;
-            }
+            free(title_main);
+            free(title_detail);
+            return selected_button == 0 ? 1 : 0;
         }
         if (key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter)) {
             free(title_main);
@@ -11969,7 +12035,29 @@ static int play_movie(
         }
         if (pointer_click) {
             SDL_Rect bar = progress_bar_rect();
-            if (show_ui && pointer.y >= SCREEN_H - UI_BAR_H && pointer.y < SCREEN_H) {
+            SDL_Rect click_src;
+            SDL_Rect click_dst;
+            SDL_Rect scale_badge;
+            SDL_Rect speed_badge;
+            bool handled_badge_click = false;
+
+            compute_video_rects(&movie, scale_mode, video_align_x, video_align_y, &click_src, &click_dst);
+            status_badge_rects(fonts, &click_dst, scale_mode, playback_rate, &scale_badge, &speed_badge);
+            if (show_ui && !help_menu_open && pointer_over_rect(&pointer, &scale_badge)) {
+                scale_mode = (ScaleMode) ((scale_mode + 1) % 4);
+                ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+                handled_badge_click = true;
+            } else if (show_ui && !help_menu_open && pointer_over_rect(&pointer, &speed_badge)) {
+                playback_rate_index = (playback_rate_index + 1) % PLAYBACK_RATE_COUNT;
+                playback_rate = playback_rate_for_index(playback_rate_index);
+                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+                handled_badge_click = true;
+            }
+
+            if (handled_badge_click) {
+                pointer_click = false;
+            } else if (show_ui && pointer.y >= SCREEN_H - UI_BAR_H && pointer.y < SCREEN_H) {
                 int seek_x = clamp_int(pointer.x, bar.x, bar.x + bar.w);
                 if (!seek_to_ratio(&movie, (uint32_t) (seek_x - bar.x), (uint32_t) bar.w)) {
                     report_movie_decode_failure(&movie, path, "pointer seek");
