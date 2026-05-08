@@ -7896,22 +7896,330 @@ static void draw_subtitle(
 
 static SDL_Rect progress_bar_rect(void)
 {
-    SDL_Rect rect = {14, SCREEN_H - 11, SCREEN_W - 28, 5};
+    SDL_Rect rect = {18, SCREEN_H - 15, SCREEN_W - 36, 6};
     return rect;
+}
+
+#define UI_RGB565(r, g, b) ((Uint16) (((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3))))
+
+enum {
+    UI_COLOR_BLACK = UI_RGB565(0, 0, 0),
+    UI_COLOR_WHITE = UI_RGB565(255, 255, 255),
+    UI_COLOR_AERO_CYAN = UI_RGB565(64, 224, 255),
+    UI_COLOR_AERO_BLUE = UI_RGB565(26, 91, 140),
+    UI_COLOR_BG_TOP = UI_RGB565(10, 21, 38),
+    UI_COLOR_BG_BOTTOM = UI_RGB565(2, 5, 10),
+    UI_CURSOR_KEY = UI_RGB565(255, 0, 255)
+};
+
+static bool surface_is_rgb565(const SDL_Surface *surface)
+{
+    return surface &&
+        surface->format &&
+        surface->format->BitsPerPixel == 16 &&
+        surface->format->Rmask == 0xF800 &&
+        surface->format->Gmask == 0x07E0 &&
+        surface->format->Bmask == 0x001F;
+}
+
+static void rgb565_to_rgb888(Uint16 color, int *r, int *g, int *b)
+{
+    int r5 = (color >> 11) & 0x1F;
+    int g6 = (color >> 5) & 0x3F;
+    int b5 = color & 0x1F;
+
+    if (r) {
+        *r = (r5 << 3) | (r5 >> 2);
+    }
+    if (g) {
+        *g = (g6 << 2) | (g6 >> 4);
+    }
+    if (b) {
+        *b = (b5 << 3) | (b5 >> 2);
+    }
+}
+
+static Uint32 map_rgb565(SDL_Surface *screen, Uint16 color)
+{
+    int r;
+    int g;
+    int b;
+
+    rgb565_to_rgb888(color, &r, &g, &b);
+    return SDL_MapRGB(screen->format, r, g, b);
+}
+
+static Uint16 rgb565_lerp(Uint16 from, Uint16 to, int step, int steps)
+{
+    int ar = (from >> 11) & 0x1F;
+    int ag = (from >> 5) & 0x3F;
+    int ab = from & 0x1F;
+    int br = (to >> 11) & 0x1F;
+    int bg = (to >> 5) & 0x3F;
+    int bb = to & 0x1F;
+    int r;
+    int g;
+    int b;
+
+    if (steps <= 0) {
+        return to;
+    }
+    step = clamp_int(step, 0, steps);
+    r = ar + (((br - ar) * step + (steps / 2)) / steps);
+    g = ag + (((bg - ag) * step + (steps / 2)) / steps);
+    b = ab + (((bb - ab) * step + (steps / 2)) / steps);
+    return (Uint16) ((r << 11) | (g << 5) | b);
+}
+
+static Uint16 blend_rgb565(Uint16 base, Uint16 overlay, int alpha)
+{
+    return rgb565_lerp(base, overlay, alpha, 255);
+}
+
+static void fill_rect_rgb565(SDL_Surface *screen, const SDL_Rect *rect, Uint16 color)
+{
+    if (!screen || !rect || rect->w == 0 || rect->h == 0) {
+        return;
+    }
+    SDL_FillRect(screen, (SDL_Rect *) rect, map_rgb565(screen, color));
+}
+
+static void draw_vertical_gradient(SDL_Surface *screen, const SDL_Rect *rect, Uint16 color_top, Uint16 color_bottom)
+{
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+    int y;
+    int denominator;
+    bool locked = false;
+
+    if (!screen || !rect || rect->w == 0 || rect->h == 0) {
+        return;
+    }
+
+    x0 = clamp_int(rect->x, 0, screen->w);
+    y0 = clamp_int(rect->y, 0, screen->h);
+    x1 = clamp_int(rect->x + rect->w, 0, screen->w);
+    y1 = clamp_int(rect->y + rect->h, 0, screen->h);
+    if (x0 >= x1 || y0 >= y1) {
+        return;
+    }
+
+    denominator = rect->h > 1 ? rect->h - 1 : 1;
+    if (!surface_is_rgb565(screen)) {
+        for (y = y0; y < y1; ++y) {
+            SDL_Rect line = {(Sint16) x0, (Sint16) y, (Uint16) (x1 - x0), 1};
+            fill_rect_rgb565(screen, &line, rgb565_lerp(color_top, color_bottom, y - rect->y, denominator));
+        }
+        return;
+    }
+
+    if (SDL_MUSTLOCK(screen)) {
+        if (SDL_LockSurface(screen) != 0) {
+            return;
+        }
+        locked = true;
+    }
+
+    {
+        Uint16 *pixels = (Uint16 *) screen->pixels;
+        int pitch = screen->pitch / 2;
+        for (y = y0; y < y1; ++y) {
+            Uint16 color = rgb565_lerp(color_top, color_bottom, y - rect->y, denominator);
+            Uint16 *row = pixels + (y * pitch) + x0;
+            int x;
+            for (x = x0; x < x1; ++x) {
+                *row++ = color;
+            }
+        }
+    }
+
+    if (locked) {
+        SDL_UnlockSurface(screen);
+    }
+}
+
+static void draw_rect_outline_rgb565(SDL_Surface *screen, const SDL_Rect *rect, Uint16 color)
+{
+    SDL_Rect line;
+
+    if (!screen || !rect || rect->w == 0 || rect->h == 0) {
+        return;
+    }
+
+    line.x = rect->x;
+    line.y = rect->y;
+    line.w = rect->w;
+    line.h = 1;
+    fill_rect_rgb565(screen, &line, color);
+    line.y = (Sint16) (rect->y + rect->h - 1);
+    fill_rect_rgb565(screen, &line, color);
+    line.x = rect->x;
+    line.y = rect->y;
+    line.w = 1;
+    line.h = rect->h;
+    fill_rect_rgb565(screen, &line, color);
+    line.x = (Sint16) (rect->x + rect->w - 1);
+    fill_rect_rgb565(screen, &line, color);
+}
+
+static void cut_rect_corners(SDL_Surface *screen, const SDL_Rect *rect, Uint16 color)
+{
+    SDL_Rect pixel;
+
+    if (!screen || !rect || rect->w < 2 || rect->h < 2) {
+        return;
+    }
+    pixel.w = 1;
+    pixel.h = 1;
+    pixel.x = rect->x;
+    pixel.y = rect->y;
+    fill_rect_rgb565(screen, &pixel, color);
+    pixel.x = (Sint16) (rect->x + rect->w - 1);
+    fill_rect_rgb565(screen, &pixel, color);
+    pixel.x = rect->x;
+    pixel.y = (Sint16) (rect->y + rect->h - 1);
+    fill_rect_rgb565(screen, &pixel, color);
+    pixel.x = (Sint16) (rect->x + rect->w - 1);
+    fill_rect_rgb565(screen, &pixel, color);
+}
+
+static Uint16 picker_background_color_at_y(int y)
+{
+    return rgb565_lerp(UI_COLOR_BG_TOP, UI_COLOR_BG_BOTTOM, clamp_int(y, 0, SCREEN_H - 1), SCREEN_H - 1);
+}
+
+static void draw_glass_panel(SDL_Surface *screen, const SDL_Rect *rect, Uint16 base_color, bool is_selected)
+{
+    SDL_Rect gloss;
+    SDL_Rect line;
+    Uint16 top;
+    Uint16 bottom;
+    Uint16 gloss_top;
+    Uint16 gloss_bottom;
+
+    if (!screen || !rect || rect->w == 0 || rect->h == 0) {
+        return;
+    }
+
+    top = blend_rgb565(base_color, UI_COLOR_WHITE, is_selected ? 48 : 28);
+    bottom = blend_rgb565(base_color, UI_COLOR_BLACK, is_selected ? 70 : 92);
+    draw_vertical_gradient(screen, rect, top, bottom);
+
+    if (rect->h >= 4 && rect->w >= 4) {
+        gloss.x = (Sint16) (rect->x + 1);
+        gloss.y = (Sint16) (rect->y + 1);
+        gloss.w = (Uint16) (rect->w - 2);
+        gloss.h = (Uint16) ((rect->h / 2) - 1);
+        if (gloss.h > 0) {
+            gloss_top = blend_rgb565(base_color, UI_COLOR_WHITE, is_selected ? 150 : 104);
+            gloss_bottom = blend_rgb565(base_color, UI_COLOR_WHITE, is_selected ? 34 : 20);
+            draw_vertical_gradient(screen, &gloss, gloss_top, gloss_bottom);
+        }
+    }
+
+    line.x = (Sint16) (rect->x + 1);
+    line.y = (Sint16) (rect->y + 1);
+    line.w = rect->w > 2 ? (Uint16) (rect->w - 2) : rect->w;
+    line.h = 1;
+    fill_rect_rgb565(screen, &line, blend_rgb565(base_color, UI_COLOR_WHITE, is_selected ? 210 : 128));
+    line.y = (Sint16) (rect->y + rect->h - 1);
+    fill_rect_rgb565(screen, &line, blend_rgb565(base_color, UI_COLOR_BLACK, 170));
+
+    if (is_selected) {
+        draw_rect_outline_rgb565(screen, rect, UI_COLOR_AERO_CYAN);
+    } else {
+        draw_rect_outline_rgb565(screen, rect, blend_rgb565(base_color, UI_COLOR_BLACK, 120));
+    }
+}
+
+static void draw_shadow_label(SDL_Surface *screen, const Fonts *fonts, int x, int y, const char *label)
+{
+    if (!screen || !fonts || !label) {
+        return;
+    }
+    nSDL_DrawString(screen, fonts->outline, x + 1, y + 1, "%s", label);
+    nSDL_DrawString(screen, fonts->white, x, y, "%s", label);
+}
+
+static void draw_checker_darken(SDL_Surface *screen)
+{
+    int y;
+    bool locked = false;
+
+    if (!screen || !screen->pixels) {
+        return;
+    }
+    if (screen->format->BitsPerPixel != 16) {
+        SDL_Rect veil = {0, 0, SCREEN_W, SCREEN_H};
+        SDL_FillRect(screen, &veil, SDL_MapRGB(screen->format, 0, 0, 0));
+        return;
+    }
+    if (SDL_MUSTLOCK(screen)) {
+        if (SDL_LockSurface(screen) != 0) {
+            return;
+        }
+        locked = true;
+    }
+    {
+        Uint16 *pixels = (Uint16 *) screen->pixels;
+        int pitch = screen->pitch / 2;
+        Uint16 black = (Uint16) SDL_MapRGB(screen->format, 0, 0, 0);
+        for (y = 0; y < screen->h; ++y) {
+            Uint16 *row = pixels + (y * pitch);
+            int x;
+            for (x = (y & 1); x < screen->w; x += 2) {
+                row[x] = black;
+            }
+        }
+    }
+    if (locked) {
+        SDL_UnlockSurface(screen);
+    }
 }
 
 static void draw_cursor(SDL_Surface *screen, int x, int y)
 {
-    SDL_Rect black_h = {(Sint16) (x - 6), (Sint16) (y - 1), 13, 3};
-    SDL_Rect black_v = {(Sint16) (x - 1), (Sint16) (y - 6), 3, 13};
-    SDL_Rect white_h = {(Sint16) (x - 5), (Sint16) y, 11, 1};
-    SDL_Rect white_v = {(Sint16) x, (Sint16) (y - 5), 1, 11};
-    SDL_Rect center = {(Sint16) (x - 1), (Sint16) (y - 1), 3, 3};
-    SDL_FillRect(screen, &black_h, SDL_MapRGB(screen->format, 0, 0, 0));
-    SDL_FillRect(screen, &black_v, SDL_MapRGB(screen->format, 0, 0, 0));
-    SDL_FillRect(screen, &white_h, SDL_MapRGB(screen->format, 255, 255, 255));
-    SDL_FillRect(screen, &white_v, SDL_MapRGB(screen->format, 255, 255, 255));
-    SDL_FillRect(screen, &center, SDL_MapRGB(screen->format, 255, 255, 255));
+    static const Uint16 cursor_pixels[12 * 12] = {
+        UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+        UI_COLOR_WHITE, UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+        UI_COLOR_WHITE, UI_RGB565(198, 238, 255), UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+        UI_COLOR_WHITE, UI_RGB565(198, 238, 255), UI_RGB565(198, 238, 255), UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+        UI_COLOR_WHITE, UI_RGB565(198, 238, 255), UI_RGB565(132, 212, 255), UI_RGB565(198, 238, 255), UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+        UI_COLOR_WHITE, UI_RGB565(198, 238, 255), UI_RGB565(132, 212, 255), UI_RGB565(132, 212, 255), UI_RGB565(198, 238, 255), UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+        UI_COLOR_WHITE, UI_RGB565(198, 238, 255), UI_RGB565(132, 212, 255), UI_RGB565(78, 174, 230), UI_RGB565(78, 174, 230), UI_RGB565(198, 238, 255), UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+        UI_COLOR_WHITE, UI_RGB565(198, 238, 255), UI_RGB565(132, 212, 255), UI_RGB565(78, 174, 230), UI_RGB565(42, 112, 176), UI_RGB565(42, 112, 176), UI_RGB565(198, 238, 255), UI_COLOR_WHITE, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+        UI_COLOR_WHITE, UI_RGB565(198, 238, 255), UI_RGB565(132, 212, 255), UI_RGB565(78, 174, 230), UI_RGB565(42, 112, 176), UI_RGB565(18, 28, 38), UI_RGB565(18, 28, 38), UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+        UI_CURSOR_KEY, UI_RGB565(24, 28, 34), UI_CURSOR_KEY, UI_CURSOR_KEY, UI_RGB565(78, 174, 230), UI_RGB565(18, 28, 38), UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+        UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_RGB565(24, 28, 34), UI_RGB565(18, 28, 38), UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY,
+        UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_RGB565(24, 28, 34), UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY
+    };
+    static SDL_Surface *cursor_surface = NULL;
+    SDL_Rect dst = {(Sint16) x, (Sint16) y, 12, 12};
+
+    if (!screen) {
+        return;
+    }
+    if (!cursor_surface) {
+        cursor_surface = SDL_CreateRGBSurfaceFrom(
+            (void *) cursor_pixels,
+            12,
+            12,
+            16,
+            12 * 2,
+            0xF800,
+            0x07E0,
+            0x001F,
+            0
+        );
+        if (cursor_surface) {
+            SDL_SetColorKey(cursor_surface, SDL_SRCCOLORKEY, UI_CURSOR_KEY);
+        }
+    }
+    if (cursor_surface) {
+        SDL_BlitSurface(cursor_surface, NULL, screen, &dst);
+    }
 }
 
 static void compute_video_rects(
@@ -8009,38 +8317,50 @@ static int top_overlay_y_for_rect(const SDL_Rect *video_rect, int overlay_h)
 static int draw_text_badge(SDL_Surface *screen, const Fonts *fonts, int right_x, int y, const char *label)
 {
     int text_w = nSDL_GetStringWidth(fonts->white, label);
-    SDL_Rect badge = {(Sint16) (right_x - text_w - 10), (Sint16) y, (Uint16) (text_w + 10), 16};
-    SDL_FillRect(screen, &badge, SDL_MapRGB(screen->format, 18, 18, 24));
-    nSDL_DrawString(screen, fonts->white, badge.x + 5, badge.y + 4, "%s", label);
+    SDL_Rect shadow = {(Sint16) (right_x - text_w - 9), (Sint16) (y + 2), (Uint16) (text_w + 12), 16};
+    SDL_Rect badge = {(Sint16) (right_x - text_w - 12), (Sint16) y, (Uint16) (text_w + 12), 16};
+
+    fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
+    draw_glass_panel(screen, &badge, UI_RGB565(16, 46, 72), false);
+    cut_rect_corners(screen, &badge, UI_COLOR_BLACK);
+    draw_shadow_label(screen, fonts, badge.x + 6, badge.y + 4, label);
     return badge.x - 6;
 }
 
 static int draw_left_text_badge(SDL_Surface *screen, const Fonts *fonts, int left_x, int y, const char *label)
 {
     int text_w = nSDL_GetStringWidth(fonts->white, label);
-    SDL_Rect badge = {(Sint16) left_x, (Sint16) y, (Uint16) (text_w + 10), 16};
-    SDL_FillRect(screen, &badge, SDL_MapRGB(screen->format, 18, 18, 24));
-    nSDL_DrawString(screen, fonts->white, badge.x + 5, badge.y + 4, "%s", label);
+    SDL_Rect shadow = {(Sint16) (left_x + 3), (Sint16) (y + 2), (Uint16) (text_w + 12), 16};
+    SDL_Rect badge = {(Sint16) left_x, (Sint16) y, (Uint16) (text_w + 12), 16};
+
+    fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
+    draw_glass_panel(screen, &badge, UI_RGB565(16, 46, 72), false);
+    cut_rect_corners(screen, &badge, UI_COLOR_BLACK);
+    draw_shadow_label(screen, fonts, badge.x + 6, badge.y + 4, label);
     return badge.x + badge.w + 6;
 }
 
 static void draw_centered_text_badge(SDL_Surface *screen, const Fonts *fonts, int center_x, int y, const char *label)
 {
     int text_w = nSDL_GetStringWidth(fonts->white, label);
-    int width = text_w + 10;
+    int width = text_w + 12;
     SDL_Rect badge = {
         (Sint16) clamp_int(center_x - (width / 2), 0, SCREEN_W - width),
         (Sint16) y,
         (Uint16) width,
         16
     };
+    SDL_Rect shadow = {(Sint16) (badge.x + 3), (Sint16) (badge.y + 2), badge.w, badge.h};
 
-    SDL_FillRect(screen, &badge, SDL_MapRGB(screen->format, 18, 18, 24));
-    nSDL_DrawString(screen, fonts->white, badge.x + 5, badge.y + 4, "%s", label);
+    fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
+    draw_glass_panel(screen, &badge, UI_RGB565(16, 46, 72), false);
+    cut_rect_corners(screen, &badge, UI_COLOR_BLACK);
+    draw_shadow_label(screen, fonts, badge.x + 6, badge.y + 4, label);
 }
 
 static void draw_surface_panel(SDL_Surface *screen, SDL_Surface *surface, int x, int y)
 {
+    SDL_Rect shadow;
     SDL_Rect border;
     SDL_Rect inner;
     SDL_Rect dst;
@@ -8049,6 +8369,10 @@ static void draw_surface_panel(SDL_Surface *screen, SDL_Surface *surface, int x,
         return;
     }
 
+    shadow.x = (Sint16) (x + 2);
+    shadow.y = (Sint16) (y + 2);
+    shadow.w = (Uint16) (surface->w + 4);
+    shadow.h = (Uint16) (surface->h + 4);
     border.x = (Sint16) x;
     border.y = (Sint16) y;
     border.w = (Uint16) (surface->w + 4);
@@ -8062,9 +8386,59 @@ static void draw_surface_panel(SDL_Surface *screen, SDL_Surface *surface, int x,
     dst.w = (Uint16) surface->w;
     dst.h = (Uint16) surface->h;
 
-    SDL_FillRect(screen, &border, SDL_MapRGB(screen->format, 0, 0, 0));
-    SDL_FillRect(screen, &inner, SDL_MapRGB(screen->format, 12, 18, 28));
+    fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
+    fill_rect_rgb565(screen, &border, UI_RGB565(18, 24, 32));
+    fill_rect_rgb565(screen, &inner, UI_RGB565(232, 248, 255));
     SDL_BlitSurface(surface, NULL, screen, &dst);
+}
+
+static void draw_seek_preview_panel(SDL_Surface *screen, SDL_Surface *surface, int x, int y, int marker_x)
+{
+    SDL_Rect shadow;
+    SDL_Rect outer;
+    SDL_Rect inner;
+    SDL_Rect dst;
+    SDL_Rect triangle;
+    int center_x;
+
+    if (!screen || !surface) {
+        return;
+    }
+
+    shadow.x = (Sint16) (x + 3);
+    shadow.y = (Sint16) (y + 3);
+    shadow.w = (Uint16) (surface->w + 6);
+    shadow.h = (Uint16) (surface->h + 6);
+    outer.x = (Sint16) x;
+    outer.y = (Sint16) y;
+    outer.w = (Uint16) (surface->w + 6);
+    outer.h = (Uint16) (surface->h + 6);
+    inner.x = (Sint16) (x + 2);
+    inner.y = (Sint16) (y + 2);
+    inner.w = (Uint16) (surface->w + 2);
+    inner.h = (Uint16) (surface->h + 2);
+    dst.x = (Sint16) (x + 3);
+    dst.y = (Sint16) (y + 3);
+    dst.w = (Uint16) surface->w;
+    dst.h = (Uint16) surface->h;
+
+    fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
+    fill_rect_rgb565(screen, &outer, UI_RGB565(18, 20, 24));
+    fill_rect_rgb565(screen, &inner, UI_COLOR_WHITE);
+    SDL_BlitSurface(surface, NULL, screen, &dst);
+
+    center_x = clamp_int(marker_x, outer.x + 4, outer.x + outer.w - 5);
+    triangle.x = (Sint16) (center_x - 1);
+    triangle.y = (Sint16) (outer.y + outer.h);
+    triangle.w = 3;
+    triangle.h = 1;
+    fill_rect_rgb565(screen, &triangle, UI_RGB565(18, 20, 24));
+    triangle.x = (Sint16) center_x;
+    triangle.y = (Sint16) (outer.y + outer.h + 1);
+    triangle.w = 1;
+    fill_rect_rgb565(screen, &triangle, UI_RGB565(18, 20, 24));
+    triangle.y = (Sint16) (outer.y + outer.h - 1);
+    fill_rect_rgb565(screen, &triangle, UI_COLOR_WHITE);
 }
 
 static void draw_screenshot_preview_osd(
@@ -8123,20 +8497,23 @@ static int draw_status_badges(
 
 static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect, bool paused)
 {
-    Uint32 background = SDL_MapRGB(screen->format, 18, 18, 24);
-    Uint32 inner = SDL_MapRGB(screen->format, 8, 10, 14);
-    Uint32 foreground = SDL_MapRGB(screen->format, 255, 255, 255);
     int y = top_overlay_y_for_rect(video_rect, 22);
     SDL_Rect outer = {8, (Sint16) y, 22, 22};
+    SDL_Rect shadow = {10, (Sint16) (y + 2), 22, 22};
     SDL_Rect fill = {9, (Sint16) (y + 1), 20, 20};
 
-    SDL_FillRect(screen, &outer, background);
-    SDL_FillRect(screen, &fill, inner);
+    fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
+    draw_glass_panel(screen, &outer, UI_RGB565(14, 54, 86), true);
+    cut_rect_corners(screen, &outer, UI_COLOR_BLACK);
     if (paused) {
+        SDL_Rect left_shadow = {15, (Sint16) (y + 6), 3, 10};
+        SDL_Rect right_shadow = {22, (Sint16) (y + 6), 3, 10};
         SDL_Rect left_bar = {14, (Sint16) (y + 5), 3, 10};
         SDL_Rect right_bar = {21, (Sint16) (y + 5), 3, 10};
-        SDL_FillRect(screen, &left_bar, foreground);
-        SDL_FillRect(screen, &right_bar, foreground);
+        fill_rect_rgb565(screen, &left_shadow, UI_COLOR_BLACK);
+        fill_rect_rgb565(screen, &right_shadow, UI_COLOR_BLACK);
+        fill_rect_rgb565(screen, &left_bar, UI_COLOR_WHITE);
+        fill_rect_rgb565(screen, &right_bar, UI_COLOR_WHITE);
     } else {
         int triangle_width = 9;
         int triangle_half_height = 6;
@@ -8148,13 +8525,20 @@ static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect,
         for (column = 0; column < triangle_width; ++column) {
             int remaining = triangle_denominator - column;
             int half_height = (triangle_half_height * remaining + (triangle_denominator / 2)) / triangle_denominator;
+            SDL_Rect shadow_slice = {
+                (Sint16) (triangle_left + column + 1),
+                (Sint16) (triangle_center_y - half_height + 1),
+                1,
+                (Uint16) (half_height * 2 + 1)
+            };
             SDL_Rect slice = {
                 (Sint16) (triangle_left + column),
                 (Sint16) (triangle_center_y - half_height),
                 1,
                 (Uint16) (half_height * 2 + 1)
             };
-            SDL_FillRect(screen, &slice, foreground);
+            fill_rect_rgb565(screen, &shadow_slice, UI_COLOR_BLACK);
+            fill_rect_rgb565(screen, &slice, UI_COLOR_WHITE);
         }
     }
 }
@@ -8260,10 +8644,23 @@ static void draw_memory_badge(
     }
 }
 
-static void draw_help_row(SDL_Surface *screen, const Fonts *fonts, int shortcut_x, int description_x, int y, const char *shortcut, const char *description)
+static void draw_help_row(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    int shortcut_x,
+    int shortcut_w,
+    int description_x,
+    int y,
+    const char *shortcut,
+    const char *description
+)
 {
-    nSDL_DrawString(screen, fonts->white, shortcut_x, y, "%s", shortcut);
-    nSDL_DrawString(screen, fonts->white, description_x, y, "%s", description);
+    SDL_Rect key = {(Sint16) (shortcut_x - 4), (Sint16) (y - 1), (Uint16) (shortcut_w + 8), 9};
+
+    draw_glass_panel(screen, &key, UI_RGB565(20, 48, 70), false);
+    cut_rect_corners(screen, &key, UI_RGB565(15, 18, 22));
+    draw_shadow_label(screen, fonts, shortcut_x, y, shortcut);
+    draw_shadow_label(screen, fonts, description_x, y, description);
 }
 
 static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
@@ -8271,6 +8668,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     const int menu_w = 296;
     const int menu_h = 204;
     const int safe_h = SCREEN_H - UI_BAR_H;
+    SDL_Rect shadow = {(SCREEN_W - menu_w) / 2 + 4, (safe_h - menu_h) / 2 + 5, menu_w, menu_h};
     SDL_Rect border = {(SCREEN_W - menu_w) / 2, (safe_h - menu_h) / 2, menu_w, menu_h};
     SDL_Rect panel = {border.x + 1, border.y + 1, border.w - 2, border.h - 2};
     SDL_Rect header = {panel.x, panel.y, panel.w, 24};
@@ -8306,18 +8704,19 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     int y;
     size_t index;
 
-    SDL_FillRect(screen, &border, SDL_MapRGB(screen->format, 0, 0, 0));
-    SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 8, 10, 14));
-    SDL_FillRect(screen, &header, SDL_MapRGB(screen->format, 12, 18, 28));
-    SDL_FillRect(screen, &accent, SDL_MapRGB(screen->format, 32, 182, 255));
+    draw_checker_darken(screen);
+    fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
+    fill_rect_rgb565(screen, &border, UI_RGB565(214, 226, 232));
+    draw_glass_panel(screen, &panel, UI_RGB565(18, 20, 24), false);
+    draw_glass_panel(screen, &header, UI_RGB565(28, 68, 98), false);
+    draw_vertical_gradient(screen, &accent, UI_RGB565(140, 255, 255), UI_RGB565(0, 136, 255));
 
-    nSDL_DrawString(screen, fonts->white, panel.x + 10, panel.y + 6, "%s", title_text);
-    nSDL_DrawString(
+    draw_shadow_label(screen, fonts, panel.x + 10, panel.y + 6, title_text);
+    draw_shadow_label(
         screen,
-        fonts->white,
+        fonts,
         panel.x + panel.w - 10 - nSDL_GetStringWidth(fonts->white, close_text),
         panel.y + 6,
-        "%s",
         close_text
     );
 
@@ -8329,10 +8728,10 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts)
     }
     shortcut_x = panel.x + 12;
     description_x = shortcut_x + max_shortcut_w + 16;
-    y = accent.y + 8;
+    y = accent.y + 7;
     for (index = 0; index < sizeof(rows) / sizeof(rows[0]); ++index) {
-        draw_help_row(screen, fonts, shortcut_x, description_x, y, rows[index].shortcut, rows[index].description);
-        y += 10;
+        draw_help_row(screen, fonts, shortcut_x, max_shortcut_w, description_x, y, rows[index].shortcut, rows[index].description);
+        y += 9;
     }
 }
 
@@ -8346,9 +8745,13 @@ static void draw_progress(
     const SeekBarPreviewState *seek_preview
 )
 {
-    SDL_Rect overlay = {0, SCREEN_H - UI_BAR_H, SCREEN_W, UI_BAR_H};
+    SDL_Rect overlay_shadow = {6, SCREEN_H - 32, SCREEN_W - 8, 30};
+    SDL_Rect overlay = {4, SCREEN_H - 34, SCREEN_W - 8, 30};
     SDL_Rect bar_back = progress_bar_rect();
     SDL_Rect bar_front = bar_back;
+    SDL_Rect track_outer = {(Sint16) (bar_back.x - 1), (Sint16) (bar_back.y - 1), (Uint16) (bar_back.w + 2), (Uint16) (bar_back.h + 2)};
+    SDL_Rect track_top_shadow = {bar_back.x, bar_back.y, bar_back.w, 1};
+    SDL_Rect track_bottom_highlight = {bar_back.x, (Sint16) (bar_back.y + bar_back.h), bar_back.w, 1};
     int index;
     char current_text[24];
     char total_text[24];
@@ -8361,29 +8764,52 @@ static void draw_progress(
     bool hover_bar = false;
     uint32_t hover_ms = 0;
     int hover_badge_y = bar_back.y - 20;
-    SDL_FillRect(screen, &overlay, SDL_MapRGB(screen->format, 0, 0, 0));
-    SDL_FillRect(screen, &bar_back, SDL_MapRGB(screen->format, 52, 52, 68));
+
+    fill_rect_rgb565(screen, &overlay_shadow, UI_COLOR_BLACK);
+    draw_glass_panel(screen, &overlay, UI_RGB565(18, 24, 30), false);
+    cut_rect_corners(screen, &overlay, UI_COLOR_BLACK);
+
+    fill_rect_rgb565(screen, &track_outer, UI_COLOR_BLACK);
+    draw_vertical_gradient(screen, &bar_back, UI_RGB565(38, 42, 52), UI_RGB565(14, 16, 22));
+    fill_rect_rgb565(screen, &track_top_shadow, UI_COLOR_BLACK);
+    fill_rect_rgb565(screen, &track_bottom_highlight, UI_RGB565(116, 128, 144));
+
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
         if (movie->prefetched[index].chunk_index >= 0) {
             const ChunkIndexEntry *entry = movie->chunk_index + movie->prefetched[index].chunk_index;
+            int bar_right = bar_back.x + bar_back.w;
             SDL_Rect prefetch_rect = bar_back;
             prefetch_rect.x = bar_back.x + (int) (((uint64_t) bar_back.w * entry->first_frame) / movie->header.frame_count);
             prefetch_rect.w = (Uint16) (((uint64_t) bar_back.w * entry->frame_count) / movie->header.frame_count);
             if (prefetch_rect.w <= 0) {
                 prefetch_rect.w = 1;
             }
-            SDL_FillRect(screen, &prefetch_rect, SDL_MapRGB(screen->format, 104, 104, 116));
+            if (prefetch_rect.x >= bar_right) {
+                prefetch_rect.w = 0;
+            } else if (prefetch_rect.x + prefetch_rect.w > bar_right) {
+                prefetch_rect.w = (Uint16) (bar_right - prefetch_rect.x);
+            }
+            if (prefetch_rect.w > 0) {
+                draw_vertical_gradient(screen, &prefetch_rect, UI_RGB565(144, 154, 164), UI_RGB565(72, 78, 88));
+            }
         }
     }
+    bar_front.w = 0;
     if (duration_ms > 0) {
         bar_front.w = (Uint16) (((uint64_t) bar_back.w * current_ms) / duration_ms);
     }
-    SDL_FillRect(screen, &bar_front, SDL_MapRGB(screen->format, 32, 182, 255));
+    if (bar_front.w > 0) {
+        SDL_Rect meniscus = {bar_front.x, bar_front.y, bar_front.w, 1};
+        draw_vertical_gradient(screen, &bar_front, UI_RGB565(0, 255, 255), UI_RGB565(0, 136, 255));
+        fill_rect_rgb565(screen, &meniscus, UI_COLOR_WHITE);
+    }
     if (pointer && pointer->visible) {
         int marker_x = clamp_int(pointer->x, bar_back.x, bar_back.x + bar_back.w - 1);
-        SDL_Rect marker = {(Sint16) marker_x, (Sint16) (bar_back.y - 2), 1, 10};
-        SDL_FillRect(screen, &marker, SDL_MapRGB(screen->format, 255, 255, 255));
-        hover_bar = pointer->y >= overlay.y && pointer->y < SCREEN_H;
+        SDL_Rect marker_shadow = {(Sint16) (marker_x + 1), (Sint16) (bar_back.y - 3), 1, 12};
+        SDL_Rect marker = {(Sint16) marker_x, (Sint16) (bar_back.y - 3), 1, 12};
+        fill_rect_rgb565(screen, &marker_shadow, UI_COLOR_BLACK);
+        fill_rect_rgb565(screen, &marker, UI_COLOR_WHITE);
+        hover_bar = pointer->y >= overlay.y && pointer->y < overlay.y + overlay.h;
         if (hover_bar && duration_ms > 0) {
             int preview_x;
             int preview_y;
@@ -8391,16 +8817,16 @@ static void draw_progress(
             format_clock(hover_ms, hover_text, sizeof(hover_text));
             if (seek_preview && seek_preview->surface && seek_preview->over_bar) {
                 preview_x = clamp_int(
-                    marker_x - ((seek_preview->surface->w + 4) / 2),
+                    marker_x - ((seek_preview->surface->w + 6) / 2),
                     0,
-                    SCREEN_W - (seek_preview->surface->w + 4)
+                    SCREEN_W - (seek_preview->surface->w + 6)
                 );
-                preview_y = bar_back.y - seek_preview->surface->h - 28;
+                preview_y = bar_back.y - seek_preview->surface->h - 34;
                 if (preview_y < 0) {
                     preview_y = 0;
                 }
-                draw_surface_panel(screen, seek_preview->surface, preview_x, preview_y);
-                hover_badge_y = preview_y + seek_preview->surface->h + 8;
+                draw_seek_preview_panel(screen, seek_preview->surface, preview_x, preview_y, marker_x);
+                hover_badge_y = preview_y + seek_preview->surface->h + 12;
             }
             draw_centered_text_badge(screen, fonts, marker_x, hover_badge_y, hover_text);
         }
@@ -8410,13 +8836,12 @@ static void draw_progress(
     format_clock(duration_ms > current_ms ? (duration_ms - current_ms) : 0, remaining_text, sizeof(remaining_text));
     snprintf(left_text, sizeof(left_text), "%s / %s", current_text, total_text);
     snprintf(right_text, sizeof(right_text), "-%s", remaining_text);
-    nSDL_DrawString(screen, fonts->white, 12, SCREEN_H - UI_BAR_H + 7, "%s", left_text);
-    nSDL_DrawString(
+    draw_shadow_label(screen, fonts, 14, overlay.y + 7, left_text);
+    draw_shadow_label(
         screen,
-        fonts->white,
+        fonts,
         SCREEN_W - 12 - nSDL_GetStringWidth(fonts->white, right_text),
-        SCREEN_H - UI_BAR_H + 7,
-        "%s",
+        overlay.y + 7,
         right_text
     );
     if (pending_seek_ms != 0) {
@@ -8602,7 +9027,7 @@ static int picker_row_index_at(size_t count, size_t selected, int y)
 
 static void draw_loading_overlay(SDL_Surface *screen, const Fonts *fonts, const char *label, int phase)
 {
-    SDL_Rect shadow = {92, 88, 136, 46};
+    SDL_Rect shadow = {92, 88, 138, 48};
     SDL_Rect panel = {88, 84, 136, 46};
     SDL_Rect accent = {88, 84, 136, 2};
     char spinner[8];
@@ -8610,11 +9035,12 @@ static void draw_loading_overlay(SDL_Surface *screen, const Fonts *fonts, const 
 
     memset(spinner, '.', (size_t) dot_count);
     spinner[dot_count] = '\0';
-    SDL_FillRect(screen, &shadow, SDL_MapRGB(screen->format, 0, 0, 0));
-    SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 10, 14, 20));
-    SDL_FillRect(screen, &accent, SDL_MapRGB(screen->format, 32, 182, 255));
-    nSDL_DrawString(screen, fonts->white, panel.x + 12, panel.y + 12, "%s", label ? label : "Loading");
-    nSDL_DrawString(screen, fonts->white, panel.x + panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), panel.y + 12, "%s", spinner);
+    fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
+    draw_glass_panel(screen, &panel, UI_RGB565(16, 44, 68), false);
+    cut_rect_corners(screen, &panel, UI_COLOR_BLACK);
+    draw_vertical_gradient(screen, &accent, UI_RGB565(140, 255, 255), UI_RGB565(0, 136, 255));
+    draw_shadow_label(screen, fonts, panel.x + 12, panel.y + 12, label ? label : "Loading");
+    draw_shadow_label(screen, fonts, panel.x + panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), panel.y + 12, spinner);
 }
 
 static void copy_fitted_text(nSDL_Font *font, const char *text, char *buffer, size_t buffer_size, int max_width)
@@ -8720,9 +9146,9 @@ static void draw_movie_hover_tooltip(SDL_Surface *screen, const Fonts *fonts, co
     panel.w = (Uint16) (width - 2);
     panel.h = (Uint16) (height - 2);
 
-    SDL_FillRect(screen, &shadow, SDL_MapRGB(screen->format, 0, 0, 0));
-    SDL_FillRect(screen, &border, SDL_MapRGB(screen->format, 42, 42, 42));
-    SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 255, 252, 214));
+    fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
+    fill_rect_rgb565(screen, &border, UI_RGB565(106, 74, 34));
+    draw_vertical_gradient(screen, &panel, UI_RGB565(255, 255, 224), UI_RGB565(255, 218, 185));
     nSDL_DrawString(screen, fonts->outline, x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y, "%s", title);
     nSDL_DrawString(screen, fonts->outline, x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y + TOOLTIP_LINE_GAP, "%s", detail);
 }
@@ -8734,14 +9160,18 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
     size_t end_index;
     size_t index;
     int y = 52;
-    SDL_Rect header = {0, 0, SCREEN_W, 38};
-    SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 8, 10, 14));
-    SDL_FillRect(screen, &header, SDL_MapRGB(screen->format, 12, 18, 28));
-    nSDL_DrawString(screen, fonts->white, 10, 10, "ND Video Player");
-    nSDL_DrawString(screen, fonts->white, 10, 24, "ENTER open   UP/DOWN choose   ESC exit");
+    SDL_Rect background = {0, 0, SCREEN_W, SCREEN_H};
+    SDL_Rect header = {0, 0, SCREEN_W, 32};
+    SDL_Rect header_top = {0, 0, SCREEN_W, 1};
+
+    draw_vertical_gradient(screen, &background, UI_COLOR_BG_TOP, UI_COLOR_BG_BOTTOM);
+    draw_glass_panel(screen, &header, UI_RGB565(28, 62, 92), false);
+    fill_rect_rgb565(screen, &header_top, UI_RGB565(210, 244, 255));
+    draw_shadow_label(screen, fonts, 10, 8, "ND Video Player");
+    draw_shadow_label(screen, fonts, 10, 21, "ENTER open   UP/DOWN choose   ESC exit");
     if (count == 0) {
-        nSDL_DrawString(screen, fonts->white, 10, 54, "No .nvp or .nvp.tns files found");
-        nSDL_DrawString(screen, fonts->white, 10, SCREEN_H - 16, "%s", credit);
+        draw_shadow_label(screen, fonts, 10, 54, "No .nvp or .nvp.tns files found");
+        draw_shadow_label(screen, fonts, 10, SCREEN_H - 16, credit);
         if (pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
@@ -8757,31 +9187,50 @@ static void render_picker(SDL_Surface *screen, const Fonts *fonts, MovieFile *fi
         end_index = count;
     }
     for (index = start_index; index < end_index && y < SCREEN_H - 20; ++index) {
-        SDL_Rect row = {8, (Sint16) (y - 5), SCREEN_W - 16, 20};
+        SDL_Rect row = {8, (Sint16) (y - 5), SCREEN_W - 24, 20};
+        SDL_Rect divider = {12, (Sint16) (row.y + row.h - 1), SCREEN_W - 32, 1};
         const char *resume_label = files[index].has_resume ? "RESUME" : NULL;
-        int text_x = index == selected ? 24 : 12;
+        int text_x = index == selected ? 20 : 12;
         int reserved_right = resume_label ? nSDL_GetStringWidth(fonts->white, resume_label) + 22 : 0;
-        int text_max_width = SCREEN_W - text_x - 16 - reserved_right;
+        int text_max_width = SCREEN_W - text_x - 28 - reserved_right;
         char fitted_title[128];
         if (index == selected) {
-            SDL_Rect accent = {8, (Sint16) (y - 5), 4, 20};
-            SDL_FillRect(screen, &row, SDL_MapRGB(screen->format, 26, 118, 180));
-            SDL_FillRect(screen, &accent, SDL_MapRGB(screen->format, 32, 182, 255));
+            draw_glass_panel(screen, &row, UI_COLOR_AERO_BLUE, true);
+            cut_rect_corners(screen, &row, picker_background_color_at_y(row.y));
         } else {
-            SDL_FillRect(screen, &row, SDL_MapRGB(screen->format, 16, 20, 28));
+            fill_rect_rgb565(screen, &divider, UI_RGB565(10, 28, 46));
         }
         copy_fitted_text(fonts->white, files[index].name, fitted_title, sizeof(fitted_title), text_max_width);
-        nSDL_DrawString(screen, fonts->white, text_x, y, "%s", fitted_title);
+        draw_shadow_label(screen, fonts, text_x, y, fitted_title);
         if (resume_label) {
             draw_text_badge(screen, fonts, SCREEN_W - 16, y - 3, resume_label);
         }
         y += 20;
     }
+    if (count > PICKER_VISIBLE_ROWS) {
+        SDL_Rect track = {SCREEN_W - 8, 42, 3, SCREEN_H - 62};
+        int thumb_h = (int) (((uint64_t) track.h * PICKER_VISIBLE_ROWS) / count);
+        int thumb_y;
+        SDL_Rect thumb;
+
+        thumb_h = clamp_int(thumb_h, 18, track.h);
+        thumb_y = track.y;
+        if (count > 1 && track.h > thumb_h) {
+            thumb_y += (int) (((uint64_t) (track.h - thumb_h) * selected) / (count - 1));
+        }
+        thumb.x = (Sint16) (SCREEN_W - 9);
+        thumb.y = (Sint16) thumb_y;
+        thumb.w = 5;
+        thumb.h = (Uint16) thumb_h;
+        draw_vertical_gradient(screen, &track, UI_RGB565(8, 20, 34), UI_RGB565(32, 62, 86));
+        draw_glass_panel(screen, &thumb, UI_RGB565(210, 228, 236), false);
+        cut_rect_corners(screen, &thumb, picker_background_color_at_y(thumb.y));
+    }
     {
         char footer[32];
-        nSDL_DrawString(screen, fonts->white, 10, SCREEN_H - 16, "%s", credit);
+        draw_shadow_label(screen, fonts, 10, SCREEN_H - 16, credit);
         snprintf(footer, sizeof(footer), "%lu file(s)", (unsigned long) count);
-        nSDL_DrawString(screen, fonts->white, SCREEN_W - 10 - nSDL_GetStringWidth(fonts->white, footer), SCREEN_H - 16, "%s", footer);
+        draw_shadow_label(screen, fonts, SCREEN_W - 10 - nSDL_GetStringWidth(fonts->white, footer), SCREEN_H - 16, footer);
     }
     if (loading_label) {
         draw_loading_overlay(screen, fonts, loading_label, loading_phase);
@@ -9567,24 +10016,14 @@ static bool seek_to_ratio(Movie *movie, uint32_t numerator, uint32_t denominator
 
 static void draw_prompt_button(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *button, const char *label, bool selected)
 {
-    Uint32 background = selected
-        ? SDL_MapRGB(screen->format, 26, 118, 180)
-        : SDL_MapRGB(screen->format, 18, 24, 34);
-    Uint32 accent = selected
-        ? SDL_MapRGB(screen->format, 32, 182, 255)
-        : SDL_MapRGB(screen->format, 52, 62, 78);
-    SDL_Rect left_accent = {button->x, button->y, 4, button->h};
+    SDL_Rect shadow = {(Sint16) (button->x + 2), (Sint16) (button->y + 2), button->w, button->h};
+    Uint16 base = selected ? UI_COLOR_AERO_BLUE : UI_RGB565(24, 30, 38);
+    int text_x = button->x + (button->w - nSDL_GetStringWidth(fonts->white, label)) / 2;
 
-    SDL_FillRect(screen, (SDL_Rect *) button, background);
-    SDL_FillRect(screen, &left_accent, accent);
-    nSDL_DrawString(
-        screen,
-        fonts->white,
-        button->x + (button->w - nSDL_GetStringWidth(fonts->white, label)) / 2,
-        button->y + 6,
-        "%s",
-        label
-    );
+    fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
+    draw_glass_panel(screen, button, base, selected);
+    cut_rect_corners(screen, button, UI_RGB565(18, 20, 24));
+    draw_shadow_label(screen, fonts, text_x, button->y + 6, label);
 }
 
 static int prompt_resume_position(
@@ -9601,17 +10040,21 @@ static int prompt_resume_position(
     bool prev_esc = false;
     PointerState pointer;
     PointerHoverGuard hover_guard;
+    SDL_Rect full_screen = {0, 0, SCREEN_W, SCREEN_H};
     SDL_Rect shadow = {34, 24, 252, 192};
+    SDL_Rect border = {27, 17, 254, 194};
     SDL_Rect panel = {28, 18, 252, 192};
     SDL_Rect header = {28, 18, 252, 26};
     SDL_Rect accent = {28, 44, 252, 2};
     SDL_Rect preview = {74, 56, 160, 90};
+    SDL_Rect preview_shadow = {74, 56, 164, 94};
     SDL_Rect preview_border = {72, 54, 164, 94};
     SDL_Rect continue_button = {46, 162, 90, 22};
     SDL_Rect restart_button = {172, 162, 90, 22};
     char time_label[64];
     char time_value[24];
     char title[96];
+    char fitted_title[96];
     const char *filename = path;
     char *display_name = NULL;
     int selected_button = 0;
@@ -9636,7 +10079,8 @@ static int prompt_resume_position(
     }
     display_name = display_name_for_movie(filename);
     snprintf(title, sizeof(title), "%s", display_name ? display_name : filename);
-    title_preview_gap = preview.y - (title_y + nSDL_GetStringHeight(fonts->white, title));
+    copy_fitted_text(fonts->white, title, fitted_title, sizeof(fitted_title), panel.w - 24);
+    title_preview_gap = preview.y - (title_y + nSDL_GetStringHeight(fonts->white, fitted_title));
     if (title_preview_gap < 0) {
         title_preview_gap = 0;
     }
@@ -9648,16 +10092,19 @@ static int prompt_resume_position(
         bool pointer_click = pointer_update(&pointer);
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
 
-        SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
-        SDL_FillRect(screen, &shadow, SDL_MapRGB(screen->format, 0, 0, 0));
-        SDL_FillRect(screen, &panel, SDL_MapRGB(screen->format, 8, 10, 14));
-        SDL_FillRect(screen, &header, SDL_MapRGB(screen->format, 12, 18, 28));
-        SDL_FillRect(screen, &accent, SDL_MapRGB(screen->format, 32, 182, 255));
-        SDL_FillRect(screen, &preview_border, SDL_MapRGB(screen->format, 0, 0, 0));
+        SDL_SoftStretch(movie->frame_surface, NULL, screen, &full_screen);
+        draw_checker_darken(screen);
+        fill_rect_rgb565(screen, &shadow, UI_COLOR_BLACK);
+        fill_rect_rgb565(screen, &border, UI_RGB565(214, 226, 232));
+        draw_glass_panel(screen, &panel, UI_RGB565(18, 20, 24), false);
+        draw_glass_panel(screen, &header, UI_RGB565(28, 68, 98), false);
+        draw_vertical_gradient(screen, &accent, UI_RGB565(140, 255, 255), UI_RGB565(0, 136, 255));
+        fill_rect_rgb565(screen, &preview_shadow, UI_COLOR_BLACK);
+        fill_rect_rgb565(screen, &preview_border, UI_COLOR_WHITE);
         SDL_SoftStretch(movie->frame_surface, NULL, screen, &preview);
-        nSDL_DrawString(screen, fonts->white, panel.x + 12, panel.y + 8, "Continue Watching?");
-        nSDL_DrawString(screen, fonts->white, panel.x + 12, title_y, "%s", title);
-        nSDL_DrawString(screen, fonts->white, panel.x + 12, time_label_y, "%s", time_label);
+        draw_shadow_label(screen, fonts, panel.x + 12, panel.y + 8, "Continue Watching?");
+        draw_shadow_label(screen, fonts, panel.x + 12, title_y, fitted_title);
+        draw_shadow_label(screen, fonts, panel.x + 12, time_label_y, time_label);
         draw_prompt_button(screen, fonts, &continue_button, "CONTINUE", selected_button == 0);
         draw_prompt_button(screen, fonts, &restart_button, "START OVER", selected_button == 1);
         if (pointer.visible) {
