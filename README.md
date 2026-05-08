@@ -9,9 +9,13 @@ This project targets the **TI-Nspire CX II-T** and plays streamed `.nvp` movies 
 
 ## Screenshots
 
-| Subtitle playback | UI overlay | Dialogue scene |
+| Main menu | Continue watching | Playback controls |
 | --- | --- | --- |
-| ![Subtitle playback](./examples/screenshots/subtitles.png) | ![Playback UI overlay](./examples/screenshots/ui-overlay.png) | ![Dialogue scene](./examples/screenshots/dialogue.png) |
+| ![Main menu](./examples/screenshots/main-menu.png) | ![Continue watching](./examples/screenshots/continue-watching.png) | ![Playback controls](./examples/screenshots/playback-controls.png) |
+
+| UI overlay | Dialogue scene | Subtitle playback |
+| --- | --- | --- |
+| ![Playback UI overlay](./examples/screenshots/ui-overlay.png) | ![Dialogue scene](./examples/screenshots/dialogue.png) | ![Subtitle playback](./examples/screenshots/subtitles.png) |
 
 ## Current Format
 
