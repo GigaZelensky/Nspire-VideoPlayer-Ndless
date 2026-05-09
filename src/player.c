@@ -9894,7 +9894,6 @@ static void draw_progress_overlay(SDL_Surface *screen, const SDL_Rect *overlay)
     Uint16 gloss_bottom = blend_rgb565(base, UI_COLOR_WHITE, 20);
     Uint16 rim_top = blend_rgb565(base, UI_COLOR_WHITE, 128);
     Uint16 rim_bottom = blend_rgb565(base, UI_COLOR_BLACK, 120);
-    Uint16 aa_corner = blend_rgb565(base, UI_COLOR_BLACK, 24);
     Uint16 aa_top = blend_rgb565(rim_top, base, 72);
     Uint16 aa_side;
     SDL_Rect line;
@@ -9909,9 +9908,11 @@ static void draw_progress_overlay(SDL_Surface *screen, const SDL_Rect *overlay)
 
     denominator = overlay->h > 1 ? overlay->h - 1 : 1;
     for (row = 0; row < overlay->h; ++row) {
-        line.x = overlay->x;
+        int top_cut = row == 0 ? 1 : 0;
+
+        line.x = (Sint16) (overlay->x + top_cut);
         line.y = (Sint16) (overlay->y + row);
-        line.w = overlay->w;
+        line.w = (Uint16) (overlay->w - (top_cut * 2));
         line.h = 1;
         fill_rect_rgb565(screen, &line, rgb565_lerp(body_top, body_bottom, row, denominator));
     }
@@ -9926,9 +9927,9 @@ static void draw_progress_overlay(SDL_Surface *screen, const SDL_Rect *overlay)
         fill_rect_rgb565(screen, &line, rgb565_lerp(gloss_top, gloss_bottom, row - 1, gloss_height - 1));
     }
 
-    line.x = overlay->x;
+    line.x = (Sint16) (overlay->x + 1);
     line.y = overlay->y;
-    line.w = overlay->w;
+    line.w = (Uint16) (overlay->w - 2);
     line.h = 1;
     fill_rect_rgb565(screen, &line, rim_top);
     line.x = overlay->x;
@@ -9948,12 +9949,6 @@ static void draw_progress_overlay(SDL_Surface *screen, const SDL_Rect *overlay)
         pixel.x = (Sint16) (overlay->x + overlay->w - 1);
         fill_rect_rgb565(screen, &pixel, edge);
     }
-
-    pixel.y = overlay->y;
-    pixel.x = overlay->x;
-    fill_rect_rgb565(screen, &pixel, aa_corner);
-    pixel.x = (Sint16) (overlay->x + overlay->w - 1);
-    fill_rect_rgb565(screen, &pixel, aa_corner);
     pixel.y = overlay->y;
     pixel.x = (Sint16) (overlay->x + 1);
     fill_rect_rgb565(screen, &pixel, aa_top);
