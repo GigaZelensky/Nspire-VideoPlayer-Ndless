@@ -41,6 +41,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define PROMPT_BUTTON_ANIM_MS 90U
 #define UI_CHROME_ANIM_MS 115U
 #define UI_HOVER_ANIM_MS 105U
+#define UI_TITLE_ANIM_MS 135U
 #define UI_PRESS_ANIM_MS 120U
 #define UI_PRESS_RELEASE_ANIM_MS 84U
 #define UI_PRESS_PRIME_MIX 72U
@@ -75,6 +76,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define POINTER_AXIS_LOCK_RATIO_DEN 1
 #define POINTER_SPIKE_DELTA_DIVISOR 3
 #define POINTER_HOVER_REARM_PIXELS 8
+#define PLAYBACK_TITLE_TOP_EDGE_PX 1
 #define PREFETCH_FILE_BLOCK_SIZE 32768U
 #define PREFETCH_ACTIVE_FILE_BLOCK_SIZE 2048U
 #define PREFETCH_INFLATE_OUTPUT_SLICE 2048U
@@ -389,6 +391,7 @@ typedef struct {
     UiTransition speed_badge;
     UiTransition speed_press;
     UiTransition seek_preview;
+    UiTransition title_strip;
     UiTransition help_menu;
 } PlaybackUiTransitions;
 
@@ -401,6 +404,7 @@ typedef struct {
     uint8_t speed_badge;
     uint8_t speed_press;
     uint8_t seek_preview;
+    uint8_t title_strip;
     uint8_t help_menu;
 } PlaybackUiMixes;
 
@@ -9739,6 +9743,7 @@ static bool playback_ui_mixes_animating(const PlaybackUiMixes *mixes)
         ui_mix_animating(mixes->speed_badge) ||
         ui_mix_animating(mixes->speed_press) ||
         ui_mix_animating(mixes->seek_preview) ||
+        ui_mix_animating(mixes->title_strip) ||
         ui_mix_animating(mixes->help_menu)
     );
 }
@@ -9985,6 +9990,7 @@ static int draw_left_text_badge_animated(
 }
 
 static void format_seek_delta(int32_t delta_ms, char *buffer, size_t buffer_size);
+static void copy_fitted_text(nSDL_Font *font, const char *text, char *buffer, size_t buffer_size, int max_width);
 
 static void draw_seek_delta_badge(
     SDL_Surface *screen,
@@ -10067,6 +10073,105 @@ static void draw_status_overlay_badge(
         return;
     }
     draw_left_text_badge_animated(screen, fonts, left_x, y, label, mix, offset_x);
+}
+
+static SDL_Rect playback_badge_rect(const SDL_Rect *video_rect);
+static void status_badge_rects(
+    const Fonts *fonts,
+    const SDL_Rect *video_rect,
+    ScaleMode scale_mode,
+    const PlaybackRate *playback_rate,
+    SDL_Rect *scale_badge,
+    SDL_Rect *speed_badge
+);
+
+static void draw_playback_title_strip(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    const SDL_Rect *video_rect,
+    ScaleMode scale_mode,
+    const PlaybackRate *playback_rate,
+    const char *title,
+    const char *detail,
+    uint8_t mix
+)
+{
+    SDL_Rect strip;
+    SDL_Rect glint;
+    SDL_Rect playback_badge;
+    SDL_Rect scale_badge;
+    SDL_Rect speed_badge;
+    char fitted_title[160];
+    char fitted_detail[160];
+    int title_w;
+    int detail_w;
+    int required_w;
+    int left_x;
+    int right_x;
+    int level_1_right;
+    int level_2_right;
+    int level_3_right;
+    int text_x;
+    int detail_x = 0;
+    int y;
+    bool has_detail;
+
+    if (!screen || !fonts || !video_rect || !title || title[0] == '\0' || mix == 0) {
+        return;
+    }
+
+    has_detail = detail && detail[0] != '\0';
+    playback_badge = playback_badge_rect(video_rect);
+    status_badge_rects(fonts, video_rect, scale_mode, playback_rate, &scale_badge, &speed_badge);
+    left_x = playback_badge.x + playback_badge.w + 6;
+    level_1_right = scale_badge.x - 6;
+    level_2_right = speed_badge.x - 6;
+    level_3_right = SCREEN_W - 8;
+    title_w = nSDL_GetStringWidth(fonts->white, title);
+    detail_w = has_detail ? nSDL_GetStringWidth(fonts->white, detail) : 0;
+    required_w = (title_w > detail_w ? title_w : detail_w) + 16;
+    if (required_w <= level_1_right - left_x) {
+        right_x = level_1_right;
+    } else if (required_w <= level_2_right - left_x) {
+        right_x = level_2_right;
+    } else {
+        right_x = level_3_right;
+    }
+    if (right_x <= left_x + 16) {
+        return;
+    }
+
+    y = (has_detail ? -30 : -20) + (((int) mix * (has_detail ? 34 : 26) + 127) / 255);
+    strip.x = (Sint16) left_x;
+    strip.y = (Sint16) y;
+    strip.w = (Uint16) (right_x - left_x);
+    strip.h = has_detail ? 30 : 20;
+    copy_fitted_text(fonts->white, title, fitted_title, sizeof(fitted_title), strip.w - 16);
+    text_x = strip.x + 8;
+    if (has_detail) {
+        copy_fitted_text(fonts->white, detail, fitted_detail, sizeof(fitted_detail), strip.w - 16);
+        detail_x = strip.x + 8;
+    }
+
+    draw_soft_glass_panel_mix(
+        screen,
+        &strip,
+        rgb565_lerp(ui_theme()->gunmetal, ui_theme()->row_selected, mix, 255),
+        mix
+    );
+    if (mix > 40) {
+        glint.x = (Sint16) (strip.x + 3);
+        glint.y = (Sint16) (strip.y + 2);
+        glint.w = (Uint16) (strip.w - 6);
+        glint.h = 1;
+        fill_rect_rgb565(screen, &glint, rgb565_lerp(ui_theme()->row_selected, UI_COLOR_WARM_WHITE, 72, 255));
+    }
+    if (mix > 48) {
+        draw_ui_label(screen, fonts, text_x, strip.y + (has_detail ? 5 : 6), fitted_title);
+        if (has_detail) {
+            draw_ui_label(screen, fonts, detail_x, strip.y + 17, fitted_detail);
+        }
+    }
 }
 
 static void draw_centered_text_badge(SDL_Surface *screen, const Fonts *fonts, int center_x, int y, const char *label)
@@ -10347,8 +10452,6 @@ static int draw_status_badges(
     return scale_badge.x - 6;
 }
 
-static SDL_Rect playback_badge_rect(const SDL_Rect *video_rect);
-
 static void update_playback_ui_mixes(
     PlaybackUiTransitions *transitions,
     PlaybackUiMixes *mixes,
@@ -10364,6 +10467,7 @@ static void update_playback_ui_mixes(
     bool force_playback_press,
     bool force_scale_press,
     bool force_speed_press,
+    bool show_title_strip,
     const PointerState *pointer,
     uint32_t now_ms
 )
@@ -10444,6 +10548,12 @@ static void update_playback_ui_mixes(
         seek_hovered,
         now_ms,
         UI_TOOLTIP_ANIM_MS
+    );
+    mixes->title_strip = ui_transition_update(
+        &transitions->title_strip,
+        show_title_strip,
+        now_ms,
+        UI_TITLE_ANIM_MS
     );
     mixes->help_menu = ui_transition_update(
         &transitions->help_menu,
@@ -11126,6 +11236,8 @@ static void render_movie(
     bool subtitle_font_overlay_visible,
     int subtitle_size,
     SubtitlePlacement subtitle_placement,
+    const char *movie_title_text,
+    const char *movie_detail_text,
     const char *status_overlay_text,
     uint32_t status_overlay_started_ms,
     uint32_t status_overlay_until_ms,
@@ -11202,6 +11314,28 @@ static void render_movie(
     if (chrome_visible) {
         if (!help_menu_visible) {
             memory_right_limit = draw_status_badges(screen, fonts, &dst, scale_mode, playback_rate, ui_mixes, chrome_mix);
+            if (playback_badge_visible) {
+                draw_playback_badge(
+                    screen,
+                    &dst,
+                    paused,
+                    ui_mixes ? ui_mixes->playback_badge : 0,
+                    ui_mixes ? ui_mixes->playback_press : 0,
+                    chrome_mix
+                );
+            }
+            if (ui_mixes && ui_mixes->title_strip > 0) {
+                draw_playback_title_strip(
+                    screen,
+                    fonts,
+                    &dst,
+                    scale_mode,
+                    playback_rate,
+                    movie_title_text,
+                    movie_detail_text,
+                    ui_mixes->title_strip
+                );
+            }
             draw_status_overlay_badge(
                 screen,
                 fonts,
@@ -11213,16 +11347,6 @@ static void render_movie(
                 now_ms,
                 chrome_mix
             );
-            if (playback_badge_visible) {
-                draw_playback_badge(
-                    screen,
-                    &dst,
-                    paused,
-                    ui_mixes ? ui_mixes->playback_badge : 0,
-                    ui_mixes ? ui_mixes->playback_press : 0,
-                    chrome_mix
-                );
-            }
         }
         draw_progress(
             screen,
@@ -13793,12 +13917,14 @@ static int play_movie(
     uint32_t tab_repeat_next_ms = 0;
     uint32_t seek_repeat_next_ms = 0;
     uint32_t brightness_repeat_next_ms = 0;
+    uint32_t speed_repeat_next_ms = 0;
     uint32_t ui_visible_until;
     uint32_t resume_input_guard_until_ms = 0;
     uint32_t subtitle_font_overlay_until = 0;
     int result = 0;
     int seek_repeat_direction = 0;
     int brightness_repeat_direction = 0;
+    int speed_repeat_direction = 0;
     ScaleMode scale_mode = SCALE_FIT;
     size_t playback_rate_index = PLAYBACK_RATE_DEFAULT_INDEX;
     size_t subtitle_font_index = SUBTITLE_FONT_DEFAULT_INDEX;
@@ -13808,6 +13934,8 @@ static int play_movie(
     SubtitlePlacement subtitle_placement = SUBTITLE_POS_BAR_BOTTOM;
     VideoAlign video_align_x = VIDEO_ALIGN_CENTER;
     VideoAlign video_align_y = VIDEO_ALIGN_CENTER;
+    char playback_title[128] = {0};
+    char playback_detail[128] = {0};
     char status_overlay_text[64] = {0};
     uint32_t status_overlay_started_ms = 0;
     uint32_t status_overlay_until = 0;
@@ -13844,6 +13972,9 @@ static int play_movie(
     bool playback_enter_press_active = false;
     bool hover_preview_needs_rebuffer = false;
     SDL_Surface *loading_snapshot = NULL;
+    const char *movie_filename = path;
+    char *playback_title_alloc = NULL;
+    char *playback_detail_alloc = NULL;
 
     memset(&subtitle_cache, 0, sizeof(subtitle_cache));
     memset(&screenshot_preview, 0, sizeof(screenshot_preview));
@@ -13855,6 +13986,21 @@ static int play_movie(
     seek_preview.decoded_frame_index = UINT32_MAX;
     seek_preview.last_pointer_x = -1;
     seek_preview.decode_job.chunk_index = -1;
+    if (strrchr(path, '/')) {
+        movie_filename = strrchr(path, '/') + 1;
+    } else if (strrchr(path, '\\')) {
+        movie_filename = strrchr(path, '\\') + 1;
+    }
+    if (movie_display_fields_for_filename(movie_filename ? movie_filename : "", &playback_title_alloc, &playback_detail_alloc)) {
+        snprintf(playback_title, sizeof(playback_title), "%s", playback_title_alloc);
+        if (playback_detail_alloc) {
+            snprintf(playback_detail, sizeof(playback_detail), "%s", playback_detail_alloc);
+        }
+        free(playback_title_alloc);
+        free(playback_detail_alloc);
+    } else {
+        snprintf(playback_title, sizeof(playback_title), "%s", movie_filename ? movie_filename : "");
+    }
 
     if (debug_is_runtime_logging_enabled()) {
         g_debug_ring_count = 0;
@@ -14030,6 +14176,7 @@ static int play_movie(
         bool cat_edge = key_pressed_edge(KEY_NSPIRE_CAT, &prev_cat);
         bool esc_exit_request;
         bool divide_edge = key_pressed_edge(KEY_NSPIRE_DIVIDE, &prev_divide);
+        bool divide_down = prev_divide;
         bool exp_edge = key_pressed_edge(KEY_NSPIRE_EXP, &prev_exp);
         bool tenx_edge = key_pressed_edge(KEY_NSPIRE_TENX, &prev_tenx);
         bool lp_edge = key_pressed_edge(KEY_NSPIRE_LP, &prev_lp);
@@ -14038,6 +14185,9 @@ static int play_movie(
         bool gthan_edge = key_pressed_edge(KEY_NSPIRE_GTHAN, &prev_gthan);
         bool speed_down_edge = lp_edge || lthan_edge;
         bool speed_up_edge = rp_edge || gthan_edge;
+        bool speed_down_down = prev_lp || prev_lthan;
+        bool speed_up_down = prev_rp || prev_gthan;
+        bool speed_key_down = speed_down_down || speed_up_down;
         bool seek_left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left);
         bool seek_right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right);
         bool seek_left_down = prev_left;
@@ -14069,6 +14219,7 @@ static int play_movie(
         bool playback_badge_press_triggered = false;
         int seek_delta_ms = 0;
         int brightness_delta = 0;
+        int speed_delta = 0;
 
         esc_exit_request = esc_edge || (!help_menu_open && esc_down && !esc_exit_suppressed_until_release);
 
@@ -14083,6 +14234,9 @@ static int play_movie(
         }
         if (!enter_down) {
             playback_enter_press_active = false;
+        }
+        if (divide_down || speed_key_down) {
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
 
         if (theme_edge) {
@@ -14355,6 +14509,7 @@ static int play_movie(
                 false,
                 false,
                 false,
+                false,
                 &pointer,
                 now_ms
             );
@@ -14375,6 +14530,8 @@ static int play_movie(
                 false,
                 subtitle_size,
                 subtitle_placement,
+                playback_title,
+                playback_detail,
                 status_overlay_text,
                 status_overlay_started_ms,
                 status_overlay_until,
@@ -14510,6 +14667,8 @@ static int play_movie(
                 brightness_repeat_next_ms = 0;
                 seek_repeat_direction = 0;
                 seek_repeat_next_ms = 0;
+                speed_repeat_direction = 0;
+                speed_repeat_next_ms = 0;
                 display_power_off(&display_power_state, was_paused);
                 present_black_screen(screen);
                 if (!seek_preroll_active) {
@@ -14570,18 +14729,44 @@ static int play_movie(
             trigger_badge_press(&ui_transitions.scale_press, &scale_badge_press_until_ms, now_ms);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
-        if (speed_down_edge && playback_rate_index > 0) {
-            playback_rate_index--;
-            playback_rate = playback_rate_for_index(playback_rate_index);
+        if (speed_down_edge) {
+            speed_delta = -1;
+            speed_repeat_direction = -1;
+            speed_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
             trigger_badge_press(&ui_transitions.speed_press, &speed_badge_press_until_ms, now_ms);
-            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
-            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        } else if (speed_up_edge) {
+            speed_delta = 1;
+            speed_repeat_direction = 1;
+            speed_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
+            trigger_badge_press(&ui_transitions.speed_press, &speed_badge_press_until_ms, now_ms);
+        } else if ((speed_repeat_direction < 0 && !speed_down_down) ||
+                   (speed_repeat_direction > 0 && !speed_up_down) ||
+                   (speed_down_down && speed_up_down)) {
+            speed_repeat_direction = 0;
+            speed_repeat_next_ms = 0;
+        } else if (speed_repeat_direction != 0 &&
+                   speed_repeat_next_ms != 0U &&
+                   (int32_t) (now_ms - speed_repeat_next_ms) >= 0) {
+            speed_delta = speed_repeat_direction;
+            speed_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_FALLBACK_INTERVAL_MS;
         }
-        if (speed_up_edge && playback_rate_index + 1 < PLAYBACK_RATE_COUNT) {
-            playback_rate_index++;
-            playback_rate = playback_rate_for_index(playback_rate_index);
-            trigger_badge_press(&ui_transitions.speed_press, &speed_badge_press_until_ms, now_ms);
-            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+        if (speed_delta != 0) {
+            bool speed_changed = false;
+
+            if (speed_delta < 0 && playback_rate_index > 0) {
+                playback_rate_index--;
+                speed_changed = true;
+            } else if (speed_delta > 0 && playback_rate_index + 1 < PLAYBACK_RATE_COUNT) {
+                playback_rate_index++;
+                speed_changed = true;
+            } else {
+                speed_repeat_direction = 0;
+                speed_repeat_next_ms = 0;
+            }
+            if (speed_changed) {
+                playback_rate = playback_rate_for_index(playback_rate_index);
+                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            }
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (exp_edge || tenx_edge) {
@@ -14976,8 +15161,9 @@ static int play_movie(
                 help_menu_open,
                 playback_press_target,
                 playback_enter_press_active || ui_time_before(render_now_ms, playback_badge_press_until_ms),
-                ui_time_before(render_now_ms, scale_badge_press_until_ms),
-                ui_time_before(render_now_ms, speed_badge_press_until_ms),
+                divide_down || ui_time_before(render_now_ms, scale_badge_press_until_ms),
+                speed_key_down || ui_time_before(render_now_ms, speed_badge_press_until_ms),
+                show_ui && !help_menu_open && pointer.visible && pointer.y < PLAYBACK_TITLE_TOP_EDGE_PX,
                 &pointer,
                 render_now_ms
             );
@@ -14998,6 +15184,8 @@ static int play_movie(
                 subtitle_font_overlay_visible,
                 subtitle_size,
                 subtitle_placement,
+                playback_title,
+                playback_detail,
                 status_overlay_text,
                 status_overlay_started_ms,
                 status_overlay_until,
