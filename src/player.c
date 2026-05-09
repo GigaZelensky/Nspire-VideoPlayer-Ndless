@@ -35,7 +35,9 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define UI_HOVER_ANIM_MS 105U
 #define UI_TOOLTIP_ANIM_MS 115U
 #define UI_MENU_ANIM_MS 130U
-#define RESUME_MORPH_ANIM_MS 105U
+#define RESUME_PROMPT_ANIM_MS 150U
+#define RESUME_MORPH_ANIM_MS 150U
+#define RESUME_INPUT_GUARD_MS 260U
 #define UI_WAKE_MIN_MIX 28U
 #define UI_PAUSE_QUIET_MS 160U
 #define MAX_PATH_LEN 512
@@ -12027,14 +12029,14 @@ static int prompt_resume_position(
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         uint32_t prompt_close_elapsed_ms = prompt_closing ? (now_ms - prompt_close_started_ms) : 0;
         uint8_t close_mix = prompt_closing
-            ? ui_ease_out_cubic(prompt_close_elapsed_ms, UI_MENU_ANIM_MS)
+            ? ui_ease_out_cubic(prompt_close_elapsed_ms, RESUME_PROMPT_ANIM_MS)
             : 0;
         uint8_t morph_mix = prompt_closing
             ? ui_ease_out_cubic(prompt_close_elapsed_ms, RESUME_MORPH_ANIM_MS)
             : 0;
         uint8_t prompt_mix = prompt_closing
             ? (uint8_t) (255U - close_mix)
-            : ui_ease_out_cubic(now_ms - prompt_open_started_ms, UI_MENU_ANIM_MS);
+            : ui_ease_out_cubic(now_ms - prompt_open_started_ms, RESUME_PROMPT_ANIM_MS);
         int prompt_y_offset = ((255 - prompt_mix) * 5 + 127) / 255;
         int dim_strength = prompt_closing ? ((112 * prompt_mix + 127) / 255) : 112;
         SDL_Rect background_src = full_src;
@@ -12254,6 +12256,7 @@ static int play_movie(
     uint32_t seek_repeat_next_ms = 0;
     uint32_t brightness_repeat_next_ms = 0;
     uint32_t ui_visible_until;
+    uint32_t resume_input_guard_until_ms = 0;
     uint32_t subtitle_font_overlay_until = 0;
     int result = 0;
     int seek_repeat_direction = 0;
@@ -12284,6 +12287,7 @@ static int play_movie(
     HistoryStore startup_history;
     int startup_history_index = -1;
     bool startup_has_resume = false;
+    bool resume_prompt_returned = false;
     int32_t pending_seek_ms = 0;
     uint32_t pending_seek_commit_at_ms = 0;
     bool seek_preroll_active = false;
@@ -12373,6 +12377,7 @@ static int play_movie(
                 destroy_movie(&movie);
                 return 0;
             }
+            resume_prompt_returned = true;
         }
         if (resume_choice == 0) {
             decode_to_frame(&movie, 0);
@@ -12384,10 +12389,13 @@ static int play_movie(
             }
             snprintf(status_overlay_text, sizeof(status_overlay_text), "RESUMED");
             status_overlay_until = monotonic_clock_now_ms() + STATUS_OVERLAY_MS;
-            begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+            if (resume_without_prompt) {
+                begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+            }
         }
     }
     pointer_init(&pointer);
+    pointer_update(&pointer);
     prev_tab = isKeyPressed(KEY_NSPIRE_TAB);
     prev_up = isKeyPressed(KEY_NSPIRE_UP);
     prev_down = isKeyPressed(KEY_NSPIRE_DOWN);
@@ -12411,7 +12419,7 @@ static int play_movie(
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
     tab_hold_repeat_interval_ms = tab_hold_frame_repeat_interval_ms(&movie);
     last_history_saved_ms = movie_frame_time_ms(&movie, movie.current_frame);
-    {
+    if (!resume_prompt_returned) {
         prefetch_tick(&movie, true, 1000);
     }
     debug_tracef(
@@ -12436,6 +12444,9 @@ static int play_movie(
         );
     }
     ui_visible_until = monotonic_clock_now_ms() + POINTER_UI_TIMEOUT_MS;
+    if (resume_prompt_returned || resume_without_prompt) {
+        resume_input_guard_until_ms = monotonic_clock_now_ms() + RESUME_INPUT_GUARD_MS;
+    }
 
     while (1) {
         bool pointer_click = pointer_update(&pointer);
@@ -12487,6 +12498,16 @@ static int play_movie(
         bool tab_repeat_step = false;
         int seek_delta_ms = 0;
         int brightness_delta = 0;
+
+        if (resume_input_guard_until_ms != 0U) {
+            if (ui_time_before(now_ms, resume_input_guard_until_ms)) {
+                pointer_click = false;
+                enter_edge = false;
+                tab_edge = false;
+            } else {
+                resume_input_guard_until_ms = 0;
+            }
+        }
 
         if (theme_edge) {
             ui_cycle_theme();
