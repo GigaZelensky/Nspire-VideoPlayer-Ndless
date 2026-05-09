@@ -9369,6 +9369,48 @@ static void draw_soft_glass_panel_mix(SDL_Surface *screen, const SDL_Rect *rect,
     fill_rect_rgb565(screen, &pixel, outline);
 }
 
+static void draw_soft_glass_panel_rim(SDL_Surface *screen, const SDL_Rect *rect, Uint16 base_color, uint8_t selected_mix)
+{
+    Uint16 outline;
+    SDL_Rect line;
+    SDL_Rect side;
+    SDL_Rect pixel;
+
+    if (!screen || !rect || rect->w < 4 || rect->h < 4 || selected_mix == 0) {
+        return;
+    }
+
+    outline = rgb565_lerp(blend_rgb565(base_color, UI_COLOR_BLACK, 124), UI_COLOR_ACCENT, selected_mix, 255);
+    line.x = (Sint16) (rect->x + 2);
+    line.y = rect->y;
+    line.w = (Uint16) (rect->w - 4);
+    line.h = 1;
+    fill_rect_rgb565(screen, &line, outline);
+    line.y = (Sint16) (rect->y + rect->h - 1);
+    fill_rect_rgb565(screen, &line, outline);
+
+    side.x = rect->x;
+    side.y = (Sint16) (rect->y + 2);
+    side.w = 1;
+    side.h = (Uint16) (rect->h - 4);
+    fill_rect_rgb565(screen, &side, outline);
+    side.x = (Sint16) (rect->x + rect->w - 1);
+    fill_rect_rgb565(screen, &side, outline);
+
+    pixel.w = 1;
+    pixel.h = 1;
+    pixel.x = (Sint16) (rect->x + 1);
+    pixel.y = (Sint16) (rect->y + 1);
+    fill_rect_rgb565(screen, &pixel, outline);
+    pixel.x = (Sint16) (rect->x + rect->w - 2);
+    fill_rect_rgb565(screen, &pixel, outline);
+    pixel.x = (Sint16) (rect->x + 1);
+    pixel.y = (Sint16) (rect->y + rect->h - 2);
+    fill_rect_rgb565(screen, &pixel, outline);
+    pixel.x = (Sint16) (rect->x + rect->w - 2);
+    fill_rect_rgb565(screen, &pixel, outline);
+}
+
 static void draw_soft_glass_panel(SDL_Surface *screen, const SDL_Rect *rect, Uint16 base_color, bool is_selected)
 {
     draw_soft_glass_panel_mix(screen, rect, base_color, is_selected ? 255 : 0);
@@ -9837,6 +9879,11 @@ static int pressed_control_offset_x(uint8_t press_mix)
     return press_mix >= 178 ? 1 : 0;
 }
 
+static uint8_t max_u8(uint8_t a, uint8_t b)
+{
+    return a > b ? a : b;
+}
+
 static Uint16 pressed_control_base(Uint16 base, uint8_t press_mix)
 {
     return rgb565_lerp(base, UI_COLOR_BLACK, (uint8_t) ((42U * press_mix) / 255U), 255);
@@ -9946,6 +9993,7 @@ static int draw_text_badge(
         hover_mix
     );
     draw_pressed_control_reflection(screen, &badge, press_mix);
+    draw_soft_glass_panel_rim(screen, &badge, base, max_u8(hover_mix, press_mix));
     draw_ui_label(screen, fonts, badge.x + 6 + press_offset_x, badge.y + 4 + press_offset_y, label);
     return badge.x - 6;
 }
@@ -10580,6 +10628,7 @@ static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect,
     int y;
     SDL_Rect fill;
     Uint16 base;
+    Uint16 pressed_base;
 
     outer.y = (Sint16) (outer.y + y_offset);
     y = outer.y;
@@ -10587,23 +10636,22 @@ static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect,
     fill.y = (Sint16) (y + 1 + press_offset_y);
     fill.w = 20;
     fill.h = 20;
-    base = pressed_control_base(
-        rgb565_lerp(
-            UI_COLOR_BLACK,
-            animated_control_color(UI_COLOR_CARBON, ui_theme()->row_selected, hover_mix),
-            chrome_mix,
-            255
-        ),
-        press_mix
+    base = rgb565_lerp(
+        UI_COLOR_BLACK,
+        animated_control_color(UI_COLOR_CARBON, ui_theme()->row_selected, hover_mix),
+        chrome_mix,
+        255
     );
+    pressed_base = pressed_control_base(base, press_mix);
 
     draw_soft_glass_panel_mix(
         screen,
         &outer,
-        base,
+        pressed_base,
         hover_mix
     );
     draw_pressed_control_reflection(screen, &outer, press_mix);
+    draw_soft_glass_panel_rim(screen, &outer, base, max_u8(hover_mix, press_mix));
     if (chrome_mix < 48) {
         return;
     }
@@ -11929,6 +11977,7 @@ static void draw_resume_badge(
         fill_rect_rgb565(screen, &glint, rgb565_lerp(base, UI_COLOR_ACCENT_HOT, hover_mix, 255));
     }
     draw_pressed_control_reflection(screen, &draw_badge, press_mix);
+    draw_soft_glass_panel_rim(screen, &draw_badge, base, max_u8(hover_mix, press_mix));
     if (visible_mix > 54) {
         draw_ui_label(screen, fonts, draw_badge.x + 6 + press_offset_x, draw_badge.y + 4 + press_offset_y, "RESUME");
     }
