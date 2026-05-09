@@ -12530,6 +12530,10 @@ static int play_movie(
                 now_ms = monotonic_clock_now_ms();
                 status_overlay_until = now_ms + STATUS_OVERLAY_MS;
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+                if (brightness_up_edge) {
+                    brightness_repeat_direction = -1;
+                    brightness_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
+                }
                 if (!seek_preroll_active) {
                     reset_playback_timeline(
                         &movie,
