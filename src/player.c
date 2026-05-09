@@ -26,6 +26,8 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define SEEK_BADGE_ANIM_MS 120U
 #define SEEK_BADGE_EXIT_ANIM_MS 105U
 #define SEEK_BADGE_HIDE_PENDING UINT32_MAX
+#define STATUS_BADGE_ANIM_MS 115U
+#define STATUS_BADGE_EXIT_ANIM_MS 95U
 #define TAB_HOLD_FRAME_REPEAT_DELAY_MS 250U
 #define TAB_HOLD_FRAME_REPEAT_FALLBACK_INTERVAL_MS 80U
 #define PICKER_MAX_FILES 128
@@ -9768,6 +9770,19 @@ static bool ui_time_before(uint32_t now_ms, uint32_t until_ms)
     return until_ms != 0U && (int32_t) (now_ms - until_ms) < 0;
 }
 
+static void status_overlay_show(uint32_t now_ms, bool restart_animation, uint32_t *started_ms, uint32_t *until_ms)
+{
+    if (now_ms == 0U) {
+        now_ms = 1U;
+    }
+    if (started_ms && (restart_animation || *started_ms == 0U)) {
+        *started_ms = now_ms;
+    }
+    if (until_ms) {
+        *until_ms = now_ms + STATUS_OVERLAY_MS;
+    }
+}
+
 static bool seek_preview_surface_animating(const SeekBarPreviewState *preview, uint32_t now_ms)
 {
     return preview &&
@@ -9940,6 +9955,35 @@ static int draw_left_text_badge(SDL_Surface *screen, const Fonts *fonts, int lef
     return badge.x + badge.w + 6;
 }
 
+static int draw_left_text_badge_animated(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    int left_x,
+    int y,
+    const char *label,
+    uint8_t mix,
+    int offset_x
+)
+{
+    int text_w;
+    SDL_Rect badge;
+
+    if (!screen || !fonts || !label || mix == 0) {
+        return left_x;
+    }
+    text_w = nSDL_GetStringWidth(fonts->white, label);
+    badge.x = (Sint16) (left_x + offset_x);
+    badge.y = (Sint16) y;
+    badge.w = (Uint16) (text_w + 12);
+    badge.h = 16;
+
+    draw_soft_glass_panel(screen, &badge, rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, mix, 255), false);
+    if (mix > 48) {
+        draw_ui_label(screen, fonts, badge.x + 6, badge.y + 4, label);
+    }
+    return badge.x + badge.w + 6;
+}
+
 static void format_seek_delta(int32_t delta_ms, char *buffer, size_t buffer_size);
 
 static void draw_seek_delta_badge(
@@ -9991,6 +10035,38 @@ static void draw_seek_delta_badge(
     if (mix > 48) {
         draw_ui_label(screen, fonts, badge.x + 6, badge.y + 4, label);
     }
+}
+
+static void draw_status_overlay_badge(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    int left_x,
+    int y,
+    const char *label,
+    uint32_t started_ms,
+    uint32_t until_ms,
+    uint32_t now_ms,
+    uint8_t chrome_mix
+)
+{
+    uint8_t mix;
+    int offset_x;
+
+    if (!label || label[0] == '\0' || started_ms == 0U || until_ms == 0U || chrome_mix <= 48) {
+        return;
+    }
+    if ((int32_t) (now_ms - until_ms) <= 0) {
+        mix = ui_ease_out_cubic(now_ms - started_ms, STATUS_BADGE_ANIM_MS);
+        offset_x = -((255 - (int) mix) * 14 + 127) / 255;
+    } else if ((int32_t) (now_ms - (until_ms + STATUS_BADGE_EXIT_ANIM_MS)) < 0) {
+        uint8_t out_mix = ui_ease_smoothstep(now_ms - until_ms, STATUS_BADGE_EXIT_ANIM_MS);
+
+        mix = (uint8_t) (255U - out_mix);
+        offset_x = -(((int) out_mix * 12 + 127) / 255);
+    } else {
+        return;
+    }
+    draw_left_text_badge_animated(screen, fonts, left_x, y, label, mix, offset_x);
 }
 
 static void draw_centered_text_badge(SDL_Surface *screen, const Fonts *fonts, int center_x, int y, const char *label)
@@ -11051,6 +11127,8 @@ static void render_movie(
     int subtitle_size,
     SubtitlePlacement subtitle_placement,
     const char *status_overlay_text,
+    uint32_t status_overlay_started_ms,
+    uint32_t status_overlay_until_ms,
     const ScreenshotPreviewState *screenshot_preview,
     SeekBarPreviewState *seek_preview,
     uint32_t now_ms,
@@ -11123,6 +11201,18 @@ static void render_movie(
     }
     if (chrome_visible) {
         if (!help_menu_visible) {
+            memory_right_limit = draw_status_badges(screen, fonts, &dst, scale_mode, playback_rate, ui_mixes, chrome_mix);
+            draw_status_overlay_badge(
+                screen,
+                fonts,
+                playback_badge_visible ? 36 : 8,
+                top_overlay_y_for_rect(&dst, 16),
+                status_overlay_text,
+                status_overlay_started_ms,
+                status_overlay_until_ms,
+                now_ms,
+                chrome_mix
+            );
             if (playback_badge_visible) {
                 draw_playback_badge(
                     screen,
@@ -11132,10 +11222,6 @@ static void render_movie(
                     ui_mixes ? ui_mixes->playback_press : 0,
                     chrome_mix
                 );
-            }
-            memory_right_limit = draw_status_badges(screen, fonts, &dst, scale_mode, playback_rate, ui_mixes, chrome_mix);
-            if (status_overlay_text && status_overlay_text[0] != '\0' && chrome_mix > 48) {
-                draw_left_text_badge(screen, fonts, playback_badge_visible ? 36 : 8, top_overlay_y_for_rect(&dst, 16), status_overlay_text);
             }
         }
         draw_progress(
@@ -13723,6 +13809,7 @@ static int play_movie(
     VideoAlign video_align_x = VIDEO_ALIGN_CENTER;
     VideoAlign video_align_y = VIDEO_ALIGN_CENTER;
     char status_overlay_text[64] = {0};
+    uint32_t status_overlay_started_ms = 0;
     uint32_t status_overlay_until = 0;
     SubtitleSurfaceCache subtitle_cache;
     ScreenshotPreviewState screenshot_preview;
@@ -13849,7 +13936,7 @@ static int play_movie(
                 return PLAY_MOVIE_RESULT_ERROR;
             }
             snprintf(status_overlay_text, sizeof(status_overlay_text), "RESUMED");
-            status_overlay_until = monotonic_clock_now_ms() + STATUS_OVERLAY_MS;
+            status_overlay_show(monotonic_clock_now_ms(), true, &status_overlay_started_ms, &status_overlay_until);
             if (resume_without_prompt) {
                 begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
             }
@@ -14002,7 +14089,7 @@ static int play_movie(
             ui_cycle_theme();
             ui_save_theme_for_movie(path);
             snprintf(status_overlay_text, sizeof(status_overlay_text), "THEME %s", ui_theme_name(g_ui_theme_id));
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             show_ui = true;
         }
@@ -14010,6 +14097,10 @@ static int play_movie(
         if (display_power_state.off) {
             if (on_edge || brightness_up_edge) {
                 bool resume_playback = display_power_state.resume_playback_on_wake;
+                bool keep_brightness_badge =
+                    brightness_up_edge &&
+                    strncmp(status_overlay_text, "BRIGHT ", 7) == 0 &&
+                    (int32_t) (now_ms - (status_overlay_until + STATUS_BADGE_EXIT_ANIM_MS)) < 0;
 
                 display_power_on(&display_power_state);
                 paused = !resume_playback;
@@ -14034,7 +14125,12 @@ static int play_movie(
                     snprintf(status_overlay_text, sizeof(status_overlay_text), "PAUSED");
                 }
                 now_ms = monotonic_clock_now_ms();
-                status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+                status_overlay_show(
+                    now_ms,
+                    !brightness_up_edge || !keep_brightness_badge,
+                    &status_overlay_started_ms,
+                    &status_overlay_until
+                );
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
                 if (brightness_up_edge) {
                     brightness_repeat_direction = -1;
@@ -14279,7 +14375,9 @@ static int play_movie(
                 false,
                 subtitle_size,
                 subtitle_placement,
-                (now_ms <= status_overlay_until) ? status_overlay_text : NULL,
+                status_overlay_text,
+                status_overlay_started_ms,
+                status_overlay_until,
                 &screenshot_preview,
                 &seek_preview,
                 now_ms,
@@ -14321,62 +14419,62 @@ static int play_movie(
         if (playback_mode_edge) {
             playback_mode = (PlaybackMode) ((playback_mode + 1) % PLAYBACK_MODE_COUNT);
             snprintf(status_overlay_text, sizeof(status_overlay_text), "MODE %s", playback_mode_text(playback_mode));
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (video_up_left_edge) {
             apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_NEGATIVE, VIDEO_ALIGN_NEGATIVE);
             format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (video_up_edge) {
             apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_CENTER, VIDEO_ALIGN_NEGATIVE);
             format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (video_up_right_edge) {
             apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_POSITIVE, VIDEO_ALIGN_NEGATIVE);
             format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (video_left_edge) {
             apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_NEGATIVE, VIDEO_ALIGN_CENTER);
             format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (video_center_edge) {
             video_align_x = VIDEO_ALIGN_CENTER;
             video_align_y = VIDEO_ALIGN_CENTER;
             format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (video_right_edge) {
             apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_POSITIVE, VIDEO_ALIGN_CENTER);
             format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (video_down_left_edge) {
             apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_NEGATIVE, VIDEO_ALIGN_POSITIVE);
             format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (video_down_edge) {
             apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_CENTER, VIDEO_ALIGN_POSITIVE);
             format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (video_down_right_edge) {
             apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_POSITIVE, VIDEO_ALIGN_POSITIVE);
             format_video_align_status(video_align_x, video_align_y, status_overlay_text, sizeof(status_overlay_text));
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (brightness_up_edge) {
@@ -14400,6 +14498,9 @@ static int play_movie(
         }
         if (brightness_delta != 0) {
             uint32_t brightness_raw;
+            bool keep_brightness_badge =
+                strncmp(status_overlay_text, "BRIGHT ", 7) == 0 &&
+                (int32_t) (now_ms - (status_overlay_until + STATUS_BADGE_EXIT_ANIM_MS)) < 0;
 
             if (brightness_delta > 0 && current_lcd_brightness() >= LCD_BRIGHTNESS_MAX) {
                 bool was_paused = paused;
@@ -14431,7 +14532,7 @@ static int play_movie(
                 "BRIGHT %u%%",
                 lcd_brightness_percent(brightness_raw)
             );
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, !keep_brightness_badge, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (enter_edge) {
@@ -14494,7 +14595,7 @@ static int play_movie(
                 "SUB POS %s",
                 subtitle_placement_label(subtitle_placement)
             );
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (key_pressed_edge(KEY_NSPIRE_PLUS, &prev_plus) && subtitle_size < 3) {
@@ -14526,7 +14627,7 @@ static int play_movie(
                 "SUB %.22s",
                 active_subtitle_track_name(&movie)
             );
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (memory_overlay_edge) {
@@ -14562,7 +14663,7 @@ static int play_movie(
             debug_set_metrics_collection(
                 memory_overlay_mode != MEMORY_OVERLAY_OFF || debug_is_runtime_logging_enabled()
             );
-            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (tab_edge) {
@@ -14792,7 +14893,7 @@ static int play_movie(
                         }
                         if (playback_mode == PLAYBACK_MODE_AUTO_NEXT) {
                             snprintf(status_overlay_text, sizeof(status_overlay_text), "END OF LIST");
-                            status_overlay_until = now_ms + STATUS_OVERLAY_MS;
+                            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
                         }
                         ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
                     }
@@ -14897,7 +14998,9 @@ static int play_movie(
                 subtitle_font_overlay_visible,
                 subtitle_size,
                 subtitle_placement,
-                (render_now_ms <= status_overlay_until) ? status_overlay_text : NULL,
+                status_overlay_text,
+                status_overlay_started_ms,
+                status_overlay_until,
                 &screenshot_preview,
                 &seek_preview,
                 render_now_ms,
