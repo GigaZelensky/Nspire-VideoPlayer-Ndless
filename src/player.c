@@ -1735,22 +1735,87 @@ static int picker_tooltip_hover_update(PickerTooltipHoverState *state, int hover
     return -1;
 }
 
+static char *append_uint_decimal_raw(char *out, uint32_t value)
+{
+    char digits[10];
+    size_t count = 0;
+
+    do {
+        digits[count++] = (char) ('0' + (value % 10U));
+        value /= 10U;
+    } while (value > 0U && count < sizeof(digits));
+    while (count > 0) {
+        *out++ = digits[--count];
+    }
+    return out;
+}
+
+static char *append_two_digits_raw(char *out, uint32_t value)
+{
+    value %= 100U;
+    *out++ = (char) ('0' + (value / 10U));
+    *out++ = (char) ('0' + (value % 10U));
+    return out;
+}
+
+static void copy_truncated(char *buffer, size_t buffer_size, const char *text)
+{
+    size_t index;
+
+    if (!buffer || buffer_size == 0) {
+        return;
+    }
+    if (!text) {
+        buffer[0] = '\0';
+        return;
+    }
+    for (index = 0; index + 1 < buffer_size && text[index] != '\0'; ++index) {
+        buffer[index] = text[index];
+    }
+    buffer[index] = '\0';
+}
+
+static char *append_text_bounded(char *out, char *end, const char *text)
+{
+    if (!out || !end || out > end) {
+        return out;
+    }
+    if (!text) {
+        *out = '\0';
+        return out;
+    }
+    while (out < end && *text != '\0') {
+        *out++ = *text++;
+    }
+    *out = '\0';
+    return out;
+}
+
 static void format_clock(uint32_t total_ms, char *buffer, size_t buffer_size)
 {
     uint32_t total_seconds = total_ms / 1000;
     uint32_t hours = total_seconds / 3600;
     uint32_t minutes = (total_seconds / 60) % 60;
     uint32_t seconds = total_seconds % 60;
-    if (hours > 0) {
-        snprintf(buffer, buffer_size, "%lu:%02lu:%02lu",
-            (unsigned long) hours,
-            (unsigned long) minutes,
-            (unsigned long) seconds);
-    } else {
-        snprintf(buffer, buffer_size, "%02lu:%02lu",
-            (unsigned long) minutes,
-            (unsigned long) seconds);
+    char formatted[16];
+    char *out = formatted;
+
+    if (!buffer || buffer_size == 0) {
+        return;
     }
+    if (hours > 0) {
+        out = append_uint_decimal_raw(out, hours);
+        *out++ = ':';
+        out = append_two_digits_raw(out, minutes);
+        *out++ = ':';
+        out = append_two_digits_raw(out, seconds);
+    } else {
+        out = append_two_digits_raw(out, minutes);
+        *out++ = ':';
+        out = append_two_digits_raw(out, seconds);
+    }
+    *out = '\0';
+    copy_truncated(buffer, buffer_size, formatted);
 }
 
 static MemoryStats query_memory_stats(const Movie *movie)
@@ -9059,19 +9124,23 @@ static void format_seek_delta(int32_t delta_ms, char *buffer, size_t buffer_size
 {
     uint32_t magnitude_ms;
     char time_text[24];
+    char formatted[32];
+    char *out = formatted;
 
     if (!buffer || buffer_size == 0) {
         return;
     }
 
     if (delta_ms == 0) {
-        snprintf(buffer, buffer_size, "0s");
+        copy_truncated(buffer, buffer_size, "0s");
         return;
     }
 
     magnitude_ms = (uint32_t) (delta_ms < 0 ? -delta_ms : delta_ms);
     format_clock(magnitude_ms, time_text, sizeof(time_text));
-    snprintf(buffer, buffer_size, "%c%s", delta_ms < 0 ? '-' : '+', time_text);
+    *out++ = delta_ms < 0 ? '-' : '+';
+    copy_truncated(out, sizeof(formatted) - 1, time_text);
+    copy_truncated(buffer, buffer_size, formatted);
 }
 
 static void status_badge_rects(
@@ -9664,8 +9733,16 @@ static void draw_progress(
     format_clock(current_ms, current_text, sizeof(current_text));
     format_clock(duration_ms, total_text, sizeof(total_text));
     format_clock(duration_ms > current_ms ? (duration_ms - current_ms) : 0, remaining_text, sizeof(remaining_text));
-    snprintf(left_text, sizeof(left_text), "%s / %s", current_text, total_text);
-    snprintf(right_text, sizeof(right_text), "-%s", remaining_text);
+    {
+        char *left_out = left_text;
+        char *left_end = left_text + sizeof(left_text) - 1;
+
+        left_out = append_text_bounded(left_out, left_end, current_text);
+        left_out = append_text_bounded(left_out, left_end, " / ");
+        append_text_bounded(left_out, left_end, total_text);
+    }
+    right_text[0] = '-';
+    copy_truncated(right_text + 1, sizeof(right_text) - 1, remaining_text);
     draw_ui_label(screen, fonts, 14, overlay.y + 3, left_text);
     draw_ui_label(
         screen,
