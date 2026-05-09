@@ -28,6 +28,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define PICKER_MAX_FILES 128
 #define PICKER_VISIBLE_ROWS 8
 #define PICKER_TOOLTIP_DWELL_MS 450U
+#define PICKER_SELECTION_ANIM_MS 120U
 #define MAX_PATH_LEN 512
 #define MAX_SUBTITLE_LINES 3
 #define MAX_SUBTITLE_LINE_LEN 96
@@ -10187,12 +10188,66 @@ static void draw_resume_hover_tooltip(SDL_Surface *screen, const Fonts *fonts, c
     nSDL_DrawString(screen, fonts->white, x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y + TOOLTIP_LINE_GAP, "%s", detail);
 }
 
+static uint8_t picker_selection_ease(uint32_t elapsed_ms)
+{
+    uint32_t t;
+    uint32_t inverse;
+
+    if (elapsed_ms >= PICKER_SELECTION_ANIM_MS) {
+        return 255;
+    }
+    t = (elapsed_ms * 255U) / PICKER_SELECTION_ANIM_MS;
+    inverse = 255U - t;
+    return (uint8_t) (255U - ((inverse * inverse) / 255U));
+}
+
+static uint8_t picker_row_selection_mix(
+    size_t index,
+    size_t selected,
+    size_t previous_selected,
+    uint32_t selection_anim_started_ms,
+    uint32_t now_ms
+)
+{
+    uint8_t eased;
+
+    if (selected == previous_selected || selection_anim_started_ms == 0) {
+        return index == selected ? 255 : 0;
+    }
+    eased = picker_selection_ease(now_ms - selection_anim_started_ms);
+    if (index == selected) {
+        return eased;
+    }
+    if (index == previous_selected) {
+        return (uint8_t) (255U - eased);
+    }
+    return 0;
+}
+
+static void picker_set_selected(
+    size_t *selected,
+    size_t *previous_selected,
+    uint32_t *selection_anim_started_ms,
+    size_t next_selected,
+    uint32_t now_ms
+)
+{
+    if (!selected || !previous_selected || !selection_anim_started_ms || *selected == next_selected) {
+        return;
+    }
+    *previous_selected = *selected;
+    *selected = next_selected;
+    *selection_anim_started_ms = now_ms ? now_ms : 1U;
+}
+
 static void render_picker(
     SDL_Surface *screen,
     const Fonts *fonts,
     MovieFile *files,
     size_t count,
     size_t selected,
+    size_t previous_selected,
+    uint32_t selection_anim_started_ms,
     int hovered_index,
     int resume_hovered_index,
     const PointerState *pointer,
@@ -10252,12 +10307,21 @@ static void render_picker(
         SDL_Rect resume_badge;
         bool has_resume_badge = picker_resume_badge_rect(fonts, &files[index], y, &resume_badge);
         bool resume_hovered = resume_hovered_index == (int) index;
-        int text_x = index == selected ? 20 : 12;
+        uint8_t selection_mix = picker_row_selection_mix(
+            index,
+            selected,
+            previous_selected,
+            selection_anim_started_ms,
+            now_ms
+        );
+        int text_x = 12 + ((int) selection_mix * 8 + 127) / 255;
         int reserved_right = has_resume_badge ? resume_badge.w + 10 : 0;
         int text_max_width = SCREEN_W - text_x - 28 - reserved_right;
         char fitted_title[128];
-        if (index == selected) {
-            draw_glass_panel(screen, &row, ui_theme()->row_selected, true);
+        if (selection_mix > 0) {
+            Uint16 row_color = rgb565_lerp(ui_theme()->gunmetal, ui_theme()->row_selected, selection_mix, 255);
+
+            draw_glass_panel(screen, &row, row_color, selection_mix > 170);
             cut_rect_corners(screen, &row, picker_background_color_at_y(row.y));
         } else {
             fill_rect_rgb565(screen, &divider, ui_theme()->row_divider);
@@ -11088,6 +11152,8 @@ static int pick_movie(
     MovieFile *files;
     size_t count = 0;
     size_t selected = 0;
+    size_t previous_selected = 0;
+    uint32_t selection_anim_started_ms = 0;
 
     memset(&screenshot_preview, 0, sizeof(screenshot_preview));
     files = scan_movies(directory, &count);
@@ -11118,7 +11184,13 @@ static int pick_movie(
             : picker_tooltip_hover_update(&tooltip_hover, hovered_index, &pointer, pointer_click, now_ms);
 
         if (hovered_index >= 0) {
-            selected = (size_t) hovered_index;
+            picker_set_selected(
+                &selected,
+                &previous_selected,
+                &selection_anim_started_ms,
+                (size_t) hovered_index,
+                now_ms
+            );
         }
         if (key_pressed_edge(KEY_NSPIRE_C, &prev_c)) {
             ui_cycle_theme();
@@ -11130,6 +11202,8 @@ static int pick_movie(
             files,
             count,
             selected,
+            previous_selected,
+            selection_anim_started_ms,
             tooltip_index,
             resume_hovered_index,
             &pointer,
@@ -11145,11 +11219,23 @@ static int pick_movie(
             }
         }
         if (key_pressed_edge(KEY_NSPIRE_UP, &prev_up) && selected > 0) {
-            selected--;
+            picker_set_selected(
+                &selected,
+                &previous_selected,
+                &selection_anim_started_ms,
+                selected - 1,
+                now_ms
+            );
             pointer_hover_guard_lock(&hover_guard, &pointer);
         }
         if (key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) && selected + 1 < count) {
-            selected++;
+            picker_set_selected(
+                &selected,
+                &previous_selected,
+                &selection_anim_started_ms,
+                selected + 1,
+                now_ms
+            );
             pointer_hover_guard_lock(&hover_guard, &pointer);
         }
         if (pointer_click && count > 0) {
@@ -11164,6 +11250,8 @@ static int pick_movie(
                     files,
                     count,
                     selected,
+                    previous_selected,
+                    selection_anim_started_ms,
                     -1,
                     -1,
                     &pointer,
@@ -11192,6 +11280,8 @@ static int pick_movie(
                     files,
                     count,
                     selected,
+                    previous_selected,
+                    selection_anim_started_ms,
                     -1,
                     -1,
                     &pointer,
