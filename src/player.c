@@ -10001,6 +10001,7 @@ static void draw_progress(
     const Fonts *fonts,
     Movie *movie,
     uint32_t current_ms,
+    bool paused,
     const PointerState *pointer,
     int32_t pending_seek_ms,
     const SeekBarPreviewState *seek_preview,
@@ -10086,11 +10087,17 @@ static void draw_progress(
         SDL_Rect marker = {(Sint16) marker_x, (Sint16) (bar_back.y - 3), 1, 12};
         int preview_marker_x = marker_x;
         bool has_preview_anchor = false;
+        bool use_cached_anchor = false;
+        bool show_surface_preview = paused && seek_preview && seek_preview->surface;
+
         fill_rect_rgb565(screen, &marker, UI_COLOR_WHITE);
         hover_bar = pointer->y >= overlay.y && pointer->y < overlay.y + overlay.h;
-        if (!hover_bar && seek_preview && seek_preview->marker_x >= bar_back.x &&
+        if (!hover_bar && show_surface_preview && seek_preview->marker_x >= bar_back.x &&
             seek_preview->marker_x < bar_back.x + bar_back.w) {
             preview_marker_x = seek_preview->marker_x;
+            has_preview_anchor = true;
+            use_cached_anchor = true;
+        } else if (!hover_bar && preview_mix > 0) {
             has_preview_anchor = true;
         }
         if ((hover_bar || has_preview_anchor) && duration_ms > 0 && preview_mix > 0) {
@@ -10098,9 +10105,11 @@ static void draw_progress(
             int preview_offset = ((255 - preview_mix) * 4 + 127) / 255;
             hover_ms = hover_bar
                 ? (uint32_t) (((uint64_t) duration_ms * (uint32_t) (preview_marker_x - bar_back.x)) / (uint32_t) bar_back.w)
-                : (seek_preview ? seek_preview->hover_ms : 0);
+                : (use_cached_anchor
+                    ? seek_preview->hover_ms
+                    : (uint32_t) (((uint64_t) duration_ms * (uint32_t) (preview_marker_x - bar_back.x)) / (uint32_t) bar_back.w));
             format_clock(hover_ms, hover_text, sizeof(hover_text));
-            if (seek_preview && seek_preview->surface) {
+            if (show_surface_preview) {
                 preview_x = clamp_int(
                     preview_marker_x - ((seek_preview->surface->w + 4) / 2),
                     0,
@@ -10284,7 +10293,7 @@ static void render_movie(
                 draw_left_text_badge(screen, fonts, playback_badge_visible ? 36 : 8, top_overlay_y_for_rect(&dst, 16), status_overlay_text);
             }
         }
-        draw_progress(screen, fonts, movie, current_ms, pointer, pending_seek_ms, seek_preview, ui_mixes ? ui_mixes->seek_preview : 0, chrome_mix);
+        draw_progress(screen, fonts, movie, current_ms, paused, pointer, pending_seek_ms, seek_preview, ui_mixes ? ui_mixes->seek_preview : 0, chrome_mix);
         if (!help_menu_visible && pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
