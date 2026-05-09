@@ -35,6 +35,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define UI_HOVER_ANIM_MS 105U
 #define UI_PRESS_ANIM_MS 120U
 #define UI_PRESS_RELEASE_ANIM_MS 72U
+#define UI_PRESS_PRIME_MIX 72U
 #define UI_TOOLTIP_ANIM_MS 115U
 #define UI_MENU_ANIM_MS 130U
 #define UI_LOADING_ANIM_MS 150U
@@ -9663,6 +9664,22 @@ static uint8_t ui_transition_update_press(
     return current_mix;
 }
 
+static void ui_transition_prime_press(UiTransition *transition, uint32_t now_ms)
+{
+    if (!transition) {
+        return;
+    }
+    if (!transition->initialized) {
+        ui_transition_init(transition, false);
+    }
+    if (transition->current_mix < UI_PRESS_PRIME_MIX) {
+        transition->current_mix = UI_PRESS_PRIME_MIX;
+    }
+    transition->target_active = true;
+    transition->start_mix = transition->current_mix;
+    transition->started_ms = now_ms ? now_ms : 1U;
+}
+
 static bool ui_mix_animating(uint8_t mix)
 {
     return mix > 0 && mix < 255;
@@ -9681,6 +9698,20 @@ static bool playback_ui_mixes_animating(const PlaybackUiMixes *mixes)
         ui_mix_animating(mixes->seek_preview) ||
         ui_mix_animating(mixes->help_menu)
     );
+}
+
+static void trigger_playback_badge_press(
+    PlaybackUiTransitions *transitions,
+    uint32_t *press_until_ms,
+    uint32_t now_ms
+)
+{
+    if (press_until_ms) {
+        *press_until_ms = now_ms + UI_PRESS_ANIM_MS;
+    }
+    if (transitions) {
+        ui_transition_prime_press(&transitions->playback_press, now_ms);
+    }
 }
 
 static bool ui_time_before(uint32_t now_ms, uint32_t until_ms)
@@ -10149,6 +10180,7 @@ static void update_playback_ui_mixes(
     bool show_ui,
     bool help_menu_open,
     PlaybackPressTarget pressed_target,
+    bool force_playback_press,
     const PointerState *pointer,
     uint32_t now_ms
 )
@@ -10196,7 +10228,8 @@ static void update_playback_ui_mixes(
     );
     mixes->playback_press = ui_transition_update_press(
         &transitions->playback_press,
-        pressed_target == PLAYBACK_PRESS_PLAY && pointer && pointer->down && playback_hovered,
+        force_playback_press ||
+            (pressed_target == PLAYBACK_PRESS_PLAY && pointer && pointer->down && playback_hovered),
         now_ms
     );
     mixes->scale_badge = ui_transition_update(
@@ -12583,6 +12616,7 @@ static int pick_movie(
     int pressed_row_index = -1;
     int pressed_resume_badge_index = -1;
     bool pressed_selected_fallback = false;
+    int enter_press_stage = 0;
 
     memset(&screenshot_preview, 0, sizeof(screenshot_preview));
     memset(&resume_badge_anim, 0, sizeof(resume_badge_anim));
@@ -12607,6 +12641,8 @@ static int pick_movie(
         bool pointer_click = pointer_update(&pointer);
         uint32_t now_ms = monotonic_clock_now_ms();
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
+        bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
+        bool enter_down = prev_enter;
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
         int hovered_index = pointer_hover_allowed ? picker_row_index_at(count, selected, pointer.x, pointer.y) : -1;
         int resume_hovered_index = pointer_hover_allowed
@@ -12688,19 +12724,29 @@ static int pick_movie(
                 pressed_selected_fallback = false;
             }
         }
-        picker_press_hot = pointer.down && (
+        if (enter_edge && count > 0 && enter_press_stage == 0) {
+            enter_press_stage = 1;
+            pressed_row_index = (int) selected;
+            pressed_resume_badge_index = -1;
+            pressed_selected_fallback = true;
+            ui_transition_init(&picker_press_anim, false);
+        }
+        if (enter_press_stage == 1 && !enter_down) {
+            enter_press_stage = 2;
+        }
+        picker_press_hot = (enter_press_stage == 1 && pressed_row_index >= 0) || (pointer.down && (
             (pressed_resume_badge_index >= 0 && resume_hovered_index == pressed_resume_badge_index) ||
             (pressed_row_index >= 0 && (
                 (pressed_selected_fallback && pressed_row_index == (int) selected) ||
                 hovered_index == pressed_row_index
             ))
-        );
+        ));
         picker_press_mix = ui_transition_update_press(
             &picker_press_anim,
             picker_press_hot,
             now_ms
         );
-        if (!pointer.down && !pointer.release_edge && picker_press_mix == 0) {
+        if (enter_press_stage == 0 && !pointer.down && !pointer.release_edge && picker_press_mix == 0) {
             pressed_row_index = -1;
             pressed_resume_badge_index = -1;
             pressed_selected_fallback = false;
@@ -12739,7 +12785,7 @@ static int pick_movie(
                 prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
             }
         }
-        if (key_pressed_edge(KEY_NSPIRE_UP, &prev_up) && selected > 0) {
+        if (enter_press_stage == 0 && key_pressed_edge(KEY_NSPIRE_UP, &prev_up) && selected > 0) {
             picker_set_selected(
                 &selected,
                 &previous_selected,
@@ -12749,7 +12795,7 @@ static int pick_movie(
             );
             pointer_hover_guard_lock(&hover_guard, &pointer);
         }
-        if (key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) && selected + 1 < count) {
+        if (enter_press_stage == 0 && key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) && selected + 1 < count) {
             picker_set_selected(
                 &selected,
                 &previous_selected,
@@ -12759,7 +12805,7 @@ static int pick_movie(
             );
             pointer_hover_guard_lock(&hover_guard, &pointer);
         }
-        if (pointer.release_edge && count > 0) {
+        if (enter_press_stage == 0 && pointer.release_edge && count > 0) {
             int activated_index = -1;
             bool activated_resume = false;
             int release_step;
@@ -12823,15 +12869,22 @@ static int pick_movie(
                 return 0;
             }
         }
-        if (key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) && count > 0) {
-            strncpy(selected_path, files[selected].path, selected_size - 1);
-            selected_path[selected_size - 1] = '\0';
-            if (resume_without_prompt) {
-                *resume_without_prompt = false;
+        if (enter_press_stage != 0) {
+            if (enter_press_stage == 2 && picker_press_mix == 0 && pressed_row_index >= 0) {
+                selected = (size_t) pressed_row_index;
+                pressed_row_index = -1;
+                pressed_resume_badge_index = -1;
+                pressed_selected_fallback = false;
+                enter_press_stage = 0;
+                strncpy(selected_path, files[selected].path, selected_size - 1);
+                selected_path[selected_size - 1] = '\0';
+                if (resume_without_prompt) {
+                    *resume_without_prompt = false;
+                }
+                free_movie_files(files, count);
+                clear_screenshot_preview(&screenshot_preview);
+                return 0;
             }
-            free_movie_files(files, count);
-            clear_screenshot_preview(&screenshot_preview);
-            return 0;
         }
         if (key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc)) {
             free_movie_files(files, count);
@@ -12945,6 +12998,7 @@ static int prompt_resume_position(
     size_t previous_selected_button = 0;
     UiTransition button_press_anim;
     int pressed_button = -1;
+    int enter_button_press_stage = 0;
     bool pressed_button_fallback = false;
     uint32_t button_anim_started_ms = 0;
     uint32_t prompt_open_started_ms = 0;
@@ -13045,6 +13099,8 @@ static int prompt_resume_position(
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
         uint32_t now_ms = monotonic_clock_now_ms();
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
+        bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
+        bool enter_down = prev_enter;
         uint32_t prompt_close_elapsed_ms = prompt_closing ? (now_ms - prompt_close_started_ms) : 0;
         uint8_t close_mix = prompt_closing
             ? ui_ease_out_cubic(prompt_close_elapsed_ms, RESUME_PROMPT_ANIM_MS)
@@ -13123,7 +13179,8 @@ static int prompt_resume_position(
                     );
                 }
             }
-            if (key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right)) {
+            if (enter_button_press_stage == 0 &&
+                (key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right))) {
                 picker_set_selected(
                     &selected_button,
                     &previous_selected_button,
@@ -13143,16 +13200,28 @@ static int prompt_resume_position(
                 pressed_button_fallback = true;
             }
         }
-        button_press_hot = !prompt_closing && pointer.down && pressed_button >= 0 && (
-            hovered_button == pressed_button ||
-            (pressed_button_fallback && pressed_button == (int) selected_button)
+        if (!prompt_closing && enter_edge && enter_button_press_stage == 0) {
+            enter_button_press_stage = 1;
+            pressed_button = (int) selected_button;
+            pressed_button_fallback = true;
+            ui_transition_init(&button_press_anim, false);
+        }
+        if (enter_button_press_stage == 1 && !enter_down) {
+            enter_button_press_stage = 2;
+        }
+        button_press_hot = !prompt_closing && pressed_button >= 0 && (
+            enter_button_press_stage == 1 ||
+            (pointer.down && (
+                hovered_button == pressed_button ||
+                (pressed_button_fallback && pressed_button == (int) selected_button)
+            ))
         );
         button_press_mix = ui_transition_update_press(
             &button_press_anim,
             button_press_hot,
             now_ms
         );
-        if (!pointer.down && !pointer.release_edge && button_press_mix == 0) {
+        if (enter_button_press_stage == 0 && !pointer.down && !pointer.release_edge && button_press_mix == 0) {
             pressed_button = -1;
             pressed_button_fallback = false;
         }
@@ -13227,7 +13296,7 @@ static int prompt_resume_position(
             msleep(16);
             continue;
         }
-        if (pointer.release_edge) {
+        if (enter_button_press_stage == 0 && pointer.release_edge) {
             if (pressed_button >= 0 && (hovered_button == pressed_button || pressed_button_fallback)) {
                 prompt_closing = true;
                 prompt_closing_result = pressed_button == 0 ? 1 : 0;
@@ -13235,11 +13304,14 @@ static int prompt_resume_position(
                 continue;
             }
         }
-        if (key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter)) {
-            prompt_closing = true;
-            prompt_closing_result = selected_button == 0 ? 1 : 0;
-            prompt_close_started_ms = now_ms ? now_ms : 1U;
-            continue;
+        if (enter_button_press_stage != 0) {
+            if (enter_button_press_stage == 2 && button_press_mix == 0 && pressed_button >= 0) {
+                prompt_closing = true;
+                prompt_closing_result = pressed_button == 0 ? 1 : 0;
+                prompt_close_started_ms = now_ms ? now_ms : 1U;
+                enter_button_press_stage = 0;
+                continue;
+            }
         }
         if (key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc)) {
             prompt_closing = true;
@@ -13346,6 +13418,8 @@ static int play_movie(
     uint32_t seek_preroll_started_ms = 0;
     size_t seek_preroll_target_ready_count = 0;
     uint32_t paused_ui_quiet_until_ms = 0;
+    uint32_t playback_badge_press_until_ms = 0;
+    bool playback_enter_press_active = false;
     bool hover_preview_needs_rebuffer = false;
     SDL_Surface *loading_snapshot = NULL;
 
@@ -13528,6 +13602,7 @@ static int play_movie(
         const PlaybackRate *playback_rate = playback_rate_for_index(playback_rate_index);
         bool show_ui = help_menu_open || paused || (now_ms <= ui_visible_until);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
+        bool enter_down = prev_enter;
         bool tab_edge = key_pressed_edge(KEY_NSPIRE_TAB, &prev_tab);
         bool tab_down = prev_tab;
         bool cat_edge = key_pressed_edge(KEY_NSPIRE_CAT, &prev_cat);
@@ -13569,6 +13644,7 @@ static int play_movie(
         bool take_screenshot = false;
         bool tab_repeat_step = false;
         bool restart_after_pause = false;
+        bool playback_badge_press_triggered = false;
         int seek_delta_ms = 0;
         int brightness_delta = 0;
 
@@ -13582,6 +13658,9 @@ static int play_movie(
             } else {
                 resume_input_guard_until_ms = 0;
             }
+        }
+        if (!enter_down) {
+            playback_enter_press_active = false;
         }
 
         if (theme_edge) {
@@ -13827,6 +13906,7 @@ static int play_movie(
                 true,
                 help_menu_open,
                 PLAYBACK_PRESS_NONE,
+                false,
                 &pointer,
                 now_ms
             );
@@ -14002,6 +14082,9 @@ static int play_movie(
         if (enter_edge) {
             bool was_paused = paused;
 
+            playback_enter_press_active = true;
+            ui_transition_prime_press(&ui_transitions.playback_press, now_ms);
+            playback_badge_press_triggered = true;
             if (movie.current_frame + 1 >= movie.header.frame_count) {
                 if (!decode_to_frame(&movie, 0)) {
                     report_movie_decode_failure(&movie, path, "restart");
@@ -14241,6 +14324,8 @@ static int play_movie(
             } else if (pointer_click) {
                 bool was_paused = paused;
 
+                trigger_playback_badge_press(&ui_transitions, &playback_badge_press_until_ms, now_ms);
+                playback_badge_press_triggered = true;
                 if (movie.current_frame + 1 >= movie.header.frame_count) {
                     if (!decode_to_frame(&movie, 0)) {
                         report_movie_decode_failure(&movie, path, "pointer restart");
@@ -14266,7 +14351,11 @@ static int play_movie(
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             }
         }
-        if (!restart_after_pause) {
+        if (restart_after_pause) {
+            if (!playback_badge_press_triggered) {
+                trigger_playback_badge_press(&ui_transitions, &playback_badge_press_until_ms, now_ms);
+            }
+        } else {
             maybe_defer_history_save(&movie, &last_history_saved_ms, &history_save_pending);
         }
         if (seek_preroll_active) {
@@ -14408,6 +14497,7 @@ static int play_movie(
                 show_ui || ui_transitions.help_menu.current_mix > 0,
                 help_menu_open,
                 playback_press_target,
+                playback_enter_press_active || ui_time_before(render_now_ms, playback_badge_press_until_ms),
                 &pointer,
                 render_now_ms
             );
