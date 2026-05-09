@@ -37,6 +37,9 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define UI_PRESS_RELEASE_ANIM_MS 72U
 #define UI_TOOLTIP_ANIM_MS 115U
 #define UI_MENU_ANIM_MS 130U
+#define UI_LOADING_ANIM_MS 150U
+#define UI_LOADING_DIM_ALPHA 112
+#define UI_DISMISS_ANIM_MS 130U
 #define RESUME_PROMPT_ANIM_MS 150U
 #define RESUME_MORPH_ANIM_MS 150U
 #define RESUME_INPUT_GUARD_MS 260U
@@ -768,6 +771,15 @@ static void clear_seek_bar_preview(SeekBarPreviewState *preview);
 static void clear_screenshot_preview(ScreenshotPreviewState *preview);
 static void prepare_screenshot_preview(ScreenshotPreviewState *preview, SDL_Surface *screen, const char *saved_path);
 static void begin_seek_preroll(const Movie *movie, bool *active, uint32_t *started_ms, size_t *target_ready_count);
+static void draw_movie_frame_background(
+    SDL_Surface *screen,
+    Movie *movie,
+    ScaleMode scale_mode,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y,
+    SDL_Rect *out_src,
+    SDL_Rect *out_dst
+);
 
 static bool ensure_debug_ring_storage(void)
 {
@@ -2235,9 +2247,83 @@ static uint32_t h264_prefetch_decode_guard_ms(const Movie *movie)
     return guard_ms;
 }
 
-static void wait_until_ticks_precise(uint64_t target_ticks)
+static bool playback_wait_key_pending(void)
 {
-    while ((int64_t) (target_ticks - monotonic_clock_now_ticks()) > 0) {
+    return
+        isKeyPressed(KEY_NSPIRE_ESC) ||
+        isKeyPressed(KEY_NSPIRE_ENTER) ||
+        isKeyPressed(KEY_NSPIRE_TAB) ||
+        isKeyPressed(KEY_NSPIRE_CAT) ||
+        isKeyPressed(KEY_NSPIRE_LEFT) ||
+        isKeyPressed(KEY_NSPIRE_RIGHT) ||
+        isKeyPressed(KEY_NSPIRE_UP) ||
+        isKeyPressed(KEY_NSPIRE_DOWN) ||
+        isKeyPressed(KEY_NSPIRE_DIVIDE) ||
+        isKeyPressed(KEY_NSPIRE_LP) ||
+        isKeyPressed(KEY_NSPIRE_RP) ||
+        isKeyPressed(KEY_NSPIRE_LTHAN) ||
+        isKeyPressed(KEY_NSPIRE_GTHAN) ||
+        isKeyPressed(KEY_NSPIRE_PLUS) ||
+        isKeyPressed(KEY_NSPIRE_MINUS) ||
+        isKeyPressed(KEY_NSPIRE_S) ||
+        isKeyPressed(KEY_NSPIRE_C) ||
+        isKeyPressed(KEY_NSPIRE_P) ||
+        on_key_pressed();
+}
+
+static bool playback_wait_touchpad_pending(const PointerState *pointer)
+{
+    touchpad_report_t report;
+    bool current_down;
+    bool has_touch_position;
+    int dx;
+    int dy;
+
+    if (!pointer || !pointer->info || touchpad_scan(&report) != 0) {
+        return false;
+    }
+    current_down = (report.pressed && report.arrow == TPAD_ARROW_CLICK) ? true : false;
+    if (current_down != pointer->down) {
+        return true;
+    }
+    has_touch_position =
+        (report.contact || report.proximity) &&
+        report.x < pointer->info->width &&
+        report.y < pointer->info->height;
+    if (!has_touch_position) {
+        return pointer->tracking;
+    }
+    if (!pointer->tracking) {
+        return true;
+    }
+    dx = (int) report.x - pointer->last_touch_x;
+    dy = (int) report.y - pointer->last_touch_y;
+    if (dx < 0) {
+        dx = -dx;
+    }
+    if (dy < 0) {
+        dy = -dy;
+    }
+    return dx > POINTER_JITTER_THRESHOLD || dy > POINTER_JITTER_THRESHOLD;
+}
+
+static void wait_until_ticks_playback(uint64_t target_ticks, const PointerState *pointer)
+{
+    uint64_t poll_interval_ticks = ((uint64_t) monotonic_clock_ticks_per_second()) / 1000U;
+    uint64_t next_poll_ticks = monotonic_clock_now_ticks();
+    uint64_t now_ticks = next_poll_ticks;
+
+    if (poll_interval_ticks == 0) {
+        poll_interval_ticks = 1;
+    }
+    while ((int64_t) (target_ticks - now_ticks) > 0) {
+        if ((int64_t) (now_ticks - next_poll_ticks) >= 0) {
+            if (playback_wait_key_pending() || playback_wait_touchpad_pending(pointer)) {
+                break;
+            }
+            next_poll_ticks = now_ticks + poll_interval_ticks;
+        }
+        now_ticks = monotonic_clock_now_ticks();
     }
 }
 
@@ -10834,13 +10920,7 @@ static void render_movie(
     const PlaybackUiMixes *ui_mixes
 )
 {
-    SDL_Rect src;
-    SDL_Rect dst;
-    SDL_Rect top_bar;
-    SDL_Rect bottom_bar;
-    SDL_Rect left_bar;
-    SDL_Rect right_bar;
-    Uint32 black = SDL_MapRGB(screen->format, 0, 0, 0);
+    SDL_Rect dst = {0, 0, SCREEN_W, SCREEN_H};
     int memory_right_limit = SCREEN_W - 8;
     uint32_t current_ms = movie_frame_time_ms(movie, movie->current_frame);
     uint8_t chrome_mix = ui_mixes ? ui_mixes->chrome : (show_ui ? 255 : 0);
@@ -10856,40 +10936,7 @@ static void render_movie(
     bool playback_badge_visible = chrome_visible && !help_menu_visible;
     bool memory_badge_visible = !help_menu_visible && (memory_overlay_mode == MEMORY_OVERLAY_ALWAYS);
 
-    compute_video_rects(movie, scale_mode, video_align_x, video_align_y, &src, &dst);
-    top_bar.x = 0;
-    top_bar.y = 0;
-    top_bar.w = SCREEN_W;
-    top_bar.h = (Uint16) clamp_int(dst.y, 0, SCREEN_H);
-    if (top_bar.h > 0) {
-        SDL_FillRect(screen, &top_bar, black);
-    }
-    bottom_bar.x = 0;
-    bottom_bar.y = (Sint16) clamp_int(dst.y + dst.h, 0, SCREEN_H);
-    bottom_bar.w = SCREEN_W;
-    bottom_bar.h = (Uint16) (SCREEN_H - bottom_bar.y);
-    if (bottom_bar.h > 0) {
-        SDL_FillRect(screen, &bottom_bar, black);
-    }
-    left_bar.x = 0;
-    left_bar.y = (Sint16) clamp_int(dst.y, 0, SCREEN_H);
-    left_bar.w = (Uint16) clamp_int(dst.x, 0, SCREEN_W);
-    left_bar.h = (Uint16) clamp_int(dst.h, 0, SCREEN_H - left_bar.y);
-    if (left_bar.w > 0 && left_bar.h > 0) {
-        SDL_FillRect(screen, &left_bar, black);
-    }
-    right_bar.x = (Sint16) clamp_int(dst.x + dst.w, 0, SCREEN_W);
-    right_bar.y = left_bar.y;
-    right_bar.w = (Uint16) (SCREEN_W - right_bar.x);
-    right_bar.h = left_bar.h;
-    if (right_bar.w > 0 && right_bar.h > 0) {
-        SDL_FillRect(screen, &right_bar, black);
-    }
-    if (dst.w == movie->header.video_width && dst.h == movie->header.video_height) {
-        SDL_BlitSurface(movie->frame_surface, NULL, screen, &dst);
-    } else {
-        SDL_SoftStretch(movie->frame_surface, &src, screen, &dst);
-    }
+    draw_movie_frame_background(screen, movie, scale_mode, video_align_x, video_align_y, NULL, &dst);
     if (subtitle && subtitle_size >= 0) {
         SubtitleLayoutSpec subtitle_layout;
 
@@ -10962,6 +11009,70 @@ static void render_movie(
     }
     draw_screenshot_preview_osd(screen, fonts, screenshot_preview, now_ms);
     present_screen(screen);
+}
+
+static void draw_movie_frame_background(
+    SDL_Surface *screen,
+    Movie *movie,
+    ScaleMode scale_mode,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y,
+    SDL_Rect *out_src,
+    SDL_Rect *out_dst
+)
+{
+    SDL_Rect src;
+    SDL_Rect dst;
+    SDL_Rect top_bar;
+    SDL_Rect bottom_bar;
+    SDL_Rect left_bar;
+    SDL_Rect right_bar;
+    Uint32 black;
+
+    if (!screen || !movie || !movie->frame_surface) {
+        return;
+    }
+    black = SDL_MapRGB(screen->format, 0, 0, 0);
+    compute_video_rects(movie, scale_mode, video_align_x, video_align_y, &src, &dst);
+    if (out_src) {
+        *out_src = src;
+    }
+    if (out_dst) {
+        *out_dst = dst;
+    }
+    top_bar.x = 0;
+    top_bar.y = 0;
+    top_bar.w = SCREEN_W;
+    top_bar.h = (Uint16) clamp_int(dst.y, 0, SCREEN_H);
+    if (top_bar.h > 0) {
+        SDL_FillRect(screen, &top_bar, black);
+    }
+    bottom_bar.x = 0;
+    bottom_bar.y = (Sint16) clamp_int(dst.y + dst.h, 0, SCREEN_H);
+    bottom_bar.w = SCREEN_W;
+    bottom_bar.h = (Uint16) (SCREEN_H - bottom_bar.y);
+    if (bottom_bar.h > 0) {
+        SDL_FillRect(screen, &bottom_bar, black);
+    }
+    left_bar.x = 0;
+    left_bar.y = (Sint16) clamp_int(dst.y, 0, SCREEN_H);
+    left_bar.w = (Uint16) clamp_int(dst.x, 0, SCREEN_W);
+    left_bar.h = (Uint16) clamp_int(dst.h, 0, SCREEN_H - left_bar.y);
+    if (left_bar.w > 0 && left_bar.h > 0) {
+        SDL_FillRect(screen, &left_bar, black);
+    }
+    right_bar.x = (Sint16) clamp_int(dst.x + dst.w, 0, SCREEN_W);
+    right_bar.y = left_bar.y;
+    right_bar.w = (Uint16) (SCREEN_W - right_bar.x);
+    right_bar.h = left_bar.h;
+    if (right_bar.w > 0 && right_bar.h > 0) {
+        SDL_FillRect(screen, &right_bar, black);
+    }
+    if (dst.w == movie->header.video_width && dst.h == movie->header.video_height) {
+        SDL_BlitSurface(movie->frame_surface, NULL, screen, &dst);
+    } else {
+        SDL_SoftStretch(movie->frame_surface, &src, screen, &dst);
+    }
 }
 
 static int picker_row_index_at(size_t count, size_t selected, int x, int y)
@@ -11045,19 +11156,204 @@ static int picker_resume_badge_index_at(
     return -1;
 }
 
-static void draw_loading_overlay(SDL_Surface *screen, const Fonts *fonts, const char *label, int phase)
+static void draw_loading_overlay_mix(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    const char *label,
+    int phase,
+    uint8_t mix,
+    bool opening
+)
 {
     SDL_Rect panel = {88, 92, 136, 30};
     SDL_Rect accent = {90, 93, 132, 1};
     char spinner[8];
     int dot_count = (phase % 3) + 1;
+    int offset_y;
+    SDL_Surface *composite = NULL;
+
+    if (!screen || !fonts || mix == 0) {
+        return;
+    }
 
     memset(spinner, '.', (size_t) dot_count);
     spinner[dot_count] = '\0';
+
+    offset_y = ((255 - mix) * 5 + 127) / 255;
+    if (!opening) {
+        offset_y = -(((255 - mix) * 8 + 127) / 255);
+    }
+    panel.y = (Sint16) (panel.y + offset_y);
+    accent.y = (Sint16) (accent.y + offset_y);
+
+    if (mix < 255 && panel.x >= 0 && panel.y >= 0 &&
+        panel.x + panel.w <= screen->w && panel.y + panel.h <= screen->h) {
+        SDL_Rect source = panel;
+        SDL_Rect local_panel = {0, 0, panel.w, panel.h};
+        SDL_Rect local_accent = {2, 1, accent.w, accent.h};
+
+        composite = create_rgb565_surface(panel.w, panel.h);
+        if (composite) {
+            SDL_BlitSurface(screen, &source, composite, NULL);
+            draw_soft_glass_panel(composite, &local_panel, UI_COLOR_GUNMETAL, false);
+            draw_vertical_gradient(composite, &local_accent, UI_COLOR_ACCENT, UI_COLOR_ACCENT_DEEP);
+            draw_ui_label(composite, fonts, 12, 10, label ? label : "Loading");
+            draw_ui_label(composite, fonts, panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), 10, spinner);
+            blit_surface_rgb565_mix(screen, composite, &panel, mix);
+            SDL_FreeSurface(composite);
+            return;
+        }
+    }
+
     draw_soft_glass_panel(screen, &panel, UI_COLOR_GUNMETAL, false);
     draw_vertical_gradient(screen, &accent, UI_COLOR_ACCENT, UI_COLOR_ACCENT_DEEP);
     draw_ui_label(screen, fonts, panel.x + 12, panel.y + 10, label ? label : "Loading");
     draw_ui_label(screen, fonts, panel.x + panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), panel.y + 10, spinner);
+}
+
+static void draw_loading_overlay(SDL_Surface *screen, const Fonts *fonts, const char *label, int phase)
+{
+    draw_loading_overlay_mix(screen, fonts, label, phase, 255, true);
+}
+
+static SDL_Surface *capture_screen_surface(SDL_Surface *screen)
+{
+    SDL_Surface *snapshot;
+
+    if (!screen || screen->w <= 0 || screen->h <= 0) {
+        return NULL;
+    }
+    snapshot = create_rgb565_surface(screen->w, screen->h);
+    if (!snapshot) {
+        return NULL;
+    }
+    SDL_BlitSurface(screen, NULL, snapshot, NULL);
+    return snapshot;
+}
+
+static void draw_loading_transition_frame(
+    SDL_Surface *screen,
+    SDL_Surface *snapshot,
+    const Fonts *fonts,
+    const char *label,
+    uint8_t mix,
+    int phase,
+    bool opening
+)
+{
+    SDL_Rect full_screen = {0, 0, SCREEN_W, SCREEN_H};
+
+    if (snapshot) {
+        SDL_BlitSurface(snapshot, NULL, screen, NULL);
+    } else {
+        SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 8, 10, 14));
+    }
+    dim_rect_rgb565(screen, &full_screen, (UI_LOADING_DIM_ALPHA * mix + 127) / 255);
+    draw_loading_overlay_mix(screen, fonts, label, phase, mix, opening);
+    present_screen(screen);
+}
+
+static void animate_loading_transition(
+    SDL_Surface *screen,
+    SDL_Surface *snapshot,
+    const Fonts *fonts,
+    const char *label,
+    bool opening
+)
+{
+    uint32_t started_ms = monotonic_clock_now_ms();
+
+    while (1) {
+        uint32_t now_ms = monotonic_clock_now_ms();
+        uint8_t eased = ui_ease_out_cubic(now_ms - started_ms, UI_LOADING_ANIM_MS);
+        uint8_t mix = opening ? eased : (uint8_t) (255U - eased);
+
+        draw_loading_transition_frame(
+            screen,
+            snapshot,
+            fonts,
+            label,
+            mix,
+            (int) ((now_ms / 180U) % 3U),
+            opening
+        );
+        if (eased >= 255) {
+            break;
+        }
+        msleep(16);
+    }
+}
+
+static void finish_loading_transition(
+    SDL_Surface *screen,
+    SDL_Surface **snapshot,
+    const Fonts *fonts,
+    const char *label
+)
+{
+    if (!snapshot || !*snapshot) {
+        return;
+    }
+    animate_loading_transition(screen, *snapshot, fonts, label, false);
+    SDL_FreeSurface(*snapshot);
+    *snapshot = NULL;
+}
+
+static void set_return_transition_surface(SDL_Surface *screen, SDL_Surface **transition_surface)
+{
+    if (!transition_surface) {
+        return;
+    }
+    if (*transition_surface) {
+        SDL_FreeSurface(*transition_surface);
+    }
+    *transition_surface = capture_screen_surface(screen);
+}
+
+static void animate_surface_slide_down_over_current_screen(SDL_Surface *screen, SDL_Surface **foreground_surface)
+{
+    SDL_Surface *background = capture_screen_surface(screen);
+    SDL_Surface *foreground;
+    uint32_t started_ms = monotonic_clock_now_ms();
+
+    if (!foreground_surface || !*foreground_surface) {
+        if (background) {
+            SDL_FreeSurface(background);
+        }
+        return;
+    }
+    foreground = *foreground_surface;
+    *foreground_surface = NULL;
+
+    while (1) {
+        uint32_t now_ms = monotonic_clock_now_ms();
+        uint32_t elapsed_ms = now_ms - started_ms;
+        uint8_t move_mix = ui_ease_out_cubic(elapsed_ms, UI_DISMISS_ANIM_MS);
+        uint8_t fade_mix = ui_ease_smoothstep(elapsed_ms, UI_DISMISS_ANIM_MS);
+        uint8_t foreground_mix = (uint8_t) (255U - fade_mix);
+        int offset_y = (SCREEN_H * move_mix + 254) / 255;
+
+        if (background) {
+            SDL_BlitSurface(background, NULL, screen, NULL);
+        } else {
+            SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 8, 10, 14));
+        }
+        if (foreground && offset_y < SCREEN_H) {
+            SDL_Rect dst = {0, (Sint16) offset_y, 0, 0};
+            blit_surface_rgb565_mix(screen, foreground, &dst, foreground_mix);
+        }
+        present_screen(screen);
+        if (move_mix >= 255) {
+            break;
+        }
+        msleep(16);
+    }
+    if (foreground) {
+        SDL_FreeSurface(foreground);
+    }
+    if (background) {
+        SDL_FreeSurface(background);
+    }
 }
 
 static void copy_fitted_text(nSDL_Font *font, const char *text, char *buffer, size_t buffer_size, int max_width)
@@ -11396,7 +11692,8 @@ static void render_picker(
     const ScreenshotPreviewState *screenshot_preview,
     uint32_t now_ms,
     const char *loading_label,
-    int loading_phase
+    int loading_phase,
+    SDL_Surface **entry_transition_surface
 )
 {
     const char *credit = "Made by GigaZelensky";
@@ -11432,7 +11729,11 @@ static void render_picker(
         if (pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
-        present_screen(screen);
+        if (entry_transition_surface && *entry_transition_surface) {
+            animate_surface_slide_down_over_current_screen(screen, entry_transition_surface);
+        } else {
+            present_screen(screen);
+        }
         return;
     }
     start_index = selected > (PICKER_VISIBLE_ROWS / 2) ? selected - (PICKER_VISIBLE_ROWS / 2) : 0;
@@ -11515,6 +11816,9 @@ static void render_picker(
         draw_ui_label(screen, fonts, SCREEN_W - 12 - nSDL_GetStringWidth(fonts->white, footer), SCREEN_H - 17, footer);
     }
     if (loading_label) {
+        SDL_Rect full_screen = {0, 0, SCREEN_W, SCREEN_H};
+
+        dim_rect_rgb565(screen, &full_screen, UI_LOADING_DIM_ALPHA);
         draw_loading_overlay(screen, fonts, loading_label, loading_phase);
     } else if (resume_tooltip_index >= 0 && (size_t) resume_tooltip_index < count && resume_tooltip_mix > 0) {
         draw_resume_hover_tooltip(screen, fonts, &files[resume_tooltip_index], pointer, resume_tooltip_mix);
@@ -11525,7 +11829,11 @@ static void render_picker(
     if (pointer && pointer->visible) {
         draw_cursor(screen, pointer->x, pointer->y);
     }
-    present_screen(screen);
+    if (entry_transition_surface && *entry_transition_surface) {
+        animate_surface_slide_down_over_current_screen(screen, entry_transition_surface);
+    } else {
+        present_screen(screen);
+    }
 }
 
 static void strip_filename(char *path)
@@ -12246,7 +12554,8 @@ static int pick_movie(
     const char *directory,
     char *selected_path,
     size_t selected_size,
-    bool *resume_without_prompt
+    bool *resume_without_prompt,
+    SDL_Surface **entry_transition_surface
 )
 {
     bool prev_up = false;
@@ -12421,7 +12730,8 @@ static int pick_movie(
             &screenshot_preview,
             now_ms,
             NULL,
-            0
+            0,
+            entry_transition_surface
         );
         if (screenshot_edge) {
             char saved_path[MAX_PATH_LEN];
@@ -12453,7 +12763,6 @@ static int pick_movie(
             int activated_index = -1;
             bool activated_resume = false;
             int release_step;
-            int phase;
 
             if (pressed_resume_badge_index >= 0 && resume_hovered_index == pressed_resume_badge_index) {
                 activated_index = pressed_resume_badge_index;
@@ -12493,7 +12802,8 @@ static int pick_movie(
                         &screenshot_preview,
                         release_now_ms,
                         NULL,
-                        0
+                        0,
+                        NULL
                     );
                     if (release_mix == 0) {
                         break;
@@ -12503,32 +12813,6 @@ static int pick_movie(
                 pressed_row_index = -1;
                 pressed_resume_badge_index = -1;
                 pressed_selected_fallback = false;
-                for (phase = 0; phase < 6; ++phase) {
-                    render_picker(
-                        screen,
-                        fonts,
-                        files,
-                        count,
-                        selected,
-                        previous_selected,
-                        selection_anim_started_ms,
-                        -1,
-                        0,
-                        -1,
-                        0,
-                        -1,
-                        0,
-                        -1,
-                        -1,
-                        0,
-                        &pointer,
-                        &screenshot_preview,
-                        monotonic_clock_now_ms(),
-                        "Loading",
-                        phase
-                    );
-                    msleep(30);
-                }
                 strncpy(selected_path, files[activated_index].path, selected_size - 1);
                 selected_path[selected_size - 1] = '\0';
                 if (resume_without_prompt) {
@@ -12540,33 +12824,6 @@ static int pick_movie(
             }
         }
         if (key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) && count > 0) {
-            int phase;
-            for (phase = 0; phase < 6; ++phase) {
-                render_picker(
-                    screen,
-                    fonts,
-                    files,
-                    count,
-                    selected,
-                    previous_selected,
-                    selection_anim_started_ms,
-                    -1,
-                    0,
-                    -1,
-                    0,
-                    -1,
-                    0,
-                    -1,
-                    -1,
-                    0,
-                    &pointer,
-                    &screenshot_preview,
-                    monotonic_clock_now_ms(),
-                    "Loading",
-                    phase
-                );
-                msleep(30);
-            }
             strncpy(selected_path, files[selected].path, selected_size - 1);
             selected_path[selected_size - 1] = '\0';
             if (resume_without_prompt) {
@@ -12651,7 +12908,8 @@ static int prompt_resume_position(
     uint32_t resume_frame,
     ScaleMode scale_mode,
     VideoAlign video_align_x,
-    VideoAlign video_align_y
+    VideoAlign video_align_y,
+    SDL_Surface **loading_snapshot
 )
 {
     bool prev_left = false;
@@ -12711,8 +12969,13 @@ static int prompt_resume_position(
         resume_frame = movie->header.frame_count ? (movie->header.frame_count - 1) : 0;
     }
     if (!decode_to_frame(movie, resume_frame)) {
+        finish_loading_transition(screen, loading_snapshot, fonts, "Loading");
         return 0;
     }
+    if (loading_snapshot && *loading_snapshot) {
+        draw_movie_frame_background(*loading_snapshot, movie, scale_mode, video_align_x, video_align_y, NULL, NULL);
+    }
+    finish_loading_transition(screen, loading_snapshot, fonts, "Loading");
     compute_video_rects(movie, scale_mode, video_align_x, video_align_y, &playback_src, &playback_dst);
     full_src.x = 0;
     full_src.y = 0;
@@ -12994,7 +13257,8 @@ static int play_movie(
     const char *path,
     char *next_path,
     size_t next_path_size,
-    bool resume_without_prompt
+    bool resume_without_prompt,
+    SDL_Surface **return_transition_surface
 )
 {
     static Movie movie;
@@ -13033,6 +13297,7 @@ static int play_movie(
     bool prev_minus = false;
     bool prev_on = false;
     bool paused = false;
+    bool esc_exit_suppressed_until_release = false;
     uint64_t frame_interval_ticks;
     uint64_t next_frame_due_ticks;
     uint64_t playback_anchor_ticks;
@@ -13082,6 +13347,7 @@ static int play_movie(
     size_t seek_preroll_target_ready_count = 0;
     uint32_t paused_ui_quiet_until_ms = 0;
     bool hover_preview_needs_rebuffer = false;
+    SDL_Surface *loading_snapshot = NULL;
 
     memset(&subtitle_cache, 0, sizeof(subtitle_cache));
     memset(&screenshot_preview, 0, sizeof(screenshot_preview));
@@ -13101,16 +13367,10 @@ static int play_movie(
         release_debug_ring_storage();
     }
     debug_clear_last_error();
-    {
-        int phase;
-        for (phase = 0; phase < 4; ++phase) {
-            SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 8, 10, 14));
-            draw_loading_overlay(screen, fonts, "Loading", phase);
-            present_screen(screen);
-            msleep(24);
-        }
-    }
+    loading_snapshot = capture_screen_surface(screen);
+    animate_loading_transition(screen, loading_snapshot, fonts, "Loading", true);
     if (!load_movie(path, &movie)) {
+        finish_loading_transition(screen, &loading_snapshot, fonts, "Loading");
         report_movie_open_failure(path);
         return -1;
     }
@@ -13155,7 +13415,8 @@ static int play_movie(
                 resume_frame,
                 scale_mode,
                 video_align_x,
-                video_align_y
+                video_align_y,
+                &loading_snapshot
             );
             if (resume_choice < 0) {
                 if (debug_is_runtime_logging_enabled()) {
@@ -13163,6 +13424,7 @@ static int play_movie(
                     debug_log_path_for_movie(path, log_path, sizeof(log_path));
                     debug_dump_session(log_path, &movie, "resume-cancel");
                 }
+                set_return_transition_surface(screen, return_transition_surface);
                 destroy_movie(&movie);
                 return 0;
             }
@@ -13172,6 +13434,7 @@ static int play_movie(
             decode_to_frame(&movie, 0);
         } else {
             if (resume_without_prompt && !decode_to_frame(&movie, resume_frame)) {
+                finish_loading_transition(screen, &loading_snapshot, fonts, "Loading");
                 report_movie_decode_failure(&movie, path, "direct resume");
                 destroy_movie(&movie);
                 return PLAY_MOVIE_RESULT_ERROR;
@@ -13183,6 +13446,10 @@ static int play_movie(
             }
         }
     }
+    if (loading_snapshot) {
+        draw_movie_frame_background(loading_snapshot, &movie, scale_mode, video_align_x, video_align_y, NULL, NULL);
+    }
+    finish_loading_transition(screen, &loading_snapshot, fonts, "Loading");
     pointer_init(&pointer);
     pointer_update(&pointer);
     prev_tab = isKeyPressed(KEY_NSPIRE_TAB);
@@ -13203,6 +13470,7 @@ static int play_movie(
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     prev_p = isKeyPressed(KEY_NSPIRE_P);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
+    prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
     prev_on = on_key_pressed() ? true : false;
     debug_set_metrics_collection(debug_is_runtime_logging_enabled());
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
@@ -13238,6 +13506,21 @@ static int play_movie(
     }
 
     while (1) {
+        bool esc_down = isKeyPressed(KEY_NSPIRE_ESC) ? true : false;
+        bool esc_edge = esc_down && !prev_esc;
+        prev_esc = esc_down;
+        if (!esc_down) {
+            esc_exit_suppressed_until_release = false;
+        }
+        if (display_power_state.off && esc_down) {
+            result = PLAY_MOVIE_RESULT_APP_EXIT;
+            break;
+        }
+        if (!display_power_state.off && !help_menu_open && esc_down && !esc_exit_suppressed_until_release) {
+            set_return_transition_surface(screen, return_transition_surface);
+            break;
+        }
+
         bool pointer_click = pointer_update(&pointer);
         bool pending_seek_consumed_click = false;
         uint64_t now_ticks = monotonic_clock_now_ticks();
@@ -13248,7 +13531,7 @@ static int play_movie(
         bool tab_edge = key_pressed_edge(KEY_NSPIRE_TAB, &prev_tab);
         bool tab_down = prev_tab;
         bool cat_edge = key_pressed_edge(KEY_NSPIRE_CAT, &prev_cat);
-        bool esc_edge = key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc);
+        bool esc_exit_request;
         bool divide_edge = key_pressed_edge(KEY_NSPIRE_DIVIDE, &prev_divide);
         bool exp_edge = key_pressed_edge(KEY_NSPIRE_EXP, &prev_exp);
         bool tenx_edge = key_pressed_edge(KEY_NSPIRE_TENX, &prev_tenx);
@@ -13285,8 +13568,11 @@ static int play_movie(
         bool on_edge = on_key_pressed_edge(&prev_on);
         bool take_screenshot = false;
         bool tab_repeat_step = false;
+        bool restart_after_pause = false;
         int seek_delta_ms = 0;
         int brightness_delta = 0;
+
+        esc_exit_request = esc_edge || (!help_menu_open && esc_down && !esc_exit_suppressed_until_release);
 
         if (resume_input_guard_until_ms != 0U) {
             if (ui_time_before(now_ms, resume_input_guard_until_ms)) {
@@ -13308,10 +13594,6 @@ static int play_movie(
         }
 
         if (display_power_state.off) {
-            if (esc_edge) {
-                result = PLAY_MOVIE_RESULT_APP_EXIT;
-                break;
-            }
             if (on_edge || brightness_up_edge) {
                 bool resume_playback = display_power_state.resume_playback_on_wake;
 
@@ -13498,13 +13780,16 @@ static int play_movie(
                 paused = true;
             }
             note_pause_transition(was_paused, paused, now_ms, &paused_ui_quiet_until_ms);
+            if (!was_paused && paused) {
+                restart_after_pause = true;
+            }
             if (!seek_preroll_active) {
                 reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             }
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             show_ui = true;
         }
-        if (esc_edge) {
+        if (esc_exit_request) {
             if (help_menu_open) {
                 bool was_paused = paused;
 
@@ -13523,7 +13808,9 @@ static int play_movie(
                 note_pause_transition(was_paused, paused, now_ms, &paused_ui_quiet_until_ms);
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
                 show_ui = true;
+                esc_exit_suppressed_until_release = true;
             } else {
+                set_return_transition_surface(screen, return_transition_surface);
                 break;
             }
         }
@@ -13731,6 +14018,9 @@ static int play_movie(
                 hover_preview_needs_rebuffer = false;
             }
             note_pause_transition(was_paused, paused, now_ms, &paused_ui_quiet_until_ms);
+            if (!was_paused && paused) {
+                restart_after_pause = true;
+            }
             if (!seek_preroll_active) {
                 reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             }
@@ -13845,6 +14135,9 @@ static int play_movie(
                 break;
             }
             note_pause_transition(was_paused, paused, now_ms, &paused_ui_quiet_until_ms);
+            if (!was_paused && paused) {
+                restart_after_pause = true;
+            }
             reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
@@ -13915,6 +14208,9 @@ static int play_movie(
                             hover_preview_needs_rebuffer = false;
                         }
                         note_pause_transition(was_paused, paused, now_ms, &paused_ui_quiet_until_ms);
+                        if (!was_paused && paused) {
+                            restart_after_pause = true;
+                        }
                         if (!seek_preroll_active) {
                             reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
                         }
@@ -13961,13 +14257,18 @@ static int play_movie(
                     hover_preview_needs_rebuffer = false;
                 }
                 note_pause_transition(was_paused, paused, now_ms, &paused_ui_quiet_until_ms);
+                if (!was_paused && paused) {
+                    restart_after_pause = true;
+                }
                 if (!seek_preroll_active) {
                     reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
                 }
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             }
         }
-        maybe_defer_history_save(&movie, &last_history_saved_ms, &history_save_pending);
+        if (!restart_after_pause) {
+            maybe_defer_history_save(&movie, &last_history_saved_ms, &history_save_pending);
+        }
         if (seek_preroll_active) {
             size_t ready_frames = h264_frame_ring_contiguous_ready_count(&movie);
             if (ready_frames >= seek_preroll_target_ready_count ||
@@ -14144,7 +14445,9 @@ static int play_movie(
         }
         if (paused || frame_interval_ticks == 0 || seek_preroll_active) {
             uint32_t idle_now_ms = monotonic_clock_now_ms();
-            if (paused && seek_bar_preview_decode_active(&seek_preview)) {
+            bool paused_input_grace = paused && ui_time_before(idle_now_ms, paused_ui_quiet_until_ms);
+
+            if (paused && !paused_input_grace && seek_bar_preview_decode_active(&seek_preview)) {
                 step_seek_bar_preview_decode(
                     &movie,
                     &seek_preview,
@@ -14156,7 +14459,7 @@ static int play_movie(
                 playback_ui_mixes_animating(&ui_mixes) ||
                 seek_bar_preview_decode_active(&seek_preview) ||
                 seek_preview_surface_animating(&seek_preview, idle_now_ms) ||
-                ui_time_before(idle_now_ms, paused_ui_quiet_until_ms)
+                paused_input_grace
             );
 
             if (!paused_ui_busy) {
@@ -14183,7 +14486,7 @@ static int play_movie(
                 movie.diag_last_snapshot_ms = now_ms;
                 debug_trace_runtime_snapshot(&movie, true, 1000U, playback_rate, "paused");
             }
-            msleep(16);
+            msleep(paused_input_grace ? 2 : 16);
         } else {
             uint64_t after_render_ticks = monotonic_clock_now_ticks();
             uint64_t spare_ticks = next_frame_due_ticks > after_render_ticks ? (next_frame_due_ticks - after_render_ticks) : 0;
@@ -14208,7 +14511,7 @@ static int play_movie(
                 if (spare_ticks > max_wait_ticks) {
                     wait_target_ticks = after_render_ticks + max_wait_ticks;
                 }
-                wait_until_ticks_precise(wait_target_ticks);
+                wait_until_ticks_playback(wait_target_ticks, &pointer);
             }
         }
     }
@@ -14261,6 +14564,7 @@ int main(int argc, char **argv)
     int result = 0;
     bool have_queued_movie = false;
     bool resume_without_prompt = false;
+    SDL_Surface *picker_entry_transition_surface = NULL;
 
     if (argc < 1) {
         show_msgbox("ND Video Player", "Ndless did not provide argv[0].");
@@ -14306,7 +14610,14 @@ int main(int argc, char **argv)
             strncpy(movie_path, argv[1], sizeof(movie_path) - 1);
             movie_path[sizeof(movie_path) - 1] = '\0';
         } else {
-            if (pick_movie(screen, &fonts, directory, movie_path, sizeof(movie_path), &resume_without_prompt) != 0) {
+            if (pick_movie(
+                    screen,
+                    &fonts,
+                    directory,
+                    movie_path,
+                    sizeof(movie_path),
+                    &resume_without_prompt,
+                    &picker_entry_transition_surface) != 0) {
                 break;
             }
         }
@@ -14317,7 +14628,8 @@ int main(int argc, char **argv)
             movie_path,
             queued_movie_path,
             sizeof(queued_movie_path),
-            resume_without_prompt
+            resume_without_prompt,
+            &picker_entry_transition_surface
         );
         argc = 1;
         if (result == PLAY_MOVIE_RESULT_AUTO_NEXT) {
@@ -14333,6 +14645,9 @@ int main(int argc, char **argv)
     }
 
     free_fonts(&fonts);
+    if (picker_entry_transition_surface) {
+        SDL_FreeSurface(picker_entry_transition_surface);
+    }
     SDL_Quit();
     sram_shutdown();
     monotonic_clock_shutdown();
