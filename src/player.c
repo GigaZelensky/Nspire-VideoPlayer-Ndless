@@ -29,6 +29,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define PICKER_VISIBLE_ROWS 8
 #define PICKER_TOOLTIP_DWELL_MS 450U
 #define PICKER_SELECTION_ANIM_MS 120U
+#define PICKER_DESELECTION_ANIM_MS 85U
 #define PROMPT_BUTTON_ANIM_MS 90U
 #define UI_CHROME_ANIM_MS 115U
 #define UI_HOVER_ANIM_MS 105U
@@ -10626,15 +10627,15 @@ static void draw_resume_hover_tooltip(
     }
 }
 
-static uint8_t picker_selection_ease(uint32_t elapsed_ms)
+static uint8_t picker_selection_ease(uint32_t elapsed_ms, uint32_t duration_ms)
 {
     uint32_t t;
     uint32_t inverse;
 
-    if (elapsed_ms >= PICKER_SELECTION_ANIM_MS) {
+    if (duration_ms == 0 || elapsed_ms >= duration_ms) {
         return 255;
     }
-    t = (elapsed_ms * 255U) / PICKER_SELECTION_ANIM_MS;
+    t = (elapsed_ms * 255U) / duration_ms;
     inverse = 255U - t;
     return (uint8_t) (255U - ((inverse * inverse) / 255U));
 }
@@ -10652,9 +10653,17 @@ static uint8_t picker_row_selection_mix(
     if (selected == previous_selected || selection_anim_started_ms == 0) {
         return index == selected ? 255 : 0;
     }
-    eased = picker_selection_ease(now_ms - selection_anim_started_ms);
+    eased = picker_selection_ease(now_ms - selection_anim_started_ms, PICKER_SELECTION_ANIM_MS);
     if (index == selected) {
         return eased;
+    }
+    if (index == previous_selected) {
+        uint8_t out_eased = picker_selection_ease(
+            now_ms - selection_anim_started_ms,
+            PICKER_DESELECTION_ANIM_MS
+        );
+
+        return (uint8_t) (255U - out_eased);
     }
     return 0;
 }
