@@ -139,6 +139,8 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define SEEK_PREROLL_TIMEOUT_MS 120U
 #define SEEK_PREROLL_TARGET_LOW_FRAMES 3U
 #define SEEK_PREROLL_TARGET_HIGH_FRAMES 6U
+#define SEEK_BAR_PREVIEW_IO_BLOCK_SIZE 8192U
+#define SEEK_BAR_PREVIEW_SLICE_MS 8U
 #define SEEK_BAR_PREVIEW_DEBOUNCE_MS 250U
 #define SCREENSHOT_PREVIEW_MAX_W 96
 #define SCREENSHOT_PREVIEW_MAX_H 72
@@ -529,16 +531,38 @@ typedef struct {
 } ScreenshotPreviewState;
 
 typedef struct {
+    storage_t *decoder;
+    bool decoder_initialized;
+    bool active;
+    int chunk_index;
+    uint32_t target_frame;
+    uint32_t next_frame;
+    uint8_t *chunk_storage;
+    size_t chunk_storage_size;
+    size_t read_offset;
+    uint32_t *frame_offsets;
+    uint8_t *chunk_bytes;
+    size_t chunk_size;
+    size_t consumed_bytes;
+    unsigned zero_advance_retries;
+    uint16_t *pixels;
+    uint16_t avg_mbs_per_ms_q8;
+} SeekPreviewDecodeJob;
+
+typedef struct {
     SDL_Surface *surface;
     int decoded_chunk_index;
+    uint32_t decoded_frame_index;
     int marker_x;
     uint32_t hover_ms;
     uint32_t last_move_ms;
     uint32_t surface_started_ms;
     int last_pointer_x;
     bool surface_fade_pending;
+    bool surface_render_pending;
     bool tracking;
     bool over_bar;
+    SeekPreviewDecodeJob decode_job;
 } SeekBarPreviewState;
 
 typedef struct {
@@ -717,11 +741,12 @@ static void invalidate_subtitle_surface_cache(SubtitleSurfaceCache *cache);
 static SDL_Surface *create_rgb565_surface(int width, int height);
 static SDL_Surface *create_scaled_surface_from_surface(SDL_Surface *source, int max_width, int max_height);
 static const char *filename_from_path(const char *path);
-static bool decode_h264_frame_to_rgb565_buffer(Movie *movie, uint32_t frame_index, uint16_t *dst_pixels, size_t dst_pitch_pixels);
 static bool finish_h264_boundary_warmup(Movie *movie);
 static void invalidate_loaded_chunk_state(Movie *movie);
 static bool recover_failed_h264_playback_state(Movie *movie);
 static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, const PointerState *pointer, bool show_ui, uint32_t now_ms);
+static void step_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, uint32_t deadline_ms);
+static bool seek_bar_preview_decode_active(const SeekBarPreviewState *preview);
 static void clear_seek_bar_preview(SeekBarPreviewState *preview);
 static void clear_screenshot_preview(ScreenshotPreviewState *preview);
 static void prepare_screenshot_preview(ScreenshotPreviewState *preview, SDL_Surface *screen, const char *saved_path);
@@ -1492,6 +1517,28 @@ static void clear_screenshot_preview(ScreenshotPreviewState *preview)
     memset(preview, 0, sizeof(*preview));
 }
 
+static void clear_seek_bar_preview_decode_job(SeekBarPreviewState *preview)
+{
+    SeekPreviewDecodeJob *job;
+
+    if (!preview) {
+        return;
+    }
+
+    job = &preview->decode_job;
+    if (job->decoder) {
+        if (job->decoder_initialized) {
+            h264bsdShutdown(job->decoder);
+        }
+        h264bsdFree(job->decoder);
+    }
+    free(job->chunk_storage);
+    free(job->frame_offsets);
+    free(job->pixels);
+    memset(job, 0, sizeof(*job));
+    job->chunk_index = -1;
+}
+
 static void clear_seek_bar_preview_surface(SeekBarPreviewState *preview)
 {
     if (!preview) {
@@ -1502,8 +1549,10 @@ static void clear_seek_bar_preview_surface(SeekBarPreviewState *preview)
         preview->surface = NULL;
     }
     preview->decoded_chunk_index = -1;
+    preview->decoded_frame_index = UINT32_MAX;
     preview->surface_started_ms = 0;
     preview->surface_fade_pending = false;
+    preview->surface_render_pending = false;
 }
 
 static void clear_seek_bar_preview(SeekBarPreviewState *preview)
@@ -1511,10 +1560,13 @@ static void clear_seek_bar_preview(SeekBarPreviewState *preview)
     if (!preview) {
         return;
     }
+    clear_seek_bar_preview_decode_job(preview);
     clear_seek_bar_preview_surface(preview);
     memset(preview, 0, sizeof(*preview));
     preview->decoded_chunk_index = -1;
+    preview->decoded_frame_index = UINT32_MAX;
     preview->last_pointer_x = -1;
+    preview->decode_job.chunk_index = -1;
 }
 
 static bool monotonic_clock_try_init_hw_timer(void)
@@ -5189,6 +5241,294 @@ static bool load_chunk(Movie *movie, int chunk_index)
     return load_chunk_from_file(movie, chunk_index, true);
 }
 
+static bool seek_bar_preview_decode_active(const SeekBarPreviewState *preview)
+{
+    return preview && preview->decode_job.active;
+}
+
+static bool begin_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, int chunk_index, uint32_t target_frame)
+{
+    const ChunkIndexEntry *entry;
+    SeekPreviewDecodeJob *job;
+    size_t frame_pixels;
+
+    if (!movie || !preview || chunk_index < 0 || (uint32_t) chunk_index >= movie->header.chunk_count) {
+        return false;
+    }
+
+    entry = movie->chunk_index + chunk_index;
+    if (entry->frame_count == 0 ||
+        target_frame < entry->first_frame ||
+        target_frame >= entry->first_frame + entry->frame_count ||
+        entry->packed_size != entry->unpacked_size) {
+        return false;
+    }
+
+    clear_seek_bar_preview_decode_job(preview);
+    job = &preview->decode_job;
+    job->chunk_index = chunk_index;
+    job->target_frame = target_frame;
+    job->next_frame = entry->first_frame;
+    job->chunk_storage_size = entry->packed_size;
+
+    frame_pixels = (size_t) movie->header.video_width * movie->header.video_height;
+    job->decoder = h264bsdAlloc();
+    if (job->decoder) {
+        memset(job->decoder, 0, sizeof(*job->decoder));
+    }
+    job->chunk_storage = (uint8_t *) malloc(job->chunk_storage_size);
+    job->pixels = (uint16_t *) malloc(frame_pixels * sizeof(uint16_t));
+    if (!job->decoder || !job->chunk_storage || !job->pixels ||
+        !reset_h264_storage_decoder(job->decoder, &job->decoder_initialized)) {
+        clear_seek_bar_preview_decode_job(preview);
+        return false;
+    }
+
+    job->active = true;
+    return true;
+}
+
+static bool read_seek_bar_preview_chunk_step(Movie *movie, SeekPreviewDecodeJob *job, uint32_t deadline_ms)
+{
+    const ChunkIndexEntry *entry;
+
+    if (!movie || !job || !job->active || job->chunk_index < 0 ||
+        (uint32_t) job->chunk_index >= movie->header.chunk_count) {
+        return false;
+    }
+    if (job->frame_offsets) {
+        return true;
+    }
+
+    entry = movie->chunk_index + job->chunk_index;
+    while (job->read_offset < job->chunk_storage_size) {
+        size_t remaining;
+        size_t read_size;
+        long target_pos;
+        size_t bytes_read;
+
+        if (deadline_ms != 0U && prefetch_deadline_reached(deadline_ms)) {
+            return true;
+        }
+
+        remaining = job->chunk_storage_size - job->read_offset;
+        read_size = remaining > SEEK_BAR_PREVIEW_IO_BLOCK_SIZE
+            ? SEEK_BAR_PREVIEW_IO_BLOCK_SIZE
+            : remaining;
+        target_pos = (long) (entry->offset + job->read_offset);
+        if (movie->current_file_pos != target_pos) {
+            if (fseek(movie->file, target_pos, SEEK_SET) != 0) {
+                movie->current_file_pos = -1;
+                return false;
+            }
+            movie->current_file_pos = target_pos;
+        }
+        bytes_read = fread(job->chunk_storage + job->read_offset, 1, read_size, movie->file);
+        if (bytes_read != read_size) {
+            movie->current_file_pos = -1;
+            return false;
+        }
+        movie->current_file_pos += (long) read_size;
+        job->read_offset += read_size;
+    }
+
+    return configure_chunk_view_from_storage(
+        movie,
+        job->chunk_index,
+        job->chunk_storage,
+        job->chunk_storage_size,
+        &job->frame_offsets,
+        &job->chunk_bytes,
+        &job->chunk_size
+    );
+}
+
+static bool publish_seek_bar_preview_picture(Movie *movie, SeekBarPreviewState *preview, uint32_t frame_index, const uint8_t *picture)
+{
+    SeekPreviewDecodeJob *job;
+    SDL_Surface *full_surface = NULL;
+    SDL_Surface *thumbnail = NULL;
+    bool had_surface;
+
+    if (!movie || !preview || !picture) {
+        return false;
+    }
+
+    job = &preview->decode_job;
+    if (!job->pixels ||
+        !blit_h264_picture_to_target(movie, picture, job->pixels, movie->header.video_width)) {
+        return false;
+    }
+
+    full_surface = SDL_CreateRGBSurfaceFrom(
+        job->pixels,
+        movie->header.video_width,
+        movie->header.video_height,
+        16,
+        movie->header.video_width * 2,
+        0xF800, 0x07E0, 0x001F, 0
+    );
+    if (!full_surface) {
+        return false;
+    }
+    thumbnail = create_scaled_surface_from_surface(full_surface, SEEK_BAR_PREVIEW_MAX_W, SEEK_BAR_PREVIEW_MAX_H);
+    SDL_FreeSurface(full_surface);
+    if (!thumbnail) {
+        return false;
+    }
+
+    had_surface = preview->surface != NULL;
+    if (preview->surface) {
+        SDL_FreeSurface(preview->surface);
+    }
+    preview->surface = thumbnail;
+    preview->decoded_chunk_index = job->chunk_index;
+    preview->decoded_frame_index = frame_index;
+    preview->surface_render_pending = true;
+    if (!had_surface) {
+        preview->surface_started_ms = 0;
+        preview->surface_fade_pending = true;
+    } else {
+        if (preview->surface_started_ms == 0U) {
+            uint32_t now_ms = monotonic_clock_now_ms();
+            preview->surface_started_ms = now_ms > UI_TOOLTIP_ANIM_MS ? (now_ms - UI_TOOLTIP_ANIM_MS) : 1U;
+        }
+        preview->surface_fade_pending = false;
+    }
+    return true;
+}
+
+static uint32_t seek_bar_preview_macroblock_budget(
+    const Movie *movie,
+    const storage_t *decoder,
+    uint16_t avg_mbs_per_ms_q8,
+    uint32_t spare_ms
+)
+{
+    if (!decoder) {
+        return h264_incremental_total_mbs(movie, decoder);
+    }
+    return h264_incremental_budget(movie, decoder, avg_mbs_per_ms_q8, spare_ms);
+}
+
+static void step_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, uint32_t deadline_ms)
+{
+    SeekPreviewDecodeJob *job;
+    const ChunkIndexEntry *entry;
+
+    if (!movie || !preview || !preview->decode_job.active) {
+        return;
+    }
+    if (preview->surface_render_pending) {
+        return;
+    }
+
+    job = &preview->decode_job;
+    if (!read_seek_bar_preview_chunk_step(movie, job, deadline_ms)) {
+        clear_seek_bar_preview_decode_job(preview);
+        return;
+    }
+    if (!job->frame_offsets) {
+        return;
+    }
+
+    entry = movie->chunk_index + job->chunk_index;
+    while (job->active && job->next_frame <= job->target_frame) {
+        uint32_t local_index;
+        size_t start;
+        size_t end;
+        uint32_t remaining_ms;
+        uint32_t macroblock_budget;
+        uint32_t decode_start_ms;
+        uint32_t start_decoded_mbs;
+        uint32_t total_mbs;
+        uint32_t decoded_mbs;
+        bool picture_ready = false;
+        bool pending = false;
+        uint8_t *picture = NULL;
+
+        if (deadline_ms != 0U) {
+            uint32_t now_ms = monotonic_clock_now_ms();
+            if ((int32_t) (deadline_ms - now_ms) <= 0) {
+                return;
+            }
+            remaining_ms = deadline_ms - now_ms;
+        } else {
+            remaining_ms = SEEK_BAR_PREVIEW_SLICE_MS;
+        }
+
+        local_index = job->next_frame - entry->first_frame;
+        if (local_index >= entry->frame_count) {
+            clear_seek_bar_preview_decode_job(preview);
+            return;
+        }
+
+        start = job->frame_offsets[local_index];
+        end = (local_index + 1U < entry->frame_count) ? job->frame_offsets[local_index + 1U] : job->chunk_size;
+        if (end <= start || end > job->chunk_size) {
+            clear_seek_bar_preview_decode_job(preview);
+            return;
+        }
+
+        macroblock_budget = seek_bar_preview_macroblock_budget(movie, job->decoder, job->avg_mbs_per_ms_q8, remaining_ms);
+        if (macroblock_budget == 0U) {
+            return;
+        }
+
+        decode_start_ms = monotonic_clock_now_ms();
+        start_decoded_mbs = job->decoder->slice->numDecodedMbs;
+        total_mbs = h264_incremental_total_mbs(movie, job->decoder);
+        if (!pump_h264_access_unit(
+                movie,
+                job->decoder,
+                job->chunk_bytes + start,
+                end - start,
+                &job->consumed_bytes,
+                &job->zero_advance_retries,
+                macroblock_budget,
+                false,
+                "seek preview",
+                &picture_ready,
+                &pending,
+                &picture)) {
+            clear_seek_bar_preview_decode_job(preview);
+            return;
+        }
+
+        decoded_mbs = job->decoder->slice->numDecodedMbs - start_decoded_mbs;
+        if (picture_ready && decoded_mbs == 0U) {
+            decoded_mbs = total_mbs > start_decoded_mbs ? (total_mbs - start_decoded_mbs) : 0U;
+        }
+        update_h264_incremental_rate(&job->avg_mbs_per_ms_q8, monotonic_clock_now_ms() - decode_start_ms, decoded_mbs);
+
+        if (picture_ready) {
+            if (!publish_seek_bar_preview_picture(movie, preview, job->next_frame, picture)) {
+                clear_seek_bar_preview_decode_job(preview);
+                return;
+            }
+
+            job->next_frame++;
+            job->consumed_bytes = 0;
+            job->zero_advance_retries = 0;
+            if (job->next_frame > job->target_frame) {
+                clear_seek_bar_preview_decode_job(preview);
+            }
+            return;
+        } else if (pending) {
+            return;
+        } else {
+            clear_seek_bar_preview_decode_job(preview);
+            return;
+        }
+
+        if (deadline_ms != 0U && prefetch_deadline_reached(deadline_ms)) {
+            return;
+        }
+    }
+
+    clear_seek_bar_preview_decode_job(preview);
+}
+
 static bool prefetch_chunk(Movie *movie, int chunk_index)
 {
     const ChunkIndexEntry *entry;
@@ -6187,77 +6527,6 @@ static bool decode_h264_frame(
                 (unsigned long) replay_index,
                 (unsigned long) start,
                 (unsigned long) end,
-                (unsigned long) (end - start)
-            );
-            return false;
-        }
-        movie->decoded_local_frame = (int) replay_index;
-    }
-
-    return true;
-}
-
-static bool decode_h264_frame_to_rgb565_buffer(
-    Movie *movie,
-    uint32_t frame_index,
-    uint16_t *dst_pixels,
-    size_t dst_pitch_pixels
-)
-{
-    int chunk_index = movie_chunk_for_frame(movie, frame_index);
-    const ChunkIndexEntry *entry;
-    uint32_t local_index;
-    uint32_t replay_index;
-
-    if (!movie || !dst_pixels || dst_pitch_pixels == 0) {
-        return false;
-    }
-    if (chunk_index < 0) {
-        debug_failf("preview frame=%lu invalid h264 chunk", (unsigned long) frame_index);
-        return false;
-    }
-    if (!load_chunk(movie, chunk_index)) {
-        debug_tracef("preview frame=%lu load h264 chunk=%d fail", (unsigned long) frame_index, chunk_index);
-        return false;
-    }
-
-    entry = movie->chunk_index + chunk_index;
-    local_index = frame_index - entry->first_frame;
-    if (movie->decoded_local_frame > (int) local_index) {
-        if (movie->h264_chunk_dirty) {
-            if (!load_chunk_from_file(movie, chunk_index, true)) {
-                debug_failf("preview chunk reload failed chunk=%d", chunk_index);
-                return false;
-            }
-            entry = movie->chunk_index + chunk_index;
-            local_index = frame_index - entry->first_frame;
-        } else if (!reset_h264_decoder(movie)) {
-            return false;
-        }
-        movie->decoded_local_frame = -1;
-    }
-
-    for (replay_index = (uint32_t) (movie->decoded_local_frame + 1); replay_index <= local_index; ++replay_index) {
-        size_t start = movie->frame_offsets[replay_index];
-        size_t end = (replay_index + 1 < entry->frame_count)
-            ? movie->frame_offsets[replay_index + 1]
-            : movie->chunk_size;
-        uint32_t decoded_frame_index = entry->first_frame + replay_index;
-
-        movie->h264_chunk_dirty = true;
-        if (!decode_h264_access_unit_to_target(
-                movie,
-                movie->chunk_bytes + start,
-                end - start,
-                decoded_frame_index,
-                decoded_frame_index == frame_index ? dst_pixels : NULL,
-                dst_pitch_pixels,
-                false)) {
-            debug_tracef(
-                "preview frame decode fail frame=%lu chunk=%d local=%lu size=%lu",
-                (unsigned long) decoded_frame_index,
-                chunk_index,
-                (unsigned long) replay_index,
                 (unsigned long) (end - start)
             );
             return false;
@@ -10268,7 +10537,8 @@ static void draw_progress(
                     seek_preview->surface_fade_pending = false;
                     surface_mix = 0;
                 } else if (seek_preview->surface_started_ms != 0U) {
-                    surface_mix = ui_ease_out_cubic(now_ms - seek_preview->surface_started_ms, UI_TOOLTIP_ANIM_MS);
+                    uint32_t surface_elapsed_ms = now_ms - seek_preview->surface_started_ms;
+                    surface_mix = ui_ease_out_cubic(surface_elapsed_ms, UI_TOOLTIP_ANIM_MS);
                     surface_mix = (uint8_t) (((uint32_t) surface_mix * surface_mix + 127U) / 255U);
                     if (surface_mix > preview_mix) {
                         surface_mix = preview_mix;
@@ -10286,6 +10556,7 @@ static void draw_progress(
                 if (surface_mix > 0) {
                     int surface_offset = ((255 - surface_mix) * 4 + 127) / 255;
                     draw_seek_preview_panel(screen, seek_preview->surface, preview_x, preview_y + surface_offset, preview_marker_x, surface_mix);
+                    seek_preview->surface_render_pending = false;
                 }
             }
             if (preview_mix > 32) {
@@ -11668,11 +11939,6 @@ static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, 
     uint32_t target_ms;
     uint32_t target_frame;
     int chunk_index;
-    const ChunkIndexEntry *entry;
-    uint16_t *preview_pixels = NULL;
-    SDL_Surface *full_surface = NULL;
-    SDL_Surface *thumbnail = NULL;
-    bool ok = true;
 
     if (!preview) {
         return false;
@@ -11683,6 +11949,7 @@ static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, 
         pointer->y < SCREEN_H - UI_BAR_H || pointer->y >= SCREEN_H) {
         preview->tracking = false;
         preview->last_pointer_x = -1;
+        clear_seek_bar_preview_decode_job(preview);
         return false;
     }
 
@@ -11717,60 +11984,23 @@ static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, 
     if ((int32_t) (now_ms - preview->last_move_ms) < (int32_t) SEEK_BAR_PREVIEW_DEBOUNCE_MS) {
         return true;
     }
-    if (preview->surface && preview->decoded_chunk_index == chunk_index) {
+    if (preview->surface && preview->decoded_frame_index == target_frame) {
+        clear_seek_bar_preview_decode_job(preview);
         return true;
     }
-
-    entry = movie->chunk_index + chunk_index;
-    clear_h264_frame_ring(movie);
-    clear_all_prefetched_chunks(movie);
-    movie->h264_active_prefetch_backoff = H264_ACTIVE_PREFETCH_BACKOFF_HEAVY;
-    preview_pixels = (uint16_t *) calloc((size_t) movie->header.video_width * movie->header.video_height, sizeof(uint16_t));
-    if (!preview_pixels) {
-        ok = false;
-        goto cleanup;
-    }
-    if (!decode_h264_frame_to_rgb565_buffer(movie, entry->first_frame, preview_pixels, movie->header.video_width)) {
-        ok = false;
-        goto cleanup;
+    if (preview->decode_job.active && preview->decode_job.chunk_index == chunk_index) {
+        if (preview->decode_job.target_frame == target_frame) {
+            return true;
+        }
+        if (target_frame >= preview->decode_job.next_frame) {
+            preview->decode_job.target_frame = target_frame;
+            return true;
+        }
     }
 
-    full_surface = SDL_CreateRGBSurfaceFrom(
-        preview_pixels,
-        movie->header.video_width,
-        movie->header.video_height,
-        16,
-        movie->header.video_width * 2,
-        0xF800, 0x07E0, 0x001F, 0
-    );
-    if (!full_surface) {
-        ok = false;
-        goto cleanup;
-    }
-    thumbnail = create_scaled_surface_from_surface(full_surface, SEEK_BAR_PREVIEW_MAX_W, SEEK_BAR_PREVIEW_MAX_H);
-    if (!thumbnail) {
-        ok = false;
-        goto cleanup;
-    }
-
-cleanup:
-    if (full_surface) {
-        SDL_FreeSurface(full_surface);
-    }
-    free(preview_pixels);
-    invalidate_loaded_chunk_state(movie);
-    reset_h264_decoder(movie);
-    if (!ok) {
+    if (!begin_seek_bar_preview_decode(movie, preview, chunk_index, target_frame)) {
         return false;
     }
-
-    if (preview->surface) {
-        SDL_FreeSurface(preview->surface);
-    }
-    preview->surface = thumbnail;
-    preview->decoded_chunk_index = chunk_index;
-    preview->surface_started_ms = 0;
-    preview->surface_fade_pending = true;
     return true;
 }
 
@@ -12480,7 +12710,9 @@ static int play_movie(
     memset(&ui_mixes, 0, sizeof(ui_mixes));
     memset(&display_power_state, 0, sizeof(display_power_state));
     seek_preview.decoded_chunk_index = -1;
+    seek_preview.decoded_frame_index = UINT32_MAX;
     seek_preview.last_pointer_x = -1;
+    seek_preview.decode_job.chunk_index = -1;
 
     if (debug_is_runtime_logging_enabled()) {
         g_debug_ring_count = 0;
@@ -12788,22 +13020,20 @@ static int play_movie(
         }
         if (!pointer_click) {
             bool allow_seek_preview = paused && show_ui && !help_menu_open;
-            int previous_preview_chunk = seek_preview.decoded_chunk_index;
-            if (allow_seek_preview &&
-                update_seek_bar_preview(&movie, &seek_preview, &pointer, allow_seek_preview, now_ms) &&
-                seek_preview.surface &&
-                seek_preview.decoded_chunk_index != previous_preview_chunk) {
-                hover_preview_needs_rebuffer = true;
-            } else if (!allow_seek_preview) {
+            if (allow_seek_preview) {
+                update_seek_bar_preview(&movie, &seek_preview, &pointer, allow_seek_preview, now_ms);
+            } else {
                 seek_preview.over_bar = false;
                 seek_preview.tracking = false;
                 seek_preview.last_pointer_x = -1;
+                clear_seek_bar_preview_decode_job(&seek_preview);
                 if (!paused) {
                     clear_seek_bar_preview(&seek_preview);
                 }
             }
         } else {
             seek_preview.over_bar = false;
+            clear_seek_bar_preview_decode_job(&seek_preview);
         }
         if (seek_left_edge) {
             seek_delta_ms = -SEEK_STEP_MS;
@@ -13484,8 +13714,17 @@ static int play_movie(
         }
         if (paused || frame_interval_ticks == 0 || seek_preroll_active) {
             uint32_t idle_now_ms = monotonic_clock_now_ms();
+            if (paused && seek_bar_preview_decode_active(&seek_preview)) {
+                step_seek_bar_preview_decode(
+                    &movie,
+                    &seek_preview,
+                    idle_now_ms + SEEK_BAR_PREVIEW_SLICE_MS
+                );
+                idle_now_ms = monotonic_clock_now_ms();
+            }
             bool paused_ui_busy = paused && (
                 playback_ui_mixes_animating(&ui_mixes) ||
+                seek_bar_preview_decode_active(&seek_preview) ||
                 seek_preview_surface_animating(&seek_preview, idle_now_ms) ||
                 ui_time_before(idle_now_ms, paused_ui_quiet_until_ms)
             );
