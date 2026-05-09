@@ -7656,6 +7656,38 @@ static int ui_bar_visible_height_for_mix(uint8_t chrome_mix)
     return UI_BAR_H - ui_bar_hidden_offset_for_mix(chrome_mix);
 }
 
+static int subtitle_visible_bottom_limit(const SubtitleLayoutSpec *layout, int bottom_margin)
+{
+    int bottom;
+
+    if (!layout) {
+        return SCREEN_H;
+    }
+
+    bottom = layout->video_rect.y + layout->video_rect.h - bottom_margin;
+    if (layout->overlay_mix > 0) {
+        int ui_top = SCREEN_H - 2 - ui_bar_visible_height_for_mix(layout->overlay_mix);
+        if (bottom > ui_top) {
+            bottom = ui_top;
+        }
+    }
+    return bottom;
+}
+
+static int subtitle_visible_max_y(const SubtitleLayoutSpec *layout, int surface_h)
+{
+    int min_y;
+    int max_y;
+
+    if (!layout) {
+        return 0;
+    }
+
+    min_y = layout->video_rect.y;
+    max_y = subtitle_visible_bottom_limit(layout, 0) - surface_h;
+    return max_y < min_y ? min_y : max_y;
+}
+
 static void subtitle_layout_dst_rect(
     const SubtitleLayoutSpec *layout,
     int surface_w,
@@ -7693,7 +7725,7 @@ static void subtitle_layout_dst_rect(
         }
 
         x = clamp_int(x, video_rect->x, video_rect->x + video_rect->w - surface_w);
-        y = clamp_int(y, video_rect->y, video_rect->y + video_rect->h - surface_h);
+        y = clamp_int(y, video_rect->y, subtitle_visible_max_y(layout, surface_h));
     } else if (layout->mode == SUBTITLE_CUE_POSITION_MARGIN && layout->align >= 1 && layout->align <= 9) {
         int column = subtitle_align_column(layout->align);
         int row = subtitle_align_row(layout->align);
@@ -7707,7 +7739,7 @@ static void subtitle_layout_dst_rect(
         }
 
         if (row == 0) {
-            y = (video_rect->y + video_rect->h) - layout->margin_v - surface_h;
+            y = subtitle_visible_bottom_limit(layout, layout->margin_v) - surface_h;
         } else if (row == 2) {
             y = video_rect->y + layout->margin_v;
         } else {
@@ -7715,7 +7747,7 @@ static void subtitle_layout_dst_rect(
         }
 
         x = clamp_int(x, video_rect->x, video_rect->x + video_rect->w - surface_w);
-        y = clamp_int(y, video_rect->y, video_rect->y + video_rect->h - surface_h);
+        y = clamp_int(y, video_rect->y, subtitle_visible_max_y(layout, surface_h));
     } else {
         int area_x;
         int area_y;
@@ -7761,7 +7793,7 @@ static void subtitle_layout_dst_rect(
                 break;
             case SUBTITLE_POS_VIDEO_BOTTOM:
             default:
-                area_y = (video_rect->y + video_rect->h - 8) - surface_h;
+                area_y = subtitle_visible_bottom_limit(layout, 8) - surface_h;
                 if (area_y < video_rect->y + 4) {
                     area_y = video_rect->y + 4;
                 }
