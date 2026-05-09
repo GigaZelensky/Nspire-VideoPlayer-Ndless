@@ -40,6 +40,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define UI_MENU_ANIM_MS 130U
 #define UI_LOADING_ANIM_MS 150U
 #define UI_LOADING_DIM_ALPHA 112
+#define RESUME_PROMPT_DIM_ALPHA 112
 #define UI_DISMISS_ANIM_MS 130U
 #define RESUME_PROMPT_ANIM_MS 150U
 #define RESUME_MORPH_ANIM_MS 150U
@@ -9714,6 +9715,14 @@ static void trigger_playback_badge_press(
     }
 }
 
+static void trigger_badge_press(UiTransition *transition, uint32_t *press_until_ms, uint32_t now_ms)
+{
+    if (press_until_ms) {
+        *press_until_ms = now_ms + UI_PRESS_ANIM_MS;
+    }
+    ui_transition_prime_press(transition, now_ms);
+}
+
 static bool ui_time_before(uint32_t now_ms, uint32_t until_ms)
 {
     return until_ms != 0U && (int32_t) (now_ms - until_ms) < 0;
@@ -10181,6 +10190,8 @@ static void update_playback_ui_mixes(
     bool help_menu_open,
     PlaybackPressTarget pressed_target,
     bool force_playback_press,
+    bool force_scale_press,
+    bool force_speed_press,
     const PointerState *pointer,
     uint32_t now_ms
 )
@@ -10240,7 +10251,8 @@ static void update_playback_ui_mixes(
     );
     mixes->scale_press = ui_transition_update_press(
         &transitions->scale_press,
-        pressed_target == PLAYBACK_PRESS_SCALE && pointer && pointer->down && scale_hovered,
+        force_scale_press ||
+            (pressed_target == PLAYBACK_PRESS_SCALE && pointer && pointer->down && scale_hovered),
         now_ms
     );
     mixes->speed_badge = ui_transition_update(
@@ -10251,7 +10263,8 @@ static void update_playback_ui_mixes(
     );
     mixes->speed_press = ui_transition_update_press(
         &transitions->speed_press,
-        pressed_target == PLAYBACK_PRESS_SPEED && pointer && pointer->down && speed_hovered,
+        force_speed_press ||
+            (pressed_target == PLAYBACK_PRESS_SPEED && pointer && pointer->down && speed_hovered),
         now_ms
     );
     mixes->seek_preview = ui_transition_update(
@@ -11108,6 +11121,23 @@ static void draw_movie_frame_background(
     }
 }
 
+static void draw_resume_prompt_background(SDL_Surface *screen, Movie *movie)
+{
+    SDL_Rect full_screen = {0, 0, SCREEN_W, SCREEN_H};
+    SDL_Rect full_src;
+
+    if (!screen || !movie || !movie->frame_surface) {
+        return;
+    }
+    full_src.x = 0;
+    full_src.y = 0;
+    full_src.w = movie->header.video_width;
+    full_src.h = movie->header.video_height;
+    SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
+    SDL_SoftStretch(movie->frame_surface, &full_src, screen, &full_screen);
+    dim_rect_rgb565(screen, &full_screen, RESUME_PROMPT_DIM_ALPHA);
+}
+
 static int picker_row_index_at(size_t count, size_t selected, int x, int y)
 {
     size_t start_index;
@@ -11271,7 +11301,8 @@ static void draw_loading_transition_frame(
     const char *label,
     uint8_t mix,
     int phase,
-    bool opening
+    bool opening,
+    bool dim_background
 )
 {
     SDL_Rect full_screen = {0, 0, SCREEN_W, SCREEN_H};
@@ -11281,17 +11312,20 @@ static void draw_loading_transition_frame(
     } else {
         SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 8, 10, 14));
     }
-    dim_rect_rgb565(screen, &full_screen, (UI_LOADING_DIM_ALPHA * mix + 127) / 255);
+    if (dim_background) {
+        dim_rect_rgb565(screen, &full_screen, (UI_LOADING_DIM_ALPHA * mix + 127) / 255);
+    }
     draw_loading_overlay_mix(screen, fonts, label, phase, mix, opening);
     present_screen(screen);
 }
 
-static void animate_loading_transition(
+static void animate_loading_transition_ex(
     SDL_Surface *screen,
     SDL_Surface *snapshot,
     const Fonts *fonts,
     const char *label,
-    bool opening
+    bool opening,
+    bool dim_background
 )
 {
     uint32_t started_ms = monotonic_clock_now_ms();
@@ -11308,13 +11342,41 @@ static void animate_loading_transition(
             label,
             mix,
             (int) ((now_ms / 180U) % 3U),
-            opening
+            opening,
+            dim_background
         );
         if (eased >= 255) {
             break;
         }
         msleep(16);
     }
+}
+
+static void animate_loading_transition(
+    SDL_Surface *screen,
+    SDL_Surface *snapshot,
+    const Fonts *fonts,
+    const char *label,
+    bool opening
+)
+{
+    animate_loading_transition_ex(screen, snapshot, fonts, label, opening, true);
+}
+
+static void finish_loading_transition_ex(
+    SDL_Surface *screen,
+    SDL_Surface **snapshot,
+    const Fonts *fonts,
+    const char *label,
+    bool dim_background
+)
+{
+    if (!snapshot || !*snapshot) {
+        return;
+    }
+    animate_loading_transition_ex(screen, *snapshot, fonts, label, false, dim_background);
+    SDL_FreeSurface(*snapshot);
+    *snapshot = NULL;
 }
 
 static void finish_loading_transition(
@@ -11324,12 +11386,7 @@ static void finish_loading_transition(
     const char *label
 )
 {
-    if (!snapshot || !*snapshot) {
-        return;
-    }
-    animate_loading_transition(screen, *snapshot, fonts, label, false);
-    SDL_FreeSurface(*snapshot);
-    *snapshot = NULL;
+    finish_loading_transition_ex(screen, snapshot, fonts, label, true);
 }
 
 static void set_return_transition_surface(SDL_Surface *screen, SDL_Surface **transition_surface)
@@ -12593,6 +12650,8 @@ static int pick_movie(
 {
     bool prev_up = false;
     bool prev_down = false;
+    bool prev_left = false;
+    bool prev_right = false;
     bool prev_enter = false;
     bool prev_esc = false;
     bool prev_c = false;
@@ -12616,6 +12675,7 @@ static int pick_movie(
     int pressed_row_index = -1;
     int pressed_resume_badge_index = -1;
     bool pressed_selected_fallback = false;
+    bool keyboard_resume_focused = false;
     int enter_press_stage = 0;
 
     memset(&screenshot_preview, 0, sizeof(screenshot_preview));
@@ -12631,6 +12691,8 @@ static int pick_movie(
     pointer_update(&pointer);
     prev_up = isKeyPressed(KEY_NSPIRE_UP);
     prev_down = isKeyPressed(KEY_NSPIRE_DOWN);
+    prev_left = isKeyPressed(KEY_NSPIRE_LEFT);
+    prev_right = isKeyPressed(KEY_NSPIRE_RIGHT);
     prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
@@ -12643,11 +12705,14 @@ static int pick_movie(
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
         bool enter_down = prev_enter;
+        bool left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left);
+        bool right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right);
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
         int hovered_index = pointer_hover_allowed ? picker_row_index_at(count, selected, pointer.x, pointer.y) : -1;
         int resume_hovered_index = pointer_hover_allowed
             ? picker_resume_badge_index_at(fonts, files, count, selected, pointer.x, pointer.y)
             : -1;
+        int active_resume_index;
         int tooltip_index = resume_hovered_index >= 0
             ? -1
             : picker_tooltip_hover_update(&tooltip_hover, hovered_index, &pointer, pointer_click, now_ms);
@@ -12657,6 +12722,10 @@ static int pick_movie(
         bool picker_press_hot;
         uint8_t picker_press_mix;
 
+        if (pointer.press_edge ||
+            (keyboard_resume_focused && pointer_hover_allowed && (hovered_index >= 0 || resume_hovered_index >= 0))) {
+            keyboard_resume_focused = false;
+        }
         if (hovered_index >= 0) {
             picker_set_selected(
                 &selected,
@@ -12666,17 +12735,28 @@ static int pick_movie(
                 now_ms
             );
         }
-        if (resume_hovered_index >= 0 && resume_badge_anim_index != resume_hovered_index) {
+        if (enter_press_stage == 0 && right_edge && count > 0 && files[selected].has_resume) {
+            keyboard_resume_focused = true;
+            pointer_hover_guard_lock(&hover_guard, &pointer);
+        }
+        if (enter_press_stage == 0 && left_edge && keyboard_resume_focused) {
+            keyboard_resume_focused = false;
+            pointer_hover_guard_lock(&hover_guard, &pointer);
+        }
+        active_resume_index = (keyboard_resume_focused && count > 0 && files[selected].has_resume)
+            ? (int) selected
+            : resume_hovered_index;
+        if (active_resume_index >= 0 && resume_badge_anim_index != active_resume_index) {
             ui_transition_init(&resume_badge_anim, false);
-            resume_badge_anim_index = resume_hovered_index;
+            resume_badge_anim_index = active_resume_index;
         }
         resume_badge_mix = ui_transition_update(
             &resume_badge_anim,
-            resume_hovered_index >= 0,
+            active_resume_index >= 0,
             now_ms,
             UI_HOVER_ANIM_MS
         );
-        if (resume_badge_mix == 0 && resume_hovered_index < 0) {
+        if (resume_badge_mix == 0 && active_resume_index < 0) {
             resume_badge_anim_index = -1;
         }
         if (resume_hovered_index >= 0 && resume_tooltip_anim_index != resume_hovered_index) {
@@ -12726,15 +12806,21 @@ static int pick_movie(
         }
         if (enter_edge && count > 0 && enter_press_stage == 0) {
             enter_press_stage = 1;
-            pressed_row_index = (int) selected;
-            pressed_resume_badge_index = -1;
-            pressed_selected_fallback = true;
+            if (keyboard_resume_focused && files[selected].has_resume) {
+                pressed_row_index = -1;
+                pressed_resume_badge_index = (int) selected;
+                pressed_selected_fallback = false;
+            } else {
+                pressed_row_index = (int) selected;
+                pressed_resume_badge_index = -1;
+                pressed_selected_fallback = true;
+            }
             ui_transition_init(&picker_press_anim, false);
         }
         if (enter_press_stage == 1 && !enter_down) {
             enter_press_stage = 2;
         }
-        picker_press_hot = (enter_press_stage == 1 && pressed_row_index >= 0) || (pointer.down && (
+        picker_press_hot = (enter_press_stage == 1 && (pressed_row_index >= 0 || pressed_resume_badge_index >= 0)) || (pointer.down && (
             (pressed_resume_badge_index >= 0 && resume_hovered_index == pressed_resume_badge_index) ||
             (pressed_row_index >= 0 && (
                 (pressed_selected_fallback && pressed_row_index == (int) selected) ||
@@ -12786,6 +12872,7 @@ static int pick_movie(
             }
         }
         if (enter_press_stage == 0 && key_pressed_edge(KEY_NSPIRE_UP, &prev_up) && selected > 0) {
+            keyboard_resume_focused = false;
             picker_set_selected(
                 &selected,
                 &previous_selected,
@@ -12796,6 +12883,7 @@ static int pick_movie(
             pointer_hover_guard_lock(&hover_guard, &pointer);
         }
         if (enter_press_stage == 0 && key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) && selected + 1 < count) {
+            keyboard_resume_focused = false;
             picker_set_selected(
                 &selected,
                 &previous_selected,
@@ -12870,16 +12958,21 @@ static int pick_movie(
             }
         }
         if (enter_press_stage != 0) {
-            if (enter_press_stage == 2 && picker_press_mix == 0 && pressed_row_index >= 0) {
-                selected = (size_t) pressed_row_index;
+            if (enter_press_stage == 2 && picker_press_mix == 0 &&
+                (pressed_row_index >= 0 || pressed_resume_badge_index >= 0)) {
+                bool activated_resume = pressed_resume_badge_index >= 0;
+                int activated_index = activated_resume ? pressed_resume_badge_index : pressed_row_index;
+
+                selected = (size_t) activated_index;
                 pressed_row_index = -1;
                 pressed_resume_badge_index = -1;
                 pressed_selected_fallback = false;
                 enter_press_stage = 0;
+                keyboard_resume_focused = false;
                 strncpy(selected_path, files[selected].path, selected_size - 1);
                 selected_path[selected_size - 1] = '\0';
                 if (resume_without_prompt) {
-                    *resume_without_prompt = false;
+                    *resume_without_prompt = activated_resume;
                 }
                 free_movie_files(files, count);
                 clear_screenshot_preview(&screenshot_preview);
@@ -13027,9 +13120,9 @@ static int prompt_resume_position(
         return 0;
     }
     if (loading_snapshot && *loading_snapshot) {
-        draw_movie_frame_background(*loading_snapshot, movie, scale_mode, video_align_x, video_align_y, NULL, NULL);
+        draw_resume_prompt_background(*loading_snapshot, movie);
     }
-    finish_loading_transition(screen, loading_snapshot, fonts, "Loading");
+    finish_loading_transition_ex(screen, loading_snapshot, fonts, "Loading", false);
     compute_video_rects(movie, scale_mode, video_align_x, video_align_y, &playback_src, &playback_dst);
     full_src.x = 0;
     full_src.y = 0;
@@ -13112,7 +13205,9 @@ static int prompt_resume_position(
             ? (uint8_t) (255U - close_mix)
             : ui_ease_out_cubic(now_ms - prompt_open_started_ms, RESUME_PROMPT_ANIM_MS);
         int prompt_y_offset = ((255 - prompt_mix) * 5 + 127) / 255;
-        int dim_strength = prompt_closing ? ((112 * prompt_mix + 127) / 255) : 112;
+        int dim_strength = prompt_closing
+            ? ((RESUME_PROMPT_DIM_ALPHA * prompt_mix + 127) / 255)
+            : RESUME_PROMPT_DIM_ALPHA;
         SDL_Rect background_src = full_src;
         SDL_Rect background_dst = full_screen;
         SDL_Rect draw_border = border;
@@ -13419,6 +13514,8 @@ static int play_movie(
     size_t seek_preroll_target_ready_count = 0;
     uint32_t paused_ui_quiet_until_ms = 0;
     uint32_t playback_badge_press_until_ms = 0;
+    uint32_t scale_badge_press_until_ms = 0;
+    uint32_t speed_badge_press_until_ms = 0;
     bool playback_enter_press_active = false;
     bool hover_preview_needs_rebuffer = false;
     SDL_Surface *loading_snapshot = NULL;
@@ -13907,6 +14004,8 @@ static int play_movie(
                 help_menu_open,
                 PLAYBACK_PRESS_NONE,
                 false,
+                false,
+                false,
                 &pointer,
                 now_ms
             );
@@ -14111,17 +14210,20 @@ static int play_movie(
         }
         if (divide_edge) {
             scale_mode = (ScaleMode) ((scale_mode + 1) % 4);
+            trigger_badge_press(&ui_transitions.scale_press, &scale_badge_press_until_ms, now_ms);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (speed_down_edge && playback_rate_index > 0) {
             playback_rate_index--;
             playback_rate = playback_rate_for_index(playback_rate_index);
+            trigger_badge_press(&ui_transitions.speed_press, &speed_badge_press_until_ms, now_ms);
             reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (speed_up_edge && playback_rate_index + 1 < PLAYBACK_RATE_COUNT) {
             playback_rate_index++;
             playback_rate = playback_rate_for_index(playback_rate_index);
+            trigger_badge_press(&ui_transitions.speed_press, &speed_badge_press_until_ms, now_ms);
             reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
@@ -14498,6 +14600,8 @@ static int play_movie(
                 help_menu_open,
                 playback_press_target,
                 playback_enter_press_active || ui_time_before(render_now_ms, playback_badge_press_until_ms),
+                ui_time_before(render_now_ms, scale_badge_press_until_ms),
+                ui_time_before(render_now_ms, speed_badge_press_until_ms),
                 &pointer,
                 render_now_ms
             );
