@@ -35,12 +35,14 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define PICKER_DESELECTION_ANIM_MS 85U
 #define PICKER_INTRO_ANIM_MS 360U
 #define PICKER_INTRO_ROW_STAGGER_MS 28U
+#define PICKER_PRESS_RELEASE_ANIM_MS 94U
 #define PROMPT_BUTTON_ANIM_MS 90U
 #define UI_CHROME_ANIM_MS 115U
 #define UI_HOVER_ANIM_MS 105U
 #define UI_PRESS_ANIM_MS 120U
-#define UI_PRESS_RELEASE_ANIM_MS 72U
+#define UI_PRESS_RELEASE_ANIM_MS 84U
 #define UI_PRESS_PRIME_MIX 72U
+#define UI_PRESS_RELEASE_VISIBLE_MIX 255U
 #define UI_TOOLTIP_ANIM_MS 115U
 #define UI_MENU_ANIM_MS 130U
 #define UI_LOADING_ANIM_MS 150U
@@ -9642,10 +9644,12 @@ static uint8_t ui_transition_update(
     return ui_transition_update_ex(transition, active, now_ms, duration_ms, 0);
 }
 
-static uint8_t ui_transition_update_press(
+static uint8_t ui_transition_update_press_ex(
     UiTransition *transition,
     bool active,
-    uint32_t now_ms
+    uint32_t now_ms,
+    uint32_t press_duration_ms,
+    uint32_t release_duration_ms
 )
 {
     uint8_t current_mix;
@@ -9657,17 +9661,32 @@ static uint8_t ui_transition_update_press(
     if (!transition->initialized) {
         ui_transition_init(transition, false);
     }
-    duration_ms = transition->target_active ? UI_PRESS_ANIM_MS : UI_PRESS_RELEASE_ANIM_MS;
+    duration_ms = transition->target_active ? press_duration_ms : release_duration_ms;
     current_mix = ui_transition_value_with_ease(transition, now_ms, duration_ms, ui_ease_smoothstep);
     if (transition->target_active != active) {
         transition->target_active = active;
         transition->start_mix = current_mix;
         transition->started_ms = now_ms ? now_ms : 1U;
-        duration_ms = active ? UI_PRESS_ANIM_MS : UI_PRESS_RELEASE_ANIM_MS;
+        duration_ms = active ? press_duration_ms : release_duration_ms;
         current_mix = ui_transition_value_with_ease(transition, now_ms, duration_ms, ui_ease_smoothstep);
     }
     transition->current_mix = current_mix;
     return current_mix;
+}
+
+static uint8_t ui_transition_update_press(
+    UiTransition *transition,
+    bool active,
+    uint32_t now_ms
+)
+{
+    return ui_transition_update_press_ex(
+        transition,
+        active,
+        now_ms,
+        UI_PRESS_ANIM_MS,
+        UI_PRESS_RELEASE_ANIM_MS
+    );
 }
 
 static void ui_transition_prime_press(UiTransition *transition, uint32_t now_ms)
@@ -9682,6 +9701,22 @@ static void ui_transition_prime_press(UiTransition *transition, uint32_t now_ms)
         transition->current_mix = UI_PRESS_PRIME_MIX;
     }
     transition->target_active = true;
+    transition->start_mix = transition->current_mix;
+    transition->started_ms = now_ms ? now_ms : 1U;
+}
+
+static void ui_transition_begin_press_release(UiTransition *transition, uint32_t now_ms)
+{
+    if (!transition) {
+        return;
+    }
+    if (!transition->initialized) {
+        ui_transition_init(transition, false);
+    }
+    if (transition->current_mix < UI_PRESS_RELEASE_VISIBLE_MIX) {
+        transition->current_mix = UI_PRESS_RELEASE_VISIBLE_MIX;
+    }
+    transition->target_active = false;
     transition->start_mix = transition->current_mix;
     transition->started_ms = now_ms ? now_ms : 1U;
 }
@@ -12909,6 +12944,8 @@ static int pick_movie(
         uint8_t movie_tooltip_mix;
         bool picker_press_hot;
         uint8_t picker_press_mix;
+        int pointer_release_activated_index = -1;
+        bool pointer_release_activated_resume = false;
 
         if (pointer.press_edge ||
             (keyboard_resume_focused && pointer_hover_allowed && (hovered_index >= 0 || resume_hovered_index >= 0))) {
@@ -13007,6 +13044,20 @@ static int pick_movie(
         }
         if (enter_press_stage == 1 && !enter_down) {
             enter_press_stage = 2;
+            ui_transition_begin_press_release(&picker_press_anim, now_ms);
+        }
+        if (enter_press_stage == 0 && pointer.release_edge && count > 0) {
+            if (pressed_resume_badge_index >= 0 && resume_hovered_index == pressed_resume_badge_index) {
+                pointer_release_activated_index = pressed_resume_badge_index;
+                pointer_release_activated_resume = true;
+            } else if (pressed_row_index >= 0 && hovered_index == pressed_row_index) {
+                pointer_release_activated_index = pressed_row_index;
+            } else if (pressed_selected_fallback && pressed_row_index >= 0) {
+                pointer_release_activated_index = pressed_row_index;
+            }
+            if (pointer_release_activated_index >= 0) {
+                ui_transition_begin_press_release(&picker_press_anim, now_ms);
+            }
         }
         picker_press_hot = (enter_press_stage == 1 && (pressed_row_index >= 0 || pressed_resume_badge_index >= 0)) || (pointer.down && (
             (pressed_resume_badge_index >= 0 && resume_hovered_index == pressed_resume_badge_index) ||
@@ -13015,10 +13066,12 @@ static int pick_movie(
                 hovered_index == pressed_row_index
             ))
         ));
-        picker_press_mix = ui_transition_update_press(
+        picker_press_mix = ui_transition_update_press_ex(
             &picker_press_anim,
             picker_press_hot,
-            now_ms
+            now_ms,
+            UI_PRESS_ANIM_MS,
+            PICKER_PRESS_RELEASE_ANIM_MS
         );
         if (enter_press_stage == 0 && !pointer.down && !pointer.release_edge && picker_press_mix == 0) {
             pressed_row_index = -1;
@@ -13082,70 +13135,60 @@ static int pick_movie(
             );
             pointer_hover_guard_lock(&hover_guard, &pointer);
         }
-        if (enter_press_stage == 0 && pointer.release_edge && count > 0) {
-            int activated_index = -1;
-            bool activated_resume = false;
+        if (pointer_release_activated_index >= 0) {
             int release_step;
 
-            if (pressed_resume_badge_index >= 0 && resume_hovered_index == pressed_resume_badge_index) {
-                activated_index = pressed_resume_badge_index;
-                activated_resume = true;
-            } else if (pressed_row_index >= 0 && hovered_index == pressed_row_index) {
-                activated_index = pressed_row_index;
-            } else if (pressed_selected_fallback && pressed_row_index >= 0) {
-                activated_index = pressed_row_index;
-            }
-            if (activated_index >= 0) {
-                for (release_step = 0; release_step < 8; ++release_step) {
-                    uint32_t release_now_ms = monotonic_clock_now_ms();
-                    uint8_t release_mix = ui_transition_update_press(
-                        &picker_press_anim,
-                        false,
-                        release_now_ms
-                    );
+            for (release_step = 0; release_step < 9; ++release_step) {
+                uint32_t release_now_ms = monotonic_clock_now_ms();
+                uint8_t release_mix = ui_transition_update_press_ex(
+                    &picker_press_anim,
+                    false,
+                    release_now_ms,
+                    UI_PRESS_ANIM_MS,
+                    PICKER_PRESS_RELEASE_ANIM_MS
+                );
 
-                    render_picker(
-                        screen,
-                        fonts,
-                        files,
-                        count,
-                        selected,
-                        previous_selected,
-                        selection_anim_started_ms,
-                        -1,
-                        0,
-                        -1,
-                        0,
-                        -1,
-                        0,
-                        pressed_row_index,
-                        pressed_resume_badge_index,
-                        release_mix,
-                        &pointer,
-                        &screenshot_preview,
-                        release_now_ms,
-                        0,
-                        NULL,
-                        0,
-                        NULL
-                    );
-                    if (release_mix == 0) {
-                        break;
-                    }
-                    msleep(16);
+                render_picker(
+                    screen,
+                    fonts,
+                    files,
+                    count,
+                    selected,
+                    previous_selected,
+                    selection_anim_started_ms,
+                    -1,
+                    0,
+                    -1,
+                    0,
+                    -1,
+                    0,
+                    pressed_row_index,
+                    pressed_resume_badge_index,
+                    release_mix,
+                    &pointer,
+                    &screenshot_preview,
+                    release_now_ms,
+                    0,
+                    NULL,
+                    0,
+                    NULL
+                );
+                if (release_mix == 0) {
+                    break;
                 }
-                pressed_row_index = -1;
-                pressed_resume_badge_index = -1;
-                pressed_selected_fallback = false;
-                strncpy(selected_path, files[activated_index].path, selected_size - 1);
-                selected_path[selected_size - 1] = '\0';
-                if (resume_without_prompt) {
-                    *resume_without_prompt = activated_resume;
-                }
-                free_movie_files(files, count);
-                clear_screenshot_preview(&screenshot_preview);
-                return 0;
+                msleep(16);
             }
+            pressed_row_index = -1;
+            pressed_resume_badge_index = -1;
+            pressed_selected_fallback = false;
+            strncpy(selected_path, files[pointer_release_activated_index].path, selected_size - 1);
+            selected_path[selected_size - 1] = '\0';
+            if (resume_without_prompt) {
+                *resume_without_prompt = pointer_release_activated_resume;
+            }
+            free_movie_files(files, count);
+            clear_screenshot_preview(&screenshot_preview);
+            return 0;
         }
         if (enter_press_stage != 0) {
             if (enter_press_stage == 2 && picker_press_mix == 0 &&
@@ -13493,6 +13536,15 @@ static int prompt_resume_position(
         }
         if (enter_button_press_stage == 1 && !enter_down) {
             enter_button_press_stage = 2;
+            ui_transition_begin_press_release(&button_press_anim, now_ms);
+        }
+        if (!prompt_closing &&
+            enter_button_press_stage == 0 &&
+            pointer.release_edge &&
+            pressed_button >= 0 &&
+            (hovered_button == pressed_button || pressed_button_fallback)) {
+            enter_button_press_stage = 2;
+            ui_transition_begin_press_release(&button_press_anim, now_ms);
         }
         button_press_hot = !prompt_closing && pressed_button >= 0 && (
             enter_button_press_stage == 1 ||
@@ -13580,14 +13632,6 @@ static int prompt_resume_position(
         if (prompt_closing) {
             msleep(16);
             continue;
-        }
-        if (enter_button_press_stage == 0 && pointer.release_edge) {
-            if (pressed_button >= 0 && (hovered_button == pressed_button || pressed_button_fallback)) {
-                prompt_closing = true;
-                prompt_closing_result = pressed_button == 0 ? 1 : 0;
-                prompt_close_started_ms = now_ms ? now_ms : 1U;
-                continue;
-            }
         }
         if (enter_button_press_stage != 0) {
             if (enter_button_press_stage == 2 && button_press_mix == 0 && pressed_button >= 0) {
