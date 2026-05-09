@@ -10218,9 +10218,6 @@ static uint8_t picker_row_selection_mix(
     if (index == selected) {
         return eased;
     }
-    if (index == previous_selected) {
-        return (uint8_t) (255U - eased);
-    }
     return 0;
 }
 
