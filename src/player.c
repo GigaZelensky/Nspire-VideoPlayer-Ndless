@@ -534,7 +534,9 @@ typedef struct {
     int marker_x;
     uint32_t hover_ms;
     uint32_t last_move_ms;
+    uint32_t surface_started_ms;
     int last_pointer_x;
+    bool surface_fade_pending;
     bool tracking;
     bool over_bar;
 } SeekBarPreviewState;
@@ -1490,14 +1492,26 @@ static void clear_screenshot_preview(ScreenshotPreviewState *preview)
     memset(preview, 0, sizeof(*preview));
 }
 
-static void clear_seek_bar_preview(SeekBarPreviewState *preview)
+static void clear_seek_bar_preview_surface(SeekBarPreviewState *preview)
 {
     if (!preview) {
         return;
     }
     if (preview->surface) {
         SDL_FreeSurface(preview->surface);
+        preview->surface = NULL;
     }
+    preview->decoded_chunk_index = -1;
+    preview->surface_started_ms = 0;
+    preview->surface_fade_pending = false;
+}
+
+static void clear_seek_bar_preview(SeekBarPreviewState *preview)
+{
+    if (!preview) {
+        return;
+    }
+    clear_seek_bar_preview_surface(preview);
     memset(preview, 0, sizeof(*preview));
     preview->decoded_chunk_index = -1;
     preview->last_pointer_x = -1;
@@ -8514,6 +8528,134 @@ static void fill_rect_rgb565(SDL_Surface *screen, const SDL_Rect *rect, Uint16 c
     SDL_FillRect(screen, (SDL_Rect *) rect, map_rgb565(screen, color));
 }
 
+static void fill_rect_rgb565_mix(SDL_Surface *screen, const SDL_Rect *rect, Uint16 color, uint8_t mix)
+{
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+    int y;
+    bool locked = false;
+
+    if (!screen || !rect || rect->w == 0 || rect->h == 0 || mix == 0) {
+        return;
+    }
+    if (mix >= 255) {
+        fill_rect_rgb565(screen, rect, color);
+        return;
+    }
+    if (!surface_is_rgb565(screen)) {
+        return;
+    }
+
+    x0 = clamp_int(rect->x, 0, screen->w);
+    y0 = clamp_int(rect->y, 0, screen->h);
+    x1 = clamp_int(rect->x + rect->w, 0, screen->w);
+    y1 = clamp_int(rect->y + rect->h, 0, screen->h);
+    if (x0 >= x1 || y0 >= y1) {
+        return;
+    }
+
+    if (SDL_MUSTLOCK(screen)) {
+        if (SDL_LockSurface(screen) != 0) {
+            return;
+        }
+        locked = true;
+    }
+
+    {
+        Uint16 *pixels = (Uint16 *) screen->pixels;
+        int pitch = screen->pitch / 2;
+        for (y = y0; y < y1; ++y) {
+            Uint16 *row = pixels + (y * pitch) + x0;
+            int x;
+            for (x = x0; x < x1; ++x) {
+                *row = blend_rgb565(*row, color, mix);
+                ++row;
+            }
+        }
+    }
+
+    if (locked) {
+        SDL_UnlockSurface(screen);
+    }
+}
+
+static void blit_surface_rgb565_mix(SDL_Surface *screen, SDL_Surface *surface, const SDL_Rect *dst_rect, uint8_t mix)
+{
+    int dst_x0;
+    int dst_y0;
+    int dst_x1;
+    int dst_y1;
+    int src_x0;
+    int src_y0;
+    int y;
+    bool screen_locked = false;
+    bool surface_locked = false;
+
+    if (!screen || !surface || !dst_rect || mix == 0) {
+        return;
+    }
+    if (mix >= 255) {
+        SDL_BlitSurface(surface, NULL, screen, (SDL_Rect *) dst_rect);
+        return;
+    }
+    if (!surface_is_rgb565(screen) || !surface_is_rgb565(surface)) {
+        return;
+    }
+
+    dst_x0 = clamp_int(dst_rect->x, 0, screen->w);
+    dst_y0 = clamp_int(dst_rect->y, 0, screen->h);
+    dst_x1 = clamp_int(dst_rect->x + surface->w, 0, screen->w);
+    dst_y1 = clamp_int(dst_rect->y + surface->h, 0, screen->h);
+    if (dst_x0 >= dst_x1 || dst_y0 >= dst_y1) {
+        return;
+    }
+    src_x0 = dst_x0 - dst_rect->x;
+    src_y0 = dst_y0 - dst_rect->y;
+
+    if (SDL_MUSTLOCK(screen)) {
+        if (SDL_LockSurface(screen) != 0) {
+            return;
+        }
+        screen_locked = true;
+    }
+    if (SDL_MUSTLOCK(surface)) {
+        if (SDL_LockSurface(surface) != 0) {
+            if (screen_locked) {
+                SDL_UnlockSurface(screen);
+            }
+            return;
+        }
+        surface_locked = true;
+    }
+
+    {
+        Uint16 *dst_pixels = (Uint16 *) screen->pixels;
+        Uint16 *src_pixels = (Uint16 *) surface->pixels;
+        int dst_pitch = screen->pitch / 2;
+        int src_pitch = surface->pitch / 2;
+
+        for (y = dst_y0; y < dst_y1; ++y) {
+            Uint16 *dst_row = dst_pixels + (y * dst_pitch) + dst_x0;
+            Uint16 *src_row = src_pixels + ((src_y0 + (y - dst_y0)) * src_pitch) + src_x0;
+            int x;
+            for (x = dst_x0; x < dst_x1; ++x) {
+                *dst_row = blend_rgb565(*dst_row, *src_row, mix);
+                ++dst_row;
+                ++src_row;
+            }
+        }
+    }
+
+    if (surface_locked) {
+        SDL_UnlockSurface(surface);
+    }
+    if (screen_locked) {
+        SDL_UnlockSurface(screen);
+    }
+}
+
 static void dim_rect_rgb565(SDL_Surface *screen, const SDL_Rect *rect, int alpha)
 {
     int x0;
@@ -9112,6 +9254,15 @@ static bool ui_time_before(uint32_t now_ms, uint32_t until_ms)
     return until_ms != 0U && (int32_t) (now_ms - until_ms) < 0;
 }
 
+static bool seek_preview_surface_animating(const SeekBarPreviewState *preview, uint32_t now_ms)
+{
+    return preview &&
+        preview->surface &&
+        (preview->surface_fade_pending ||
+            (preview->surface_started_ms != 0U &&
+                ui_time_before(now_ms, preview->surface_started_ms + UI_TOOLTIP_ANIM_MS)));
+}
+
 static void note_pause_transition(
     bool was_paused,
     bool now_paused,
@@ -9298,7 +9449,7 @@ static void draw_surface_panel(SDL_Surface *screen, SDL_Surface *surface, int x,
     SDL_BlitSurface(surface, NULL, screen, &dst);
 }
 
-static void draw_seek_preview_panel(SDL_Surface *screen, SDL_Surface *surface, int x, int y, int marker_x)
+static void draw_seek_preview_panel(SDL_Surface *screen, SDL_Surface *surface, int x, int y, int marker_x, uint8_t panel_mix)
 {
     SDL_Rect outer;
     SDL_Rect inner;
@@ -9306,7 +9457,7 @@ static void draw_seek_preview_panel(SDL_Surface *screen, SDL_Surface *surface, i
     SDL_Rect triangle;
     int center_x;
 
-    if (!screen || !surface) {
+    if (!screen || !surface || panel_mix == 0) {
         return;
     }
 
@@ -9323,40 +9474,40 @@ static void draw_seek_preview_panel(SDL_Surface *screen, SDL_Surface *surface, i
     dst.w = (Uint16) surface->w;
     dst.h = (Uint16) surface->h;
 
-    fill_rect_rgb565(screen, &outer, ui_theme()->preview_outer);
-    fill_rect_rgb565(screen, &inner, UI_COLOR_WARM_WHITE);
-    SDL_BlitSurface(surface, NULL, screen, &dst);
+    fill_rect_rgb565_mix(screen, &outer, ui_theme()->preview_outer, panel_mix);
+    fill_rect_rgb565_mix(screen, &inner, UI_COLOR_WARM_WHITE, panel_mix);
+    blit_surface_rgb565_mix(screen, surface, &dst, panel_mix);
 
     center_x = clamp_int(marker_x, outer.x + 5, outer.x + outer.w - 6);
     triangle.x = (Sint16) (center_x - 3);
     triangle.y = (Sint16) (outer.y + outer.h - 1);
     triangle.w = 7;
     triangle.h = 1;
-    fill_rect_rgb565(screen, &triangle, ui_theme()->preview_outer);
+    fill_rect_rgb565_mix(screen, &triangle, ui_theme()->preview_outer, panel_mix);
     triangle.x = (Sint16) (center_x - 2);
     triangle.y = (Sint16) (outer.y + outer.h);
     triangle.w = 5;
-    fill_rect_rgb565(screen, &triangle, ui_theme()->preview_outer);
+    fill_rect_rgb565_mix(screen, &triangle, ui_theme()->preview_outer, panel_mix);
     triangle.x = (Sint16) (center_x - 1);
     triangle.y = (Sint16) (outer.y + outer.h + 1);
     triangle.w = 3;
-    fill_rect_rgb565(screen, &triangle, ui_theme()->preview_outer);
+    fill_rect_rgb565_mix(screen, &triangle, ui_theme()->preview_outer, panel_mix);
     triangle.x = (Sint16) center_x;
     triangle.y = (Sint16) (outer.y + outer.h + 2);
     triangle.w = 1;
-    fill_rect_rgb565(screen, &triangle, ui_theme()->preview_outer);
+    fill_rect_rgb565_mix(screen, &triangle, ui_theme()->preview_outer, panel_mix);
     triangle.x = (Sint16) (center_x - 2);
     triangle.y = (Sint16) (outer.y + outer.h - 1);
     triangle.w = 5;
-    fill_rect_rgb565(screen, &triangle, UI_COLOR_WARM_WHITE);
+    fill_rect_rgb565_mix(screen, &triangle, UI_COLOR_WARM_WHITE, panel_mix);
     triangle.x = (Sint16) (center_x - 1);
     triangle.y = (Sint16) (outer.y + outer.h);
     triangle.w = 3;
-    fill_rect_rgb565(screen, &triangle, UI_COLOR_WARM_WHITE);
+    fill_rect_rgb565_mix(screen, &triangle, UI_COLOR_WARM_WHITE, panel_mix);
     triangle.x = (Sint16) center_x;
     triangle.y = (Sint16) (outer.y + outer.h + 1);
     triangle.w = 1;
-    fill_rect_rgb565(screen, &triangle, UI_COLOR_WARM_WHITE);
+    fill_rect_rgb565_mix(screen, &triangle, UI_COLOR_WARM_WHITE, panel_mix);
 }
 
 static void draw_screenshot_preview_osd(
@@ -10002,9 +10153,10 @@ static void draw_progress(
     Movie *movie,
     uint32_t current_ms,
     bool paused,
+    uint32_t now_ms,
     const PointerState *pointer,
     int32_t pending_seek_ms,
-    const SeekBarPreviewState *seek_preview,
+    SeekBarPreviewState *seek_preview,
     uint8_t preview_mix,
     uint8_t chrome_mix
 )
@@ -10089,6 +10241,7 @@ static void draw_progress(
         bool has_preview_anchor = false;
         bool use_cached_anchor = false;
         bool show_surface_preview = paused && seek_preview && seek_preview->surface;
+        uint8_t surface_mix = preview_mix;
 
         fill_rect_rgb565(screen, &marker, UI_COLOR_WHITE);
         hover_bar = pointer->y >= overlay.y && pointer->y < overlay.y + overlay.h;
@@ -10110,6 +10263,17 @@ static void draw_progress(
                     : (uint32_t) (((uint64_t) duration_ms * (uint32_t) (preview_marker_x - bar_back.x)) / (uint32_t) bar_back.w));
             format_clock(hover_ms, hover_text, sizeof(hover_text));
             if (show_surface_preview) {
+                if (seek_preview->surface_fade_pending) {
+                    seek_preview->surface_started_ms = now_ms != 0U ? now_ms : 1U;
+                    seek_preview->surface_fade_pending = false;
+                    surface_mix = 0;
+                } else if (seek_preview->surface_started_ms != 0U) {
+                    surface_mix = ui_ease_out_cubic(now_ms - seek_preview->surface_started_ms, UI_TOOLTIP_ANIM_MS);
+                    surface_mix = (uint8_t) (((uint32_t) surface_mix * surface_mix + 127U) / 255U);
+                    if (surface_mix > preview_mix) {
+                        surface_mix = preview_mix;
+                    }
+                }
                 preview_x = clamp_int(
                     preview_marker_x - ((seek_preview->surface->w + 4) / 2),
                     0,
@@ -10119,7 +10283,10 @@ static void draw_progress(
                 if (preview_y < 0) {
                     preview_y = 0;
                 }
-                draw_seek_preview_panel(screen, seek_preview->surface, preview_x, preview_y + preview_offset, preview_marker_x);
+                if (surface_mix > 0) {
+                    int surface_offset = ((255 - surface_mix) * 4 + 127) / 255;
+                    draw_seek_preview_panel(screen, seek_preview->surface, preview_x, preview_y + surface_offset, preview_marker_x, surface_mix);
+                }
             }
             if (preview_mix > 32) {
                 draw_centered_text_badge(screen, fonts, preview_marker_x, hover_badge_y + preview_offset, hover_text);
@@ -10178,7 +10345,7 @@ static void render_movie(
     SubtitlePlacement subtitle_placement,
     const char *status_overlay_text,
     const ScreenshotPreviewState *screenshot_preview,
-    const SeekBarPreviewState *seek_preview,
+    SeekBarPreviewState *seek_preview,
     uint32_t now_ms,
     const PointerState *pointer,
     int32_t pending_seek_ms,
@@ -10293,7 +10460,7 @@ static void render_movie(
                 draw_left_text_badge(screen, fonts, playback_badge_visible ? 36 : 8, top_overlay_y_for_rect(&dst, 16), status_overlay_text);
             }
         }
-        draw_progress(screen, fonts, movie, current_ms, paused, pointer, pending_seek_ms, seek_preview, ui_mixes ? ui_mixes->seek_preview : 0, chrome_mix);
+        draw_progress(screen, fonts, movie, current_ms, paused, now_ms, pointer, pending_seek_ms, seek_preview, ui_mixes ? ui_mixes->seek_preview : 0, chrome_mix);
         if (!help_menu_visible && pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
@@ -11529,6 +11696,17 @@ static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, 
         target_ms = 0;
     }
     preview->hover_ms = target_ms;
+    if (movie->header.frame_count == 0) {
+        return true;
+    }
+    target_frame = movie_frames_from_ms(movie, target_ms);
+    if (target_frame >= movie->header.frame_count) {
+        target_frame = movie->header.frame_count - 1U;
+    }
+    chunk_index = movie_chunk_for_frame(movie, target_frame);
+    if (chunk_index < 0) {
+        return false;
+    }
 
     if (!preview->tracking || pointer->moved || preview->last_pointer_x != marker_x) {
         preview->tracking = true;
@@ -11538,18 +11716,6 @@ static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, 
     }
     if ((int32_t) (now_ms - preview->last_move_ms) < (int32_t) SEEK_BAR_PREVIEW_DEBOUNCE_MS) {
         return true;
-    }
-    if (movie->header.frame_count == 0) {
-        return true;
-    }
-
-    target_frame = movie_frames_from_ms(movie, target_ms);
-    if (target_frame >= movie->header.frame_count) {
-        target_frame = movie->header.frame_count - 1U;
-    }
-    chunk_index = movie_chunk_for_frame(movie, target_frame);
-    if (chunk_index < 0) {
-        return false;
     }
     if (preview->surface && preview->decoded_chunk_index == chunk_index) {
         return true;
@@ -11603,6 +11769,8 @@ cleanup:
     }
     preview->surface = thumbnail;
     preview->decoded_chunk_index = chunk_index;
+    preview->surface_started_ms = 0;
+    preview->surface_fade_pending = true;
     return true;
 }
 
@@ -12630,6 +12798,9 @@ static int play_movie(
                 seek_preview.over_bar = false;
                 seek_preview.tracking = false;
                 seek_preview.last_pointer_x = -1;
+                if (!paused) {
+                    clear_seek_bar_preview(&seek_preview);
+                }
             }
         } else {
             seek_preview.over_bar = false;
@@ -13312,9 +13483,11 @@ static int play_movie(
             }
         }
         if (paused || frame_interval_ticks == 0 || seek_preroll_active) {
+            uint32_t idle_now_ms = monotonic_clock_now_ms();
             bool paused_ui_busy = paused && (
                 playback_ui_mixes_animating(&ui_mixes) ||
-                ui_time_before(monotonic_clock_now_ms(), paused_ui_quiet_until_ms)
+                seek_preview_surface_animating(&seek_preview, idle_now_ms) ||
+                ui_time_before(idle_now_ms, paused_ui_quiet_until_ms)
             );
 
             if (!paused_ui_busy) {
