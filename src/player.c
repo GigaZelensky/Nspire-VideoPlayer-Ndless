@@ -14021,6 +14021,7 @@ static int play_movie(
     uint32_t scale_badge_press_until_ms = 0;
     uint32_t speed_badge_press_until_ms = 0;
     bool playback_enter_press_active = false;
+    bool playback_pointer_press_active = false;
     bool hover_preview_needs_rebuffer = false;
     SDL_Surface *loading_snapshot = NULL;
     const char *movie_filename = path;
@@ -14293,6 +14294,9 @@ static int play_movie(
         }
         if (!enter_down) {
             playback_enter_press_active = false;
+        }
+        if (!pointer.down) {
+            playback_pointer_press_active = false;
         }
         if (divide_down || speed_key_down) {
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
@@ -15036,6 +15040,7 @@ static int play_movie(
             } else if (pointer_click) {
                 bool was_paused = paused;
 
+                playback_pointer_press_active = true;
                 trigger_playback_badge_press(&ui_transitions, &playback_badge_press_until_ms, now_ms);
                 playback_badge_press_triggered = true;
                 if (movie.current_frame + 1 >= movie.header.frame_count) {
@@ -15228,7 +15233,7 @@ static int play_movie(
                 show_ui || ui_transitions.help_menu.current_mix > 0,
                 help_menu_open,
                 playback_press_target,
-                playback_enter_press_active || ui_time_before(render_now_ms, playback_badge_press_until_ms),
+                playback_enter_press_active || playback_pointer_press_active || ui_time_before(render_now_ms, playback_badge_press_until_ms),
                 divide_down || ui_time_before(render_now_ms, scale_badge_press_until_ms),
                 speed_key_down || ui_time_before(render_now_ms, speed_badge_press_until_ms),
                 show_ui && !help_menu_open && pointer.visible && pointer.y < PLAYBACK_TITLE_TOP_EDGE_PX,
