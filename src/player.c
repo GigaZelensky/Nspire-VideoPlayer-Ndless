@@ -51,7 +51,7 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define UI_LOADING_ANIM_MS 150U
 #define UI_LOADING_DIM_ALPHA 112
 #define RESUME_PROMPT_DIM_ALPHA 112
-#define UI_DISMISS_ANIM_MS 130U
+#define UI_RETURN_COLLAPSE_ANIM_MS 210U
 #define RESUME_PROMPT_ANIM_MS 150U
 #define RESUME_MORPH_ANIM_MS 150U
 #define RESUME_INPUT_GUARD_MS 260U
@@ -11758,60 +11758,62 @@ static void finish_loading_transition(
     finish_loading_transition_ex(screen, snapshot, fonts, label, true);
 }
 
-static void set_return_transition_surface(SDL_Surface *screen, SDL_Surface **transition_surface)
+static void animate_movie_collapse_to_black(
+    SDL_Surface *screen,
+    Movie *movie,
+    ScaleMode scale_mode,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y,
+    SDL_Surface **overlay_surface
+)
 {
-    if (!transition_surface) {
-        return;
-    }
-    if (*transition_surface) {
-        SDL_FreeSurface(*transition_surface);
-    }
-    *transition_surface = capture_screen_surface(screen);
-}
-
-static void animate_surface_slide_down_over_current_screen(SDL_Surface *screen, SDL_Surface **foreground_surface)
-{
-    SDL_Surface *background = capture_screen_surface(screen);
-    SDL_Surface *foreground;
+    SDL_Rect src;
+    SDL_Rect start_dst;
     uint32_t started_ms = monotonic_clock_now_ms();
 
-    if (!foreground_surface || !*foreground_surface) {
-        if (background) {
-            SDL_FreeSurface(background);
+    if (!screen || !movie || !movie->frame_surface) {
+        present_black_screen(screen);
+        if (overlay_surface && *overlay_surface) {
+            SDL_FreeSurface(*overlay_surface);
+            *overlay_surface = NULL;
         }
         return;
     }
-    foreground = *foreground_surface;
-    *foreground_surface = NULL;
 
+    compute_video_rects(movie, scale_mode, video_align_x, video_align_y, &src, &start_dst);
     while (1) {
         uint32_t now_ms = monotonic_clock_now_ms();
         uint32_t elapsed_ms = now_ms - started_ms;
-        uint8_t move_mix = ui_ease_out_cubic(elapsed_ms, UI_DISMISS_ANIM_MS);
-        uint8_t fade_mix = ui_ease_smoothstep(elapsed_ms, UI_DISMISS_ANIM_MS);
-        uint8_t foreground_mix = (uint8_t) (255U - fade_mix);
-        int offset_y = (SCREEN_H * move_mix + 254) / 255;
+        uint8_t collapse_mix = ui_ease_smoothstep(elapsed_ms, UI_RETURN_COLLAPSE_ANIM_MS);
+        int remaining_h = ((int) start_dst.h * (255 - (int) collapse_mix) + 127) / 255;
+        SDL_Rect dst = start_dst;
 
-        if (background) {
-            SDL_BlitSurface(background, NULL, screen, NULL);
-        } else {
-            SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 8, 10, 14));
+        SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
+        if (remaining_h > 0) {
+            dst.y = (Sint16) (start_dst.y + (start_dst.h - remaining_h) / 2);
+            dst.h = (Uint16) remaining_h;
+            if (dst.w > 0 && dst.h > 0) {
+                SDL_SoftStretch(movie->frame_surface, &src, screen, &dst);
+            }
         }
-        if (foreground && offset_y < SCREEN_H) {
-            SDL_Rect dst = {0, (Sint16) offset_y, 0, 0};
-            blit_surface_rgb565_mix(screen, foreground, &dst, foreground_mix);
+        if (overlay_surface && *overlay_surface && collapse_mix < 255) {
+            uint8_t overlay_mix = (uint8_t) (255U - ui_ease_out_cubic(elapsed_ms, UI_CHROME_ANIM_MS));
+
+            if (overlay_mix > 0) {
+                SDL_Rect overlay_dst = {0, 0, 0, 0};
+                blit_surface_rgb565_mix(screen, *overlay_surface, &overlay_dst, overlay_mix);
+            }
         }
         present_screen(screen);
-        if (move_mix >= 255) {
+        if (collapse_mix >= 255) {
             break;
         }
         msleep(16);
     }
-    if (foreground) {
-        SDL_FreeSurface(foreground);
-    }
-    if (background) {
-        SDL_FreeSurface(background);
+    present_black_screen(screen);
+    if (overlay_surface && *overlay_surface) {
+        SDL_FreeSurface(*overlay_surface);
+        *overlay_surface = NULL;
     }
 }
 
@@ -12182,8 +12184,7 @@ static void render_picker(
     uint32_t now_ms,
     uint32_t intro_started_ms,
     const char *loading_label,
-    int loading_phase,
-    SDL_Surface **entry_transition_surface
+    int loading_phase
 )
 {
     const char *credit = "Made by GigaZelensky";
@@ -12251,11 +12252,7 @@ static void render_picker(
         if (pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
-        if (entry_transition_surface && *entry_transition_surface) {
-            animate_surface_slide_down_over_current_screen(screen, entry_transition_surface);
-        } else {
-            present_screen(screen);
-        }
+        present_screen(screen);
         return;
     }
     start_index = selected > (PICKER_VISIBLE_ROWS / 2) ? selected - (PICKER_VISIBLE_ROWS / 2) : 0;
@@ -12397,11 +12394,7 @@ static void render_picker(
     if (pointer && pointer->visible) {
         draw_cursor(screen, pointer->x, pointer->y);
     }
-    if (entry_transition_surface && *entry_transition_surface) {
-        animate_surface_slide_down_over_current_screen(screen, entry_transition_surface);
-    } else {
-        present_screen(screen);
-    }
+    present_screen(screen);
 }
 
 static void strip_filename(char *path)
@@ -13122,8 +13115,7 @@ static int pick_movie(
     const char *directory,
     char *selected_path,
     size_t selected_size,
-    bool *resume_without_prompt,
-    SDL_Surface **entry_transition_surface
+    bool *resume_without_prompt
 )
 {
     bool prev_up = false;
@@ -13178,9 +13170,7 @@ static int pick_movie(
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     pointer_hover_guard_reset(&hover_guard);
     picker_tooltip_hover_reset(&tooltip_hover);
-    intro_started_ms = (entry_transition_surface && *entry_transition_surface)
-        ? 0
-        : monotonic_clock_now_ms();
+    intro_started_ms = monotonic_clock_now_ms();
     while (1) {
         bool pointer_click = pointer_update(&pointer);
         uint32_t now_ms = monotonic_clock_now_ms();
@@ -13363,8 +13353,7 @@ static int pick_movie(
             now_ms,
             intro_started_ms,
             NULL,
-            0,
-            entry_transition_surface
+            0
         );
         if (screenshot_edge) {
             char saved_path[MAX_PATH_LEN];
@@ -13429,8 +13418,7 @@ static int pick_movie(
                     release_now_ms,
                     0,
                     NULL,
-                    0,
-                    NULL
+                    0
                 );
                 if (release_mix == 0) {
                     break;
@@ -13686,12 +13674,15 @@ static int prompt_resume_position(
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
         bool enter_down = prev_enter;
+        bool prompt_canceling = prompt_closing && prompt_closing_result < 0;
         uint32_t prompt_close_elapsed_ms = prompt_closing ? (now_ms - prompt_close_started_ms) : 0;
         uint8_t close_mix = prompt_closing
             ? ui_ease_out_cubic(prompt_close_elapsed_ms, RESUME_PROMPT_ANIM_MS)
             : 0;
         uint8_t morph_mix = prompt_closing
-            ? ui_ease_out_cubic(prompt_close_elapsed_ms, RESUME_MORPH_ANIM_MS)
+            ? (prompt_canceling
+                ? ui_ease_smoothstep(prompt_close_elapsed_ms, UI_RETURN_COLLAPSE_ANIM_MS)
+                : ui_ease_out_cubic(prompt_close_elapsed_ms, RESUME_MORPH_ANIM_MS))
             : 0;
         uint8_t prompt_mix = prompt_closing
             ? (uint8_t) (255U - close_mix)
@@ -13718,7 +13709,14 @@ static int prompt_resume_position(
         uint8_t button_press_mix;
 
         if (prompt_closing) {
-            if (morph_mix >= 255) {
+            if (prompt_canceling) {
+                int remaining_h = (SCREEN_H * (255 - (int) morph_mix) + 127) / 255;
+
+                background_dst.x = 0;
+                background_dst.y = (Sint16) ((SCREEN_H - remaining_h) / 2);
+                background_dst.w = SCREEN_W;
+                background_dst.h = (Uint16) remaining_h;
+            } else if (morph_mix >= 255) {
                 background_src = playback_src;
                 background_dst = playback_dst;
             } else {
@@ -13827,7 +13825,9 @@ static int prompt_resume_position(
             ui_save_theme_for_movie(path);
         }
         SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
-        SDL_SoftStretch(movie->frame_surface, &background_src, screen, &background_dst);
+        if (background_dst.w > 0 && background_dst.h > 0) {
+            SDL_SoftStretch(movie->frame_surface, &background_src, screen, &background_dst);
+        }
         dim_rect_rgb565(screen, &full_screen, dim_strength);
         if (prompt_mix > 0) {
             fill_rect_rgb565(screen, &draw_border, ui_theme()->menu_border);
@@ -13875,7 +13875,10 @@ static int prompt_resume_position(
             draw_cursor(screen, pointer.x, pointer.y);
         }
         present_screen(screen);
-        if (prompt_closing && close_mix >= 255) {
+        if (prompt_closing && (prompt_canceling ? morph_mix : close_mix) >= 255) {
+            if (prompt_canceling) {
+                present_black_screen(screen);
+            }
             free(title_main);
             free(title_detail);
             clear_screenshot_preview(&screenshot_preview);
@@ -13917,8 +13920,7 @@ static int play_movie(
     const char *path,
     char *next_path,
     size_t next_path_size,
-    bool resume_without_prompt,
-    SDL_Surface **return_transition_surface
+    bool resume_without_prompt
 )
 {
     static Movie movie;
@@ -14115,7 +14117,6 @@ static int play_movie(
                     debug_log_path_for_movie(path, log_path, sizeof(log_path));
                     debug_dump_session(log_path, &movie, "resume-cancel");
                 }
-                set_return_transition_surface(screen, return_transition_surface);
                 destroy_movie(&movie);
                 return 0;
             }
@@ -14208,7 +14209,16 @@ static int play_movie(
             break;
         }
         if (!display_power_state.off && !help_menu_open && esc_down && !esc_exit_suppressed_until_release) {
-            set_return_transition_surface(screen, return_transition_surface);
+            SDL_Surface *collapse_overlay = capture_screen_surface(screen);
+
+            animate_movie_collapse_to_black(
+                screen,
+                &movie,
+                scale_mode,
+                video_align_x,
+                video_align_y,
+                &collapse_overlay
+            );
             break;
         }
 
@@ -14538,7 +14548,16 @@ static int play_movie(
                 show_ui = true;
                 esc_exit_suppressed_until_release = true;
             } else {
-                set_return_transition_surface(screen, return_transition_surface);
+                SDL_Surface *collapse_overlay = capture_screen_surface(screen);
+
+                animate_movie_collapse_to_black(
+                    screen,
+                    &movie,
+                    scale_mode,
+                    video_align_x,
+                    video_align_y,
+                    &collapse_overlay
+                );
                 break;
             }
         }
@@ -15382,7 +15401,6 @@ int main(int argc, char **argv)
     int result = 0;
     bool have_queued_movie = false;
     bool resume_without_prompt = false;
-    SDL_Surface *picker_entry_transition_surface = NULL;
 
     if (argc < 1) {
         show_msgbox("ND Video Player", "Ndless did not provide argv[0].");
@@ -15434,8 +15452,7 @@ int main(int argc, char **argv)
                     directory,
                     movie_path,
                     sizeof(movie_path),
-                    &resume_without_prompt,
-                    &picker_entry_transition_surface) != 0) {
+                    &resume_without_prompt) != 0) {
                 break;
             }
         }
@@ -15446,8 +15463,7 @@ int main(int argc, char **argv)
             movie_path,
             queued_movie_path,
             sizeof(queued_movie_path),
-            resume_without_prompt,
-            &picker_entry_transition_surface
+            resume_without_prompt
         );
         argc = 1;
         if (result == PLAY_MOVIE_RESULT_AUTO_NEXT) {
@@ -15463,9 +15479,6 @@ int main(int argc, char **argv)
     }
 
     free_fonts(&fonts);
-    if (picker_entry_transition_surface) {
-        SDL_FreeSurface(picker_entry_transition_surface);
-    }
     SDL_Quit();
     sram_shutdown();
     monotonic_clock_shutdown();
