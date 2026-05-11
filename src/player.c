@@ -1710,6 +1710,16 @@ static void clear_seek_bar_preview(SeekBarPreviewState *preview)
     preview->decode_job.chunk_index = -1;
 }
 
+static void suppress_seek_bar_preview_rebuild(SeekBarPreviewState *preview, int marker_x, uint32_t frame_index)
+{
+    if (!preview) {
+        return;
+    }
+    preview->suppress_until_pointer_moves = true;
+    preview->suppress_marker_x = marker_x;
+    preview->suppress_frame_index = frame_index;
+}
+
 static bool monotonic_clock_try_init_hw_timer(void)
 {
     if (is_classic) {
@@ -8862,6 +8872,55 @@ static SDL_Rect progress_bar_rect(void)
     return rect;
 }
 
+static uint32_t progress_bar_denominator(const SDL_Rect *bar)
+{
+    return bar && bar->w > 1 ? (uint32_t) (bar->w - 1) : 1U;
+}
+
+static int progress_bar_marker_x_from_pointer(const SDL_Rect *bar, int pointer_x)
+{
+    if (!bar) {
+        return 0;
+    }
+    return clamp_int(pointer_x, bar->x, bar->x + bar->w - 1);
+}
+
+static uint32_t progress_bar_ms_for_marker(const Movie *movie, const SDL_Rect *bar, int marker_x)
+{
+    uint32_t duration_ms;
+
+    if (!movie || !bar) {
+        return 0;
+    }
+    duration_ms = movie_duration_ms(movie);
+    if (duration_ms == 0) {
+        return 0;
+    }
+    marker_x = progress_bar_marker_x_from_pointer(bar, marker_x);
+    return (uint32_t) (((uint64_t) duration_ms * (uint32_t) (marker_x - bar->x)) / progress_bar_denominator(bar));
+}
+
+static bool progress_bar_target_frame_for_marker(const Movie *movie, const SDL_Rect *bar, int marker_x, uint32_t *out_target_frame, uint32_t *out_target_ms)
+{
+    uint32_t target_ms;
+    uint32_t target_frame;
+
+    if (!movie || !bar || !out_target_frame || movie->header.frame_count == 0) {
+        return false;
+    }
+
+    target_ms = progress_bar_ms_for_marker(movie, bar, marker_x);
+    target_frame = movie_frames_from_ms(movie, target_ms);
+    if (target_frame >= movie->header.frame_count) {
+        target_frame = movie->header.frame_count - 1U;
+    }
+    *out_target_frame = target_frame;
+    if (out_target_ms) {
+        *out_target_ms = target_ms;
+    }
+    return true;
+}
+
 #define UI_RGB565(r, g, b) ((Uint16) (((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3))))
 
 enum {
@@ -11327,6 +11386,38 @@ static void draw_progress_track(SDL_Surface *screen, const SDL_Rect *bar_back, U
     fill_rect_rgb565(screen, &bottom_edge, ui_theme()->progress_edge_bottom);
 }
 
+static void draw_progress_buffer_range(SDL_Surface *screen, const SDL_Rect *rect)
+{
+    SDL_Rect line;
+    Uint16 top;
+    Uint16 bottom;
+
+    if (!screen || !rect || rect->w == 0 || rect->h == 0) {
+        return;
+    }
+
+    top = blend_rgb565(
+        blend_rgb565(ui_theme()->buffer_top, ui_theme()->progress_fill_top, 96),
+        UI_COLOR_WHITE,
+        42
+    );
+    bottom = blend_rgb565(
+        blend_rgb565(ui_theme()->buffer_bottom, ui_theme()->buffer_top, 155),
+        UI_COLOR_WHITE,
+        18
+    );
+    draw_vertical_gradient(screen, rect, top, bottom);
+    if (rect->h > 2) {
+        line.x = rect->x;
+        line.y = rect->y;
+        line.w = rect->w;
+        line.h = 1;
+        fill_rect_rgb565_mix(screen, &line, UI_COLOR_WHITE, 56);
+        line.y = (Sint16) (rect->y + rect->h - 1);
+        fill_rect_rgb565_mix(screen, &line, UI_COLOR_BLACK, 12);
+    }
+}
+
 static void draw_progress_overlay(SDL_Surface *screen, const SDL_Rect *overlay)
 {
     Uint16 base = ui_theme()->progress_overlay_base;
@@ -11476,14 +11567,28 @@ static void draw_progress(
 
             if (prefetch_rect.w > 0) {
                 SDL_Rect sep = {prefetch_rect.x + prefetch_rect.w - 1, prefetch_rect.y, 1, prefetch_rect.h};
-                draw_vertical_gradient(screen, &prefetch_rect, ui_theme()->buffer_top, ui_theme()->buffer_bottom);
-                fill_rect_rgb565(screen, &sep, ui_theme()->buffer_separator);
+                draw_progress_buffer_range(screen, &prefetch_rect);
+                if (prefetch_rect.w > 2) {
+                    fill_rect_rgb565_mix(screen, &sep, UI_COLOR_BLACK, 28);
+                }
             }
         }
     }
     bar_front.w = 0;
-    if (duration_ms > 0) {
+    if (seek_preview &&
+        seek_preview->suppress_until_pointer_moves &&
+        seek_preview->suppress_frame_index == movie->current_frame &&
+        seek_preview->suppress_marker_x >= bar_back.x &&
+        seek_preview->suppress_marker_x < bar_back.x + bar_back.w) {
+        bar_front.w = (Uint16) (seek_preview->suppress_marker_x - bar_back.x + 1);
+    } else if (duration_ms > 0) {
         bar_front.w = (Uint16) (((uint64_t) bar_back.w * current_ms) / duration_ms);
+        if (movie->header.frame_count > 0 && bar_front.w == 0) {
+            bar_front.w = 1;
+        }
+        if (movie->header.frame_count > 0 && movie->current_frame + 1U >= movie->header.frame_count) {
+            bar_front.w = bar_back.w;
+        }
     }
     if (bar_front.w > 0) {
         SDL_Rect glow = {bar_front.x, (Sint16) (bar_front.y + 1), bar_front.w, 1};
@@ -11493,7 +11598,7 @@ static void draw_progress(
         fill_rect_rgb565(screen, &cap, ui_theme()->progress_fill_cap);
     }
     if (pointer && pointer->visible) {
-        int marker_x = clamp_int(pointer->x, bar_back.x, bar_back.x + bar_back.w - 1);
+        int marker_x = progress_bar_marker_x_from_pointer(&bar_back, pointer->x);
         SDL_Rect marker = {(Sint16) marker_x, (Sint16) (bar_back.y - 3), 1, 12};
         int preview_marker_x = marker_x;
         bool has_preview_anchor = false;
@@ -11515,10 +11620,10 @@ static void draw_progress(
             int preview_x;
             int preview_offset = ((255 - preview_mix) * 4 + 127) / 255;
             hover_ms = hover_bar
-                ? (uint32_t) (((uint64_t) duration_ms * (uint32_t) (preview_marker_x - bar_back.x)) / (uint32_t) bar_back.w)
+                ? progress_bar_ms_for_marker(movie, &bar_back, preview_marker_x)
                 : (use_cached_anchor
                     ? seek_preview->hover_ms
-                    : (uint32_t) (((uint64_t) duration_ms * (uint32_t) (preview_marker_x - bar_back.x)) / (uint32_t) bar_back.w));
+                    : progress_bar_ms_for_marker(movie, &bar_back, preview_marker_x));
             format_clock(hover_ms, hover_text, sizeof(hover_text));
             if (show_surface_preview) {
                 if (seek_preview->surface_fade_pending) {
@@ -13581,22 +13686,17 @@ static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, 
     }
 
     preview->over_bar = true;
-    marker_x = clamp_int(pointer->x, bar.x, bar.x + bar.w - 1);
+    marker_x = progress_bar_marker_x_from_pointer(&bar, pointer->x);
     preview->marker_x = marker_x;
-    duration_ms = movie_duration_ms(movie);
-    if (duration_ms > 0) {
-        target_ms = (uint32_t) (((uint64_t) duration_ms * (uint32_t) (marker_x - bar.x)) / (uint32_t) bar.w);
-    } else {
-        target_ms = 0;
-    }
-    preview->hover_ms = target_ms;
     if (movie->header.frame_count == 0) {
+        preview->hover_ms = 0;
         return true;
     }
-    target_frame = movie_frames_from_ms(movie, target_ms);
-    if (target_frame >= movie->header.frame_count) {
-        target_frame = movie->header.frame_count - 1U;
+    duration_ms = movie_duration_ms(movie);
+    if (!progress_bar_target_frame_for_marker(movie, &bar, marker_x, &target_frame, &target_ms)) {
+        return false;
     }
+    preview->hover_ms = duration_ms > 0 ? target_ms : 0;
     chunk_index = movie_chunk_for_frame(movie, target_frame);
     if (chunk_index < 0) {
         return false;
@@ -14033,24 +14133,6 @@ static bool seek_delta_target_frame(const Movie *movie, int32_t delta_ms, uint32
         target_ms = duration_ms > 1 ? duration_ms - 1 : 0;
     }
     target_frame = movie_frames_from_ms(movie, (uint32_t) target_ms);
-    if (target_frame >= movie->header.frame_count) {
-        target_frame = movie->header.frame_count - 1;
-    }
-    *out_target_frame = target_frame;
-    return true;
-}
-
-static bool seek_ratio_target_frame(const Movie *movie, uint32_t numerator, uint32_t denominator, uint32_t *out_target_frame)
-{
-    uint32_t duration_ms;
-    uint32_t target_ms;
-    uint32_t target_frame;
-    if (!movie || !out_target_frame || denominator == 0 || movie->header.frame_count == 0) {
-        return false;
-    }
-    duration_ms = movie_duration_ms(movie);
-    target_ms = (uint32_t) (((uint64_t) duration_ms * numerator) / denominator);
-    target_frame = movie_frames_from_ms(movie, target_ms);
     if (target_frame >= movie->header.frame_count) {
         target_frame = movie->header.frame_count - 1;
     }
@@ -15654,21 +15736,21 @@ static int play_movie(
             }
 
             if (pointer_click && show_ui_before_pointer_activation && pointer.y >= SCREEN_H - UI_BAR_H && pointer.y < SCREEN_H) {
-                int seek_x = clamp_int(pointer.x, bar.x, bar.x + bar.w);
-                int seek_marker_x = clamp_int(pointer.x, bar.x, bar.x + bar.w - 1);
+                int seek_marker_x = progress_bar_marker_x_from_pointer(&bar, pointer.x);
                 uint32_t target_frame;
                 uint32_t seek_render_now_ms;
                 CommittedSeekRenderContext seek_context;
                 bool used_preview_frame = false;
 
                 seek_render_now_ms = monotonic_clock_now_ms();
-                if (!seek_ratio_target_frame(&movie, (uint32_t) (seek_x - bar.x), (uint32_t) bar.w, &target_frame)) {
+                if (!progress_bar_target_frame_for_marker(&movie, &bar, seek_marker_x, &target_frame, NULL)) {
                     report_movie_decode_failure(&movie, path, "pointer seek");
                     result = -1;
                     break;
                 }
                 if (target_frame == movie.current_frame) {
                     clear_seek_bar_preview(&seek_preview);
+                    suppress_seek_bar_preview_rebuild(&seek_preview, seek_marker_x, target_frame);
                 } else {
                     memset(&seek_context, 0, sizeof(seek_context));
                     seek_context.screen = screen;
@@ -15720,6 +15802,7 @@ static int play_movie(
                     seek_context.target_frame = target_frame;
                     used_preview_frame = commit_seek_bar_preview_to_movie(&movie, &seek_preview, target_frame);
                     clear_seek_bar_preview(&seek_preview);
+                    suppress_seek_bar_preview_rebuild(&seek_preview, seek_marker_x, target_frame);
                     if (used_preview_frame) {
                         render_committed_seek_frame(&movie, movie.current_frame, &seek_context);
                     }
@@ -15746,9 +15829,6 @@ static int play_movie(
                         reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
                     }
                 }
-                seek_preview.suppress_until_pointer_moves = true;
-                seek_preview.suppress_marker_x = seek_marker_x;
-                seek_preview.suppress_frame_index = target_frame;
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             } else if (pointer_click) {
                 bool was_paused = paused;
