@@ -33,8 +33,8 @@ extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
 #define PICKER_MAX_FILES 128
 #define PICKER_VISIBLE_ROWS 8
 #define PICKER_TOOLTIP_DWELL_MS 450U
-#define PICKER_SELECTION_ANIM_MS 120U
-#define PICKER_DESELECTION_ANIM_MS 85U
+#define PICKER_SELECTION_ANIM_MS 155U
+#define PICKER_DESELECTION_ANIM_MS 90U
 #define PICKER_INTRO_ANIM_MS 360U
 #define PICKER_INTRO_ROW_STAGGER_MS 28U
 #define PICKER_PRESS_RELEASE_ANIM_MS 94U
@@ -9594,6 +9594,122 @@ static Uint16 ui_mix_uint16(int from, int to, uint8_t mix)
     return (Uint16) clamp_int(ui_mix_int(from, to, mix), 0, 32767);
 }
 
+static void fill_picker_selection_line(
+    SDL_Surface *screen,
+    const SDL_Rect *line,
+    Uint16 target_color,
+    uint8_t mix
+)
+{
+    fill_rect_rgb565(
+        screen,
+        line,
+        rgb565_lerp(picker_background_color_at_y(line->y), target_color, mix, 255)
+    );
+}
+
+static void draw_picker_selection_panel_mix(
+    SDL_Surface *screen,
+    const SDL_Rect *rect,
+    Uint16 base_color,
+    uint8_t selection_mix
+)
+{
+    int row;
+    int denominator;
+    int gloss_rows;
+    uint8_t highlight_mix;
+    Uint16 top;
+    Uint16 bottom;
+    Uint16 outline;
+    SDL_Rect line;
+    SDL_Rect side;
+
+    if (!screen || !rect || rect->w < 2 || rect->h < 2 || selection_mix == 0) {
+        return;
+    }
+
+    highlight_mix = (uint8_t) clamp_int(
+        selection_mix + (((255 - selection_mix) * (int) selection_mix + 768) / 1536),
+        0,
+        255
+    );
+    top = blend_rgb565(base_color, UI_COLOR_ACCENT_HOT, 74);
+    top = blend_rgb565(top, UI_COLOR_WHITE, (48 * highlight_mix + 127) / 255);
+    bottom = blend_rgb565(base_color, UI_COLOR_BLACK, 72);
+    denominator = rect->h > 1 ? rect->h - 1 : 1;
+
+    line.x = rect->x;
+    line.w = rect->w;
+    line.h = 1;
+    for (row = 0; row < rect->h; ++row) {
+        line.y = (Sint16) (rect->y + row);
+        fill_picker_selection_line(
+            screen,
+            &line,
+            rgb565_lerp(top, bottom, row, denominator),
+            selection_mix
+        );
+    }
+
+    if (rect->h >= 4 && rect->w >= 4) {
+        gloss_rows = rect->h >= 48 ? rect->h / 4 : (rect->h / 2) - 1;
+        line.x = (Sint16) (rect->x + 1);
+        line.w = (Uint16) (rect->w - 2);
+        for (row = 1; row < gloss_rows; ++row) {
+            int alpha = clamp_int(130 - (row * 9), 18, 130);
+
+            line.y = (Sint16) (rect->y + row);
+            fill_picker_selection_line(
+                screen,
+                &line,
+                blend_rgb565(base_color, UI_COLOR_WHITE, alpha),
+                highlight_mix
+            );
+        }
+    }
+
+    if (rect->w > 2) {
+        line.x = (Sint16) (rect->x + 1);
+        line.y = (Sint16) (rect->y + 1);
+        line.w = (Uint16) (rect->w - 2);
+        line.h = 1;
+        fill_picker_selection_line(
+            screen,
+            &line,
+            blend_rgb565(base_color, UI_COLOR_ACCENT_HOT, 146),
+            highlight_mix
+        );
+        line.y = (Sint16) (rect->y + rect->h - 1);
+        fill_picker_selection_line(
+            screen,
+            &line,
+            blend_rgb565(base_color, UI_COLOR_BLACK, 150),
+            selection_mix
+        );
+    }
+
+    outline = blend_rgb565(UI_COLOR_ACCENT, base_color, 68);
+    if (rect->w > 2) {
+        line.x = (Sint16) (rect->x + 1);
+        line.y = rect->y;
+        line.w = (Uint16) (rect->w - 2);
+        line.h = 1;
+        fill_picker_selection_line(screen, &line, outline, selection_mix);
+        line.y = (Sint16) (rect->y + rect->h - 1);
+        fill_picker_selection_line(screen, &line, outline, selection_mix);
+    }
+    if (rect->h > 2) {
+        side.x = rect->x;
+        side.y = (Sint16) (rect->y + 1);
+        side.w = 1;
+        side.h = (Uint16) (rect->h - 2);
+        fill_picker_selection_line(screen, &side, outline, selection_mix);
+        side.x = (Sint16) (rect->x + rect->w - 1);
+        fill_picker_selection_line(screen, &side, outline, selection_mix);
+    }
+}
+
 static void draw_glass_panel_mix(SDL_Surface *screen, const SDL_Rect *rect, Uint16 base_color, uint8_t selected_mix)
 {
     SDL_Rect gloss;
@@ -12356,6 +12472,24 @@ static void draw_resume_prompt_background(SDL_Surface *screen, Movie *movie)
     dim_rect_rgb565(screen, &full_screen, RESUME_PROMPT_DIM_ALPHA);
 }
 
+static SDL_Rect picker_row_rect_for_y(int row_y)
+{
+    SDL_Rect row = {12, (Sint16) (row_y - 5), SCREEN_W - 24, 20};
+    return row;
+}
+
+static SDL_Rect picker_row_divider_rect(const SDL_Rect *row)
+{
+    SDL_Rect divider = {12, 0, SCREEN_W - 24, 1};
+
+    if (row) {
+        divider.x = (Sint16) (row->x + 4);
+        divider.y = (Sint16) (row->y + row->h - 1);
+        divider.w = (Uint16) (row->w - 8);
+    }
+    return divider;
+}
+
 static int picker_row_index_at(size_t count, size_t selected, int x, int y)
 {
     size_t start_index;
@@ -12375,7 +12509,7 @@ static int picker_row_index_at(size_t count, size_t selected, int x, int y)
         end_index = count;
     }
     for (index = start_index; index < end_index && row_y < SCREEN_H - 20; ++index) {
-        SDL_Rect row = {8, (Sint16) (row_y - 5), SCREEN_W - 24, 20};
+        SDL_Rect row = picker_row_rect_for_y(row_y);
 
         if (rect_contains_point(&row, x, y)) {
             return (int) index;
@@ -12393,7 +12527,10 @@ static bool picker_resume_badge_rect(const Fonts *fonts, const MovieFile *file, 
         return false;
     }
     text_w = nSDL_GetStringWidth(fonts->white, "RESUME");
-    rect->x = (Sint16) (SCREEN_W - 24 - text_w - 12);
+    {
+        SDL_Rect row = picker_row_rect_for_y(row_y);
+        rect->x = (Sint16) (row.x + row.w - 8 - text_w - 12);
+    }
     rect->y = (Sint16) (row_y - 3);
     rect->w = (Uint16) (text_w + 12);
     rect->h = 16;
@@ -12920,15 +13057,7 @@ static void draw_resume_hover_tooltip(
 
 static uint8_t picker_selection_ease(uint32_t elapsed_ms, uint32_t duration_ms)
 {
-    uint32_t t;
-    uint32_t inverse;
-
-    if (duration_ms == 0 || elapsed_ms >= duration_ms) {
-        return 255;
-    }
-    t = (elapsed_ms * 255U) / duration_ms;
-    inverse = 255U - t;
-    return (uint8_t) (255U - ((inverse * inverse) / 255U));
+    return ui_ease_smoothstep(elapsed_ms, duration_ms);
 }
 
 static uint8_t picker_row_selection_mix(
@@ -12936,7 +13065,9 @@ static uint8_t picker_row_selection_mix(
     size_t selected,
     size_t previous_selected,
     uint32_t selection_anim_started_ms,
-    uint32_t now_ms
+    uint32_t now_ms,
+    uint8_t selected_start_mix,
+    uint8_t previous_start_mix
 )
 {
     uint8_t eased;
@@ -12946,7 +13077,8 @@ static uint8_t picker_row_selection_mix(
     }
     eased = picker_selection_ease(now_ms - selection_anim_started_ms, PICKER_SELECTION_ANIM_MS);
     if (index == selected) {
-        return eased;
+        return (uint8_t) (selected_start_mix +
+            (((255U - selected_start_mix) * eased + 127U) / 255U));
     }
     if (index == previous_selected) {
         uint8_t out_eased = picker_selection_ease(
@@ -12954,9 +13086,54 @@ static uint8_t picker_row_selection_mix(
             PICKER_DESELECTION_ANIM_MS
         );
 
-        return (uint8_t) (255U - out_eased);
+        return (uint8_t) (previous_start_mix -
+            ((previous_start_mix * out_eased + 127U) / 255U));
     }
     return 0;
+}
+
+static void picker_set_selected_row(
+    size_t *selected,
+    size_t *previous_selected,
+    uint32_t *selection_anim_started_ms,
+    uint8_t *selected_start_mix,
+    uint8_t *previous_start_mix,
+    size_t next_selected,
+    uint32_t now_ms
+)
+{
+    uint8_t outgoing_mix;
+    uint8_t incoming_mix;
+
+    if (!selected || !previous_selected || !selection_anim_started_ms ||
+        !selected_start_mix || !previous_start_mix || *selected == next_selected) {
+        return;
+    }
+
+    outgoing_mix = picker_row_selection_mix(
+        *selected,
+        *selected,
+        *previous_selected,
+        *selection_anim_started_ms,
+        now_ms,
+        *selected_start_mix,
+        *previous_start_mix
+    );
+    incoming_mix = picker_row_selection_mix(
+        next_selected,
+        *selected,
+        *previous_selected,
+        *selection_anim_started_ms,
+        now_ms,
+        *selected_start_mix,
+        *previous_start_mix
+    );
+
+    *previous_selected = *selected;
+    *selected = next_selected;
+    *previous_start_mix = outgoing_mix;
+    *selected_start_mix = incoming_mix;
+    *selection_anim_started_ms = now_ms ? now_ms : 1U;
 }
 
 static uint8_t prompt_button_selection_mix(
@@ -13019,6 +13196,8 @@ static void render_picker(
     size_t selected,
     size_t previous_selected,
     uint32_t selection_anim_started_ms,
+    uint8_t selected_start_mix,
+    uint8_t previous_start_mix,
     int movie_tooltip_index,
     uint8_t movie_tooltip_mix,
     int resume_badge_hover_index,
@@ -13113,9 +13292,9 @@ static void render_picker(
         end_index = count;
     }
     for (index = start_index; index < end_index && y < SCREEN_H - 20; ++index) {
-        SDL_Rect row = {8, (Sint16) (y - 5), SCREEN_W - 24, 20};
+        SDL_Rect row = picker_row_rect_for_y(y);
         SDL_Rect draw_row = row;
-        SDL_Rect divider = {12, (Sint16) (row.y + row.h - 1), SCREEN_W - 32, 1};
+        SDL_Rect divider = picker_row_divider_rect(&row);
         SDL_Rect resume_badge;
         bool has_resume_badge = picker_resume_badge_rect(fonts, &files[index], y, &resume_badge);
         uint8_t row_intro_mix = picker_intro_mix(
@@ -13135,7 +13314,9 @@ static void render_picker(
             selected,
             previous_selected,
             selection_anim_started_ms,
-            now_ms
+            now_ms,
+            selected_start_mix,
+            previous_start_mix
         );
         row.y = (Sint16) (row.y + row_intro_offset_y);
         draw_row = row;
@@ -13144,16 +13325,20 @@ static void render_picker(
             resume_badge.y = (Sint16) (resume_badge.y + row_intro_offset_y);
         }
         selection_mix = (uint8_t) (((uint16_t) selection_mix * row_intro_mix + 127U) / 255U);
-        int text_x = 12 + ((int) selection_mix * 8 + 127) / 255 + row_press_offset_x;
+        int text_x = row.x + 4 + ((int) selection_mix * 8 + 127) / 255 + row_press_offset_x;
         int text_y = y + row_intro_offset_y + row_press_offset_y;
-        int reserved_right = has_resume_badge ? resume_badge.w + 10 : 0;
-        int text_max_width = SCREEN_W - text_x - 28 - reserved_right;
+        int text_right_limit = has_resume_badge
+            ? resume_badge.x - 8
+            : row.x + row.w - 12;
+        int text_max_width = text_right_limit - text_x;
         char fitted_title[128];
+        if (text_max_width < 16) {
+            text_max_width = 16;
+        }
         if (selection_mix > 0) {
-            Uint16 row_color = rgb565_lerp(ui_theme()->gunmetal, ui_theme()->row_selected, selection_mix, 255);
+            Uint16 row_color = pressed_control_base(ui_theme()->row_selected, row_press_mix);
 
-            row_color = pressed_control_base(row_color, row_press_mix);
-            draw_glass_panel(screen, &draw_row, row_color, selection_mix > 170);
+            draw_picker_selection_panel_mix(screen, &draw_row, row_color, selection_mix);
             draw_pressed_control_reflection(screen, &draw_row, row_press_mix);
             cut_rect_corners(screen, &draw_row, picker_background_color_at_y(draw_row.y));
         } else {
@@ -14052,6 +14237,8 @@ static int pick_movie(
     size_t selected = 0;
     size_t previous_selected = 0;
     uint32_t selection_anim_started_ms = 0;
+    uint8_t selected_start_mix = 0;
+    uint8_t previous_start_mix = 0;
     uint32_t intro_started_ms = 0;
     UiTransition resume_badge_anim;
     UiTransition resume_tooltip_anim;
@@ -14121,10 +14308,12 @@ static int pick_movie(
             keyboard_resume_focused = false;
         }
         if (hovered_index >= 0) {
-            picker_set_selected(
+            picker_set_selected_row(
                 &selected,
                 &previous_selected,
                 &selection_anim_started_ms,
+                &selected_start_mix,
+                &previous_start_mix,
                 (size_t) hovered_index,
                 now_ms
             );
@@ -14259,6 +14448,8 @@ static int pick_movie(
             selected,
             previous_selected,
             selection_anim_started_ms,
+            selected_start_mix,
+            previous_start_mix,
             movie_tooltip_anim_index,
             movie_tooltip_mix,
             resume_badge_anim_index,
@@ -14291,10 +14482,12 @@ static int pick_movie(
         }
         if (enter_press_stage == 0 && key_pressed_edge(KEY_NSPIRE_UP, &prev_up) && selected > 0) {
             keyboard_resume_focused = false;
-            picker_set_selected(
+            picker_set_selected_row(
                 &selected,
                 &previous_selected,
                 &selection_anim_started_ms,
+                &selected_start_mix,
+                &previous_start_mix,
                 selected - 1,
                 now_ms
             );
@@ -14302,10 +14495,12 @@ static int pick_movie(
         }
         if (enter_press_stage == 0 && key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) && selected + 1 < count) {
             keyboard_resume_focused = false;
-            picker_set_selected(
+            picker_set_selected_row(
                 &selected,
                 &previous_selected,
                 &selection_anim_started_ms,
+                &selected_start_mix,
+                &previous_start_mix,
                 selected + 1,
                 now_ms
             );
@@ -14332,6 +14527,8 @@ static int pick_movie(
                     selected,
                     previous_selected,
                     selection_anim_started_ms,
+                    selected_start_mix,
+                    previous_start_mix,
                     -1,
                     0,
                     -1,
