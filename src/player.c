@@ -5368,7 +5368,9 @@ static bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respec
         uint64_t dynamic_block_size;
 
         if (time_left_ms <= 0) {
-            return false;
+            /* The cooperative slice expired. Keep the partial read alive so
+             * the next tick can continue it instead of restarting flash I/O. */
+            return true;
         }
         bytes_per_ms = movie->last_read_bytes / (movie->last_read_time_ms > 0 ? movie->last_read_time_ms : 1U);
         dynamic_block_size = (uint64_t) (uint32_t) time_left_ms * (uint64_t) bytes_per_ms;
