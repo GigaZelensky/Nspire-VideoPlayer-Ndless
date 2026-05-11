@@ -15753,8 +15753,14 @@ static int play_movie(
                 result = -1;
                 break;
             }
-            begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
             hover_preview_needs_rebuffer = false;
+            if (paused) {
+                begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+            } else {
+                seek_preroll_active = false;
+                seek_preroll_started_ms = 0;
+                seek_preroll_target_ready_count = 0;
+            }
             seek_badge_ms = pending_seek_ms;
             seek_badge_hide_elapsed_ms = SEEK_BADGE_HIDE_PENDING;
             pending_seek_ms = 0;
