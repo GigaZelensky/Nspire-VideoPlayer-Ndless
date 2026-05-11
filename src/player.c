@@ -9796,6 +9796,204 @@ static void draw_ui_label(SDL_Surface *screen, const Fonts *fonts, int x, int y,
     nSDL_DrawString(screen, fonts->white, x, y, "%s", label);
 }
 
+typedef struct {
+    nSDL_Font *font;
+    bool valid[NSP_FONT_NUMCHARS];
+    int min_x[NSP_FONT_NUMCHARS];
+    int max_x[NSP_FONT_NUMCHARS];
+} FontInkBoundsCache;
+
+static bool surface_pixel_has_ink(SDL_Surface *surface, int x, int y)
+{
+    Uint8 *pixel;
+    Uint32 value = 0;
+    Uint32 color_key = 0;
+    bool has_color_key = false;
+
+    if (!surface || x < 0 || y < 0 || x >= surface->w || y >= surface->h) {
+        return false;
+    }
+
+    if ((surface->flags & SDL_SRCCOLORKEY) != 0) {
+        color_key = surface->format->colorkey;
+        has_color_key = true;
+    }
+
+    pixel = (Uint8 *) surface->pixels + (y * surface->pitch) + (x * surface->format->BytesPerPixel);
+    switch (surface->format->BytesPerPixel) {
+        case 1:
+            value = *pixel;
+            break;
+        case 2:
+            value = *(Uint16 *) pixel;
+            break;
+        case 3:
+#if SDL_BYTEORDER == SDL_BIG_ENDIAN
+            value = ((Uint32) pixel[0] << 16) | ((Uint32) pixel[1] << 8) | pixel[2];
+#else
+            value = pixel[0] | ((Uint32) pixel[1] << 8) | ((Uint32) pixel[2] << 16);
+#endif
+            break;
+        case 4:
+            value = *(Uint32 *) pixel;
+            break;
+        default:
+            return false;
+    }
+    if (has_color_key && value == color_key) {
+        return false;
+    }
+    return value != 0;
+}
+
+static bool font_char_ink_bounds(nSDL_Font *font, unsigned char ch, int *out_min_x, int *out_max_x)
+{
+    static FontInkBoundsCache cache;
+    SDL_Surface *glyph;
+    int scan_w;
+    int min_x;
+    int max_x;
+    int x;
+    int y;
+    bool locked = false;
+
+    if (!font || !out_min_x || !out_max_x) {
+        return false;
+    }
+    if (cache.font != font) {
+        memset(&cache, 0, sizeof(cache));
+        cache.font = font;
+    }
+    if (cache.valid[ch]) {
+        *out_min_x = cache.min_x[ch];
+        *out_max_x = cache.max_x[ch];
+        return cache.max_x[ch] >= cache.min_x[ch];
+    }
+
+    glyph = font->chars[ch];
+    scan_w = font->monospaced ? NSP_FONT_WIDTH : font->char_width[ch];
+    if (!glyph || scan_w <= 0) {
+        cache.valid[ch] = true;
+        cache.min_x[ch] = 0;
+        cache.max_x[ch] = -1;
+        *out_min_x = 0;
+        *out_max_x = -1;
+        return false;
+    }
+    if (scan_w > glyph->w) {
+        scan_w = glyph->w;
+    }
+
+    if (SDL_MUSTLOCK(glyph)) {
+        if (SDL_LockSurface(glyph) != 0) {
+            return false;
+        }
+        locked = true;
+    }
+
+    min_x = scan_w;
+    max_x = -1;
+    for (y = 0; y < glyph->h; ++y) {
+        for (x = 0; x < scan_w; ++x) {
+            if (surface_pixel_has_ink(glyph, x, y)) {
+                if (x < min_x) {
+                    min_x = x;
+                }
+                if (x > max_x) {
+                    max_x = x;
+                }
+            }
+        }
+    }
+
+    if (locked) {
+        SDL_UnlockSurface(glyph);
+    }
+
+    cache.valid[ch] = true;
+    cache.min_x[ch] = min_x;
+    cache.max_x[ch] = max_x;
+    *out_min_x = min_x;
+    *out_max_x = max_x;
+    return max_x >= min_x;
+}
+
+static int font_char_advance_width(nSDL_Font *font, unsigned char ch)
+{
+    int width;
+
+    if (!font) {
+        return 0;
+    }
+    width = font->monospaced ? NSP_FONT_WIDTH : font->char_width[ch];
+    if (width < 0) {
+        width = 0;
+    }
+    return width + font->hspacing;
+}
+
+static bool font_string_ink_bounds(nSDL_Font *font, const char *text, int *out_min_x, int *out_max_x)
+{
+    int pen_x = 0;
+    int min_x = 32767;
+    int max_x = -32768;
+    bool has_ink = false;
+
+    if (!font || !text || !out_min_x || !out_max_x) {
+        return false;
+    }
+
+    while (*text) {
+        unsigned char ch = (unsigned char) *text++;
+        int char_min_x;
+        int char_max_x;
+
+        if (font_char_ink_bounds(font, ch, &char_min_x, &char_max_x)) {
+            int glyph_min = pen_x + char_min_x;
+            int glyph_max = pen_x + char_max_x;
+            if (glyph_min < min_x) {
+                min_x = glyph_min;
+            }
+            if (glyph_max > max_x) {
+                max_x = glyph_max;
+            }
+            has_ink = true;
+        }
+        pen_x += font_char_advance_width(font, ch);
+    }
+
+    if (!has_ink) {
+        return false;
+    }
+    *out_min_x = min_x;
+    *out_max_x = max_x;
+    return true;
+}
+
+static void draw_ui_label_ink_left(SDL_Surface *screen, const Fonts *fonts, int ink_left_x, int y, const char *label)
+{
+    int min_x;
+    int max_x;
+    int draw_x = ink_left_x;
+
+    if (fonts && font_string_ink_bounds(fonts->white, label, &min_x, &max_x)) {
+        draw_x = ink_left_x - min_x;
+    }
+    draw_ui_label(screen, fonts, draw_x, y, label);
+}
+
+static void draw_ui_label_ink_right(SDL_Surface *screen, const Fonts *fonts, int ink_right_x, int y, const char *label)
+{
+    int min_x;
+    int max_x;
+    int draw_x = fonts ? ink_right_x - nSDL_GetStringWidth(fonts->white, label) + 1 : ink_right_x;
+
+    if (fonts && font_string_ink_bounds(fonts->white, label, &min_x, &max_x)) {
+        draw_x = ink_right_x - max_x;
+    }
+    draw_ui_label(screen, fonts, draw_x, y, label);
+}
+
 static void draw_overlay_backdrop_dim(SDL_Surface *screen, uint8_t dim_mix)
 {
     SDL_Rect veil = {0, 0, SCREEN_W, SCREEN_H};
@@ -11751,12 +11949,14 @@ static void draw_progress(
     right_text[0] = '-';
     copy_truncated(right_text + 1, sizeof(right_text) - 1, remaining_text);
     if (chrome_mix > 48) {
-        draw_ui_label(screen, fonts, 14, overlay.y + 3, left_text);
-        draw_ui_label(
+        int label_inset = 10;
+        int label_y = overlay.y + 3;
+        draw_ui_label_ink_left(screen, fonts, overlay.x + label_inset, label_y, left_text);
+        draw_ui_label_ink_right(
             screen,
             fonts,
-            SCREEN_W - 12 - nSDL_GetStringWidth(fonts->white, right_text),
-            overlay.y + 3,
+            overlay.x + overlay.w - label_inset - 1,
+            label_y,
             right_text
         );
     }
