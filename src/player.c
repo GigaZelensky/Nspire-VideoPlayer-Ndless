@@ -11480,24 +11480,20 @@ static void draw_progress_buffer_range(SDL_Surface *screen, const SDL_Rect *rect
     }
 
     top = blend_rgb565(
-        blend_rgb565(ui_theme()->buffer_top, ui_theme()->progress_fill_top, 96),
-        UI_COLOR_WHITE,
-        42
+        blend_rgb565(ui_theme()->progress_fill_top, ui_theme()->progress_fill_bottom, 144),
+        UI_COLOR_BLACK,
+        78
     );
-    bottom = blend_rgb565(
-        blend_rgb565(ui_theme()->buffer_bottom, ui_theme()->buffer_top, 155),
-        UI_COLOR_WHITE,
-        18
-    );
+    bottom = blend_rgb565(ui_theme()->progress_fill_bottom, UI_COLOR_BLACK, 116);
     draw_vertical_gradient(screen, rect, top, bottom);
     if (rect->h > 2) {
         line.x = rect->x;
         line.y = rect->y;
         line.w = rect->w;
         line.h = 1;
-        fill_rect_rgb565_mix(screen, &line, UI_COLOR_WHITE, 56);
+        fill_rect_rgb565_mix(screen, &line, ui_theme()->progress_fill_glow, 42);
         line.y = (Sint16) (rect->y + rect->h - 1);
-        fill_rect_rgb565_mix(screen, &line, UI_COLOR_BLACK, 12);
+        fill_rect_rgb565_mix(screen, &line, UI_COLOR_BLACK, 18);
     }
 }
 
