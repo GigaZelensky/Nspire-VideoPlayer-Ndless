@@ -54,6 +54,7 @@
 #define UI_RETURN_COLLAPSE_ANIM_MS 210U
 #define RESUME_PROMPT_ANIM_MS 150U
 #define RESUME_MORPH_ANIM_MS 150U
+#define SCALE_MORPH_ANIM_MS RESUME_MORPH_ANIM_MS
 #define RESUME_INPUT_GUARD_MS 260U
 #define UI_WAKE_MIN_MIX 28U
 #define UI_PAUSE_QUIET_MS 160U
@@ -631,11 +632,21 @@ typedef bool (*H264FramePublishPredicate)(Movie *movie, uint32_t frame_index, vo
 typedef bool (*H264DecodedFrameHook)(Movie *movie, uint32_t frame_index, void *userdata);
 
 typedef struct {
+    bool active;
+    SDL_Rect from_src;
+    SDL_Rect from_dst;
+    SDL_Rect to_src;
+    SDL_Rect to_dst;
+    uint32_t started_ms;
+} ScaleMorphState;
+
+typedef struct {
     SDL_Surface *screen;
     const Fonts *fonts;
     bool paused;
     bool show_ui;
     ScaleMode scale_mode;
+    ScaleMorphState *scale_morph;
     VideoAlign video_align_x;
     VideoAlign video_align_y;
     const PlaybackRate *playback_rate;
@@ -10289,6 +10300,145 @@ static void compute_video_rects(
     dst->y = aligned_axis_position(SCREEN_H, dst->h, video_align_y);
 }
 
+static bool clip_scaled_rects_to_screen(
+    const SDL_Rect *src,
+    const SDL_Rect *dst,
+    int source_w,
+    int source_h,
+    SDL_Rect *clipped_src,
+    SDL_Rect *clipped_dst
+)
+{
+    int dst_x0;
+    int dst_y0;
+    int dst_x1;
+    int dst_y1;
+    int clip_x0;
+    int clip_y0;
+    int clip_x1;
+    int clip_y1;
+    int src_x0;
+    int src_y0;
+    int src_x1;
+    int src_y1;
+
+    if (!src || !dst || !clipped_src || !clipped_dst ||
+        src->w == 0 || src->h == 0 || dst->w == 0 || dst->h == 0 ||
+        source_w <= 0 || source_h <= 0) {
+        return false;
+    }
+
+    dst_x0 = dst->x;
+    dst_y0 = dst->y;
+    dst_x1 = dst_x0 + dst->w;
+    dst_y1 = dst_y0 + dst->h;
+    clip_x0 = clamp_int(dst_x0, 0, SCREEN_W);
+    clip_y0 = clamp_int(dst_y0, 0, SCREEN_H);
+    clip_x1 = clamp_int(dst_x1, 0, SCREEN_W);
+    clip_y1 = clamp_int(dst_y1, 0, SCREEN_H);
+    if (clip_x1 <= clip_x0 || clip_y1 <= clip_y0) {
+        return false;
+    }
+
+    src_x0 = src->x + (int) (((int64_t) (clip_x0 - dst_x0) * src->w) / dst->w);
+    src_y0 = src->y + (int) (((int64_t) (clip_y0 - dst_y0) * src->h) / dst->h);
+    src_x1 = src->x + (int) (((int64_t) (clip_x1 - dst_x0) * src->w) / dst->w);
+    src_y1 = src->y + (int) (((int64_t) (clip_y1 - dst_y0) * src->h) / dst->h);
+    src_x0 = clamp_int(src_x0, 0, source_w);
+    src_y0 = clamp_int(src_y0, 0, source_h);
+    src_x1 = clamp_int(src_x1, 0, source_w);
+    src_y1 = clamp_int(src_y1, 0, source_h);
+    if (src_x1 <= src_x0 || src_y1 <= src_y0) {
+        return false;
+    }
+
+    clipped_dst->x = (Sint16) clip_x0;
+    clipped_dst->y = (Sint16) clip_y0;
+    clipped_dst->w = (Uint16) (clip_x1 - clip_x0);
+    clipped_dst->h = (Uint16) (clip_y1 - clip_y0);
+    clipped_src->x = (Sint16) src_x0;
+    clipped_src->y = (Sint16) src_y0;
+    clipped_src->w = (Uint16) (src_x1 - src_x0);
+    clipped_src->h = (Uint16) (src_y1 - src_y0);
+    return true;
+}
+
+static void draw_movie_frame_scaled_clipped(
+    SDL_Surface *screen,
+    Movie *movie,
+    const SDL_Rect *src,
+    const SDL_Rect *dst
+)
+{
+    SDL_Rect clipped_src;
+    SDL_Rect clipped_dst;
+
+    if (!screen || !movie || !movie->frame_surface ||
+        !clip_scaled_rects_to_screen(
+            src,
+            dst,
+            movie->frame_surface->w,
+            movie->frame_surface->h,
+            &clipped_src,
+            &clipped_dst)) {
+        return;
+    }
+
+    if (clipped_src.w == clipped_dst.w && clipped_src.h == clipped_dst.h) {
+        SDL_BlitSurface(movie->frame_surface, &clipped_src, screen, &clipped_dst);
+    } else {
+        SDL_SoftStretch(movie->frame_surface, &clipped_src, screen, &clipped_dst);
+    }
+}
+
+static void draw_movie_frame_background_rects(
+    SDL_Surface *screen,
+    Movie *movie,
+    const SDL_Rect *src,
+    const SDL_Rect *dst
+)
+{
+    SDL_Rect top_bar;
+    SDL_Rect bottom_bar;
+    SDL_Rect left_bar;
+    SDL_Rect right_bar;
+    Uint32 black;
+
+    if (!screen || !movie || !movie->frame_surface || !src || !dst) {
+        return;
+    }
+    black = SDL_MapRGB(screen->format, 0, 0, 0);
+    top_bar.x = 0;
+    top_bar.y = 0;
+    top_bar.w = SCREEN_W;
+    top_bar.h = (Uint16) clamp_int(dst->y, 0, SCREEN_H);
+    if (top_bar.h > 0) {
+        SDL_FillRect(screen, &top_bar, black);
+    }
+    bottom_bar.x = 0;
+    bottom_bar.y = (Sint16) clamp_int(dst->y + dst->h, 0, SCREEN_H);
+    bottom_bar.w = SCREEN_W;
+    bottom_bar.h = (Uint16) (SCREEN_H - bottom_bar.y);
+    if (bottom_bar.h > 0) {
+        SDL_FillRect(screen, &bottom_bar, black);
+    }
+    left_bar.x = 0;
+    left_bar.y = (Sint16) clamp_int(dst->y, 0, SCREEN_H);
+    left_bar.w = (Uint16) clamp_int(dst->x, 0, SCREEN_W);
+    left_bar.h = (Uint16) clamp_int(dst->h, 0, SCREEN_H - left_bar.y);
+    if (left_bar.w > 0 && left_bar.h > 0) {
+        SDL_FillRect(screen, &left_bar, black);
+    }
+    right_bar.x = (Sint16) clamp_int(dst->x + dst->w, 0, SCREEN_W);
+    right_bar.y = left_bar.y;
+    right_bar.w = (Uint16) (SCREEN_W - right_bar.x);
+    right_bar.h = left_bar.h;
+    if (right_bar.w > 0 && right_bar.h > 0) {
+        SDL_FillRect(screen, &right_bar, black);
+    }
+    draw_movie_frame_scaled_clipped(screen, movie, src, dst);
+}
+
 static const char *scale_mode_text(ScaleMode scale_mode)
 {
     if (scale_mode == SCALE_FILL) {
@@ -10348,6 +10498,128 @@ static uint8_t ui_ease_smoothstep(uint32_t elapsed_ms, uint32_t duration_ms)
     t = (elapsed_ms * 255U) / duration_ms;
     t_squared = (t * t + 127U) / 255U;
     return (uint8_t) ((t_squared * ((3U * 255U) - (2U * t)) + 127U) / 255U);
+}
+
+static bool rects_equal(const SDL_Rect *a, const SDL_Rect *b)
+{
+    return a && b &&
+        a->x == b->x &&
+        a->y == b->y &&
+        a->w == b->w &&
+        a->h == b->h;
+}
+
+static SDL_Rect mix_sdl_rects(const SDL_Rect *from, const SDL_Rect *to, uint8_t mix)
+{
+    SDL_Rect rect;
+
+    rect.x = ui_mix_sint16(from->x, to->x, mix);
+    rect.y = ui_mix_sint16(from->y, to->y, mix);
+    rect.w = ui_mix_uint16(from->w, to->w, mix);
+    rect.h = ui_mix_uint16(from->h, to->h, mix);
+    return rect;
+}
+
+static void scale_morph_current_rects(
+    const Movie *movie,
+    ScaleMorphState *morph,
+    ScaleMode scale_mode,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y,
+    uint32_t now_ms,
+    SDL_Rect *src,
+    SDL_Rect *dst
+)
+{
+    uint8_t mix;
+
+    if (!movie || !src || !dst) {
+        return;
+    }
+    if (!morph || !morph->active) {
+        compute_video_rects(movie, scale_mode, video_align_x, video_align_y, src, dst);
+        return;
+    }
+
+    mix = ui_ease_out_cubic(now_ms - morph->started_ms, SCALE_MORPH_ANIM_MS);
+    if (mix >= 255) {
+        *src = morph->to_src;
+        *dst = morph->to_dst;
+        morph->active = false;
+        return;
+    }
+
+    *src = mix_sdl_rects(&morph->from_src, &morph->to_src, mix);
+    *dst = mix_sdl_rects(&morph->from_dst, &morph->to_dst, mix);
+}
+
+static bool scale_morph_animating(const ScaleMorphState *morph, uint32_t now_ms)
+{
+    return morph &&
+        morph->active &&
+        (int32_t) (now_ms - (morph->started_ms + SCALE_MORPH_ANIM_MS)) < 0;
+}
+
+static void begin_scale_mode_morph(
+    Movie *movie,
+    ScaleMorphState *morph,
+    ScaleMode current_mode,
+    ScaleMode next_mode,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y,
+    uint32_t now_ms
+)
+{
+    SDL_Rect current_src;
+    SDL_Rect current_dst;
+    SDL_Rect target_src;
+    SDL_Rect target_dst;
+
+    if (!movie || !morph || current_mode == next_mode) {
+        return;
+    }
+
+    scale_morph_current_rects(
+        movie,
+        morph,
+        current_mode,
+        video_align_x,
+        video_align_y,
+        now_ms,
+        &current_src,
+        &current_dst
+    );
+    compute_video_rects(movie, next_mode, video_align_x, video_align_y, &target_src, &target_dst);
+    if (rects_equal(&current_src, &target_src) && rects_equal(&current_dst, &target_dst)) {
+        morph->active = false;
+        return;
+    }
+
+    morph->from_src = current_src;
+    morph->from_dst = current_dst;
+    morph->to_src = target_src;
+    morph->to_dst = target_dst;
+    morph->started_ms = now_ms ? now_ms : 1U;
+    morph->active = true;
+}
+
+static void cycle_scale_mode_with_morph(
+    Movie *movie,
+    ScaleMorphState *morph,
+    ScaleMode *scale_mode,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y,
+    uint32_t now_ms
+)
+{
+    ScaleMode next_mode;
+
+    if (!scale_mode) {
+        return;
+    }
+    next_mode = (ScaleMode) ((*scale_mode + 1) % 4);
+    begin_scale_mode_morph(movie, morph, *scale_mode, next_mode, video_align_x, video_align_y, now_ms);
+    *scale_mode = next_mode;
 }
 
 static void ui_transition_init(UiTransition *transition, bool active)
@@ -11242,6 +11514,7 @@ static void update_playback_ui_mixes(
     const Fonts *fonts,
     const Movie *movie,
     ScaleMode scale_mode,
+    ScaleMorphState *scale_morph,
     VideoAlign video_align_x,
     VideoAlign video_align_y,
     const PlaybackRate *playback_rate,
@@ -11275,7 +11548,7 @@ static void update_playback_ui_mixes(
         return;
     }
 
-    compute_video_rects(movie, scale_mode, video_align_x, video_align_y, &src, &dst);
+    scale_morph_current_rects(movie, scale_morph, scale_mode, video_align_x, video_align_y, now_ms, &src, &dst);
     playback_badge = playback_badge_rect(&dst);
     status_badge_rects(fonts, &dst, scale_mode, playback_rate, &scale_badge, &speed_badge);
 
@@ -12144,6 +12417,7 @@ static void render_movie(
     bool show_ui,
     bool help_menu_open,
     ScaleMode scale_mode,
+    ScaleMorphState *scale_morph,
     VideoAlign video_align_x,
     VideoAlign video_align_y,
     const PlaybackRate *playback_rate,
@@ -12169,6 +12443,7 @@ static void render_movie(
     const PlaybackUiMixes *ui_mixes
 )
 {
+    SDL_Rect src = {0, 0, SCREEN_W, SCREEN_H};
     SDL_Rect dst = {0, 0, SCREEN_W, SCREEN_H};
     int memory_right_limit = chrome_right_x_for_margin(8);
     uint32_t current_ms = movie_frame_time_ms(movie, movie->current_frame);
@@ -12185,7 +12460,8 @@ static void render_movie(
     bool playback_badge_visible = chrome_visible && !help_menu_visible;
     bool memory_badge_visible = !help_menu_visible && (memory_overlay_mode == MEMORY_OVERLAY_ALWAYS);
 
-    draw_movie_frame_background(screen, movie, scale_mode, video_align_x, video_align_y, NULL, &dst);
+    scale_morph_current_rects(movie, scale_morph, scale_mode, video_align_x, video_align_y, now_ms, &src, &dst);
+    draw_movie_frame_background_rects(screen, movie, &src, &dst);
     if (subtitle && subtitle_size >= 0) {
         SubtitleLayoutSpec subtitle_layout;
 
@@ -12327,6 +12603,7 @@ static bool render_committed_seek_frame(Movie *movie, uint32_t frame_index, void
         context->fonts,
         movie,
         context->scale_mode,
+        context->scale_morph,
         context->video_align_x,
         context->video_align_y,
         context->playback_rate,
@@ -12348,6 +12625,7 @@ static bool render_committed_seek_frame(Movie *movie, uint32_t frame_index, void
         context->show_ui,
         false,
         context->scale_mode,
+        context->scale_morph,
         context->video_align_x,
         context->video_align_y,
         context->playback_rate,
@@ -12466,16 +12744,10 @@ static void draw_movie_frame_background(
 {
     SDL_Rect src;
     SDL_Rect dst;
-    SDL_Rect top_bar;
-    SDL_Rect bottom_bar;
-    SDL_Rect left_bar;
-    SDL_Rect right_bar;
-    Uint32 black;
 
     if (!screen || !movie || !movie->frame_surface) {
         return;
     }
-    black = SDL_MapRGB(screen->format, 0, 0, 0);
     compute_video_rects(movie, scale_mode, video_align_x, video_align_y, &src, &dst);
     if (out_src) {
         *out_src = src;
@@ -12483,39 +12755,7 @@ static void draw_movie_frame_background(
     if (out_dst) {
         *out_dst = dst;
     }
-    top_bar.x = 0;
-    top_bar.y = 0;
-    top_bar.w = SCREEN_W;
-    top_bar.h = (Uint16) clamp_int(dst.y, 0, SCREEN_H);
-    if (top_bar.h > 0) {
-        SDL_FillRect(screen, &top_bar, black);
-    }
-    bottom_bar.x = 0;
-    bottom_bar.y = (Sint16) clamp_int(dst.y + dst.h, 0, SCREEN_H);
-    bottom_bar.w = SCREEN_W;
-    bottom_bar.h = (Uint16) (SCREEN_H - bottom_bar.y);
-    if (bottom_bar.h > 0) {
-        SDL_FillRect(screen, &bottom_bar, black);
-    }
-    left_bar.x = 0;
-    left_bar.y = (Sint16) clamp_int(dst.y, 0, SCREEN_H);
-    left_bar.w = (Uint16) clamp_int(dst.x, 0, SCREEN_W);
-    left_bar.h = (Uint16) clamp_int(dst.h, 0, SCREEN_H - left_bar.y);
-    if (left_bar.w > 0 && left_bar.h > 0) {
-        SDL_FillRect(screen, &left_bar, black);
-    }
-    right_bar.x = (Sint16) clamp_int(dst.x + dst.w, 0, SCREEN_W);
-    right_bar.y = left_bar.y;
-    right_bar.w = (Uint16) (SCREEN_W - right_bar.x);
-    right_bar.h = left_bar.h;
-    if (right_bar.w > 0 && right_bar.h > 0) {
-        SDL_FillRect(screen, &right_bar, black);
-    }
-    if (dst.w == movie->header.video_width && dst.h == movie->header.video_height) {
-        SDL_BlitSurface(movie->frame_surface, NULL, screen, &dst);
-    } else {
-        SDL_SoftStretch(movie->frame_surface, &src, screen, &dst);
-    }
+    draw_movie_frame_background_rects(screen, movie, &src, &dst);
 }
 
 static void draw_resume_prompt_background(SDL_Surface *screen, Movie *movie)
@@ -12843,9 +13083,7 @@ static void animate_movie_collapse_to_black(
         if (remaining_h > 0) {
             dst.y = (Sint16) (start_dst.y + (start_dst.h - remaining_h) / 2);
             dst.h = (Uint16) remaining_h;
-            if (dst.w > 0 && dst.h > 0) {
-                SDL_SoftStretch(movie->frame_surface, &src, screen, &dst);
-            }
+            draw_movie_frame_scaled_clipped(screen, movie, &src, &dst);
         }
         if (overlay_surface && *overlay_surface && collapse_mix < 255) {
             uint8_t overlay_mix = (uint8_t) (255U - ui_ease_out_cubic(elapsed_ms, UI_CHROME_ANIM_MS));
@@ -14897,14 +15135,8 @@ static int prompt_resume_position(
                 background_src = playback_src;
                 background_dst = playback_dst;
             } else {
-                background_src.x = ui_mix_sint16(full_src.x, playback_src.x, morph_mix);
-                background_src.y = ui_mix_sint16(full_src.y, playback_src.y, morph_mix);
-                background_src.w = ui_mix_uint16(full_src.w, playback_src.w, morph_mix);
-                background_src.h = ui_mix_uint16(full_src.h, playback_src.h, morph_mix);
-                background_dst.x = ui_mix_sint16(full_screen.x, playback_dst.x, morph_mix);
-                background_dst.y = ui_mix_sint16(full_screen.y, playback_dst.y, morph_mix);
-                background_dst.w = ui_mix_uint16(full_screen.w, playback_dst.w, morph_mix);
-                background_dst.h = ui_mix_uint16(full_screen.h, playback_dst.h, morph_mix);
+                background_src = mix_sdl_rects(&full_src, &playback_src, morph_mix);
+                background_dst = mix_sdl_rects(&full_screen, &playback_dst, morph_mix);
             }
         }
         draw_border.y = (Sint16) (draw_border.y + prompt_y_offset);
@@ -15003,7 +15235,7 @@ static int prompt_resume_position(
         }
         SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
         if (background_dst.w > 0 && background_dst.h > 0) {
-            SDL_SoftStretch(movie->frame_surface, &background_src, screen, &background_dst);
+            draw_movie_frame_scaled_clipped(screen, movie, &background_src, &background_dst);
         }
         dim_rect_rgb565(screen, &full_screen, dim_strength);
         if (prompt_mix > 0) {
@@ -15173,6 +15405,7 @@ static int play_movie(
     SeekBarPreviewState seek_preview;
     PlaybackUiTransitions ui_transitions;
     PlaybackUiMixes ui_mixes;
+    ScaleMorphState scale_morph;
     PlaybackPressTarget playback_press_target = PLAYBACK_PRESS_NONE;
     PointerState pointer;
     DisplayPowerState display_power_state;
@@ -15209,6 +15442,7 @@ static int play_movie(
     memset(&seek_preview, 0, sizeof(seek_preview));
     memset(&ui_transitions, 0, sizeof(ui_transitions));
     memset(&ui_mixes, 0, sizeof(ui_mixes));
+    memset(&scale_morph, 0, sizeof(scale_morph));
     memset(&display_power_state, 0, sizeof(display_power_state));
     seek_preview.decoded_chunk_index = -1;
     seek_preview.decoded_frame_index = UINT32_MAX;
@@ -15701,6 +15935,7 @@ static int play_movie(
             seek_context.paused = paused;
             seek_context.show_ui = true;
             seek_context.scale_mode = scale_mode;
+            seek_context.scale_morph = &scale_morph;
             seek_context.video_align_x = video_align_x;
             seek_context.video_align_y = video_align_y;
             seek_context.playback_rate = playback_rate;
@@ -15845,6 +16080,7 @@ static int play_movie(
                 fonts,
                 &movie,
                 scale_mode,
+                &scale_morph,
                 video_align_x,
                 video_align_y,
                 playback_rate,
@@ -15866,6 +16102,7 @@ static int play_movie(
                 true,
                 true,
                 scale_mode,
+                &scale_morph,
                 video_align_x,
                 video_align_y,
                 playback_rate,
@@ -16055,7 +16292,7 @@ static int play_movie(
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (divide_edge) {
-            scale_mode = (ScaleMode) ((scale_mode + 1) % 4);
+            cycle_scale_mode_with_morph(&movie, &scale_morph, &scale_mode, video_align_x, video_align_y, now_ms);
             trigger_badge_press(&ui_transitions.scale_press, &scale_badge_press_until_ms, now_ms);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
@@ -16216,7 +16453,7 @@ static int play_movie(
             SDL_Rect speed_badge;
             bool controls_live;
 
-            compute_video_rects(&movie, scale_mode, video_align_x, video_align_y, &click_src, &click_dst);
+            scale_morph_current_rects(&movie, &scale_morph, scale_mode, video_align_x, video_align_y, now_ms, &click_src, &click_dst);
             playback_badge = playback_badge_rect(&click_dst);
             status_badge_rects(fonts, &click_dst, scale_mode, playback_rate, &scale_badge, &speed_badge);
             controls_live = (show_ui_before_pointer_activation || playback_press_target != PLAYBACK_PRESS_NONE) && !help_menu_open;
@@ -16272,7 +16509,7 @@ static int play_movie(
                             reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
                         }
                     } else if (released_target == PLAYBACK_PRESS_SCALE) {
-                        scale_mode = (ScaleMode) ((scale_mode + 1) % 4);
+                        cycle_scale_mode_with_morph(&movie, &scale_morph, &scale_mode, video_align_x, video_align_y, now_ms);
                     } else if (released_target == PLAYBACK_PRESS_SPEED) {
                         playback_rate_index = (playback_rate_index + 1) % PLAYBACK_RATE_COUNT;
                         playback_rate = playback_rate_for_index(playback_rate_index);
@@ -16305,6 +16542,7 @@ static int play_movie(
                     seek_context.paused = paused;
                     seek_context.show_ui = true;
                     seek_context.scale_mode = scale_mode;
+                    seek_context.scale_morph = &scale_morph;
                     seek_context.video_align_x = video_align_x;
                     seek_context.video_align_y = video_align_y;
                     seek_context.playback_rate = playback_rate;
@@ -16565,6 +16803,7 @@ static int play_movie(
                 fonts,
                 &movie,
                 scale_mode,
+                &scale_morph,
                 video_align_x,
                 video_align_y,
                 playback_rate,
@@ -16593,6 +16832,7 @@ static int play_movie(
                 show_ui,
                 false,
                 scale_mode,
+                &scale_morph,
                 video_align_x,
                 video_align_y,
                 playback_rate,
@@ -16644,6 +16884,7 @@ static int play_movie(
             }
             bool paused_ui_busy = paused && (
                 playback_ui_mixes_animating(&ui_mixes) ||
+                scale_morph_animating(&scale_morph, idle_now_ms) ||
                 seek_bar_preview_decode_active(&seek_preview) ||
                 seek_preview_surface_animating(&seek_preview, idle_now_ms) ||
                 paused_input_grace
