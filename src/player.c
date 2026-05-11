@@ -617,8 +617,11 @@ typedef struct {
     uint32_t last_move_ms;
     uint32_t surface_started_ms;
     int last_pointer_x;
+    int suppress_marker_x;
+    uint32_t suppress_frame_index;
     bool surface_fade_pending;
     bool surface_render_pending;
+    bool suppress_until_pointer_moves;
     bool tracking;
     bool over_bar;
     SeekPreviewDecodeJob decode_job;
@@ -1702,6 +1705,8 @@ static void clear_seek_bar_preview(SeekBarPreviewState *preview)
     preview->decoded_chunk_index = -1;
     preview->decoded_frame_index = UINT32_MAX;
     preview->last_pointer_x = -1;
+    preview->suppress_marker_x = -1;
+    preview->suppress_frame_index = UINT32_MAX;
     preview->decode_job.chunk_index = -1;
 }
 
@@ -5776,6 +5781,73 @@ static void step_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *prev
     }
 
     clear_seek_bar_preview_decode_job(preview);
+}
+
+static bool finish_seek_bar_preview_pending_frame(Movie *movie, SeekBarPreviewState *preview)
+{
+    SeekPreviewDecodeJob *job;
+    const ChunkIndexEntry *entry;
+    uint32_t local_index;
+    size_t start;
+    size_t end;
+    bool picture_ready = false;
+    bool pending = false;
+    uint8_t *picture = NULL;
+
+    if (!movie || !preview || !preview->decode_job.active) {
+        return true;
+    }
+
+    job = &preview->decode_job;
+    if (job->consumed_bytes == 0) {
+        return true;
+    }
+    if (!job->frame_offsets || !job->chunk_bytes ||
+        job->chunk_index < 0 ||
+        (uint32_t) job->chunk_index >= movie->header.chunk_count) {
+        return false;
+    }
+
+    entry = movie->chunk_index + job->chunk_index;
+    if (job->next_frame < entry->first_frame || job->next_frame >= entry->first_frame + entry->frame_count) {
+        return false;
+    }
+    local_index = job->next_frame - entry->first_frame;
+    start = job->frame_offsets[local_index];
+    end = (local_index + 1U < entry->frame_count) ? job->frame_offsets[local_index + 1U] : job->chunk_size;
+    if (end <= start || end > job->chunk_size) {
+        return false;
+    }
+
+    if (!pump_h264_access_unit(
+            movie,
+            job->decoder,
+            job->chunk_bytes + start,
+            end - start,
+            &job->consumed_bytes,
+            &job->zero_advance_retries,
+            0U,
+            false,
+            "seek preview commit",
+            &picture_ready,
+            &pending,
+            &picture)) {
+        return false;
+    }
+    if (pending || !picture_ready || !picture) {
+        return false;
+    }
+    if (!publish_seek_bar_preview_picture(movie, preview, job->next_frame, picture)) {
+        return false;
+    }
+
+    job->next_frame++;
+    job->consumed_bytes = 0;
+    job->zero_advance_retries = 0;
+    if (job->next_frame > job->target_frame) {
+        finish_seek_bar_preview_decode_job(preview);
+    }
+    return true;
 }
 
 static bool prefetch_chunk(Movie *movie, int chunk_index)
@@ -11744,6 +11816,7 @@ static bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *
 {
     SeekPreviewDecodeJob *job;
     const ChunkIndexEntry *entry;
+    uint32_t decoded_frame;
     size_t frame_pixels;
 
     if (!movie || !preview || !movie_uses_h264(movie)) {
@@ -11751,17 +11824,29 @@ static bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *
     }
 
     job = &preview->decode_job;
-    if (job->active || !job->complete || !job->decoder || !job->chunk_storage ||
+    if (!job->decoder || !job->chunk_storage ||
         !job->frame_offsets || !job->chunk_bytes || !job->pixels ||
-        preview->decoded_frame_index != target_frame ||
-        job->target_frame != target_frame ||
         job->chunk_index < 0 ||
-        (uint32_t) job->chunk_index >= movie->header.chunk_count) {
+        (uint32_t) job->chunk_index >= movie->header.chunk_count ||
+        (!job->active && !job->complete) ||
+        preview->decoded_frame_index == UINT32_MAX) {
+        return false;
+    }
+    if (job->active && target_frame > job->target_frame) {
+        job->target_frame = target_frame;
+    }
+    if (job->active && !finish_seek_bar_preview_pending_frame(movie, preview)) {
         return false;
     }
 
     entry = movie->chunk_index + job->chunk_index;
     if (target_frame < entry->first_frame || target_frame >= entry->first_frame + entry->frame_count) {
+        return false;
+    }
+    decoded_frame = preview->decoded_frame_index;
+    if (decoded_frame < entry->first_frame ||
+        decoded_frame >= entry->first_frame + entry->frame_count ||
+        decoded_frame > target_frame) {
         return false;
     }
     if (!sync_h264_picture_params(movie, job->decoder, true)) {
@@ -11789,10 +11874,10 @@ static bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *
     movie->chunk_bytes = job->chunk_bytes;
     movie->chunk_size = job->chunk_size;
     movie->loaded_chunk = job->chunk_index;
-    movie->decoded_local_frame = (int) (target_frame - entry->first_frame);
+    movie->decoded_local_frame = (int) (decoded_frame - entry->first_frame);
     movie->h264_chunk_dirty = true;
     memcpy(movie->framebuffer, job->pixels, frame_pixels * sizeof(uint16_t));
-    movie->current_frame = target_frame;
+    movie->current_frame = decoded_frame;
 
     job->decoder = NULL;
     job->decoder_initialized = false;
@@ -11802,7 +11887,7 @@ static bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *
     job->chunk_bytes = NULL;
     job->chunk_size = 0;
     clear_seek_bar_preview_decode_job(preview);
-    discard_h264_frame_ring_before(movie, target_frame + 1U);
+    discard_h264_frame_ring_before(movie, decoded_frame + 1U);
     return true;
 }
 
@@ -13488,6 +13573,9 @@ static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, 
         pointer->y < SCREEN_H - UI_BAR_H || pointer->y >= SCREEN_H) {
         preview->tracking = false;
         preview->last_pointer_x = -1;
+        preview->suppress_until_pointer_moves = false;
+        preview->suppress_marker_x = -1;
+        preview->suppress_frame_index = UINT32_MAX;
         clear_seek_bar_preview_decode_job(preview);
         return false;
     }
@@ -13512,6 +13600,15 @@ static bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, 
     chunk_index = movie_chunk_for_frame(movie, target_frame);
     if (chunk_index < 0) {
         return false;
+    }
+    if (preview->suppress_until_pointer_moves) {
+        if (preview->suppress_marker_x == marker_x &&
+            preview->suppress_frame_index == target_frame) {
+            return true;
+        }
+        preview->suppress_until_pointer_moves = false;
+        preview->suppress_marker_x = -1;
+        preview->suppress_frame_index = UINT32_MAX;
     }
 
     if (!preview->tracking || pointer->moved || preview->last_pointer_x != marker_x) {
@@ -15556,6 +15653,7 @@ static int play_movie(
 
             if (pointer_click && show_ui && pointer.y >= SCREEN_H - UI_BAR_H && pointer.y < SCREEN_H) {
                 int seek_x = clamp_int(pointer.x, bar.x, bar.x + bar.w);
+                int seek_marker_x = clamp_int(pointer.x, bar.x, bar.x + bar.w - 1);
                 uint32_t target_frame;
                 uint32_t seek_render_now_ms;
                 CommittedSeekRenderContext seek_context;
@@ -15567,74 +15665,82 @@ static int play_movie(
                     result = -1;
                     break;
                 }
-                memset(&seek_context, 0, sizeof(seek_context));
-                seek_context.screen = screen;
-                seek_context.fonts = fonts;
-                seek_context.paused = paused;
-                seek_context.show_ui = true;
-                seek_context.scale_mode = scale_mode;
-                seek_context.video_align_x = video_align_x;
-                seek_context.video_align_y = video_align_y;
-                seek_context.playback_rate = playback_rate;
-                seek_context.memory_overlay_mode = memory_overlay_mode;
-                seek_context.subtitle_cache = &subtitle_cache;
-                seek_context.subtitle_font_index = subtitle_font_index;
-                seek_context.subtitle_font_overlay_visible = seek_render_now_ms <= subtitle_font_overlay_until;
-                seek_context.subtitle_size = subtitle_size;
-                seek_context.subtitle_placement = subtitle_placement;
-                seek_context.movie_title_text = playback_title;
-                seek_context.movie_detail_text = playback_detail;
-                seek_context.status_overlay_text = status_overlay_text;
-                seek_context.status_overlay_started_ms = status_overlay_started_ms;
-                seek_context.status_overlay_until_ms = status_overlay_until;
-                seek_context.screenshot_preview = &screenshot_preview;
-                seek_context.seek_preview = &seek_preview;
-                seek_context.pointer = &pointer;
-                seek_context.pending_seek_ms = 0;
-                seek_context.seek_badge_ms = seek_badge_ms;
-                seek_context.seek_badge_started_ms = seek_badge_started_ms;
-                seek_context.seek_badge_hide_elapsed_ms = seek_badge_hide_elapsed_ms;
-                seek_context.ui_transitions = &ui_transitions;
-                seek_context.ui_mixes = &ui_mixes;
-                seek_context.playback_press_target = playback_press_target;
-                seek_context.playback_press_active =
-                    playback_pause_key_press_active ||
-                    playback_pointer_press_active ||
-                    (playback_press_target == PLAYBACK_PRESS_PLAY && enter_down) ||
-                    ui_time_before(seek_render_now_ms, playback_badge_press_until_ms);
-                seek_context.scale_press_active =
-                    divide_down ||
-                    (playback_press_target == PLAYBACK_PRESS_SCALE && enter_down) ||
-                    ui_time_before(seek_render_now_ms, scale_badge_press_until_ms);
-                seek_context.speed_press_active =
-                    speed_key_down ||
-                    (playback_press_target == PLAYBACK_PRESS_SPEED && enter_down) ||
-                    ui_time_before(seek_render_now_ms, speed_badge_press_until_ms);
-                seek_context.title_strip_active =
-                    !help_menu_open &&
-                    pointer.visible &&
-                    pointer.y < PLAYBACK_TITLE_TOP_EDGE_PX;
-                seek_context.target_frame = target_frame;
-                used_preview_frame = commit_seek_bar_preview_to_movie(&movie, &seek_preview, target_frame);
-                clear_seek_bar_preview(&seek_preview);
-                if (used_preview_frame) {
-                    render_committed_seek_frame(&movie, target_frame, &seek_context);
-                } else if (
-                    !decode_to_frame_with_progress(
-                        &movie,
-                        target_frame,
-                        should_publish_committed_seek_frame,
-                        render_committed_seek_frame,
-                        &seek_context)) {
-                    report_movie_decode_failure(&movie, path, "pointer seek");
-                    result = -1;
-                    break;
+                if (target_frame == movie.current_frame) {
+                    clear_seek_bar_preview(&seek_preview);
+                } else {
+                    memset(&seek_context, 0, sizeof(seek_context));
+                    seek_context.screen = screen;
+                    seek_context.fonts = fonts;
+                    seek_context.paused = paused;
+                    seek_context.show_ui = true;
+                    seek_context.scale_mode = scale_mode;
+                    seek_context.video_align_x = video_align_x;
+                    seek_context.video_align_y = video_align_y;
+                    seek_context.playback_rate = playback_rate;
+                    seek_context.memory_overlay_mode = memory_overlay_mode;
+                    seek_context.subtitle_cache = &subtitle_cache;
+                    seek_context.subtitle_font_index = subtitle_font_index;
+                    seek_context.subtitle_font_overlay_visible = seek_render_now_ms <= subtitle_font_overlay_until;
+                    seek_context.subtitle_size = subtitle_size;
+                    seek_context.subtitle_placement = subtitle_placement;
+                    seek_context.movie_title_text = playback_title;
+                    seek_context.movie_detail_text = playback_detail;
+                    seek_context.status_overlay_text = status_overlay_text;
+                    seek_context.status_overlay_started_ms = status_overlay_started_ms;
+                    seek_context.status_overlay_until_ms = status_overlay_until;
+                    seek_context.screenshot_preview = &screenshot_preview;
+                    seek_context.seek_preview = &seek_preview;
+                    seek_context.pointer = &pointer;
+                    seek_context.pending_seek_ms = 0;
+                    seek_context.seek_badge_ms = seek_badge_ms;
+                    seek_context.seek_badge_started_ms = seek_badge_started_ms;
+                    seek_context.seek_badge_hide_elapsed_ms = seek_badge_hide_elapsed_ms;
+                    seek_context.ui_transitions = &ui_transitions;
+                    seek_context.ui_mixes = &ui_mixes;
+                    seek_context.playback_press_target = playback_press_target;
+                    seek_context.playback_press_active =
+                        playback_pause_key_press_active ||
+                        playback_pointer_press_active ||
+                        (playback_press_target == PLAYBACK_PRESS_PLAY && enter_down) ||
+                        ui_time_before(seek_render_now_ms, playback_badge_press_until_ms);
+                    seek_context.scale_press_active =
+                        divide_down ||
+                        (playback_press_target == PLAYBACK_PRESS_SCALE && enter_down) ||
+                        ui_time_before(seek_render_now_ms, scale_badge_press_until_ms);
+                    seek_context.speed_press_active =
+                        speed_key_down ||
+                        (playback_press_target == PLAYBACK_PRESS_SPEED && enter_down) ||
+                        ui_time_before(seek_render_now_ms, speed_badge_press_until_ms);
+                    seek_context.title_strip_active =
+                        !help_menu_open &&
+                        pointer.visible &&
+                        pointer.y < PLAYBACK_TITLE_TOP_EDGE_PX;
+                    seek_context.target_frame = target_frame;
+                    used_preview_frame = commit_seek_bar_preview_to_movie(&movie, &seek_preview, target_frame);
+                    clear_seek_bar_preview(&seek_preview);
+                    if (used_preview_frame) {
+                        render_committed_seek_frame(&movie, movie.current_frame, &seek_context);
+                    }
+                    if ((!used_preview_frame || movie.current_frame != target_frame) &&
+                        !decode_to_frame_with_progress(
+                            &movie,
+                            target_frame,
+                            should_publish_committed_seek_frame,
+                            render_committed_seek_frame,
+                            &seek_context)) {
+                        report_movie_decode_failure(&movie, path, "pointer seek");
+                        result = -1;
+                        break;
+                    }
+                    begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+                    hover_preview_needs_rebuffer = false;
+                    if (!seek_preroll_active) {
+                        reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                    }
                 }
-                begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
-                hover_preview_needs_rebuffer = false;
-                if (!seek_preroll_active) {
-                    reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
-                }
+                seek_preview.suppress_until_pointer_moves = true;
+                seek_preview.suppress_marker_x = seek_marker_x;
+                seek_preview.suppress_frame_index = target_frame;
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             } else if (pointer_click) {
                 bool was_paused = paused;
