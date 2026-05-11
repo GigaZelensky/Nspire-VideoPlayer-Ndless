@@ -11340,14 +11340,53 @@ static void movie_update_ui_buffer_chunks(Movie *movie, int *chunks_to_draw, siz
     }
 }
 
-static void draw_progress_track(SDL_Surface *screen, const SDL_Rect *bar_back, Uint16 surrounding_color)
+static Uint16 progress_overlay_fill_color_at_y(const SDL_Rect *overlay, int y)
+{
+    Uint16 base = ui_theme()->progress_overlay_base;
+    Uint16 body_top = blend_rgb565(base, UI_COLOR_WHITE, 28);
+    Uint16 body_bottom = blend_rgb565(base, UI_COLOR_BLACK, 92);
+    Uint16 gloss_top = blend_rgb565(base, UI_COLOR_WHITE, 104);
+    Uint16 gloss_bottom = blend_rgb565(base, UI_COLOR_WHITE, 20);
+    int denominator;
+    int gloss_height;
+    int row;
+
+    if (!overlay || overlay->h == 0) {
+        return base;
+    }
+
+    row = clamp_int(y - overlay->y, 0, overlay->h - 1);
+    denominator = overlay->h > 1 ? overlay->h - 1 : 1;
+    gloss_height = (overlay->h / 2) - 1;
+
+    if (gloss_height > 1 && row >= 1 && row <= gloss_height) {
+        return rgb565_lerp(gloss_top, gloss_bottom, row - 1, gloss_height - 1);
+    }
+    return rgb565_lerp(body_top, body_bottom, row, denominator);
+}
+
+static void draw_progress_track(SDL_Surface *screen, const SDL_Rect *bar_back, const SDL_Rect *overlay)
 {
     SDL_Rect outer;
     SDL_Rect body;
     SDL_Rect left_cap;
     SDL_Rect right_cap;
+    SDL_Rect left_rim;
+    SDL_Rect right_rim;
     SDL_Rect top_edge;
     SDL_Rect bottom_edge;
+    SDL_Rect pixel;
+    Uint16 cap_top;
+    Uint16 cap_bottom;
+    Uint16 rim_top;
+    Uint16 rim_bottom;
+    Uint16 edge_top;
+    Uint16 edge_bottom;
+    Uint16 surrounding_mid;
+    Uint16 corner_top;
+    Uint16 corner_bottom;
+    Uint16 turn_top;
+    Uint16 turn_bottom;
 
     if (!screen || !bar_back || bar_back->w == 0 || bar_back->h == 0) {
         return;
@@ -11369,6 +11408,14 @@ static void draw_progress_track(SDL_Surface *screen, const SDL_Rect *bar_back, U
     right_cap.y = bar_back->y;
     right_cap.w = 1;
     right_cap.h = bar_back->h;
+    left_rim.x = outer.x;
+    left_rim.y = bar_back->y;
+    left_rim.w = 1;
+    left_rim.h = bar_back->h;
+    right_rim.x = (Sint16) (bar_back->x + bar_back->w);
+    right_rim.y = bar_back->y;
+    right_rim.w = 1;
+    right_rim.h = bar_back->h;
     top_edge.x = (Sint16) (bar_back->x + 1);
     top_edge.y = (Sint16) (bar_back->y - 1);
     top_edge.w = (Uint16) (bar_back->w - 2);
@@ -11378,12 +11425,48 @@ static void draw_progress_track(SDL_Surface *screen, const SDL_Rect *bar_back, U
     bottom_edge.w = (Uint16) (bar_back->w - 2);
     bottom_edge.h = 1;
 
-    fill_rect_rgb565(screen, &outer, surrounding_color);
+    cap_top = blend_rgb565(ui_theme()->progress_cap_top, ui_theme()->accent_mid, 58);
+    cap_bottom = blend_rgb565(ui_theme()->progress_cap_bottom, ui_theme()->accent_deep, 42);
+    rim_top = blend_rgb565(ui_theme()->progress_cap_top, ui_theme()->accent_hot, 126);
+    rim_bottom = blend_rgb565(ui_theme()->progress_cap_bottom, ui_theme()->accent_mid, 86);
+    edge_top = blend_rgb565(ui_theme()->progress_edge_top, ui_theme()->accent_hot, 70);
+    edge_bottom = blend_rgb565(ui_theme()->progress_edge_bottom, ui_theme()->accent_mid, 48);
+    surrounding_mid = progress_overlay_fill_color_at_y(overlay, bar_back->y + (bar_back->h / 2));
+    corner_top = progress_overlay_fill_color_at_y(overlay, outer.y);
+    corner_bottom = progress_overlay_fill_color_at_y(overlay, outer.y + outer.h - 1);
+    turn_top = blend_rgb565(corner_top, edge_top, 112);
+    turn_bottom = blend_rgb565(corner_bottom, edge_bottom, 96);
+
+    fill_rect_rgb565(screen, &outer, surrounding_mid);
     draw_vertical_gradient(screen, &body, ui_theme()->progress_track_top, ui_theme()->progress_track_bottom);
-    draw_vertical_gradient(screen, &left_cap, ui_theme()->progress_cap_top, ui_theme()->progress_cap_bottom);
-    draw_vertical_gradient(screen, &right_cap, ui_theme()->progress_cap_top, ui_theme()->progress_cap_bottom);
-    fill_rect_rgb565(screen, &top_edge, ui_theme()->progress_edge_top);
-    fill_rect_rgb565(screen, &bottom_edge, ui_theme()->progress_edge_bottom);
+    draw_vertical_gradient(screen, &left_cap, cap_top, cap_bottom);
+    draw_vertical_gradient(screen, &right_cap, cap_top, cap_bottom);
+    draw_vertical_gradient(screen, &left_rim, rim_top, rim_bottom);
+    draw_vertical_gradient(screen, &right_rim, rim_top, rim_bottom);
+    fill_rect_rgb565(screen, &top_edge, edge_top);
+    fill_rect_rgb565(screen, &bottom_edge, edge_bottom);
+
+    pixel.w = 1;
+    pixel.h = 1;
+    pixel.y = outer.y;
+    pixel.x = outer.x;
+    fill_rect_rgb565(screen, &pixel, corner_top);
+    pixel.x = (Sint16) (outer.x + outer.w - 1);
+    fill_rect_rgb565(screen, &pixel, corner_top);
+    pixel.x = bar_back->x;
+    fill_rect_rgb565(screen, &pixel, turn_top);
+    pixel.x = (Sint16) (bar_back->x + bar_back->w - 1);
+    fill_rect_rgb565(screen, &pixel, turn_top);
+
+    pixel.y = (Sint16) (outer.y + outer.h - 1);
+    pixel.x = outer.x;
+    fill_rect_rgb565(screen, &pixel, corner_bottom);
+    pixel.x = (Sint16) (outer.x + outer.w - 1);
+    fill_rect_rgb565(screen, &pixel, corner_bottom);
+    pixel.x = bar_back->x;
+    fill_rect_rgb565(screen, &pixel, turn_bottom);
+    pixel.x = (Sint16) (bar_back->x + bar_back->w - 1);
+    fill_rect_rgb565(screen, &pixel, turn_bottom);
 }
 
 static void draw_progress_buffer_range(SDL_Surface *screen, const SDL_Rect *rect)
@@ -11535,7 +11618,7 @@ static void draw_progress(
 
     draw_progress_overlay(screen, &overlay);
 
-    draw_progress_track(screen, &bar_back, ui_theme()->progress_overlay_base);
+    draw_progress_track(screen, &bar_back, &overlay);
 
     if (movie->header.frame_count > 0 && movie->chunk_index) {
         int chunks_to_draw[UI_BUFFER_CHUNK_CACHE_COUNT];
