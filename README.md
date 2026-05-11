@@ -80,9 +80,9 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 
 ### Playback
 
-- `Enter`: play / pause, or restart when the movie has ended
+- `Space`: play / pause, or restart when the movie has ended
 - touchpad: move cursor and show the UI
-- touchpad click: play / pause, restart at end, or seek when clicking inside the bottom UI band
+- `Enter` / touchpad click: play / pause, restart at end, click hovered controls, or seek inside the bottom UI band
 - `Left` / `Right`: seek `-5s` / `+5s`
 - `Up` / `Down`: increase / decrease screen brightness
 - `Tab`: single-frame step while paused, hold to repeat
