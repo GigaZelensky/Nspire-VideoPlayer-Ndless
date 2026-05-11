@@ -11788,7 +11788,7 @@ static void draw_progress(
     uint8_t chrome_mix
 )
 {
-    SDL_Rect overlay = {4, SCREEN_H - 28, SCREEN_W - 8, 28};
+    SDL_Rect overlay = {5, SCREEN_H - 28, SCREEN_W - 10, 28};
     SDL_Rect bar_back = progress_bar_rect();
     SDL_Rect bar_front = bar_back;
     int ui_offset = ui_bar_hidden_offset_for_mix(chrome_mix);
