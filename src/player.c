@@ -14844,6 +14844,7 @@ static int play_movie(
         int brightness_delta = 0;
         int speed_delta = 0;
         bool pointer_release_edge;
+        bool show_ui_before_pointer_activation;
 
         esc_exit_request = esc_edge || (!help_menu_open && esc_down && !esc_exit_suppressed_until_release);
 
@@ -14973,6 +14974,7 @@ static int play_movie(
             tab_repeat_next_ms = now_ms + tab_hold_repeat_interval_ms;
         }
 
+        show_ui_before_pointer_activation = show_ui;
         if (pointer.moved ||
             pointer_click ||
             (pointer.down && playback_press_target != PLAYBACK_PRESS_NONE) ||
@@ -15588,7 +15590,7 @@ static int play_movie(
             compute_video_rects(&movie, scale_mode, video_align_x, video_align_y, &click_src, &click_dst);
             playback_badge = playback_badge_rect(&click_dst);
             status_badge_rects(fonts, &click_dst, scale_mode, playback_rate, &scale_badge, &speed_badge);
-            controls_live = (show_ui || playback_press_target != PLAYBACK_PRESS_NONE) && !help_menu_open;
+            controls_live = (show_ui_before_pointer_activation || playback_press_target != PLAYBACK_PRESS_NONE) && !help_menu_open;
             if (pointer_click) {
                 playback_press_target = PLAYBACK_PRESS_NONE;
                 if (controls_live && pointer_over_rect(&pointer, &playback_badge)) {
@@ -15651,7 +15653,7 @@ static int play_movie(
                 }
             }
 
-            if (pointer_click && show_ui && pointer.y >= SCREEN_H - UI_BAR_H && pointer.y < SCREEN_H) {
+            if (pointer_click && show_ui_before_pointer_activation && pointer.y >= SCREEN_H - UI_BAR_H && pointer.y < SCREEN_H) {
                 int seek_x = clamp_int(pointer.x, bar.x, bar.x + bar.w);
                 int seek_marker_x = clamp_int(pointer.x, bar.x, bar.x + bar.w - 1);
                 uint32_t target_frame;
@@ -15732,8 +15734,14 @@ static int play_movie(
                         result = -1;
                         break;
                     }
-                    begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
                     hover_preview_needs_rebuffer = false;
+                    if (paused) {
+                        begin_seek_preroll(&movie, &seek_preroll_active, &seek_preroll_started_ms, &seek_preroll_target_ready_count);
+                    } else {
+                        seek_preroll_active = false;
+                        seek_preroll_started_ms = 0;
+                        seek_preroll_target_ready_count = 0;
+                    }
                     if (!seek_preroll_active) {
                         reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
                     }
