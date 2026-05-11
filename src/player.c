@@ -1,11 +1,10 @@
-#define OLD_SCREEN_API
+#include <stdbool.h>
 #include <dirent.h>
 #include <libndls.h>
 #include <os.h>
 #include <SDL/SDL.h>
 
 #include <ctype.h>
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,10 +15,11 @@
 #include "h264bsd_util.h"
 #include "sram.h"
 
-extern void FastMemcpy(void* dest, const void* src, size_t chunks_32byte);
-
 #define SCREEN_W 320
 #define SCREEN_H 240
+#define UI_CHROME_VISUAL_X_OFFSET 0
+#define UI_CHROME_CENTER_X ((SCREEN_W / 2) + UI_CHROME_VISUAL_X_OFFSET)
+#define UI_SOFT_PANEL_RIGHT_PERCEIVED_EDGE_INSET 1
 #define UI_BAR_H 28
 #define SEEK_STEP_MS 5000
 #define SEEK_STACK_DELAY_MS 450U
@@ -908,9 +908,31 @@ static bool debug_should_collect_metrics(void)
     return g_debug_metrics_enabled || g_debug_logging_enabled;
 }
 
-static uint8_t *hardware_screen_bytes(void)
+static scr_type_t screen_buffer_type(void)
 {
-    return (uint8_t *) (uintptr_t) SCREEN_BASE_ADDRESS;
+    return has_colors ? SCR_320x240_565 : SCR_320x240_8;
+}
+
+static scr_type_t screen_lcd_type(void)
+{
+    scr_type_t native_type = lcd_type();
+
+    return native_type == SCR_TYPE_INVALID ? screen_buffer_type() : native_type;
+}
+
+static void patch_cx2_lcd_edge_timing(void)
+{
+    volatile uint32_t *timing_1 = (volatile uint32_t *) 0xC0000004;
+
+    if (!has_colors || !is_cx2 || lcd_type() != SCR_240x320_565) {
+        return;
+    }
+
+    /* Ndless applies this same timing fix at install time for CX II panels
+     * whose first/last landscape column is clipped by the LCD controller. */
+    if (*timing_1 == 0x03780D3F) {
+        *timing_1 = 0x0720013F;
+    }
 }
 
 static void present_screen(SDL_Surface *screen)
@@ -926,7 +948,7 @@ static void present_screen(SDL_Surface *screen)
         }
         locked = true;
     }
-    FastMemcpy(hardware_screen_bytes(), screen->pixels, SCREEN_BYTES_SIZE / 32);
+    lcd_blit(screen->pixels, screen_buffer_type());
     if (locked) {
         SDL_UnlockSurface(screen);
     }
@@ -1395,6 +1417,33 @@ static int clamp_int(int value, int min_value, int max_value)
         return max_value;
     }
     return value;
+}
+
+static Sint16 chrome_centered_x_for_width(int width)
+{
+    if (width >= SCREEN_W) {
+        return 0;
+    }
+    return (Sint16) clamp_int(UI_CHROME_CENTER_X - (width / 2), 0, SCREEN_W - width);
+}
+
+static Sint16 chrome_left_x_for_margin(int margin)
+{
+    return (Sint16) clamp_int(margin + UI_CHROME_VISUAL_X_OFFSET, 0, SCREEN_W);
+}
+
+static Sint16 chrome_right_x_for_margin(int margin)
+{
+    return (Sint16) clamp_int(SCREEN_W - margin + UI_CHROME_VISUAL_X_OFFSET, 0, SCREEN_W);
+}
+
+static Sint16 chrome_soft_panel_right_x_for_margin(int margin)
+{
+    return (Sint16) clamp_int(
+        chrome_right_x_for_margin(margin) + UI_SOFT_PANEL_RIGHT_PERCEIVED_EDGE_INSET,
+        0,
+        SCREEN_W
+    );
 }
 
 static bool rect_contains_point(const SDL_Rect *rect, int x, int y)
@@ -8868,7 +8917,8 @@ static void draw_subtitle(
 
 static SDL_Rect progress_bar_rect(void)
 {
-    SDL_Rect rect = {18, SCREEN_H - 15, SCREEN_W - 36, 6};
+    const int width = SCREEN_W - 36;
+    SDL_Rect rect = {chrome_centered_x_for_width(width), SCREEN_H - 15, width, 6};
     return rect;
 }
 
@@ -10766,9 +10816,9 @@ static void draw_seek_delta_badge(
     badge.w = (Uint16) (text_w + 12);
     badge.h = 16;
     if (negative) {
-        badge.x = (Sint16) (10 - offset);
+        badge.x = (Sint16) (chrome_left_x_for_margin(10) - offset);
     } else {
-        badge.x = (Sint16) (SCREEN_W - 10 - badge.w + offset);
+        badge.x = (Sint16) (chrome_right_x_for_margin(10) - badge.w + offset);
     }
 
     draw_soft_glass_panel(screen, &badge, rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, mix, 255), false);
@@ -10860,7 +10910,7 @@ static void draw_playback_title_strip(
     left_x = playback_badge.x + playback_badge.w + 6;
     level_1_right = scale_badge.x - 6;
     level_2_right = speed_badge.x - 6;
-    level_3_right = SCREEN_W - 8;
+    level_3_right = chrome_right_x_for_margin(8);
     title_w = nSDL_GetStringWidth(fonts->white, title);
     detail_w = has_detail ? nSDL_GetStringWidth(fonts->white, detail) : 0;
     required_w = (title_w > detail_w ? title_w : detail_w) + 16;
@@ -11149,7 +11199,7 @@ static void status_badge_rects(
     SDL_Rect *speed_badge
 )
 {
-    int right_x = SCREEN_W - 8;
+    int right_x = chrome_soft_panel_right_x_for_margin(8);
     int y = top_overlay_y_for_rect(video_rect, 16);
     SDL_Rect speed = text_badge_rect(fonts, right_x, y, playback_rate ? playback_rate->label : "1.0x");
 
@@ -11300,7 +11350,7 @@ static void update_playback_ui_mixes(
 static SDL_Rect playback_badge_rect(const SDL_Rect *video_rect)
 {
     int y = top_overlay_y_for_rect(video_rect, 22);
-    SDL_Rect outer = {8, (Sint16) y, 22, 22};
+    SDL_Rect outer = {chrome_left_x_for_margin(8), (Sint16) y, 22, 22};
 
     return outer;
 }
@@ -11318,7 +11368,7 @@ static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect,
 
     outer.y = (Sint16) (outer.y + y_offset);
     y = outer.y;
-    fill.x = (Sint16) (9 + press_offset_x);
+    fill.x = (Sint16) (outer.x + 1 + press_offset_x);
     fill.y = (Sint16) (y + 1 + press_offset_y);
     fill.w = 20;
     fill.h = 20;
@@ -11342,8 +11392,8 @@ static void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect,
         return;
     }
     if (paused) {
-        SDL_Rect left_bar = {(Sint16) (14 + press_offset_x), (Sint16) (y + 5 + press_offset_y), 3, 10};
-        SDL_Rect right_bar = {(Sint16) (21 + press_offset_x), (Sint16) (y + 5 + press_offset_y), 3, 10};
+        SDL_Rect left_bar = {(Sint16) (outer.x + 6 + press_offset_x), (Sint16) (y + 5 + press_offset_y), 3, 10};
+        SDL_Rect right_bar = {(Sint16) (outer.x + 13 + press_offset_x), (Sint16) (y + 5 + press_offset_y), 3, 10};
         fill_rect_rgb565(screen, &left_bar, UI_COLOR_WHITE);
         fill_rect_rgb565(screen, &right_bar, UI_COLOR_WHITE);
     } else {
@@ -11442,7 +11492,12 @@ static void draw_memory_badge(
         debug_is_runtime_logging_enabled() ? " DBG" : ""
     );
 
-    left_x = playback_badge_visible ? 36 : 8;
+    if (playback_badge_visible) {
+        SDL_Rect playback_badge = playback_badge_rect(video_rect);
+        left_x = playback_badge.x + playback_badge.w + 6;
+    } else {
+        left_x = chrome_left_x_for_margin(8);
+    }
     y = top_overlay_y_for_rect(video_rect, 16);
 
     if (left_x + nSDL_GetStringWidth(fonts->white, label_full) + 10 <= right_limit) {
@@ -11904,7 +11959,8 @@ static void draw_progress(
     uint8_t chrome_mix
 )
 {
-    SDL_Rect overlay = {5, SCREEN_H - 28, SCREEN_W - 10, 28};
+    const int overlay_width = SCREEN_W - 10;
+    SDL_Rect overlay = {chrome_centered_x_for_width(overlay_width), SCREEN_H - 28, overlay_width, 28};
     SDL_Rect bar_back = progress_bar_rect();
     SDL_Rect bar_front = bar_back;
     int ui_offset = ui_bar_hidden_offset_for_mix(chrome_mix);
@@ -12114,7 +12170,7 @@ static void render_movie(
 )
 {
     SDL_Rect dst = {0, 0, SCREEN_W, SCREEN_H};
-    int memory_right_limit = SCREEN_W - 8;
+    int memory_right_limit = chrome_right_x_for_margin(8);
     uint32_t current_ms = movie_frame_time_ms(movie, movie->current_frame);
     uint8_t chrome_mix = ui_mixes ? ui_mixes->chrome : (show_ui ? 255 : 0);
     uint8_t help_menu_mix = ui_mixes ? ui_mixes->help_menu : (help_menu_open ? 255 : 0);
@@ -12197,17 +12253,24 @@ static void render_movie(
                     ui_mixes->title_strip
                 );
             }
-            draw_status_overlay_badge(
-                screen,
-                fonts,
-                playback_badge_visible ? 36 : 8,
-                top_overlay_y_for_rect(&dst, 16),
-                status_overlay_text,
-                status_overlay_started_ms,
-                status_overlay_until_ms,
-                now_ms,
-                chrome_mix
-            );
+            {
+                SDL_Rect playback_badge = playback_badge_rect(&dst);
+                int status_left_x = playback_badge_visible
+                    ? playback_badge.x + playback_badge.w + 6
+                    : chrome_left_x_for_margin(8);
+
+                draw_status_overlay_badge(
+                    screen,
+                    fonts,
+                    status_left_x,
+                    top_overlay_y_for_rect(&dst, 16),
+                    status_overlay_text,
+                    status_overlay_started_ms,
+                    status_overlay_until_ms,
+                    now_ms,
+                    chrome_mix
+                );
+            }
         }
         draw_progress(
             screen,
@@ -12474,13 +12537,15 @@ static void draw_resume_prompt_background(SDL_Surface *screen, Movie *movie)
 
 static SDL_Rect picker_row_rect_for_y(int row_y)
 {
-    SDL_Rect row = {12, (Sint16) (row_y - 5), SCREEN_W - 24, 20};
+    const int width = SCREEN_W - 24;
+    SDL_Rect row = {chrome_centered_x_for_width(width), (Sint16) (row_y - 5), width, 20};
     return row;
 }
 
 static SDL_Rect picker_row_divider_rect(const SDL_Rect *row)
 {
-    SDL_Rect divider = {12, 0, SCREEN_W - 24, 1};
+    const int width = SCREEN_W - 24;
+    SDL_Rect divider = {chrome_centered_x_for_width(width), 0, width, 1};
 
     if (row) {
         divider.x = (Sint16) (row->x + 4);
@@ -16690,8 +16755,16 @@ int main(int argc, char **argv)
         monotonic_clock_shutdown();
         return 1;
     }
+    if (!lcd_init(screen_lcd_type())) {
+        show_msgbox("ND Video Player", "Failed to initialize the LCD.");
+        SDL_Quit();
+        monotonic_clock_shutdown();
+        return 1;
+    }
+    patch_cx2_lcd_edge_timing();
     if (!init_fonts(&fonts)) {
         show_msgbox("ND Video Player", "Failed to load fonts.");
+        lcd_init(SCR_TYPE_INVALID);
         SDL_Quit();
         monotonic_clock_shutdown();
         return 1;
@@ -16751,6 +16824,7 @@ int main(int argc, char **argv)
     cleanup_deferred_playback_movie();
     clear_movie_picker_cache(&g_picker_cache);
     free_fonts(&fonts);
+    lcd_init(SCR_TYPE_INVALID);
     SDL_Quit();
     sram_shutdown();
     monotonic_clock_shutdown();
