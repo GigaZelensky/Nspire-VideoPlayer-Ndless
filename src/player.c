@@ -174,6 +174,7 @@
 #define SUBTITLE_COORD_SCALE 10000U
 #define H264_CLIP_OFFSET 384
 #define H264_CLIP_TABLE_SIZE 1024
+#define SRAM_MOVIE_CHUNK_BUFFER_BYTES (112U * 1024U)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -496,6 +497,7 @@ typedef struct {
     uint16_t *framebuffer;
     uint8_t *chunk_storage;
     size_t chunk_storage_size;
+    bool chunk_storage_in_sram;
     uint8_t *chunk_bytes;
     uint32_t *frame_offsets;
     size_t chunk_size;
@@ -723,6 +725,8 @@ static bool g_debug_metrics_enabled = false;
 static H264ColorTables g_h264_color_tables_storage;
 static H264ColorTables *g_h264_color_tables = &g_h264_color_tables_storage;
 static bool g_h264_color_tables_in_sram = false;
+static uint8_t *g_sram_movie_chunk_buffer = NULL;
+static size_t g_sram_movie_chunk_buffer_size = 0;
 static Movie *g_deferred_playback_movie = NULL;
 static MoviePickerCache g_picker_cache;
 static DeferredHistorySave g_pending_history_save;
@@ -2212,7 +2216,7 @@ static MemoryStats query_memory_stats(const Movie *movie)
     if (movie->frame_offsets && movie->loaded_chunk >= 0 && (uint32_t) movie->loaded_chunk < movie->header.chunk_count) {
         stats.used_bytes += (size_t) movie->chunk_index[movie->loaded_chunk].frame_count * sizeof(uint32_t);
     }
-    if (movie->chunk_storage) {
+    if (movie->chunk_storage && !movie->chunk_storage_in_sram) {
         stats.used_bytes += movie->chunk_storage_size;
     }
 
@@ -2591,6 +2595,65 @@ static void free_history_store(HistoryStore *history)
     history->count = 0;
 }
 
+static bool sram_movie_chunk_buffer_can_hold(size_t size)
+{
+    return g_sram_movie_chunk_buffer && size > 0 && size <= g_sram_movie_chunk_buffer_size;
+}
+
+static void release_movie_chunk_storage(Movie *movie)
+{
+    if (!movie) {
+        return;
+    }
+    if (movie->chunk_storage && !movie->chunk_storage_in_sram) {
+        free(movie->chunk_storage);
+    }
+    movie->chunk_storage = NULL;
+    movie->chunk_storage_size = 0;
+    movie->chunk_storage_in_sram = false;
+}
+
+static bool allocate_movie_chunk_storage(Movie *movie, size_t size)
+{
+    if (!movie || size == 0) {
+        return false;
+    }
+    release_movie_chunk_storage(movie);
+    if (sram_movie_chunk_buffer_can_hold(size)) {
+        movie->chunk_storage = g_sram_movie_chunk_buffer;
+        movie->chunk_storage_in_sram = true;
+        return true;
+    }
+
+    movie->chunk_storage = (uint8_t *) malloc(size);
+    movie->chunk_storage_in_sram = false;
+    return movie->chunk_storage != NULL;
+}
+
+static bool adopt_movie_chunk_storage(Movie *movie, uint8_t **storage, size_t size)
+{
+    uint8_t *owned_storage;
+
+    if (!movie || !storage || !*storage || size == 0) {
+        return false;
+    }
+
+    owned_storage = *storage;
+    release_movie_chunk_storage(movie);
+    if (sram_movie_chunk_buffer_can_hold(size)) {
+        memcpy(g_sram_movie_chunk_buffer, owned_storage, size);
+        free(owned_storage);
+        movie->chunk_storage = g_sram_movie_chunk_buffer;
+        movie->chunk_storage_in_sram = true;
+    } else {
+        movie->chunk_storage = owned_storage;
+        movie->chunk_storage_in_sram = false;
+    }
+    movie->chunk_storage_size = size;
+    *storage = NULL;
+    return true;
+}
+
 static void destroy_movie(Movie *movie)
 {
     uint32_t index;
@@ -2619,7 +2682,7 @@ static void destroy_movie(Movie *movie)
     free(movie->subtitle_tracks);
     free(movie->chunk_index);
     free(movie->framebuffer);
-    free(movie->chunk_storage);
+    release_movie_chunk_storage(movie);
     free(movie->frame_offsets);
     free(movie->h264_boundary_warmup.frame_offsets);
     if (movie->h264_decoder) {
@@ -2662,6 +2725,7 @@ static void defer_playback_movie_cleanup(Movie *movie)
         fclose(movie->file);
         movie->file = NULL;
     }
+    release_movie_chunk_storage(movie);
     g_deferred_playback_movie = movie;
 }
 
@@ -2788,6 +2852,31 @@ static bool init_h264_color_tables(void)
 
     tables->initialized = true;
     return true;
+}
+
+static void init_sram_movie_chunk_buffer(void)
+{
+    if (g_sram_movie_chunk_buffer || !sram_is_enabled()) {
+        return;
+    }
+
+    g_sram_movie_chunk_buffer = (uint8_t *) sram_alloc(SRAM_MOVIE_CHUNK_BUFFER_BYTES, 32U);
+    if (g_sram_movie_chunk_buffer) {
+        g_sram_movie_chunk_buffer_size = SRAM_MOVIE_CHUNK_BUFFER_BYTES;
+        debug_tracef(
+            "sram current chunk buffer=%lu used=%lu/%lu",
+            (unsigned long) g_sram_movie_chunk_buffer_size,
+            (unsigned long) sram_bytes_used(),
+            (unsigned long) sram_bytes_capacity()
+        );
+    } else {
+        g_sram_movie_chunk_buffer_size = 0;
+        debug_tracef(
+            "sram current chunk buffer unavailable used=%lu/%lu",
+            (unsigned long) sram_bytes_used(),
+            (unsigned long) sram_bytes_capacity()
+        );
+    }
 }
 
 static inline uint8_t h264_clip_byte(int32_t value)
@@ -5476,9 +5565,7 @@ static bool load_chunk_from_file(Movie *movie, int chunk_index, bool allow_prefe
     clear_h264_same_chunk_warmup(movie);
 
 retry:
-    free(movie->chunk_storage);
-    movie->chunk_storage = NULL;
-    movie->chunk_storage_size = 0;
+    release_movie_chunk_storage(movie);
 
     if (entry->packed_size != entry->unpacked_size) {
         debug_failf(
@@ -5490,9 +5577,10 @@ retry:
         return false;
     }
 
-    ensure_app_memory_headroom(movie, entry->packed_size, 2U);
-    movie->chunk_storage = (uint8_t *) malloc(entry->packed_size);
-    if (!movie->chunk_storage) {
+    if (!sram_movie_chunk_buffer_can_hold(entry->packed_size)) {
+        ensure_app_memory_headroom(movie, entry->packed_size, 2U);
+    }
+    if (!allocate_movie_chunk_storage(movie, entry->packed_size)) {
         if (allow_prefetch_retry) {
             size_t released_slots;
             debug_failf(
@@ -5511,7 +5599,9 @@ retry:
                     (unsigned long) active_h264_frame_ring_capacity(movie)
                 );
             }
-            ensure_app_memory_headroom(movie, entry->packed_size, 0U);
+            if (!sram_movie_chunk_buffer_can_hold(entry->packed_size)) {
+                ensure_app_memory_headroom(movie, entry->packed_size, 0U);
+            }
             allow_prefetch_retry = false;
             goto retry;
         }
@@ -5521,15 +5611,13 @@ retry:
     if (fseek(movie->file, (long) entry->offset, SEEK_SET) != 0) {
         debug_failf("load chunk=%d fseek fail offset=%lu", chunk_index, (unsigned long) entry->offset);
         movie->current_file_pos = -1;
-        free(movie->chunk_storage);
-        movie->chunk_storage = NULL;
+        release_movie_chunk_storage(movie);
         return false;
     }
     if (fread(movie->chunk_storage, 1, entry->packed_size, movie->file) != entry->packed_size) {
         debug_failf("load chunk=%d fread fail packed=%lu", chunk_index, (unsigned long) entry->packed_size);
         movie->current_file_pos = -1;
-        free(movie->chunk_storage);
-        movie->chunk_storage = NULL;
+        release_movie_chunk_storage(movie);
         return false;
     }
     movie->current_file_pos = (long) entry->offset + (long) entry->packed_size;
@@ -5542,9 +5630,7 @@ retry:
             (unsigned) entry->frame_count,
             (unsigned long) entry->frame_table_offset
         );
-        free(movie->chunk_storage);
-        movie->chunk_storage = NULL;
-        movie->chunk_storage_size = 0;
+        release_movie_chunk_storage(movie);
         return false;
     }
     movie->loaded_chunk = chunk_index;
@@ -5600,10 +5686,10 @@ static bool load_chunk(Movie *movie, int chunk_index)
                 return load_chunk_from_file(movie, chunk_index, true);
             }
         }
-        free(movie->chunk_storage);
-        movie->chunk_storage = prefetched->chunk_storage;
-        movie->chunk_storage_size = prefetched->chunk_storage_size;
-        prefetched->chunk_storage = NULL;
+        if (!adopt_movie_chunk_storage(movie, &prefetched->chunk_storage, prefetched->chunk_storage_size)) {
+            clear_prefetched_chunk(prefetched);
+            return load_chunk_from_file(movie, chunk_index, true);
+        }
         reset_prefetched_chunk(prefetched);
         if (!configure_chunk_view(movie, chunk_index)) {
             debug_tracef(
@@ -5613,9 +5699,7 @@ static bool load_chunk(Movie *movie, int chunk_index)
                 (unsigned) entry->frame_count,
                 (unsigned long) entry->frame_table_offset
             );
-            free(movie->chunk_storage);
-            movie->chunk_storage = NULL;
-            movie->chunk_storage_size = 0;
+            release_movie_chunk_storage(movie);
             return load_chunk_from_file(movie, chunk_index, false);
         }
         movie->loaded_chunk = chunk_index;
@@ -8223,6 +8307,7 @@ static bool activate_h264_boundary_warmup(Movie *movie)
     storage_t *decoder;
     bool decoder_initialized;
     uint32_t frame_index;
+    size_t chunk_bytes_offset;
 
     if (!movie) {
         return false;
@@ -8242,15 +8327,15 @@ static bool activate_h264_boundary_warmup(Movie *movie)
         return false;
     }
 
-    free(movie->chunk_storage);
-    movie->chunk_storage = prefetched->chunk_storage;
-    movie->chunk_storage_size = prefetched->chunk_storage_size;
-    prefetched->chunk_storage = NULL;
+    chunk_bytes_offset = (size_t) (warmup->chunk_bytes - warmup->chunk_storage);
+    if (!adopt_movie_chunk_storage(movie, &prefetched->chunk_storage, prefetched->chunk_storage_size)) {
+        return false;
+    }
     reset_prefetched_chunk(prefetched);
 
     free(movie->frame_offsets);
     movie->frame_offsets = warmup->frame_offsets;
-    movie->chunk_bytes = warmup->chunk_bytes;
+    movie->chunk_bytes = movie->chunk_storage + chunk_bytes_offset;
     movie->chunk_size = warmup->chunk_size;
     movie->loaded_chunk = warmup->chunk_index;
     movie->decoded_local_frame = warmup->decoded_local_frame;
@@ -12791,6 +12876,7 @@ static bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *
     const ChunkIndexEntry *entry;
     uint32_t decoded_frame;
     size_t frame_pixels;
+    size_t chunk_bytes_offset;
 
     if (!movie || !preview || !movie_uses_h264(movie)) {
         return false;
@@ -12827,6 +12913,7 @@ static bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *
     }
 
     frame_pixels = (size_t) movie->header.video_width * movie->header.video_height;
+    chunk_bytes_offset = (size_t) (job->chunk_bytes - job->chunk_storage);
     clear_h264_frame_ring(movie);
     clear_h264_boundary_warmup(movie);
     clear_h264_same_chunk_warmup(movie);
@@ -12836,15 +12923,16 @@ static bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *
         }
         h264bsdFree(movie->h264_decoder);
     }
-    free(movie->chunk_storage);
+    release_movie_chunk_storage(movie);
     free(movie->frame_offsets);
 
     movie->h264_decoder = job->decoder;
     movie->h264_decoder_initialized = job->decoder_initialized;
-    movie->chunk_storage = job->chunk_storage;
-    movie->chunk_storage_size = job->chunk_storage_size;
+    if (!adopt_movie_chunk_storage(movie, &job->chunk_storage, job->chunk_storage_size)) {
+        return false;
+    }
     movie->frame_offsets = job->frame_offsets;
-    movie->chunk_bytes = job->chunk_bytes;
+    movie->chunk_bytes = movie->chunk_storage + chunk_bytes_offset;
     movie->chunk_size = job->chunk_size;
     movie->loaded_chunk = job->chunk_index;
     movie->decoded_local_frame = (int) (decoded_frame - entry->first_frame);
@@ -17437,6 +17525,7 @@ int main(int argc, char **argv)
         h264bsdInitSramTables();
     }
     init_h264_color_tables();
+    init_sram_movie_chunk_buffer();
 
     strncpy(directory, argv[0], sizeof(directory) - 1);
     directory[sizeof(directory) - 1] = '\0';

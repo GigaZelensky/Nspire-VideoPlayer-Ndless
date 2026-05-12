@@ -11,8 +11,9 @@
 #define SRAM_CX_HARDWARE_SIZE (128U * 1024U)
 #define SRAM_CX_POOL_SIZE (16U * 1024U)
 #define SRAM_CX_POOL_OFFSET (SRAM_CX_HARDWARE_SIZE - SRAM_CX_POOL_SIZE)
-#define SRAM_CX2_POOL_SIZE (256U * 1024U)
-#define SRAM_CX2_POOL_OFFSET 0U
+#define SRAM_CX2_HARDWARE_SIZE (256U * 1024U)
+#define SRAM_CX2_POOL_SIZE (128U * 1024U)
+#define SRAM_CX2_POOL_OFFSET (SRAM_CX2_HARDWARE_SIZE - SRAM_CX2_POOL_SIZE)
 #define SRAM_SECTION_SIZE 0x100000U
 #define SRAM_TTB_SIZE 16384U
 #define SRAM_TTB_ALIGNMENT 16384U
@@ -88,6 +89,22 @@ static size_t sram_hardware_pool_size(void)
     return is_cx2 ? SRAM_CX2_POOL_SIZE : SRAM_CX_POOL_SIZE;
 }
 
+static bool sram_hardware_supported(void)
+{
+    /*
+     * Firebird tolerates the CX SRAM alias, but real CX hardware has been
+     * seen data-aborting inside H.264 decode with the 0xEE01xxxx alias live.
+     * Keep the SRAM fast path to CX II until the original CX alias is proven
+     * safe on-device.
+     */
+    return is_cx2;
+}
+
+static size_t sram_hardware_size(void)
+{
+    return is_cx2 ? SRAM_CX2_HARDWARE_SIZE : SRAM_CX_HARDWARE_SIZE;
+}
+
 static size_t sram_hardware_pool_offset(void)
 {
     return is_cx2 ? SRAM_CX2_POOL_OFFSET : SRAM_CX_POOL_OFFSET;
@@ -95,7 +112,7 @@ static size_t sram_hardware_pool_offset(void)
 
 static const char *sram_enabled_message(void)
 {
-    return is_cx2 ? "enabled cx2 256K" : "enabled cx high 16K";
+    return is_cx2 ? "enabled cx2 high 128K" : "enabled cx high 16K";
 }
 
 static void *sram_alloc_aligned(size_t size, size_t alignment, void **raw_allocation)
@@ -147,6 +164,7 @@ bool sram_init(void)
     uintptr_t old_table_address;
     uint32_t old_ttbr0_flags;
     uint32_t sram_entry;
+    size_t hardware_size;
     size_t pool_capacity;
     size_t pool_offset;
     size_t clone_size;
@@ -156,7 +174,12 @@ bool sram_init(void)
         sram_set_status_message(sram_enabled_message());
         return true;
     }
+    if (!sram_hardware_supported()) {
+        sram_set_status_message("disabled on cx");
+        return false;
+    }
 
+    hardware_size = sram_hardware_size();
     pool_capacity = sram_hardware_pool_size();
     pool_offset = sram_hardware_pool_offset();
     clone_size = is_cx2 ? SRAM_SECTION_SIZE : pool_capacity;
@@ -185,7 +208,7 @@ bool sram_init(void)
     }
     if (is_cx2) {
         memset(g_sram_clone, 0, SRAM_SECTION_SIZE);
-        memcpy(g_sram_clone, (const void *) (uintptr_t) SRAM_PHYSICAL_ADDRESS, pool_capacity);
+        memcpy(g_sram_clone, (const void *) (uintptr_t) SRAM_PHYSICAL_ADDRESS, hardware_size);
         sram_flush_dcache_range((uintptr_t) g_sram_clone, (uintptr_t) g_sram_clone + SRAM_SECTION_SIZE);
     } else {
         memcpy(
@@ -264,15 +287,20 @@ void sram_shutdown(void)
     }
 
     interrupt_mask = TCT_Local_Control_Interrupts(-1);
-    memcpy(
-        (void *) (uintptr_t) (SRAM_VIRTUAL_ADDRESS + g_sram_pool_offset),
-        g_sram_clone,
-        g_sram_pool_capacity
-    );
-    sram_flush_dcache_range(
-        SRAM_VIRTUAL_ADDRESS + g_sram_pool_offset,
-        SRAM_VIRTUAL_ADDRESS + g_sram_pool_offset + g_sram_pool_capacity
-    );
+    if (is_cx2) {
+        memcpy((void *) (uintptr_t) SRAM_VIRTUAL_ADDRESS, g_sram_clone, SRAM_CX2_HARDWARE_SIZE);
+        sram_flush_dcache_range(SRAM_VIRTUAL_ADDRESS, SRAM_VIRTUAL_ADDRESS + SRAM_CX2_HARDWARE_SIZE);
+    } else {
+        memcpy(
+            (void *) (uintptr_t) (SRAM_VIRTUAL_ADDRESS + g_sram_pool_offset),
+            g_sram_clone,
+            g_sram_pool_capacity
+        );
+        sram_flush_dcache_range(
+            SRAM_VIRTUAL_ADDRESS + g_sram_pool_offset,
+            SRAM_VIRTUAL_ADDRESS + g_sram_pool_offset + g_sram_pool_capacity
+        );
+    }
     sram_drain_write_buffer();
     sram_set_ttbr0(g_sram_original_ttbr0);
     sram_invalidate_tlb();
