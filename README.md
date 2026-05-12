@@ -58,11 +58,11 @@ Battery Life: ~9.5 hours of continuous H.264 playback at 100% brightness on a CX
 
 ### Picker
 
-- `Up` / `Down`: select movie
+- `Up` / `Down` or keypad `8` / `2`: select movie
 - touchpad: move cursor
 - touchpad hover: after a short pause, show filename metadata tooltip when available
 - touchpad click: open highlighted movie
-- `Enter`: open movie
+- `Enter` or keypad `5`: open movie
 - `C`: cycle theme color
 - `S`: save a BMP screenshot
 - `Esc`: exit
@@ -83,12 +83,13 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 
 - `Space`: play / pause, or restart when the movie has ended
 - touchpad: move cursor and show the UI
-- `Enter` / touchpad click: play / pause, restart at end, click hovered controls, or seek inside the bottom UI band
-- `Left` / `Right`: seek `-5s` / `+5s`
-- `Up` / `Down`: increase / decrease screen brightness
+- `Enter` / keypad `5` / touchpad click: play / pause, restart at end, click hovered controls, or seek inside the bottom UI band
+- `Left` / `Right` or keypad `4` / `6`: seek `-5s` / `+5s`
+- `Up` / `Down` or keypad `8` / `2`: increase / decrease screen brightness
 - `Tab`: single-frame step while paused, hold to repeat
 - `P`: cycle playback mode: `PLAY ONCE`, `REPLAY`, `AUTO NEXT`
 - `/`: cycle scale mode
+- `Ctrl` + keypad `1`-`9`: align video
 - `{` / `}`: decrease / increase playback speed
 - `^`: cycle subtitle placement
 - `+` / `-`: increase / decrease subtitle size, down to hidden
@@ -104,10 +105,10 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 
 ### Resume Prompt
 
-- `Left` / `Right`: choose `CONTINUE` or `START OVER`
+- `Left` / `Right` or keypad `4` / `6`: choose `CONTINUE` or `START OVER`
 - touchpad: move cursor
 - touchpad click: activate the highlighted button
-- `Enter`: confirm the selected button
+- `Enter` or keypad `5`: confirm the selected button
 - `C`: cycle theme color
 - `S`: save a BMP screenshot
 - `Esc`: cancel and return

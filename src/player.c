@@ -138,9 +138,13 @@
 #define MONOTONIC_TIMER_CLOCK_SOURCE_32768HZ 0x0AU
 #define MONOTONIC_TIMER_CONTROL_ENABLE_32BIT 0x82U
 #define MONOTONIC_TIMER_MAX_DELTA_TICKS (TIMER_TICKS_PER_SEC * 10U)
-#define LCD_BRIGHTNESS_ADDR ((volatile uint32_t *) 0x90130014U)
+#define LCD_BRIGHTNESS_CX2_ADDR ((volatile uint32_t *) 0x90130014U)
+#define LCD_BRIGHTNESS_CX_ADDR ((volatile uint32_t *) 0x900F0020U)
 #define LCD_BRIGHTNESS_MIN 0
 #define LCD_BRIGHTNESS_MAX 255
+#define LCD_BRIGHTNESS_CX_CONTRAST_OFF 0
+#define LCD_BRIGHTNESS_CX_CONTRAST_MIN_VISIBLE 1
+#define LCD_BRIGHTNESS_CX_CONTRAST_MAX 147
 #define LCD_BRIGHTNESS_LOWEST_NORMAL 225
 #define LCD_BRIGHTNESS_STEP 25
 #define DEBUG_RING_SIZE 8192
@@ -1583,17 +1587,72 @@ static void format_video_align_status(
     }
 }
 
+static uint32_t cx_contrast_to_brightness_raw(uint32_t contrast)
+{
+    uint32_t clamped = (uint32_t) clamp_int((int) contrast,
+        LCD_BRIGHTNESS_CX_CONTRAST_OFF,
+        LCD_BRIGHTNESS_CX_CONTRAST_MAX);
+    uint32_t visible_range = (uint32_t) LCD_BRIGHTNESS_CX_CONTRAST_MAX -
+        (uint32_t) LCD_BRIGHTNESS_CX_CONTRAST_MIN_VISIBLE;
+
+    if (clamped <= LCD_BRIGHTNESS_CX_CONTRAST_OFF) {
+        return LCD_BRIGHTNESS_MAX;
+    }
+    clamped -= (uint32_t) LCD_BRIGHTNESS_CX_CONTRAST_MIN_VISIBLE;
+
+    return (uint32_t) ((clamped * (uint32_t) LCD_BRIGHTNESS_MAX + (visible_range / 2U)) /
+        visible_range);
+}
+
+static uint32_t brightness_raw_to_cx_contrast(uint32_t raw_value)
+{
+    uint32_t clamped = (uint32_t) clamp_int((int) raw_value, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
+    uint32_t visible_range = (uint32_t) LCD_BRIGHTNESS_CX_CONTRAST_MAX -
+        (uint32_t) LCD_BRIGHTNESS_CX_CONTRAST_MIN_VISIBLE;
+
+    return (uint32_t) LCD_BRIGHTNESS_CX_CONTRAST_MIN_VISIBLE +
+        (uint32_t) ((clamped * visible_range + ((uint32_t) LCD_BRIGHTNESS_MAX / 2U)) /
+        (uint32_t) LCD_BRIGHTNESS_MAX);
+}
+
 static uint32_t current_lcd_brightness(void)
 {
-    return (uint32_t) clamp_int((int) *LCD_BRIGHTNESS_ADDR, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
+    if (!has_colors) {
+        return LCD_BRIGHTNESS_MIN;
+    }
+    if (is_cx2) {
+        return (uint32_t) clamp_int((int) *LCD_BRIGHTNESS_CX2_ADDR,
+            LCD_BRIGHTNESS_MIN,
+            LCD_BRIGHTNESS_MAX);
+    }
+    return cx_contrast_to_brightness_raw(*LCD_BRIGHTNESS_CX_ADDR);
 }
 
 static uint32_t set_lcd_brightness(int value)
 {
-    int clamped = clamp_int(value, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
+    uint32_t clamped = (uint32_t) clamp_int(value, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
 
-    *LCD_BRIGHTNESS_ADDR = (uint32_t) clamped;
-    return (uint32_t) clamped;
+    if (!has_colors) {
+        return clamped;
+    }
+    if (is_cx2) {
+        *LCD_BRIGHTNESS_CX2_ADDR = clamped;
+    } else {
+        *LCD_BRIGHTNESS_CX_ADDR = brightness_raw_to_cx_contrast(clamped);
+    }
+    return clamped;
+}
+
+static void set_lcd_dark_for_power_off(void)
+{
+    if (!has_colors) {
+        return;
+    }
+    if (is_cx2) {
+        set_lcd_brightness(LCD_BRIGHTNESS_MAX);
+    } else {
+        *LCD_BRIGHTNESS_CX_ADDR = LCD_BRIGHTNESS_CX_CONTRAST_OFF;
+    }
 }
 
 static uint32_t adjust_lcd_brightness(int delta)
@@ -1627,7 +1686,7 @@ static void display_power_off(DisplayPowerState *state, bool was_paused)
 
     state->resume_playback_on_wake = !was_paused;
     state->saved_brightness = current_lcd_brightness();
-    set_lcd_brightness(LCD_BRIGHTNESS_MAX);
+    set_lcd_dark_for_power_off();
     state->off = true;
 }
 
@@ -12036,7 +12095,7 @@ static void draw_help_row(
 static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu_mix)
 {
     const int menu_w = 296;
-    const int menu_h = 204;
+    const int menu_h = 207;
     const int safe_h = SCREEN_H - UI_BAR_H;
     int offset_y = ((255 - menu_mix) * 6 + 127) / 255;
     SDL_Rect border = {(SCREEN_W - menu_w) / 2, (Sint16) (((safe_h - menu_h) / 2) + offset_y), menu_w, menu_h};
@@ -12049,13 +12108,13 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu
         const char *description;
     } rows[] = {
         {"SPACE", "Play or pause"},
-        {"ENTER/CLICK", "Toggle / click / seek"},
-        {"L / R", "Seek -/+5s"},
+        {"ENTER/5", "Toggle / click / seek"},
+        {"L/R 4/6", "Seek -/+5s"},
         {"TAB", "Step one frame"},
         {"P", "Playback mode"},
         {"/", "Scale mode"},
-        {"NUMPAD", "Align video / center"},
-        {"UP / DOWN", "Screen brightness"},
+        {"CTRL+NUM", "Align video / center"},
+        {"U/D 8/2", "Screen brightness"},
         {"{ / }", "Playback speed"},
         {"^", "Subtitle position"},
         {"+ / -", "Subtitle size"},
@@ -14955,6 +15014,11 @@ static int pick_movie(
     bool prev_esc = false;
     bool prev_c = false;
     bool prev_s = false;
+    bool prev_2 = false;
+    bool prev_4 = false;
+    bool prev_5 = false;
+    bool prev_6 = false;
+    bool prev_8 = false;
     ScreenshotPreviewState screenshot_preview;
     PointerState pointer;
     PointerHoverGuard hover_guard;
@@ -15010,6 +15074,11 @@ static int pick_movie(
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
+    prev_2 = isKeyPressed(KEY_NSPIRE_2);
+    prev_4 = isKeyPressed(KEY_NSPIRE_4);
+    prev_5 = isKeyPressed(KEY_NSPIRE_5);
+    prev_6 = isKeyPressed(KEY_NSPIRE_6);
+    prev_8 = isKeyPressed(KEY_NSPIRE_8);
     pointer_hover_guard_reset(&hover_guard);
     pointer_hover_guard_lock(&hover_guard, &pointer);
     picker_tooltip_hover_reset(&tooltip_hover);
@@ -15017,15 +15086,21 @@ static int pick_movie(
     while (1) {
         bool pointer_click = pointer_update(&pointer);
         uint32_t now_ms = monotonic_clock_now_ms();
+        bool ctrl_down = isKeyPressed(KEY_NSPIRE_CTRL) ? true : false;
+        bool keypad_2_edge = key_pressed_edge(KEY_NSPIRE_2, &prev_2);
+        bool keypad_4_edge = key_pressed_edge(KEY_NSPIRE_4, &prev_4);
+        bool keypad_5_edge = key_pressed_edge(KEY_NSPIRE_5, &prev_5);
+        bool keypad_6_edge = key_pressed_edge(KEY_NSPIRE_6, &prev_6);
+        bool keypad_8_edge = key_pressed_edge(KEY_NSPIRE_8, &prev_8);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
-        bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
-        bool enter_down = prev_enter;
-        bool up_edge = key_pressed_edge(KEY_NSPIRE_UP, &prev_up);
-        bool down_edge = key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down);
-        bool up_down = prev_up;
-        bool down_down = prev_down;
-        bool left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left);
-        bool right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right);
+        bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) || (!ctrl_down && keypad_5_edge);
+        bool enter_down = prev_enter || (!ctrl_down && prev_5);
+        bool up_edge = key_pressed_edge(KEY_NSPIRE_UP, &prev_up) || (!ctrl_down && keypad_8_edge);
+        bool down_edge = key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) || (!ctrl_down && keypad_2_edge);
+        bool up_down = prev_up || (!ctrl_down && prev_8);
+        bool down_down = prev_down || (!ctrl_down && prev_2);
+        bool left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || (!ctrl_down && keypad_4_edge);
+        bool right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right) || (!ctrl_down && keypad_6_edge);
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
         int next_hover_scroll_direction = pointer_hover_allowed && !pointer.down
             ? picker_hover_scroll_direction(count, scroll_start, &pointer)
@@ -15459,6 +15534,9 @@ static int prompt_resume_position(
     bool prev_left = false;
     bool prev_right = false;
     bool prev_enter = false;
+    bool prev_4 = false;
+    bool prev_5 = false;
+    bool prev_6 = false;
     bool prev_esc = false;
     bool prev_c = false;
     bool prev_s = false;
@@ -15579,6 +15657,9 @@ static int prompt_resume_position(
     prev_left = isKeyPressed(KEY_NSPIRE_LEFT);
     prev_right = isKeyPressed(KEY_NSPIRE_RIGHT);
     prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
+    prev_4 = isKeyPressed(KEY_NSPIRE_4);
+    prev_5 = isKeyPressed(KEY_NSPIRE_5);
+    prev_6 = isKeyPressed(KEY_NSPIRE_6);
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
@@ -15589,9 +15670,15 @@ static int prompt_resume_position(
         bool pointer_click = pointer_update(&pointer);
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
         uint32_t now_ms = monotonic_clock_now_ms();
+        bool ctrl_down = isKeyPressed(KEY_NSPIRE_CTRL) ? true : false;
+        bool keypad_4_edge = key_pressed_edge(KEY_NSPIRE_4, &prev_4);
+        bool keypad_5_edge = key_pressed_edge(KEY_NSPIRE_5, &prev_5);
+        bool keypad_6_edge = key_pressed_edge(KEY_NSPIRE_6, &prev_6);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
-        bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
-        bool enter_down = prev_enter;
+        bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) || (!ctrl_down && keypad_5_edge);
+        bool enter_down = prev_enter || (!ctrl_down && prev_5);
+        bool left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || (!ctrl_down && keypad_4_edge);
+        bool right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right) || (!ctrl_down && keypad_6_edge);
         bool prompt_canceling = prompt_closing && prompt_closing_result < 0;
         uint32_t prompt_close_elapsed_ms = prompt_closing ? (now_ms - prompt_close_started_ms) : 0;
         uint8_t close_mix = prompt_closing
@@ -15676,8 +15763,7 @@ static int prompt_resume_position(
                     );
                 }
             }
-            if (enter_button_press_stage == 0 &&
-                (key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right))) {
+            if (enter_button_press_stage == 0 && (left_edge || right_edge)) {
                 picker_set_selected(
                     &selected_button,
                     &previous_selected_button,
@@ -16148,9 +16234,21 @@ static int play_movie(
         uint32_t now_ms = monotonic_clock_ticks_to_ms(now_ticks);
         const PlaybackRate *playback_rate = playback_rate_for_index(playback_rate_index);
         bool show_ui = help_menu_open || paused || (now_ms <= ui_visible_until);
-        bool enter_was_down = prev_enter;
-        bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
-        bool enter_down = prev_enter;
+        bool ctrl_down = isKeyPressed(KEY_NSPIRE_CTRL) ? true : false;
+        bool enter_key_was_down = prev_enter;
+        bool keypad_5_was_down = prev_5;
+        bool keypad_1_edge = key_pressed_edge(KEY_NSPIRE_1, &prev_1);
+        bool keypad_2_edge = key_pressed_edge(KEY_NSPIRE_2, &prev_2);
+        bool keypad_3_edge = key_pressed_edge(KEY_NSPIRE_3, &prev_3);
+        bool keypad_4_edge = key_pressed_edge(KEY_NSPIRE_4, &prev_4);
+        bool keypad_5_edge = key_pressed_edge(KEY_NSPIRE_5, &prev_5);
+        bool keypad_6_edge = key_pressed_edge(KEY_NSPIRE_6, &prev_6);
+        bool keypad_7_edge = key_pressed_edge(KEY_NSPIRE_7, &prev_7);
+        bool keypad_8_edge = key_pressed_edge(KEY_NSPIRE_8, &prev_8);
+        bool keypad_9_edge = key_pressed_edge(KEY_NSPIRE_9, &prev_9);
+        bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) || (!ctrl_down && keypad_5_edge);
+        bool enter_down = prev_enter || (!ctrl_down && prev_5);
+        bool enter_was_down = enter_key_was_down || (!ctrl_down && keypad_5_was_down);
         bool enter_release_edge = !enter_down && enter_was_down;
         bool space_edge = key_pressed_edge(KEY_NSPIRE_SPACE, &prev_space);
         bool space_down = prev_space;
@@ -16171,23 +16269,23 @@ static int play_movie(
         bool speed_down_down = prev_lp || prev_lthan;
         bool speed_up_down = prev_rp || prev_gthan;
         bool speed_key_down = speed_down_down || speed_up_down;
-        bool seek_left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left);
-        bool seek_right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right);
-        bool seek_left_down = prev_left;
-        bool seek_right_down = prev_right;
-        bool brightness_up_edge = key_pressed_edge(KEY_NSPIRE_UP, &prev_up);
-        bool brightness_down_edge = key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down);
-        bool brightness_up_down = prev_up;
-        bool brightness_down_down = prev_down;
-        bool video_down_left_edge = key_pressed_edge(KEY_NSPIRE_1, &prev_1);
-        bool video_down_edge = key_pressed_edge(KEY_NSPIRE_2, &prev_2);
-        bool video_down_right_edge = key_pressed_edge(KEY_NSPIRE_3, &prev_3);
-        bool video_left_edge = key_pressed_edge(KEY_NSPIRE_4, &prev_4);
-        bool video_center_edge = key_pressed_edge(KEY_NSPIRE_5, &prev_5);
-        bool video_right_edge = key_pressed_edge(KEY_NSPIRE_6, &prev_6);
-        bool video_up_left_edge = key_pressed_edge(KEY_NSPIRE_7, &prev_7);
-        bool video_up_edge = key_pressed_edge(KEY_NSPIRE_8, &prev_8);
-        bool video_up_right_edge = key_pressed_edge(KEY_NSPIRE_9, &prev_9);
+        bool seek_left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || (!ctrl_down && keypad_4_edge);
+        bool seek_right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right) || (!ctrl_down && keypad_6_edge);
+        bool seek_left_down = prev_left || (!ctrl_down && prev_4);
+        bool seek_right_down = prev_right || (!ctrl_down && prev_6);
+        bool brightness_up_edge = key_pressed_edge(KEY_NSPIRE_UP, &prev_up) || (!ctrl_down && keypad_8_edge);
+        bool brightness_down_edge = key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) || (!ctrl_down && keypad_2_edge);
+        bool brightness_up_down = prev_up || (!ctrl_down && prev_8);
+        bool brightness_down_down = prev_down || (!ctrl_down && prev_2);
+        bool video_down_left_edge = ctrl_down && keypad_1_edge;
+        bool video_down_edge = ctrl_down && keypad_2_edge;
+        bool video_down_right_edge = ctrl_down && keypad_3_edge;
+        bool video_left_edge = ctrl_down && keypad_4_edge;
+        bool video_center_edge = ctrl_down && keypad_5_edge;
+        bool video_right_edge = ctrl_down && keypad_6_edge;
+        bool video_up_left_edge = ctrl_down && keypad_7_edge;
+        bool video_up_edge = ctrl_down && keypad_8_edge;
+        bool video_up_right_edge = ctrl_down && keypad_9_edge;
         bool subtitle_font_edge = key_pressed_edge(KEY_NSPIRE_F, &prev_f);
         bool subtitle_track_edge = key_pressed_edge(KEY_NSPIRE_T, &prev_t);
         bool memory_overlay_edge = key_pressed_edge(KEY_NSPIRE_M, &prev_m);
