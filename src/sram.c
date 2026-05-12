@@ -8,7 +8,11 @@
 
 #define SRAM_PHYSICAL_ADDRESS 0xA4000000U
 #define SRAM_VIRTUAL_ADDRESS 0xEE000000U
-#define SRAM_POOL_SIZE (256U * 1024U)
+#define SRAM_CX_HARDWARE_SIZE (128U * 1024U)
+#define SRAM_CX_POOL_SIZE (16U * 1024U)
+#define SRAM_CX_POOL_OFFSET (SRAM_CX_HARDWARE_SIZE - SRAM_CX_POOL_SIZE)
+#define SRAM_CX2_POOL_SIZE (256U * 1024U)
+#define SRAM_CX2_POOL_OFFSET 0U
 #define SRAM_SECTION_SIZE 0x100000U
 #define SRAM_TTB_SIZE 16384U
 #define SRAM_TTB_ALIGNMENT 16384U
@@ -28,6 +32,8 @@ static void *g_sram_clone_allocation = NULL;
 static uint8_t g_sram_original_domain = 0;
 static uint8_t *g_sram_pool = NULL;
 static size_t g_sram_pool_used = 0;
+static size_t g_sram_pool_capacity = 0;
+static size_t g_sram_pool_offset = 0;
 static bool g_sram_enabled = false;
 static char g_sram_status_message[96] = "not initialized";
 
@@ -75,6 +81,21 @@ static void sram_flush_dcache_range(uintptr_t start, uintptr_t end)
 static uint32_t sram_l1_index(uintptr_t address)
 {
     return (uint32_t) (address >> 20);
+}
+
+static size_t sram_hardware_pool_size(void)
+{
+    return is_cx2 ? SRAM_CX2_POOL_SIZE : SRAM_CX_POOL_SIZE;
+}
+
+static size_t sram_hardware_pool_offset(void)
+{
+    return is_cx2 ? SRAM_CX2_POOL_OFFSET : SRAM_CX_POOL_OFFSET;
+}
+
+static const char *sram_enabled_message(void)
+{
+    return is_cx2 ? "enabled cx2 256K" : "enabled cx high 16K";
 }
 
 static void *sram_alloc_aligned(size_t size, size_t alignment, void **raw_allocation)
@@ -126,13 +147,19 @@ bool sram_init(void)
     uintptr_t old_table_address;
     uint32_t old_ttbr0_flags;
     uint32_t sram_entry;
+    size_t pool_capacity;
+    size_t pool_offset;
+    size_t clone_size;
     int interrupt_mask;
 
     if (g_sram_enabled) {
-        sram_set_status_message("enabled");
+        sram_set_status_message(sram_enabled_message());
         return true;
     }
 
+    pool_capacity = sram_hardware_pool_size();
+    pool_offset = sram_hardware_pool_offset();
+    clone_size = is_cx2 ? SRAM_SECTION_SIZE : pool_capacity;
     g_sram_original_ttbr0 = sram_get_ttbr0();
     old_ttbr0_flags = g_sram_original_ttbr0 & ~0xFFFFC000U;
     old_table_address = (uintptr_t) (g_sram_original_ttbr0 & 0xFFFFC000U);
@@ -147,13 +174,26 @@ bool sram_init(void)
     sram_set_ttbr0((uint32_t) (uintptr_t) g_sram_ttb | old_ttbr0_flags);
     sram_invalidate_tlb();
 
-    g_sram_clone = sram_alloc_aligned(SRAM_POOL_SIZE, SRAM_SECTION_SIZE, &g_sram_clone_allocation);
+    g_sram_clone = sram_alloc_aligned(
+        clone_size,
+        is_cx2 ? SRAM_SECTION_SIZE : SRAM_CACHE_LINE_SIZE,
+        &g_sram_clone_allocation
+    );
     if (!g_sram_clone) {
         sram_set_status_message("sram clone alloc failed");
         goto fail;
     }
-    memcpy(g_sram_clone, (const void *) (uintptr_t) SRAM_PHYSICAL_ADDRESS, SRAM_POOL_SIZE);
-    sram_flush_dcache_range((uintptr_t) g_sram_clone, (uintptr_t) g_sram_clone + SRAM_POOL_SIZE);
+    if (is_cx2) {
+        memset(g_sram_clone, 0, SRAM_SECTION_SIZE);
+        memcpy(g_sram_clone, (const void *) (uintptr_t) SRAM_PHYSICAL_ADDRESS, pool_capacity);
+        sram_flush_dcache_range((uintptr_t) g_sram_clone, (uintptr_t) g_sram_clone + SRAM_SECTION_SIZE);
+    } else {
+        memcpy(
+            g_sram_clone,
+            (const void *) (uintptr_t) (SRAM_PHYSICAL_ADDRESS + pool_offset),
+            pool_capacity
+        );
+    }
     sram_drain_write_buffer();
 
     sram_entry = g_sram_ttb[sram_l1_index(SRAM_PHYSICAL_ADDRESS)];
@@ -164,20 +204,22 @@ bool sram_init(void)
     g_sram_original_domain = (uint8_t) ((sram_entry >> SRAM_DOMAIN_SHIFT) & 0x0FU);
 
     interrupt_mask = TCT_Local_Control_Interrupts(-1);
-    sram_map_section(
-        SRAM_PHYSICAL_ADDRESS,
-        (uintptr_t) g_sram_clone,
-        SRAM_SECTION_ACCESS_FULL |
-        SRAM_SECTION_CACHE_NONE |
-        ((uint32_t) g_sram_original_domain << SRAM_DOMAIN_SHIFT)
-    );
-    sram_map_section(
-        0x00000000U,
-        (uintptr_t) g_sram_clone,
-        SRAM_SECTION_ACCESS_FULL |
-        SRAM_SECTION_CACHE_NONE |
-        ((uint32_t) g_sram_original_domain << SRAM_DOMAIN_SHIFT)
-    );
+    if (is_cx2) {
+        sram_map_section(
+            SRAM_PHYSICAL_ADDRESS,
+            (uintptr_t) g_sram_clone,
+            SRAM_SECTION_ACCESS_FULL |
+            SRAM_SECTION_CACHE_NONE |
+            ((uint32_t) g_sram_original_domain << SRAM_DOMAIN_SHIFT)
+        );
+        sram_map_section(
+            0x00000000U,
+            (uintptr_t) g_sram_clone,
+            SRAM_SECTION_ACCESS_FULL |
+            SRAM_SECTION_CACHE_NONE |
+            ((uint32_t) g_sram_original_domain << SRAM_DOMAIN_SHIFT)
+        );
+    }
     sram_map_section(
         SRAM_VIRTUAL_ADDRESS,
         SRAM_PHYSICAL_ADDRESS,
@@ -186,10 +228,12 @@ bool sram_init(void)
     );
     TCT_Local_Control_Interrupts(interrupt_mask);
 
-    g_sram_pool = (uint8_t *) (uintptr_t) SRAM_VIRTUAL_ADDRESS;
+    g_sram_pool = (uint8_t *) (uintptr_t) (SRAM_VIRTUAL_ADDRESS + pool_offset);
     g_sram_pool_used = 0;
+    g_sram_pool_capacity = pool_capacity;
+    g_sram_pool_offset = pool_offset;
     g_sram_enabled = true;
-    sram_set_status_message("enabled");
+    sram_set_status_message(sram_enabled_message());
     return true;
 
 fail:
@@ -205,6 +249,8 @@ fail:
     g_sram_ttb_allocation = NULL;
     g_sram_pool = NULL;
     g_sram_pool_used = 0;
+    g_sram_pool_capacity = 0;
+    g_sram_pool_offset = 0;
     g_sram_enabled = false;
     return false;
 }
@@ -218,8 +264,15 @@ void sram_shutdown(void)
     }
 
     interrupt_mask = TCT_Local_Control_Interrupts(-1);
-    memcpy((void *) (uintptr_t) SRAM_VIRTUAL_ADDRESS, g_sram_clone, SRAM_POOL_SIZE);
-    sram_flush_dcache_range(SRAM_VIRTUAL_ADDRESS, SRAM_VIRTUAL_ADDRESS + SRAM_POOL_SIZE);
+    memcpy(
+        (void *) (uintptr_t) (SRAM_VIRTUAL_ADDRESS + g_sram_pool_offset),
+        g_sram_clone,
+        g_sram_pool_capacity
+    );
+    sram_flush_dcache_range(
+        SRAM_VIRTUAL_ADDRESS + g_sram_pool_offset,
+        SRAM_VIRTUAL_ADDRESS + g_sram_pool_offset + g_sram_pool_capacity
+    );
     sram_drain_write_buffer();
     sram_set_ttbr0(g_sram_original_ttbr0);
     sram_invalidate_tlb();
@@ -233,6 +286,8 @@ void sram_shutdown(void)
     g_sram_ttb_allocation = NULL;
     g_sram_pool = NULL;
     g_sram_pool_used = 0;
+    g_sram_pool_capacity = 0;
+    g_sram_pool_offset = 0;
     g_sram_enabled = false;
     sram_set_status_message("disabled");
 }
@@ -259,7 +314,7 @@ void *sram_alloc(size_t size, size_t alignment)
         aligned_address = (aligned_address + mask) & ~mask;
     }
     aligned_used = aligned_address - (uintptr_t) g_sram_pool;
-    if (aligned_used + size > SRAM_POOL_SIZE) {
+    if (aligned_used + size > g_sram_pool_capacity) {
         return NULL;
     }
 
@@ -279,7 +334,7 @@ size_t sram_bytes_used(void)
 
 size_t sram_bytes_capacity(void)
 {
-    return SRAM_POOL_SIZE;
+    return g_sram_pool_capacity;
 }
 
 const char *sram_status_message(void)

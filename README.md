@@ -1,8 +1,8 @@
 # Nspire-VideoPlayer-Ndless
 
-Native Ndless video player and PC-side H.264 encoder for the TI-Nspire CX II line.
+Native Ndless video player and PC-side H.264 encoder for the TI-Nspire CX and CX II line.
 
-This project targets the **TI-Nspire CX II-T** and plays streamed `.nvp` movies from calculator storage. The player binary and the movie data stay separate:
+This project targets the **TI-Nspire CX**, **TI-Nspire CX II**, and **TI-Nspire CX II-T**, and plays streamed `.nvp` movies from calculator storage. The player binary and the movie data stay separate:
 
 - `ndvideo.tns`: the Ndless launcher
 - `*.nvp.tns`: movie containers produced by the encoder
@@ -29,6 +29,7 @@ The `.nvp` format used by the current player is:
 ## Features
 
 - native C/Ndless runtime
+- CX and CX II LCD paths through Ndless' native framebuffer modes
 - streamed playback from calculator storage
 - H.264 decode through `h264bsd`
 - RGB565 output
@@ -51,7 +52,7 @@ The `.nvp` format used by the current player is:
 
 ## Battery Life
 
-Battery Life: ~9.5 hours of continuous H.264 playback at 100% brightness.
+Battery Life: ~9.5 hours of continuous H.264 playback at 100% brightness on a CX II-T.
 
 ## Controls
 

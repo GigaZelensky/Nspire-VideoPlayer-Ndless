@@ -17433,8 +17433,9 @@ int main(int argc, char **argv)
         monotonic_clock_shutdown();
         return 1;
     }
-    sram_init();
-    h264bsdInitSramTables();
+    if (has_colors && sram_init()) {
+        h264bsdInitSramTables();
+    }
     init_h264_color_tables();
 
     strncpy(directory, argv[0], sizeof(directory) - 1);
