@@ -963,14 +963,19 @@ static scr_type_t screen_lcd_type(void)
 static void patch_cx2_lcd_edge_timing(void)
 {
     volatile uint32_t *timing_1 = (volatile uint32_t *) 0xC0000004;
+    uint32_t timing;
 
-    if (!has_colors || !is_cx2 || lcd_type() != SCR_240x320_565) {
+    if (!has_colors || !is_cx2) {
         return;
     }
 
     /* Ndless applies this same timing fix at install time for CX II panels
      * whose first/last landscape column is clipped by the LCD controller. */
-    if (*timing_1 == 0x03780D3F) {
+    timing = *timing_1;
+    if (timing == 0x0720013F) {
+        return;
+    }
+    if (timing == 0x03780D3F || lcd_type() == SCR_240x320_565) {
         *timing_1 = 0x0720013F;
     }
 }
@@ -982,6 +987,7 @@ static void present_screen(SDL_Surface *screen)
     if (!screen) {
         return;
     }
+    patch_cx2_lcd_edge_timing();
     if (SDL_MUSTLOCK(screen)) {
         if (SDL_LockSurface(screen) != 0) {
             return;
