@@ -38,6 +38,10 @@
 #define PICKER_INTRO_ANIM_MS 360U
 #define PICKER_INTRO_ROW_STAGGER_MS 28U
 #define PICKER_PRESS_RELEASE_ANIM_MS 94U
+#define PICKER_HOVER_SCROLL_EDGE_PX 18
+#define PICKER_HOVER_SCROLL_REPEAT_MS 145U
+#define PICKER_SCROLL_ANIM_MS 118U
+#define PICKER_ROW_STEP_PX 20
 #define PROMPT_BUTTON_ANIM_MS 90U
 #define UI_CHROME_ANIM_MS 115U
 #define UI_HOVER_ANIM_MS 105U
@@ -12917,21 +12921,171 @@ static SDL_Rect picker_row_divider_rect(const SDL_Rect *row)
     return divider;
 }
 
-static int picker_row_index_at(size_t count, size_t selected, int x, int y)
+typedef struct {
+    size_t from_start;
+    size_t to_start;
+    uint32_t started_ms;
+} PickerScrollAnim;
+
+static size_t picker_scroll_start_centered(size_t count, size_t selected)
 {
-    size_t start_index;
+    if (count == 0) {
+        return 0;
+    }
+    {
+        size_t start_index = selected > (PICKER_VISIBLE_ROWS / 2) ? selected - (PICKER_VISIBLE_ROWS / 2) : 0;
+
+        if (start_index + PICKER_VISIBLE_ROWS > count) {
+            start_index = count > PICKER_VISIBLE_ROWS ? count - PICKER_VISIBLE_ROWS : 0;
+        }
+        return start_index;
+    }
+}
+
+static size_t picker_scroll_start_clamped(size_t count, size_t start_index)
+{
+    if (start_index + PICKER_VISIBLE_ROWS > count) {
+        start_index = count > PICKER_VISIBLE_ROWS ? count - PICKER_VISIBLE_ROWS : 0;
+    }
+    return start_index;
+}
+
+static size_t picker_scroll_start_for_selection(size_t count, size_t selected, size_t start_index)
+{
+    start_index = picker_scroll_start_clamped(count, start_index);
+    if (count == 0 || count <= PICKER_VISIBLE_ROWS) {
+        return 0;
+    }
+    if (selected < start_index) {
+        return selected;
+    }
+    if (selected >= start_index + PICKER_VISIBLE_ROWS) {
+        return selected - PICKER_VISIBLE_ROWS + 1;
+    }
+    return start_index;
+}
+
+static void picker_scroll_anim_view(
+    PickerScrollAnim *anim,
+    size_t scroll_start,
+    uint32_t now_ms,
+    size_t *display_start,
+    int *offset_y
+)
+{
+    if (display_start) {
+        *display_start = scroll_start;
+    }
+    if (offset_y) {
+        *offset_y = 0;
+    }
+    if (!anim || anim->started_ms == 0 || anim->from_start == anim->to_start) {
+        return;
+    }
+    if ((uint32_t) (now_ms - anim->started_ms) >= PICKER_SCROLL_ANIM_MS) {
+        anim->started_ms = 0;
+        return;
+    }
+    {
+        uint8_t mix = ui_ease_out_cubic(now_ms - anim->started_ms, PICKER_SCROLL_ANIM_MS);
+        if (anim->to_start > anim->from_start) {
+            if (display_start) {
+                *display_start = anim->from_start;
+            }
+            if (offset_y) {
+                *offset_y = -((PICKER_ROW_STEP_PX * (int) mix + 127) / 255);
+            }
+        } else {
+            if (display_start) {
+                *display_start = anim->to_start;
+            }
+            if (offset_y) {
+                *offset_y = -PICKER_ROW_STEP_PX + ((PICKER_ROW_STEP_PX * (int) mix + 127) / 255);
+            }
+        }
+    }
+}
+
+static void picker_scroll_to(
+    size_t count,
+    size_t *scroll_start,
+    PickerScrollAnim *anim,
+    size_t next_start,
+    uint32_t now_ms
+)
+{
+    if (!scroll_start) {
+        return;
+    }
+    next_start = picker_scroll_start_clamped(count, next_start);
+    if (*scroll_start == next_start) {
+        return;
+    }
+    if (anim) {
+        size_t old_start = *scroll_start;
+        if ((old_start + 1 == next_start) || (next_start + 1 == old_start)) {
+            anim->from_start = old_start;
+            anim->to_start = next_start;
+            anim->started_ms = now_ms ? now_ms : 1U;
+        } else {
+            anim->from_start = next_start;
+            anim->to_start = next_start;
+            anim->started_ms = 0;
+        }
+    }
+    *scroll_start = next_start;
+}
+
+static int picker_hover_scroll_direction(size_t count, size_t start_index, const PointerState *pointer)
+{
+    SDL_Rect first_row;
+    SDL_Rect last_row;
+    int region_left;
+    int region_right;
+    int region_top;
+    int region_bottom;
+    int top_edge;
+    int bottom_edge;
+
+    if (!pointer || !pointer->visible || count <= PICKER_VISIBLE_ROWS) {
+        return 0;
+    }
+    start_index = picker_scroll_start_clamped(count, start_index);
+    first_row = picker_row_rect_for_y(52);
+    last_row = picker_row_rect_for_y(52 + ((PICKER_VISIBLE_ROWS - 1) * 20));
+    region_left = first_row.x;
+    region_right = SCREEN_W - 4;
+    region_top = first_row.y - 10;
+    region_bottom = SCREEN_H - 24;
+    top_edge = first_row.y + PICKER_HOVER_SCROLL_EDGE_PX;
+    bottom_edge = last_row.y + last_row.h - PICKER_HOVER_SCROLL_EDGE_PX;
+    if (pointer->x < region_left || pointer->x >= region_right ||
+        pointer->y < region_top || pointer->y >= region_bottom) {
+        return 0;
+    }
+    if (pointer->y < top_edge && start_index > 0) {
+        return -1;
+    }
+    if (pointer->y >= bottom_edge && start_index + PICKER_VISIBLE_ROWS < count) {
+        return 1;
+    }
+    return 0;
+}
+
+static int picker_row_index_at(size_t count, size_t start_index, int row_offset_y, int x, int y)
+{
     size_t end_index;
     size_t index;
-    int row_y = 52;
+    int row_y = 52 + row_offset_y;
 
     if (count == 0) {
         return -1;
     }
-    start_index = selected > (PICKER_VISIBLE_ROWS / 2) ? selected - (PICKER_VISIBLE_ROWS / 2) : 0;
-    if (start_index + PICKER_VISIBLE_ROWS > count) {
-        start_index = count > PICKER_VISIBLE_ROWS ? count - PICKER_VISIBLE_ROWS : 0;
-    }
+    start_index = picker_scroll_start_clamped(count, start_index);
     end_index = start_index + PICKER_VISIBLE_ROWS;
+    if (row_offset_y != 0) {
+        ++end_index;
+    }
     if (end_index > count) {
         end_index = count;
     }
@@ -12968,24 +13122,24 @@ static int picker_resume_badge_index_at(
     const Fonts *fonts,
     MovieFile *files,
     size_t count,
-    size_t selected,
+    size_t start_index,
+    int row_offset_y,
     int x,
     int y
 )
 {
-    size_t start_index;
     size_t end_index;
     size_t index;
-    int row_y = 52;
+    int row_y = 52 + row_offset_y;
 
     if (!fonts || !files || count == 0) {
         return -1;
     }
-    start_index = selected > (PICKER_VISIBLE_ROWS / 2) ? selected - (PICKER_VISIBLE_ROWS / 2) : 0;
-    if (start_index + PICKER_VISIBLE_ROWS > count) {
-        start_index = count > PICKER_VISIBLE_ROWS ? count - PICKER_VISIBLE_ROWS : 0;
-    }
+    start_index = picker_scroll_start_clamped(count, start_index);
     end_index = start_index + PICKER_VISIBLE_ROWS;
+    if (row_offset_y != 0) {
+        ++end_index;
+    }
     if (end_index > count) {
         end_index = count;
     }
@@ -13613,11 +13767,24 @@ static void picker_set_selected(
     *selection_anim_started_ms = now_ms ? now_ms : 1U;
 }
 
+static size_t picker_adjacent_selection(size_t count, size_t selected, int direction)
+{
+    if (count == 0) {
+        return selected;
+    }
+    if (direction < 0) {
+        return selected > 0 ? selected - 1 : count - 1;
+    }
+    return selected + 1 < count ? selected + 1 : 0;
+}
+
 static void render_picker(
     SDL_Surface *screen,
     const Fonts *fonts,
     MovieFile *files,
     size_t count,
+    size_t scroll_start,
+    int scroll_offset_y,
     size_t selected,
     size_t previous_selected,
     uint32_t selection_anim_started_ms,
@@ -13644,7 +13811,7 @@ static void render_picker(
     size_t start_index;
     size_t end_index;
     size_t index;
-    int y = 52;
+    int y = 52 + scroll_offset_y;
     SDL_Rect background = {0, 0, SCREEN_W, SCREEN_H};
     SDL_Rect header = {0, 0, SCREEN_W, 32};
     SDL_Rect header_top = {0, 0, SCREEN_W, 1};
@@ -13708,14 +13875,27 @@ static void render_picker(
         present_screen(screen);
         return;
     }
-    start_index = selected > (PICKER_VISIBLE_ROWS / 2) ? selected - (PICKER_VISIBLE_ROWS / 2) : 0;
-    if (start_index + PICKER_VISIBLE_ROWS > count) {
-        start_index = count > PICKER_VISIBLE_ROWS ? count - PICKER_VISIBLE_ROWS : 0;
-    }
+    start_index = picker_scroll_start_clamped(count, scroll_start);
     end_index = start_index + PICKER_VISIBLE_ROWS;
+    if (scroll_offset_y != 0) {
+        ++end_index;
+    }
     if (end_index > count) {
         end_index = count;
     }
+    {
+        SDL_Rect old_clip;
+        SDL_Rect first_row = picker_row_rect_for_y(52);
+        SDL_Rect last_row = picker_row_rect_for_y(52 + ((PICKER_VISIBLE_ROWS - 1) * PICKER_ROW_STEP_PX));
+        SDL_Rect rows_clip = {
+            0,
+            first_row.y,
+            SCREEN_W,
+            (Uint16) (last_row.y + last_row.h - first_row.y)
+        };
+
+        SDL_GetClipRect(screen, &old_clip);
+        SDL_SetClipRect(screen, &rows_clip);
     for (index = start_index; index < end_index && y < SCREEN_H - 20; ++index) {
         SDL_Rect row = picker_row_rect_for_y(y);
         SDL_Rect draw_row = row;
@@ -13782,29 +13962,57 @@ static void render_picker(
         }
         y += 20;
     }
+        SDL_SetClipRect(screen, &old_clip);
+    }
     if (count > PICKER_VISIBLE_ROWS) {
         uint8_t scroll_mix = picker_intro_mix(intro_started_ms, now_ms, 180U, 260U);
         int scroll_offset_x = picker_intro_offset(scroll_mix, 5);
-        SDL_Rect track = {SCREEN_W - 8, 42, 3, SCREEN_H - 76};
+        SDL_Rect track = {SCREEN_W - 7, 42, 3, SCREEN_H - 76};
+        size_t max_start = count - PICKER_VISIBLE_ROWS;
+        int visual_start_q8 = (int) start_index * 256;
         int thumb_h = (int) (((uint64_t) track.h * PICKER_VISIBLE_ROWS) / count);
         int thumb_y;
         SDL_Rect thumb;
+        Uint16 track_top;
+        Uint16 track_bottom;
+        Uint16 track_gray_top;
+        Uint16 track_gray_bottom;
 
         track.x = (Sint16) (track.x + scroll_offset_x);
         thumb_h = clamp_int(thumb_h, 18, track.h);
         thumb_y = track.y;
-        if (count > 1 && track.h > thumb_h) {
-            thumb_y += (int) (((uint64_t) (track.h - thumb_h) * selected) / (count - 1));
+        if (scroll_offset_y < 0) {
+            visual_start_q8 += ((-scroll_offset_y * 256) + (PICKER_ROW_STEP_PX / 2)) / PICKER_ROW_STEP_PX;
         }
-        thumb.x = (Sint16) (SCREEN_W - 9 + scroll_offset_x);
+        if (max_start > 0 && track.h > thumb_h) {
+            int max_start_q8 = (int) max_start * 256;
+            visual_start_q8 = clamp_int(visual_start_q8, 0, max_start_q8);
+            thumb_y += (int) (((uint64_t) (track.h - thumb_h) * (uint32_t) visual_start_q8) / (uint32_t) max_start_q8);
+        }
+        thumb.x = (Sint16) (SCREEN_W - 8 + scroll_offset_x);
         thumb.y = (Sint16) thumb_y;
         thumb.w = 5;
         thumb.h = (Uint16) thumb_h;
+        track_gray_top = blend_rgb565(ui_theme()->scroll_thumb, UI_COLOR_BLACK, 164);
+        track_gray_bottom = blend_rgb565(ui_theme()->scroll_thumb, UI_COLOR_BLACK, 112);
+        track_gray_top = blend_rgb565(track_gray_top, UI_COLOR_WHITE, 8);
+        track_bottom = rgb565_lerp(
+            picker_background_color_at_y(track.y + track.h - 1),
+            track_gray_bottom,
+            scroll_mix,
+            255
+        );
+        track_top = rgb565_lerp(
+            picker_background_color_at_y(track.y),
+            track_gray_top,
+            scroll_mix,
+            255
+        );
         draw_vertical_gradient(
             screen,
             &track,
-            rgb565_lerp(picker_background_color_at_y(track.y), ui_theme()->scroll_track_top, scroll_mix, 255),
-            rgb565_lerp(picker_background_color_at_y(track.y + track.h - 1), ui_theme()->scroll_track_bottom, scroll_mix, 255)
+            track_top,
+            track_bottom
         );
         draw_glass_panel(
             screen,
@@ -14660,6 +14868,7 @@ static int pick_movie(
     MovieFile *files;
     size_t count = 0;
     size_t selected = 0;
+    size_t scroll_start = 0;
     size_t previous_selected = 0;
     uint32_t selection_anim_started_ms = 0;
     uint8_t selected_start_mix = 0;
@@ -14669,9 +14878,14 @@ static int pick_movie(
     UiTransition resume_tooltip_anim;
     UiTransition movie_tooltip_anim;
     UiTransition picker_press_anim;
+    PickerScrollAnim scroll_anim;
     int resume_badge_anim_index = -1;
     int resume_tooltip_anim_index = -1;
     int movie_tooltip_anim_index = -1;
+    int hover_scroll_direction = 0;
+    uint32_t hover_scroll_last_ms = 0;
+    int key_scroll_direction = 0;
+    uint32_t key_scroll_repeat_next_ms = 0;
     int pressed_row_index = -1;
     int pressed_resume_badge_index = -1;
     bool pressed_selected_fallback = false;
@@ -14684,9 +14898,11 @@ static int pick_movie(
     memset(&resume_tooltip_anim, 0, sizeof(resume_tooltip_anim));
     memset(&movie_tooltip_anim, 0, sizeof(movie_tooltip_anim));
     memset(&picker_press_anim, 0, sizeof(picker_press_anim));
+    memset(&scroll_anim, 0, sizeof(scroll_anim));
     ensure_movie_picker_cache(&g_picker_cache, directory);
     files = g_picker_cache.files;
     count = g_picker_cache.count;
+    scroll_start = picker_scroll_start_centered(count, selected);
     if (resume_without_prompt) {
         *resume_without_prompt = false;
     }
@@ -14701,6 +14917,7 @@ static int pick_movie(
     prev_c = isKeyPressed(KEY_NSPIRE_C);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     pointer_hover_guard_reset(&hover_guard);
+    pointer_hover_guard_lock(&hover_guard, &pointer);
     picker_tooltip_hover_reset(&tooltip_hover);
     intro_started_ms = monotonic_clock_now_ms();
     while (1) {
@@ -14709,17 +14926,22 @@ static int pick_movie(
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
         bool enter_down = prev_enter;
+        bool up_edge = key_pressed_edge(KEY_NSPIRE_UP, &prev_up);
+        bool down_edge = key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down);
+        bool up_down = prev_up;
+        bool down_down = prev_down;
         bool left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left);
         bool right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right);
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
-        int hovered_index = pointer_hover_allowed ? picker_row_index_at(count, selected, pointer.x, pointer.y) : -1;
-        int resume_hovered_index = pointer_hover_allowed
-            ? picker_resume_badge_index_at(fonts, files, count, selected, pointer.x, pointer.y)
-            : -1;
+        int next_hover_scroll_direction = pointer_hover_allowed && !pointer.down
+            ? picker_hover_scroll_direction(count, scroll_start, &pointer)
+            : 0;
+        size_t scroll_draw_start;
+        int scroll_draw_offset_y;
+        int hovered_index;
+        int resume_hovered_index;
         int active_resume_index;
-        int tooltip_index = resume_hovered_index >= 0
-            ? -1
-            : picker_tooltip_hover_update(&tooltip_hover, hovered_index, &pointer, pointer_click, now_ms);
+        int tooltip_index;
         uint8_t resume_badge_mix;
         uint8_t resume_tooltip_mix;
         uint8_t movie_tooltip_mix;
@@ -14727,6 +14949,39 @@ static int pick_movie(
         uint8_t picker_press_mix;
         int pointer_release_activated_index = -1;
         bool pointer_release_activated_resume = false;
+
+        if (next_hover_scroll_direction != hover_scroll_direction) {
+            hover_scroll_direction = next_hover_scroll_direction;
+            hover_scroll_last_ms = 0;
+        }
+        if (hover_scroll_direction != 0 &&
+            (hover_scroll_last_ms == 0 ||
+                (uint32_t) (now_ms - hover_scroll_last_ms) >= PICKER_HOVER_SCROLL_REPEAT_MS)) {
+            size_t next_scroll_start = scroll_start;
+
+            if (hover_scroll_direction < 0 && next_scroll_start > 0) {
+                --next_scroll_start;
+            } else if (hover_scroll_direction > 0 && next_scroll_start + PICKER_VISIBLE_ROWS < count) {
+                ++next_scroll_start;
+            }
+            if (next_scroll_start != scroll_start) {
+                picker_scroll_to(count, &scroll_start, &scroll_anim, next_scroll_start, now_ms);
+                hover_scroll_last_ms = now_ms;
+            } else {
+                hover_scroll_direction = 0;
+                hover_scroll_last_ms = 0;
+            }
+        }
+        picker_scroll_anim_view(&scroll_anim, scroll_start, now_ms, &scroll_draw_start, &scroll_draw_offset_y);
+        hovered_index = pointer_hover_allowed
+            ? picker_row_index_at(count, scroll_draw_start, scroll_draw_offset_y, pointer.x, pointer.y)
+            : -1;
+        resume_hovered_index = pointer_hover_allowed
+            ? picker_resume_badge_index_at(fonts, files, count, scroll_draw_start, scroll_draw_offset_y, pointer.x, pointer.y)
+            : -1;
+        tooltip_index = resume_hovered_index >= 0
+            ? -1
+            : picker_tooltip_hover_update(&tooltip_hover, hovered_index, &pointer, pointer_click, now_ms);
 
         if (pointer.press_edge ||
             (keyboard_resume_focused && pointer_hover_allowed && (hovered_index >= 0 || resume_hovered_index >= 0))) {
@@ -14870,6 +15125,8 @@ static int pick_movie(
             fonts,
             files,
             count,
+            scroll_draw_start,
+            scroll_draw_offset_y,
             selected,
             previous_selected,
             selection_anim_started_ms,
@@ -14905,31 +15162,58 @@ static int pick_movie(
             cleanup_deferred_playback_movie();
             deferred_movie_cleanup_done = true;
         }
-        if (enter_press_stage == 0 && key_pressed_edge(KEY_NSPIRE_UP, &prev_up) && selected > 0) {
-            keyboard_resume_focused = false;
-            picker_set_selected_row(
-                &selected,
-                &previous_selected,
-                &selection_anim_started_ms,
-                &selected_start_mix,
-                &previous_start_mix,
-                selected - 1,
-                now_ms
-            );
-            pointer_hover_guard_lock(&hover_guard, &pointer);
-        }
-        if (enter_press_stage == 0 && key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) && selected + 1 < count) {
-            keyboard_resume_focused = false;
-            picker_set_selected_row(
-                &selected,
-                &previous_selected,
-                &selection_anim_started_ms,
-                &selected_start_mix,
-                &previous_start_mix,
-                selected + 1,
-                now_ms
-            );
-            pointer_hover_guard_lock(&hover_guard, &pointer);
+        {
+            int move_direction = 0;
+
+            if (enter_press_stage == 0 && count > 0) {
+                if (up_edge && !down_down) {
+                    move_direction = -1;
+                    key_scroll_direction = -1;
+                    key_scroll_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
+                } else if (down_edge && !up_down) {
+                    move_direction = 1;
+                    key_scroll_direction = 1;
+                    key_scroll_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
+                } else if (up_down != down_down) {
+                    int held_direction = up_down ? -1 : 1;
+
+                    if (key_scroll_direction != held_direction || key_scroll_repeat_next_ms == 0U) {
+                        key_scroll_direction = held_direction;
+                        key_scroll_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_DELAY_MS;
+                    } else if ((int32_t) (now_ms - key_scroll_repeat_next_ms) >= 0) {
+                        move_direction = held_direction;
+                        key_scroll_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_FALLBACK_INTERVAL_MS;
+                    }
+                } else {
+                    key_scroll_direction = 0;
+                    key_scroll_repeat_next_ms = 0;
+                }
+            } else {
+                key_scroll_direction = 0;
+                key_scroll_repeat_next_ms = 0;
+            }
+            if (move_direction != 0) {
+                size_t next_selected = picker_adjacent_selection(count, selected, move_direction);
+
+                keyboard_resume_focused = false;
+                picker_set_selected_row(
+                    &selected,
+                    &previous_selected,
+                    &selection_anim_started_ms,
+                    &selected_start_mix,
+                    &previous_start_mix,
+                    next_selected,
+                    now_ms
+                );
+                picker_scroll_to(
+                    count,
+                    &scroll_start,
+                    &scroll_anim,
+                    picker_scroll_start_for_selection(count, selected, scroll_start),
+                    now_ms
+                );
+                pointer_hover_guard_lock(&hover_guard, &pointer);
+            }
         }
         if (pointer_release_activated_index >= 0) {
             int release_step;
@@ -14944,11 +15228,14 @@ static int pick_movie(
                     PICKER_PRESS_RELEASE_ANIM_MS
                 );
 
+                picker_scroll_anim_view(&scroll_anim, scroll_start, release_now_ms, &scroll_draw_start, &scroll_draw_offset_y);
                 render_picker(
                     screen,
                     fonts,
                     files,
                     count,
+                    scroll_draw_start,
+                    scroll_draw_offset_y,
                     selected,
                     previous_selected,
                     selection_anim_started_ms,
