@@ -9320,26 +9320,26 @@ typedef struct {
 static const UiThemePalette g_ui_themes[UI_THEME_COUNT] = {
     {
         "DORFic",
-        UI_RGB565(255, 176, 48),
-        UI_RGB565(255, 115, 0),
-        UI_RGB565(210, 50, 0),
+        UI_RGB565(255, 136, 28),
+        UI_RGB565(255, 82, 0),
+        UI_RGB565(194, 34, 0),
         UI_RGB565(24, 24, 24),
         UI_RGB565(8, 8, 8),
         UI_RGB565(36, 36, 36),
         UI_RGB565(44, 40, 36),
-        UI_RGB565(255, 238, 210),
-        UI_RGB565(48, 34, 22),
-        UI_RGB565(224, 164, 84),
-        UI_RGB565(44, 34, 24),
-        UI_RGB565(112, 52, 0),
-        UI_RGB565(80, 40, 0),
+        UI_RGB565(255, 232, 206),
+        UI_RGB565(50, 30, 20),
+        UI_RGB565(255, 142, 52),
+        UI_RGB565(46, 30, 22),
+        UI_RGB565(132, 40, 0),
+        UI_RGB565(112, 36, 0),
         UI_RGB565(36, 30, 24),
         UI_RGB565(28, 24, 20),
-        UI_RGB565(224, 164, 84),
+        UI_RGB565(255, 142, 52),
         UI_RGB565(18, 16, 14),
         UI_RGB565(48, 40, 32),
         UI_RGB565(220, 198, 166),
-        UI_RGB565(54, 42, 28),
+        UI_RGB565(58, 38, 28),
         UI_RGB565(18, 16, 14),
         UI_RGB565(224, 210, 190),
         UI_RGB565(22, 20, 18),
@@ -9350,22 +9350,22 @@ static const UiThemePalette g_ui_themes[UI_THEME_COUNT] = {
         UI_RGB565(16, 14, 12),
         UI_RGB565(68, 58, 46),
         UI_RGB565(28, 20, 14),
-        UI_RGB565(86, 74, 58),
-        UI_RGB565(84, 66, 42),
-        UI_RGB565(140, 80, 20),
-        UI_RGB565(70, 40, 10),
-        UI_RGB565(30, 15, 5),
-        UI_RGB565(255, 198, 62),
-        UI_RGB565(210, 50, 0),
-        UI_RGB565(255, 138, 20),
-        UI_RGB565(255, 220, 92),
+        UI_RGB565(96, 62, 48),
+        UI_RGB565(92, 48, 34),
+        UI_RGB565(154, 48, 14),
+        UI_RGB565(76, 28, 8),
+        UI_RGB565(34, 10, 4),
+        UI_RGB565(255, 142, 30),
+        UI_RGB565(216, 38, 0),
+        UI_RGB565(255, 96, 10),
+        UI_RGB565(255, 174, 44),
         UI_RGB565(32, 32, 32),
         UI_RGB565(22, 20, 18),
         UI_RGB565(24, 22, 20),
-        UI_RGB565(255, 226, 170),
-        UI_RGB565(255, 176, 48),
-        UI_RGB565(226, 96, 0),
-        UI_RGB565(112, 48, 0),
+        UI_RGB565(255, 210, 154),
+        UI_RGB565(255, 132, 30),
+        UI_RGB565(232, 72, 0),
+        UI_RGB565(126, 36, 0),
         UI_RGB565(24, 20, 16)
     },
     {
@@ -9945,6 +9945,16 @@ static void fill_picker_selection_line(
     );
 }
 
+static Uint16 control_outline_color(Uint16 base_color, uint8_t selected_mix)
+{
+    return rgb565_lerp(
+        blend_rgb565(base_color, UI_COLOR_BLACK, 120),
+        UI_COLOR_ACCENT,
+        selected_mix,
+        255
+    );
+}
+
 static void draw_picker_selection_panel_mix(
     SDL_Surface *screen,
     const SDL_Rect *rect,
@@ -10026,7 +10036,7 @@ static void draw_picker_selection_panel_mix(
         );
     }
 
-    outline = blend_rgb565(UI_COLOR_ACCENT, base_color, 68);
+    outline = control_outline_color(base_color, 255);
     if (rect->w > 2) {
         line.x = (Sint16) (rect->x + 1);
         line.y = rect->y;
@@ -10097,7 +10107,7 @@ static void draw_glass_panel_mix(SDL_Surface *screen, const SDL_Rect *rect, Uint
     draw_rect_outline_rgb565(
         screen,
         rect,
-        rgb565_lerp(blend_rgb565(base_color, UI_COLOR_BLACK, 120), UI_COLOR_ACCENT, selected_mix, 255)
+        control_outline_color(base_color, selected_mix)
     );
 }
 
@@ -10163,7 +10173,7 @@ static void draw_soft_glass_panel_mix(SDL_Surface *screen, const SDL_Rect *rect,
         );
     }
 
-    outline = rgb565_lerp(blend_rgb565(base_color, UI_COLOR_BLACK, 124), UI_COLOR_ACCENT, selected_mix, 255);
+    outline = control_outline_color(base_color, selected_mix);
     line.x = (Sint16) (rect->x + 2);
     line.y = rect->y;
     line.w = (Uint16) (rect->w - 4);
@@ -10205,7 +10215,7 @@ static void draw_soft_glass_panel_rim(SDL_Surface *screen, const SDL_Rect *rect,
         return;
     }
 
-    outline = rgb565_lerp(blend_rgb565(base_color, UI_COLOR_BLACK, 124), UI_COLOR_ACCENT, selected_mix, 255);
+    outline = control_outline_color(base_color, selected_mix);
     line.x = (Sint16) (rect->x + 2);
     line.y = rect->y;
     line.w = (Uint16) (rect->w - 4);
