@@ -142,9 +142,10 @@
 #define LCD_BRIGHTNESS_CX_ADDR ((volatile uint32_t *) 0x900F0020U)
 #define LCD_BRIGHTNESS_MIN 0
 #define LCD_BRIGHTNESS_MAX 255
-#define LCD_BRIGHTNESS_CX_CONTRAST_OFF 0
-#define LCD_BRIGHTNESS_CX_CONTRAST_MIN_VISIBLE 1
-#define LCD_BRIGHTNESS_CX_CONTRAST_MAX 147
+/* CX uses 0x00..0xFF for visible backlight levels; 0x100 blanks it. */
+#define LCD_BRIGHTNESS_CX_LEVEL_MIN 0U
+#define LCD_BRIGHTNESS_CX_LEVEL_MAX 0xFFU
+#define LCD_BRIGHTNESS_CX_BACKLIGHT_OFF 0x100U
 #define LCD_BRIGHTNESS_LOWEST_NORMAL 225
 #define LCD_BRIGHTNESS_STEP 25
 #define DEBUG_RING_SIZE 8192
@@ -1587,32 +1588,29 @@ static void format_video_align_status(
     }
 }
 
-static uint32_t cx_contrast_to_brightness_raw(uint32_t contrast)
+static uint32_t cx_level_to_brightness_raw(uint32_t level)
 {
-    uint32_t clamped = (uint32_t) clamp_int((int) contrast,
-        LCD_BRIGHTNESS_CX_CONTRAST_OFF,
-        LCD_BRIGHTNESS_CX_CONTRAST_MAX);
-    uint32_t visible_range = (uint32_t) LCD_BRIGHTNESS_CX_CONTRAST_MAX -
-        (uint32_t) LCD_BRIGHTNESS_CX_CONTRAST_MIN_VISIBLE;
+    uint32_t clamped;
 
-    if (clamped <= LCD_BRIGHTNESS_CX_CONTRAST_OFF) {
+    if (level >= LCD_BRIGHTNESS_CX_BACKLIGHT_OFF) {
         return LCD_BRIGHTNESS_MAX;
     }
-    clamped -= (uint32_t) LCD_BRIGHTNESS_CX_CONTRAST_MIN_VISIBLE;
+    clamped = (uint32_t) clamp_int(
+        (int) level,
+        (int) LCD_BRIGHTNESS_CX_LEVEL_MIN,
+        (int) LCD_BRIGHTNESS_CX_LEVEL_MAX
+    );
 
-    return (uint32_t) ((clamped * (uint32_t) LCD_BRIGHTNESS_MAX + (visible_range / 2U)) /
-        visible_range);
+    return (uint32_t) ((clamped * (uint32_t) LCD_BRIGHTNESS_MAX +
+        (LCD_BRIGHTNESS_CX_LEVEL_MAX / 2U)) / LCD_BRIGHTNESS_CX_LEVEL_MAX);
 }
 
-static uint32_t brightness_raw_to_cx_contrast(uint32_t raw_value)
+static uint32_t brightness_raw_to_cx_level(uint32_t raw_value)
 {
     uint32_t clamped = (uint32_t) clamp_int((int) raw_value, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
-    uint32_t visible_range = (uint32_t) LCD_BRIGHTNESS_CX_CONTRAST_MAX -
-        (uint32_t) LCD_BRIGHTNESS_CX_CONTRAST_MIN_VISIBLE;
 
-    return (uint32_t) LCD_BRIGHTNESS_CX_CONTRAST_MIN_VISIBLE +
-        (uint32_t) ((clamped * visible_range + ((uint32_t) LCD_BRIGHTNESS_MAX / 2U)) /
-        (uint32_t) LCD_BRIGHTNESS_MAX);
+    return (uint32_t) ((clamped * LCD_BRIGHTNESS_CX_LEVEL_MAX +
+        ((uint32_t) LCD_BRIGHTNESS_MAX / 2U)) / (uint32_t) LCD_BRIGHTNESS_MAX);
 }
 
 static uint32_t current_lcd_brightness(void)
@@ -1625,7 +1623,7 @@ static uint32_t current_lcd_brightness(void)
             LCD_BRIGHTNESS_MIN,
             LCD_BRIGHTNESS_MAX);
     }
-    return cx_contrast_to_brightness_raw(*LCD_BRIGHTNESS_CX_ADDR);
+    return cx_level_to_brightness_raw(*LCD_BRIGHTNESS_CX_ADDR);
 }
 
 static uint32_t set_lcd_brightness(int value)
@@ -1638,7 +1636,7 @@ static uint32_t set_lcd_brightness(int value)
     if (is_cx2) {
         *LCD_BRIGHTNESS_CX2_ADDR = clamped;
     } else {
-        *LCD_BRIGHTNESS_CX_ADDR = brightness_raw_to_cx_contrast(clamped);
+        *LCD_BRIGHTNESS_CX_ADDR = brightness_raw_to_cx_level(clamped);
     }
     return clamped;
 }
@@ -1651,7 +1649,7 @@ static void set_lcd_dark_for_power_off(void)
     if (is_cx2) {
         set_lcd_brightness(LCD_BRIGHTNESS_MAX);
     } else {
-        *LCD_BRIGHTNESS_CX_ADDR = LCD_BRIGHTNESS_CX_CONTRAST_OFF;
+        *LCD_BRIGHTNESS_CX_ADDR = LCD_BRIGHTNESS_CX_BACKLIGHT_OFF;
     }
 }
 
@@ -10121,10 +10119,44 @@ static int soft_panel_inset_for_row(int row, int height)
     if (height >= 10 && (row == 0 || row == height - 1)) {
         return 2;
     }
+    if (height >= 6 && (row == 0 || row == height - 1)) {
+        return 1;
+    }
     if (height >= 6 && (row == 1 || row == height - 2)) {
         return 1;
     }
     return 0;
+}
+
+static int soft_panel_top_inset_for_row(int row, int height)
+{
+    if (height >= 10 && row == 0) {
+        return 2;
+    }
+    if (height >= 6 && row <= 1) {
+        return 1;
+    }
+    return 0;
+}
+
+static void fill_soft_panel_backplate(SDL_Surface *screen, const SDL_Rect *rect, Uint16 color)
+{
+    int row;
+    SDL_Rect line;
+
+    if (!screen || !rect || rect->w < 4 || rect->h < 4) {
+        return;
+    }
+
+    line.h = 1;
+    for (row = 0; row < rect->h; ++row) {
+        int inset = soft_panel_inset_for_row(row, rect->h);
+
+        line.x = (Sint16) (rect->x + inset);
+        line.y = (Sint16) (rect->y + row);
+        line.w = (Uint16) (rect->w - (inset * 2));
+        fill_rect_rgb565(screen, &line, color);
+    }
 }
 
 static void draw_soft_glass_panel_mix(SDL_Surface *screen, const SDL_Rect *rect, Uint16 base_color, uint8_t selected_mix)
@@ -10158,6 +10190,11 @@ static void draw_soft_glass_panel_mix(SDL_Surface *screen, const SDL_Rect *rect,
     gloss_rows = rect->h >= 10 ? rect->h / 3 : rect->h / 2;
     for (row = 1; row < gloss_rows; ++row) {
         int inset = soft_panel_inset_for_row(row, rect->h) + 1;
+        int alpha = ui_mix_int(84 - (row * 6), 128 - (row * 8), selected_mix);
+
+        if (alpha <= 0) {
+            break;
+        }
         line.x = (Sint16) (rect->x + inset);
         line.y = (Sint16) (rect->y + row);
         line.w = (Uint16) (rect->w - (inset * 2));
@@ -10165,11 +10202,7 @@ static void draw_soft_glass_panel_mix(SDL_Surface *screen, const SDL_Rect *rect,
         fill_rect_rgb565(
             screen,
             &line,
-            blend_rgb565(
-                base_color,
-                UI_COLOR_WHITE,
-                ui_mix_int(84 - (row * 6), 128 - (row * 8), selected_mix)
-            )
+            blend_rgb565(base_color, UI_COLOR_WHITE, alpha)
         );
     }
 
@@ -10202,6 +10235,114 @@ static void draw_soft_glass_panel_mix(SDL_Surface *screen, const SDL_Rect *rect,
     fill_rect_rgb565(screen, &pixel, outline);
     pixel.x = (Sint16) (rect->x + rect->w - 2);
     fill_rect_rgb565(screen, &pixel, outline);
+}
+
+static void draw_soft_glass_panel_top_mix(SDL_Surface *screen, const SDL_Rect *rect, Uint16 base_color, uint8_t selected_mix)
+{
+    int row;
+    int denominator;
+    int gloss_rows;
+    Uint16 top;
+    Uint16 bottom;
+    Uint16 outline;
+    SDL_Rect line;
+    SDL_Rect side;
+    SDL_Rect pixel;
+
+    if (!screen || !rect || rect->w < 4 || rect->h < 4) {
+        return;
+    }
+
+    top = blend_rgb565(base_color, UI_COLOR_WHITE, ui_mix_int(32, 54, selected_mix));
+    bottom = blend_rgb565(base_color, UI_COLOR_BLACK, ui_mix_int(92, 66, selected_mix));
+    denominator = rect->h > 1 ? rect->h - 1 : 1;
+    for (row = 0; row < rect->h; ++row) {
+        int inset = soft_panel_top_inset_for_row(row, rect->h);
+
+        line.x = (Sint16) (rect->x + inset);
+        line.y = (Sint16) (rect->y + row);
+        line.w = (Uint16) (rect->w - (inset * 2));
+        line.h = 1;
+        fill_rect_rgb565(screen, &line, rgb565_lerp(top, bottom, row, denominator));
+    }
+
+    gloss_rows = rect->h >= 10 ? rect->h / 3 : rect->h / 2;
+    for (row = 1; row < gloss_rows; ++row) {
+        int inset = soft_panel_top_inset_for_row(row, rect->h) + 1;
+        int alpha = ui_mix_int(84 - (row * 6), 128 - (row * 8), selected_mix);
+
+        if (alpha <= 0) {
+            break;
+        }
+        line.x = (Sint16) (rect->x + inset);
+        line.y = (Sint16) (rect->y + row);
+        line.w = (Uint16) (rect->w - (inset * 2));
+        line.h = 1;
+        fill_rect_rgb565(screen, &line, blend_rgb565(base_color, UI_COLOR_WHITE, alpha));
+    }
+
+    outline = control_outline_color(base_color, selected_mix);
+    line.x = (Sint16) (rect->x + 2);
+    line.y = rect->y;
+    line.w = (Uint16) (rect->w - 4);
+    line.h = 1;
+    fill_rect_rgb565(screen, &line, outline);
+    line.x = rect->x;
+    line.y = (Sint16) (rect->y + rect->h - 1);
+    line.w = rect->w;
+    fill_rect_rgb565(screen, &line, outline);
+
+    side.x = rect->x;
+    side.y = (Sint16) (rect->y + 2);
+    side.w = 1;
+    side.h = (Uint16) (rect->h - 2);
+    fill_rect_rgb565(screen, &side, outline);
+    side.x = (Sint16) (rect->x + rect->w - 1);
+    fill_rect_rgb565(screen, &side, outline);
+
+    pixel.w = 1;
+    pixel.h = 1;
+    pixel.x = (Sint16) (rect->x + 1);
+    pixel.y = (Sint16) (rect->y + 1);
+    fill_rect_rgb565(screen, &pixel, outline);
+    pixel.x = (Sint16) (rect->x + rect->w - 2);
+    fill_rect_rgb565(screen, &pixel, outline);
+}
+
+static void draw_soft_glass_panel_body_from_y(
+    SDL_Surface *screen,
+    const SDL_Rect *panel,
+    int body_y,
+    Uint16 base_color
+)
+{
+    int row;
+    int body_start_row;
+    int body_height;
+    int denominator;
+    Uint16 top;
+    Uint16 bottom;
+    SDL_Rect line;
+
+    if (!screen || !panel || panel->w < 4 || panel->h < 4) {
+        return;
+    }
+
+    body_start_row = clamp_int(body_y - panel->y, 0, panel->h - 1);
+    body_height = panel->h - body_start_row;
+    denominator = body_height > 1 ? body_height - 1 : 1;
+    top = blend_rgb565(base_color, UI_COLOR_WHITE, 32);
+    bottom = blend_rgb565(base_color, UI_COLOR_BLACK, 92);
+    line.h = 1;
+    for (row = body_start_row; row < panel->h; ++row) {
+        int body_row = row - body_start_row;
+        int inset = soft_panel_inset_for_row(row, panel->h);
+
+        line.x = (Sint16) (panel->x + inset);
+        line.y = (Sint16) (panel->y + row);
+        line.w = (Uint16) (panel->w - (inset * 2));
+        fill_rect_rgb565(screen, &line, rgb565_lerp(top, bottom, body_row, denominator));
+    }
 }
 
 static void draw_soft_glass_panel_rim(SDL_Surface *screen, const SDL_Rect *rect, Uint16 base_color, uint8_t selected_mix)
@@ -12096,8 +12237,7 @@ static void draw_help_row(
 {
     SDL_Rect key = {(Sint16) (shortcut_x - 4), (Sint16) (y - 1), (Uint16) (shortcut_w + 8), 9};
 
-    draw_glass_panel(screen, &key, ui_theme()->help_key, false);
-    cut_rect_corners(screen, &key, ui_theme()->help_key_cut);
+    draw_soft_glass_panel_mix(screen, &key, ui_theme()->help_key, 0);
     draw_ui_label(screen, fonts, shortcut_x, y, shortcut);
     draw_ui_label(screen, fonts, description_x, y, description);
 }
@@ -12148,9 +12288,19 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu
         return;
     }
     draw_overlay_backdrop_dim(screen, menu_mix);
-    fill_rect_rgb565(screen, &border, ui_theme()->menu_border);
-    draw_glass_panel(screen, &panel, rgb565_lerp(UI_COLOR_BLACK, ui_theme()->menu_panel, menu_mix, 255), false);
-    draw_glass_panel(screen, &header, rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, menu_mix, 255), false);
+    fill_soft_panel_backplate(screen, &border, ui_theme()->menu_border);
+    draw_soft_glass_panel_mix(
+        screen,
+        &panel,
+        rgb565_lerp(UI_COLOR_BLACK, ui_theme()->menu_panel, menu_mix, 255),
+        0
+    );
+    draw_soft_glass_panel_mix(
+        screen,
+        &header,
+        rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, menu_mix, 255),
+        0
+    );
     draw_vertical_gradient(
         screen,
         &accent,
@@ -12434,7 +12584,7 @@ static void draw_progress_overlay(SDL_Surface *screen, const SDL_Rect *overlay)
     Uint16 gloss_bottom = blend_rgb565(base, UI_COLOR_WHITE, 20);
     Uint16 rim_top = blend_rgb565(base, UI_COLOR_WHITE, 128);
     Uint16 rim_bottom = blend_rgb565(base, UI_COLOR_BLACK, 120);
-    Uint16 aa_top = blend_rgb565(rim_top, base, 72);
+    Uint16 aa_top = blend_rgb565(rim_top, body_top, 48);
     Uint16 aa_side;
     SDL_Rect line;
     SDL_Rect pixel;
@@ -12458,7 +12608,7 @@ static void draw_progress_overlay(SDL_Surface *screen, const SDL_Rect *overlay)
     }
 
     gloss_height = (overlay->h / 2) - 1;
-    aa_side = blend_rgb565(rgb565_lerp(rim_top, gloss_bottom, 1, gloss_height), base, 72);
+    aa_side = blend_rgb565(rgb565_lerp(rim_top, gloss_bottom, 1, gloss_height), body_top, 42);
     for (row = 1; row <= gloss_height; ++row) {
         line.x = (Sint16) (overlay->x + 1);
         line.y = (Sint16) (overlay->y + row);
@@ -14010,7 +14160,12 @@ static void render_picker(
         int empty_offset_y = picker_intro_offset(empty_mix, 7);
         int footer_offset_y = picker_intro_offset(footer_mix, 10);
         SDL_Rect footer_panel = {6, (Sint16) (SCREEN_H - 22 + footer_offset_y), SCREEN_W - 12, 18};
-        SDL_Rect footer_accent = {8, (Sint16) (SCREEN_H - 21 + footer_offset_y), SCREEN_W - 16, 1};
+        SDL_Rect footer_accent = {
+            (Sint16) (footer_panel.x + 1),
+            (Sint16) (footer_panel.y + 1),
+            (Uint16) (footer_panel.w - 2),
+            1
+        };
 
         if (empty_mix > 48) {
             draw_ui_label(screen, fonts, 10, 54 + empty_offset_y, "No .nvp or .nvp.tns files found");
@@ -14189,7 +14344,12 @@ static void render_picker(
         char footer[32];
         int footer_offset_y = picker_intro_offset(footer_mix, 10);
         SDL_Rect footer_panel = {6, (Sint16) (SCREEN_H - 22 + footer_offset_y), SCREEN_W - 12, 18};
-        SDL_Rect footer_accent = {8, (Sint16) (SCREEN_H - 21 + footer_offset_y), SCREEN_W - 16, 1};
+        SDL_Rect footer_accent = {
+            (Sint16) (footer_panel.x + 1),
+            (Sint16) (footer_panel.y + 1),
+            (Uint16) (footer_panel.w - 2),
+            1
+        };
 
         draw_glass_panel(
             screen,
@@ -15523,9 +15683,9 @@ static void draw_prompt_button(
     int text_x;
 
     text_x = draw_button.x + (draw_button.w - nSDL_GetStringWidth(fonts->white, label)) / 2 + press_offset_x;
-    draw_glass_panel_mix(screen, &draw_button, pressed_control_base(base, press_mix), selection_mix);
+    draw_soft_glass_panel_mix(screen, &draw_button, pressed_control_base(base, press_mix), selection_mix);
     draw_pressed_control_reflection(screen, &draw_button, press_mix);
-    cut_rect_corners(screen, &draw_button, ui_theme()->menu_panel);
+    draw_soft_glass_panel_rim(screen, &draw_button, base, max_u8(selection_mix, press_mix));
     draw_ui_label(screen, fonts, text_x, draw_button.y + 6 + press_offset_y, label);
 }
 
@@ -15838,19 +15998,33 @@ static int prompt_resume_position(
         }
         dim_rect_rgb565(screen, &full_screen, dim_strength);
         if (prompt_mix > 0) {
-            fill_rect_rgb565(screen, &draw_border, ui_theme()->menu_border);
-            draw_glass_panel(screen, &draw_panel, rgb565_lerp(UI_COLOR_BLACK, ui_theme()->modal_panel, prompt_mix, 255), false);
-            cut_rect_corners(screen, &draw_panel, ui_theme()->menu_border);
-            draw_glass_panel(screen, &draw_header, rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, prompt_mix, 255), false);
-            cut_rect_corners(screen, &draw_header, ui_theme()->modal_cut);
+            Uint16 panel_base = rgb565_lerp(UI_COLOR_BLACK, ui_theme()->modal_panel, prompt_mix, 255);
+
+            fill_soft_panel_backplate(screen, &draw_border, ui_theme()->menu_border);
+            draw_soft_glass_panel_body_from_y(
+                screen,
+                &draw_panel,
+                draw_accent.y + draw_accent.h,
+                panel_base
+            );
+            draw_soft_glass_panel_top_mix(
+                screen,
+                &draw_header,
+                rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, prompt_mix, 255),
+                0
+            );
             draw_vertical_gradient(
                 screen,
                 &draw_accent,
                 rgb565_lerp(ui_theme()->modal_panel, UI_COLOR_ACCENT, prompt_mix, 255),
                 rgb565_lerp(ui_theme()->modal_panel, UI_COLOR_ACCENT_DEEP, prompt_mix, 255)
             );
-            draw_glass_panel(screen, &draw_title_panel, rgb565_lerp(UI_COLOR_BLACK, ui_theme()->modal_title_panel, prompt_mix, 255), false);
-            cut_rect_corners(screen, &draw_title_panel, ui_theme()->modal_cut);
+            draw_soft_glass_panel_mix(
+                screen,
+                &draw_title_panel,
+                rgb565_lerp(UI_COLOR_BLACK, ui_theme()->modal_title_panel, prompt_mix, 255),
+                0
+            );
             fill_rect_rgb565(screen, &draw_preview_border, UI_COLOR_WARM_WHITE);
             SDL_SoftStretch(movie->frame_surface, NULL, screen, &draw_preview);
             if (prompt_mix > 40) {

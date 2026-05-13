@@ -52,6 +52,16 @@ DEFAULT_BURN_SUBTITLE_SIZE = 1.0
 DEFAULT_BURN_SUBTITLE_HEIGHT_RATIO = 0.10
 BITMAP_SUBTITLE_BBOX_PADDING = 4
 FILTER_COMPLEX_SCRIPT_PLACEHOLDER = "__NVP_FILTER_COMPLEX_SCRIPT__"
+HDR_TO_SDR_FILTERS = (
+    "zscale=t=linear:npl=100",
+    "format=gbrpf32le",
+    "tonemap=tonemap=mobius:param=0.35:desat=0:peak=1000",
+    "zscale=p=bt709:t=bt709:m=bt709:r=tv",
+    "format=yuv420p",
+    "sidedata=delete:type=MASTERING_DISPLAY_METADATA",
+    "sidedata=delete:type=CONTENT_LIGHT_LEVEL",
+    "setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+)
 PGS_SEGMENT_PALETTE = 0x14
 PGS_SEGMENT_OBJECT = 0x15
 PGS_SEGMENT_PRESENTATION = 0x16
@@ -2509,6 +2519,7 @@ def build_ffmpeg_command(
     start: float,
     duration: float | None,
     encode_duration: float | None,
+    hdr_to_sdr: bool,
     burn_subtitle: BurnSubtitleSource | None,
     burn_subtitle_size: float,
     pass_number: int | None,
@@ -2520,6 +2531,8 @@ def build_ffmpeg_command(
     video_filters: list[str] = []
     if crop_rect is not None:
         video_filters.append(f"crop={crop_rect.width}:{crop_rect.height}:{crop_rect.x}:{crop_rect.y}:exact=1")
+    if hdr_to_sdr:
+        video_filters.extend(HDR_TO_SDR_FILTERS)
     video_filters += [fps_filter_expression(fps), f"scale={width}:{height}:flags=lanczos", "setsar=1"]
     post_vf = ",".join(video_filters)
     flexible_keyframes = forced_keyframe_frames is not None
@@ -2802,6 +2815,7 @@ def encode_h264_bitstream(
     start: float,
     duration: float | None,
     encode_duration: float | None,
+    hdr_to_sdr: bool,
     burn_subtitle: BurnSubtitleSource | None,
     burn_subtitle_size: float,
     preview_output_path: Path | None,
@@ -2832,6 +2846,7 @@ def encode_h264_bitstream(
             start=start,
             duration=duration,
             encode_duration=encode_duration,
+            hdr_to_sdr=hdr_to_sdr,
             burn_subtitle=burn_subtitle,
             burn_subtitle_size=burn_subtitle_size,
             pass_number=None,
@@ -2861,6 +2876,7 @@ def encode_h264_bitstream(
                 start=start,
                 duration=duration,
                 encode_duration=encode_duration,
+                hdr_to_sdr=hdr_to_sdr,
                 burn_subtitle=burn_subtitle,
                 burn_subtitle_size=burn_subtitle_size,
                 pass_number=1,
@@ -2895,6 +2911,7 @@ def encode_h264_bitstream(
                 start=start,
                 duration=duration,
                 encode_duration=encode_duration,
+                hdr_to_sdr=hdr_to_sdr,
                 burn_subtitle=burn_subtitle,
                 burn_subtitle_size=burn_subtitle_size,
                 pass_number=2,
@@ -3209,6 +3226,7 @@ def encode_h264_bitstream_byte_auto(
     start: float,
     duration: float | None,
     encode_duration: float | None,
+    hdr_to_sdr: bool,
     burn_subtitle: BurnSubtitleSource | None,
     burn_subtitle_size: float,
     preview_output_path: Path | None,
@@ -3243,6 +3261,7 @@ def encode_h264_bitstream_byte_auto(
         start=start,
         duration=duration,
         encode_duration=encode_duration,
+        hdr_to_sdr=hdr_to_sdr,
         burn_subtitle=burn_subtitle,
         burn_subtitle_size=burn_subtitle_size,
         preview_output_path=None,
@@ -3293,6 +3312,7 @@ def encode_h264_bitstream_byte_auto(
             start=start,
             duration=duration,
             encode_duration=encode_duration,
+            hdr_to_sdr=hdr_to_sdr,
             burn_subtitle=burn_subtitle,
             burn_subtitle_size=burn_subtitle_size,
             preview_output_path=None,
@@ -3416,6 +3436,8 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                 f"Cropping active video to {crop_rect.width}x{crop_rect.height}+{crop_rect.x}+{crop_rect.y} before scaling.",
                 quiet=args.quiet,
             )
+        if args.hdr_to_sdr:
+            log("Tone mapping HDR BT.2020/PQ input to SDR BT.709 before scaling.", quiet=args.quiet)
         max_chunk_bytes = (args.max_chunk_kib * 1024) if args.max_chunk_kib > 0 else None
         hard_max_chunk_bytes = (
             int(max_chunk_bytes * (1.0 + (args.max_chunk_overshoot_percent / 100.0)))
@@ -3457,6 +3479,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                 start=args.start,
                 duration=args.duration,
                 encode_duration=encode_duration,
+                hdr_to_sdr=args.hdr_to_sdr,
                 burn_subtitle=burn_subtitle,
                 burn_subtitle_size=args.burn_subtitle_size,
                 preview_output_path=preview_output_path,
@@ -3494,6 +3517,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                 start=args.start,
                 duration=args.duration,
                 encode_duration=encode_duration,
+                hdr_to_sdr=args.hdr_to_sdr,
                 burn_subtitle=burn_subtitle,
                 burn_subtitle_size=args.burn_subtitle_size,
                 preview_output_path=preview_output_path,
@@ -3709,6 +3733,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-height", type=int, default=SCREEN_H, help="Fit height")
     parser.add_argument("--crop", help="Crop active video before scaling, as WIDTH:HEIGHT:X:Y or WIDTHxHEIGHT+X+Y")
     parser.add_argument("--active-aspect", help="Center-crop the source to an active-picture aspect ratio before scaling, e.g. 2.39 or 239:100")
+    parser.add_argument("--hdr-to-sdr", action="store_true", help="Tonemap HDR BT.2020/PQ video into SDR BT.709 before scaling")
     parser.add_argument("--chunk-frames", type=int, default=0, help="Maximum frames per streamed chunk; 0 disables the frame cap and packs chunks by --max-chunk-kib")
     parser.add_argument("--idr-frames", default="auto", help="Maximum frames between forced IDR access units; use 'auto' for bitrate-derived cadence or 'byte-auto' to refine IDRs from measured chunk byte boundaries")
     parser.add_argument("--max-chunk-kib", type=int, default=DEFAULT_MAX_CHUNK_KIB, help="Maximum stored chunk size target in KiB; 0 disables the byte cap")
