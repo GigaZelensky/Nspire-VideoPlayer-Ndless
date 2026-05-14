@@ -88,6 +88,7 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 - `Up` / `Down` or keypad `8` / `2`: increase / decrease screen brightness
 - `Tab`: single-frame step while paused, hold to repeat
 - `P`: cycle playback mode: `PLAY ONCE`, `REPLAY`, `AUTO NEXT`
+- `R`: toggle realtime sync, allowing displayed-frame drops instead of slowdown
 - `/`: cycle scale mode
 - `Ctrl` + keypad `1`-`9`: align video
 - `{` / `}`: decrease / increase playback speed

@@ -2585,6 +2585,7 @@ static bool playback_wait_key_pending(void)
         isKeyPressed(KEY_NSPIRE_S) ||
         isKeyPressed(KEY_NSPIRE_C) ||
         isKeyPressed(KEY_NSPIRE_P) ||
+        isKeyPressed(KEY_NSPIRE_R) ||
         on_key_pressed();
 }
 
@@ -12426,10 +12427,9 @@ static void draw_help_row(
 static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu_mix)
 {
     const int menu_w = 296;
-    const int menu_h = 207;
     const int safe_h = SCREEN_H - UI_BAR_H;
-    int offset_y = ((255 - menu_mix) * 6 + 127) / 255;
-    SDL_Rect border = {(SCREEN_W - menu_w) / 2, (Sint16) (((safe_h - menu_h) / 2) + offset_y), menu_w, menu_h};
+    const int menu_h = safe_h;
+    SDL_Rect border = {(SCREEN_W - menu_w) / 2, 0, menu_w, menu_h};
     SDL_Rect panel = {border.x + 1, border.y + 1, border.w - 2, border.h - 2};
     SDL_Rect header = {panel.x, panel.y, panel.w, 24};
     SDL_Rect accent = {panel.x, panel.y + header.h, panel.w, 2};
@@ -12443,6 +12443,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu
         {"L/R 4/6", "Seek -/+5s"},
         {"TAB", "Step one frame"},
         {"P", "Playback mode"},
+        {"R", "Realtime frame skip"},
         {"/", "Scale mode"},
         {"CTRL+NUM", "Align video / center"},
         {"U/D 8/2", "Screen brightness"},
@@ -12461,8 +12462,10 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu
     int max_shortcut_w = 0;
     int shortcut_x;
     int description_x;
-    int y;
+    int first_row_y;
+    int last_row_y;
     int close_badge_w;
+    size_t row_count = sizeof(rows) / sizeof(rows[0]);
     size_t index;
 
     if (menu_mix == 0) {
@@ -12501,7 +12504,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu
         255
     );
 
-    for (index = 0; index < sizeof(rows) / sizeof(rows[0]); ++index) {
+    for (index = 0; index < row_count; ++index) {
         int width = nSDL_GetStringWidth(fonts->white, rows[index].shortcut);
         if (width > max_shortcut_w) {
             max_shortcut_w = width;
@@ -12509,10 +12512,16 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu
     }
     shortcut_x = panel.x + 12;
     description_x = shortcut_x + max_shortcut_w + 16;
-    y = accent.y + 7;
-    for (index = 0; index < sizeof(rows) / sizeof(rows[0]); ++index) {
+    first_row_y = accent.y + accent.h + 5;
+    last_row_y = panel.y + panel.h - 12;
+    for (index = 0; index < row_count; ++index) {
+        int y = first_row_y;
+        if (row_count > 1) {
+            int row_span = last_row_y - first_row_y;
+            int row_intervals = (int) row_count - 1;
+            y += (row_span * (int) index + row_intervals / 2) / row_intervals;
+        }
         draw_help_row(screen, fonts, shortcut_x, max_shortcut_w, description_x, y, rows[index].shortcut, rows[index].description);
-        y += 9;
     }
 }
 
@@ -16887,6 +16896,7 @@ static int play_movie(
     bool prev_d = false;
     bool prev_s = false;
     bool prev_p = false;
+    bool prev_r = false;
     bool prev_c = false;
     bool prev_plus = false;
     bool prev_minus = false;
@@ -16914,6 +16924,7 @@ static int play_movie(
     size_t subtitle_font_index = SUBTITLE_FONT_DEFAULT_INDEX;
     PlaybackMode playback_mode = PLAYBACK_MODE_ONCE;
     MemoryOverlayMode memory_overlay_mode = MEMORY_OVERLAY_OFF;
+    bool realtime_frame_skip = false;
     int subtitle_size = 0;
     SubtitlePlacement subtitle_placement = SUBTITLE_POS_BAR_BOTTOM;
     VideoAlign video_align_x = VIDEO_ALIGN_CENTER;
@@ -17117,6 +17128,7 @@ static int play_movie(
     prev_d = isKeyPressed(KEY_NSPIRE_D);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     prev_p = isKeyPressed(KEY_NSPIRE_P);
+    prev_r = isKeyPressed(KEY_NSPIRE_R);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
     prev_on = on_key_pressed() ? true : false;
@@ -17242,6 +17254,7 @@ static int play_movie(
         bool debug_logging_edge = key_pressed_edge(KEY_NSPIRE_D, &prev_d);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool playback_mode_edge = key_pressed_edge(KEY_NSPIRE_P, &prev_p);
+        bool frame_skip_mode_edge = key_pressed_edge(KEY_NSPIRE_R, &prev_r);
         bool theme_edge = key_pressed_edge(KEY_NSPIRE_C, &prev_c);
         bool on_edge = on_key_pressed_edge(&prev_on);
         bool take_screenshot = false;
@@ -17287,6 +17300,7 @@ static int play_movie(
             brightness_down_edge ||
             screenshot_edge ||
             playback_mode_edge ||
+            frame_skip_mode_edge ||
             theme_edge) {
             playback_input_prefetch_quiet_until_ms = now_ms + PLAYBACK_INPUT_PREFETCH_GRACE_MS;
         }
@@ -17716,6 +17730,20 @@ static int play_movie(
             snprintf(status_overlay_text, sizeof(status_overlay_text), "MODE %s", playback_mode_text(playback_mode));
             status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+        }
+        if (frame_skip_mode_edge) {
+            realtime_frame_skip = !realtime_frame_skip;
+            snprintf(
+                status_overlay_text,
+                sizeof(status_overlay_text),
+                "SYNC %s",
+                realtime_frame_skip ? "REALTIME" : "SMOOTH"
+            );
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+            if (!paused && !seek_preroll_active) {
+                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            }
         }
         if (video_up_left_edge) {
             apply_video_align_preset(&video_align_x, &video_align_y, VIDEO_ALIGN_NEGATIVE, VIDEO_ALIGN_NEGATIVE);
@@ -18245,7 +18273,9 @@ static int play_movie(
 
                 if (target_frame > movie.current_frame + 1U) {
                     lag_frames = target_frame - (movie.current_frame + 1U);
-                    target_frame = movie.current_frame + 1U;
+                    if (!realtime_frame_skip) {
+                        target_frame = movie.current_frame + 1U;
+                    }
                     lagged = true;
                 }
                 if (lagged) {
@@ -18336,7 +18366,7 @@ static int play_movie(
                             movie.h264_active_prefetch_backoff = H264_ACTIVE_PREFETCH_BACKOFF_LIGHT;
                         }
                     }
-                    if (lagged) {
+                    if (lagged && !realtime_frame_skip) {
                         reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
                     } else {
                         next_frame_due_ticks = playback_anchor_ticks + movie_frame_time_scaled_ticks(&movie, (target_frame - playback_anchor_frame) + 1, playback_rate);
