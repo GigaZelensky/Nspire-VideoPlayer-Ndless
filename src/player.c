@@ -263,7 +263,10 @@ typedef struct {
 typedef struct {
     MovieFile *files;
     size_t count;
+    size_t selected_index;
+    size_t scroll_start;
     char directory[MAX_PATH_LEN];
+    bool has_position;
     bool valid;
 } MoviePickerCache;
 
@@ -13439,6 +13442,24 @@ static size_t picker_scroll_start_for_selection(size_t count, size_t selected, s
     return start_index;
 }
 
+static void movie_picker_cache_remember_position(
+    MoviePickerCache *cache,
+    size_t count,
+    size_t selected,
+    size_t scroll_start
+)
+{
+    if (!cache || count == 0) {
+        return;
+    }
+    if (selected >= count) {
+        selected = count - 1;
+    }
+    cache->selected_index = selected;
+    cache->scroll_start = picker_scroll_start_for_selection(count, selected, scroll_start);
+    cache->has_position = true;
+}
+
 static void picker_scroll_anim_view(
     PickerScrollAnim *anim,
     size_t scroll_start,
@@ -15657,7 +15678,13 @@ static int pick_movie(
     ensure_movie_picker_cache(&g_picker_cache, directory);
     files = g_picker_cache.files;
     count = g_picker_cache.count;
-    scroll_start = picker_scroll_start_centered(count, selected);
+    if (count > 0 && g_picker_cache.has_position) {
+        selected = g_picker_cache.selected_index < count ? g_picker_cache.selected_index : count - 1;
+        scroll_start = picker_scroll_start_for_selection(count, selected, g_picker_cache.scroll_start);
+    } else {
+        scroll_start = picker_scroll_start_centered(count, selected);
+    }
+    previous_selected = selected;
     if (resume_without_prompt) {
         *resume_without_prompt = false;
     }
@@ -15956,6 +15983,7 @@ static int pick_movie(
             }
             strncpy(selected_path, files[activated_index].path, selected_size - 1);
             selected_path[selected_size - 1] = '\0';
+            movie_picker_cache_remember_position(&g_picker_cache, count, selected, scroll_start);
             if (resume_without_prompt) {
                 *resume_without_prompt = activated_resume;
             }
