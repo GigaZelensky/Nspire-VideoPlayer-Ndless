@@ -2,8 +2,15 @@ name: Build Ndvideo
 
 on:
   push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -92,3 +99,46 @@ jobs:
             dist/ndvideo.zehn
             dist/ndvideo.elf
           if-no-files-found: error
+
+      - name: Prepare release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          release_name="${GITHUB_REF_NAME//\//-}"
+          mkdir -p release
+          cp dist/ndvideo.tns "release/ndvideo-${release_name}.tns"
+          cp dist/ndvideo.zehn "release/ndvideo-${release_name}.zehn"
+          cp dist/ndvideo.elf "release/ndvideo-${release_name}.elf"
+          (
+            cd release
+            sha256sum "ndvideo-${release_name}.tns" "ndvideo-${release_name}.zehn" "ndvideo-${release_name}.elf" > SHA256SUMS.txt
+          )
+          {
+            echo "ND Video Player ${GITHUB_REF_NAME}"
+            echo
+            echo "Built from commit ${GITHUB_SHA}."
+            echo
+            echo "## Assets"
+            echo "- \`ndvideo-${release_name}.tns\` - calculator-ready app"
+            echo "- \`ndvideo-${release_name}.zehn\` - packed Zehn payload"
+            echo "- \`ndvideo-${release_name}.elf\` - debug/symbol build artifact"
+            echo "- \`SHA256SUMS.txt\` - SHA-256 checksums"
+          } > release/RELEASE_NOTES.md
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find release -maxdepth 1 -type f ! -name RELEASE_NOTES.md | sort)
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "ND Video Player ${GITHUB_REF_NAME}" \
+              --notes-file release/RELEASE_NOTES.md
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --title "ND Video Player ${GITHUB_REF_NAME}" \
+              --notes-file release/RELEASE_NOTES.md
+          fi
