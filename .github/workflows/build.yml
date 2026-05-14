@@ -194,6 +194,9 @@ jobs:
               gh release edit "$RELEASE_TAG" \
                 --title "ND Video Player ${RELEASE_TAG}" \
                 --notes-file release/RELEASE_NOTES.md \
+                --draft=false \
+                --prerelease=false
+              gh release edit "$RELEASE_TAG" \
                 --latest
             else
               gh release edit "$RELEASE_TAG" \
