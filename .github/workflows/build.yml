@@ -187,32 +187,23 @@ jobs:
           if [ "$RELEASE_ROLLING" = "true" ]; then
             git tag -f "$RELEASE_TAG" "$build_sha"
             git push origin "refs/tags/$RELEASE_TAG" --force
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              gh release delete "$RELEASE_TAG" --yes
+            fi
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --title "ND Video Player ${RELEASE_TAG}" \
+              --notes-file release/RELEASE_NOTES.md \
+              --latest \
+              --target "$build_sha"
+            exit 0
           fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
-            if [ "$RELEASE_ROLLING" = "true" ]; then
-              gh release edit "$RELEASE_TAG" \
-                --title "ND Video Player ${RELEASE_TAG}" \
-                --notes-file release/RELEASE_NOTES.md \
-                --draft=false \
-                --prerelease=false
-              gh release edit "$RELEASE_TAG" \
-                --latest
-            else
-              gh release edit "$RELEASE_TAG" \
-                --title "ND Video Player ${RELEASE_TAG}" \
-                --notes-file release/RELEASE_NOTES.md
-            fi
+            gh release edit "$RELEASE_TAG" \
+              --title "ND Video Player ${RELEASE_TAG}" \
+              --notes-file release/RELEASE_NOTES.md
           else
-            if [ "$RELEASE_ROLLING" = "true" ]; then
-              gh release create "$RELEASE_TAG" "${assets[@]}" \
-                --title "ND Video Player ${RELEASE_TAG}" \
-                --notes-file release/RELEASE_NOTES.md \
-                --latest \
-                --target "$build_sha"
-            else
-              gh release create "$RELEASE_TAG" "${assets[@]}" \
-                --title "ND Video Player ${RELEASE_TAG}" \
-                --notes-file release/RELEASE_NOTES.md
-            fi
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --title "ND Video Player ${RELEASE_TAG}" \
+              --notes-file release/RELEASE_NOTES.md
           fi
