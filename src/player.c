@@ -60,14 +60,19 @@
 #define UI_TOOLTIP_ANIM_MS 115U
 #define UI_MENU_ANIM_MS 130U
 #define UI_LOADING_ANIM_MS 150U
+#define UI_LOADING_PROGRESS_FRAME_MS 90U
 #define UI_LOADING_DIM_ALPHA 112
 #define RESUME_PROMPT_DIM_ALPHA 112
 #define UI_RETURN_COLLAPSE_ANIM_MS 210U
-#define RESUME_BACKGROUND_REVEAL_ANIM_MS 150U
-#define RESUME_PROMPT_OPEN_DELAY_MS 190U
-#define RESUME_PROMPT_OPEN_ANIM_MS 245U
+#define RESUME_PROMPT_OPEN_MORPH_ANIM_MS 260U
+#define RESUME_PROMPT_CONTENT_START_MS 230U
+#define RESUME_PROMPT_CONTENT_STAGGER_MS 48U
+#define RESUME_PROMPT_CONTENT_ITEM_ANIM_MS 150U
+#define RESUME_PROMPT_LOADING_TEXT_EXIT_MS 120U
 #define RESUME_PROMPT_ANIM_MS 150U
+#define RESUME_COMMIT_PROMPT_ANIM_MS 190U
 #define RESUME_MORPH_ANIM_MS 150U
+#define RESUME_COMMIT_MORPH_ANIM_MS 230U
 #define SCALE_MORPH_ANIM_MS RESUME_MORPH_ANIM_MS
 #define RESUME_INPUT_GUARD_MS 260U
 #define UI_WAKE_MIN_MIX 28U
@@ -303,6 +308,16 @@ typedef struct {
     nSDL_Font *subtitle_white[NSP_NUMFONTS];
     nSDL_Font *subtitle_outline[NSP_NUMFONTS];
 } Fonts;
+
+typedef struct {
+    SDL_Surface *screen;
+    SDL_Surface *snapshot;
+    const Fonts *fonts;
+    const char *label;
+    uint32_t started_ms;
+    uint32_t last_draw_ms;
+    bool dim_background;
+} LoadingProgress;
 
 typedef enum {
     SCALE_FIT = 0,
@@ -787,6 +802,15 @@ static bool decode_to_frame_with_progress(
     H264DecodedFrameHook hook,
     void *userdata
 );
+static void loading_progress_init(
+    LoadingProgress *progress,
+    SDL_Surface *screen,
+    SDL_Surface *snapshot,
+    const Fonts *fonts,
+    const char *label,
+    bool dim_background
+);
+static void loading_progress_tick(LoadingProgress *progress, bool force);
 static bool decode_h264_frame(
     Movie *movie,
     uint32_t frame_index,
@@ -7486,7 +7510,8 @@ static bool load_subtitles(
     const MovieHeader *header,
     SubtitleCue **out_cues,
     SubtitleTrack **out_tracks,
-    uint16_t *out_track_count
+    uint16_t *out_track_count,
+    LoadingProgress *loading_progress
 )
 {
     SubtitleCue *cues = NULL;
@@ -7501,6 +7526,7 @@ static bool load_subtitles(
         debug_tracef("open subtitles none");
         return true;
     }
+    loading_progress_tick(loading_progress, false);
 
     cues = (SubtitleCue *) calloc(header->subtitle_count, sizeof(SubtitleCue));
     if (!cues) {
@@ -7524,6 +7550,7 @@ static bool load_subtitles(
             free(cues);
             return false;
         }
+        loading_progress_tick(loading_progress, false);
         *out_track_count = read_le16(track_count_bytes);
         if (*out_track_count == 0) {
             debug_tracef("open subtitles zero tracks");
@@ -7576,6 +7603,7 @@ static bool load_subtitles(
             }
             tracks[track_index].name[name_len] = '\0';
             cue_cursor += tracks[track_index].cue_count;
+            loading_progress_tick(loading_progress, false);
         }
         if (cue_cursor != header->subtitle_count) {
             debug_failf(
@@ -7623,6 +7651,7 @@ static bool load_subtitles(
             goto fail;
         }
         cues[cue_index].text[text_len] = '\0';
+        loading_progress_tick(loading_progress, false);
     }
     for (track_index = 0; track_index < *out_track_count; ++track_index) {
         uint32_t start_index = tracks[track_index].cue_start;
@@ -7669,7 +7698,7 @@ fail:
     return false;
 }
 
-static bool load_movie(const char *path, Movie *movie)
+static bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progress)
 {
     size_t framebuffer_words;
     memset(movie, 0, sizeof(*movie));
@@ -7695,6 +7724,7 @@ static bool load_movie(const char *path, Movie *movie)
     movie->h264_boundary_warmup.chunk_index = -1;
     movie->h264_boundary_warmup.decoded_local_frame = -1;
     debug_tracef("open start path=%s", path ? path : "(null)");
+    loading_progress_tick(loading_progress, false);
 
     movie->file = fopen(path, "rb");
     if (!movie->file) {
@@ -7702,6 +7732,7 @@ static bool load_movie(const char *path, Movie *movie)
         return false;
     }
     movie->current_file_pos = 0;
+    loading_progress_tick(loading_progress, false);
     if (fread(&movie->header, 1, sizeof(movie->header), movie->file) != sizeof(movie->header)) {
         debug_failf("open failed: header read");
         return false;
@@ -7724,6 +7755,7 @@ static bool load_movie(const char *path, Movie *movie)
         (unsigned long) movie->header.chunk_count,
         (unsigned long) movie->header.subtitle_count
     );
+    loading_progress_tick(loading_progress, false);
     movie->chunk_index = (ChunkIndexEntry *) calloc(movie->header.chunk_count, sizeof(ChunkIndexEntry));
     if (!movie->chunk_index) {
         debug_failf("open failed: chunk index alloc count=%lu", (unsigned long) movie->header.chunk_count);
@@ -7740,6 +7772,7 @@ static bool load_movie(const char *path, Movie *movie)
     }
     movie->current_file_pos += (long) (sizeof(ChunkIndexEntry) * movie->header.chunk_count);
     debug_tracef("open index loaded chunks=%lu", (unsigned long) movie->header.chunk_count);
+    loading_progress_tick(loading_progress, false);
     framebuffer_words = (size_t) movie->header.video_width * movie->header.video_height;
     movie->framebuffer = (uint16_t *) calloc(framebuffer_words, sizeof(uint16_t));
     init_h264_color_tables();
@@ -7770,6 +7803,7 @@ static bool load_movie(const char *path, Movie *movie)
         }
         return false;
     }
+    loading_progress_tick(loading_progress, false);
     if (!movie->framebuffer) {
         debug_failf("open failed: framebuffer missing");
         return false;
@@ -7791,6 +7825,7 @@ static bool load_movie(const char *path, Movie *movie)
         return false;
     }
     debug_tracef("open first frame ok");
+    loading_progress_tick(loading_progress, false);
     if (movie_uses_h264(movie)) {
         size_t warm_start_slots = H264_PREFETCH_MIN_READY_FRAMES + H264_PREFETCH_NEXT_CHUNK_BRIDGE_FRAMES;
         size_t max_slots = target_h264_frame_ring_capacity(movie);
@@ -7799,9 +7834,11 @@ static bool load_movie(const char *path, Movie *movie)
         }
         try_grow_h264_frame_ring(movie, warm_start_slots);
     }
-    if (!load_subtitles(movie, movie->file, &movie->header, &movie->subtitles, &movie->subtitle_tracks, &movie->subtitle_track_count)) {
+    loading_progress_tick(loading_progress, false);
+    if (!load_subtitles(movie, movie->file, &movie->header, &movie->subtitles, &movie->subtitle_tracks, &movie->subtitle_track_count, loading_progress)) {
         debug_tracef("open subtitles disabled after alloc/read failure");
     }
+    loading_progress_tick(loading_progress, false);
     return true;
 }
 
@@ -11005,6 +11042,25 @@ static SDL_Rect mix_sdl_rects(const SDL_Rect *from, const SDL_Rect *to, uint8_t 
     return rect;
 }
 
+static SDL_Rect offset_sdl_rect(const SDL_Rect *rect, int dx, int dy)
+{
+    SDL_Rect shifted = *rect;
+
+    shifted.x = (Sint16) (shifted.x + dx);
+    shifted.y = (Sint16) (shifted.y + dy);
+    return shifted;
+}
+
+static uint8_t staggered_content_mix(uint32_t elapsed_ms, uint32_t start_ms, uint32_t stagger_ms, uint32_t index, uint32_t duration_ms)
+{
+    uint32_t item_start_ms = start_ms + (stagger_ms * index);
+
+    if (elapsed_ms <= item_start_ms) {
+        return 0;
+    }
+    return ui_ease_out_cubic(elapsed_ms - item_start_ms, duration_ms);
+}
+
 static void scale_morph_current_rects(
     const Movie *movie,
     ScaleMorphState *morph,
@@ -13521,8 +13577,10 @@ static void draw_loading_overlay_mix(
     SDL_Rect panel = {88, 92, 136, 30};
     SDL_Rect accent = {90, 93, 132, 1};
     char spinner[8];
+    const char *spinner_full = "...";
     int dot_count = (phase % 3) + 1;
     int offset_y;
+    int spinner_x;
     SDL_Surface *composite = NULL;
 
     if (!screen || !fonts || mix == 0) {
@@ -13531,6 +13589,7 @@ static void draw_loading_overlay_mix(
 
     memset(spinner, '.', (size_t) dot_count);
     spinner[dot_count] = '\0';
+    spinner_x = panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner_full);
 
     offset_y = ((255 - mix) * 5 + 127) / 255;
     if (!opening) {
@@ -13551,7 +13610,7 @@ static void draw_loading_overlay_mix(
             draw_soft_glass_panel(composite, &local_panel, UI_COLOR_GUNMETAL, false);
             draw_vertical_gradient(composite, &local_accent, UI_COLOR_ACCENT, UI_COLOR_ACCENT_DEEP);
             draw_ui_label(composite, fonts, 12, 10, label ? label : "Loading");
-            draw_ui_label(composite, fonts, panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), 10, spinner);
+            draw_ui_label(composite, fonts, spinner_x, 10, spinner);
             blit_surface_rgb565_mix(screen, composite, &panel, mix);
             SDL_FreeSurface(composite);
             return;
@@ -13561,7 +13620,70 @@ static void draw_loading_overlay_mix(
     draw_soft_glass_panel(screen, &panel, UI_COLOR_GUNMETAL, false);
     draw_vertical_gradient(screen, &accent, UI_COLOR_ACCENT, UI_COLOR_ACCENT_DEEP);
     draw_ui_label(screen, fonts, panel.x + 12, panel.y + 10, label ? label : "Loading");
-    draw_ui_label(screen, fonts, panel.x + panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), panel.y + 10, spinner);
+    draw_ui_label(screen, fonts, panel.x + spinner_x, panel.y + 10, spinner);
+}
+
+static void draw_loading_overlay_label_mix(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    const SDL_Rect *panel,
+    const char *label,
+    int phase,
+    uint8_t mix
+)
+{
+    SDL_Rect source;
+    SDL_Surface *composite;
+    char spinner[8];
+    const char *spinner_full = "...";
+    const char *label_text = label ? label : "Loading";
+    int dot_count = (phase % 3) + 1;
+    int label_h;
+    int label_y;
+    int spinner_w;
+    int spinner_x;
+
+    if (!screen || !fonts || !panel || panel->w <= 0 || panel->h <= 0 || mix == 0) {
+        return;
+    }
+
+    memset(spinner, '.', (size_t) dot_count);
+    spinner[dot_count] = '\0';
+    label_h = nSDL_GetStringHeight(fonts->white, label_text);
+    label_y = (panel->h - label_h) / 2;
+    if (label_y < 5) {
+        label_y = 5;
+    } else if (label_y > 10) {
+        label_y = 10;
+    }
+    spinner_w = nSDL_GetStringWidth(fonts->white, spinner_full);
+    spinner_x = panel->w - 18 - spinner_w;
+    if (spinner_x < 70) {
+        spinner_x = 70;
+    }
+
+    if (mix >= 255) {
+        draw_ui_label(screen, fonts, panel->x + 12, panel->y + label_y, label_text);
+        draw_ui_label(screen, fonts, panel->x + spinner_x, panel->y + label_y, spinner);
+        return;
+    }
+
+    if (panel->x < 0 || panel->y < 0 ||
+        panel->x + panel->w > screen->w ||
+        panel->y + panel->h > screen->h) {
+        return;
+    }
+
+    source = *panel;
+    composite = create_rgb565_surface(panel->w, panel->h);
+    if (!composite) {
+        return;
+    }
+    SDL_BlitSurface(screen, &source, composite, NULL);
+    draw_ui_label(composite, fonts, 12, label_y, label_text);
+    draw_ui_label(composite, fonts, spinner_x, label_y, spinner);
+    blit_surface_rgb565_mix(screen, composite, panel, mix);
+    SDL_FreeSurface(composite);
 }
 
 static SDL_Surface *capture_screen_surface(SDL_Surface *screen)
@@ -13577,6 +13699,69 @@ static SDL_Surface *capture_screen_surface(SDL_Surface *screen)
     }
     SDL_BlitSurface(screen, NULL, snapshot, NULL);
     return snapshot;
+}
+
+static SDL_Surface *capture_rect_surface(SDL_Surface *screen, const SDL_Rect *source)
+{
+    SDL_Surface *snapshot;
+
+    if (!screen || !source || source->w <= 0 || source->h <= 0 ||
+        source->x < 0 || source->y < 0 ||
+        source->x + source->w > screen->w ||
+        source->y + source->h > screen->h) {
+        return NULL;
+    }
+    snapshot = create_rgb565_surface(source->w, source->h);
+    if (!snapshot) {
+        return NULL;
+    }
+    SDL_BlitSurface(screen, (SDL_Rect *) source, snapshot, NULL);
+    return snapshot;
+}
+
+static SDL_Surface *begin_faded_region_draw(
+    SDL_Surface *screen,
+    const SDL_Rect *bounds,
+    uint8_t mix,
+    SDL_Surface **target,
+    SDL_Rect *old_clip,
+    int *dx,
+    int *dy
+)
+{
+    SDL_Surface *surface = NULL;
+
+    *target = screen;
+    *dx = 0;
+    *dy = 0;
+    SDL_GetClipRect(screen, old_clip);
+    if (mix < 255) {
+        surface = capture_rect_surface(screen, bounds);
+        if (surface) {
+            *target = surface;
+            *dx = -bounds->x;
+            *dy = -bounds->y;
+            return surface;
+        }
+    }
+    SDL_SetClipRect(screen, (SDL_Rect *) bounds);
+    return NULL;
+}
+
+static void end_faded_region_draw(
+    SDL_Surface *screen,
+    SDL_Surface *surface,
+    const SDL_Rect *bounds,
+    const SDL_Rect *old_clip,
+    uint8_t mix
+)
+{
+    if (surface) {
+        blit_surface_rgb565_mix(screen, surface, bounds, mix);
+        SDL_FreeSurface(surface);
+        return;
+    }
+    SDL_SetClipRect(screen, (SDL_Rect *) old_clip);
 }
 
 static SDL_Surface *create_black_screen_snapshot(SDL_Surface *screen)
@@ -13618,6 +13803,57 @@ static void draw_loading_transition_frame(
     present_screen(screen);
 }
 
+static void loading_progress_init(
+    LoadingProgress *progress,
+    SDL_Surface *screen,
+    SDL_Surface *snapshot,
+    const Fonts *fonts,
+    const char *label,
+    bool dim_background
+)
+{
+    if (!progress) {
+        return;
+    }
+    progress->screen = screen;
+    progress->snapshot = snapshot;
+    progress->fonts = fonts;
+    progress->label = label;
+    progress->started_ms = monotonic_clock_now_ms();
+    progress->last_draw_ms = 0;
+    progress->dim_background = dim_background;
+}
+
+static void loading_progress_tick(LoadingProgress *progress, bool force)
+{
+    uint32_t now_ms;
+
+    if (!progress || !progress->screen || !progress->fonts) {
+        return;
+    }
+    now_ms = monotonic_clock_now_ms();
+    if (!force &&
+        progress->last_draw_ms != 0 &&
+        now_ms - progress->last_draw_ms < UI_LOADING_PROGRESS_FRAME_MS) {
+        return;
+    }
+    if (progress->last_draw_ms == 0 && !force) {
+        progress->last_draw_ms = now_ms;
+        return;
+    }
+    draw_loading_transition_frame(
+        progress->screen,
+        progress->snapshot,
+        progress->fonts,
+        progress->label,
+        255,
+        (int) (((now_ms - progress->started_ms) / 180U) % 3U),
+        true,
+        progress->dim_background
+    );
+    progress->last_draw_ms = now_ms;
+}
+
 static void animate_loading_transition_ex(
     SDL_Surface *screen,
     SDL_Surface *snapshot,
@@ -13640,7 +13876,7 @@ static void animate_loading_transition_ex(
             fonts,
             label,
             mix,
-            (int) ((now_ms / 180U) % 3U),
+            (int) (((now_ms - started_ms) / 180U) % 3U),
             opening,
             dim_background
         );
@@ -15981,28 +16217,49 @@ static int prompt_resume_position(
         bool right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right) || (!ctrl_down && keypad_6_edge);
         bool prompt_canceling = prompt_closing && prompt_closing_result < 0;
         uint32_t prompt_open_elapsed_ms = now_ms - prompt_open_started_ms;
-        uint32_t prompt_open_anim_elapsed_ms = prompt_open_elapsed_ms > RESUME_PROMPT_OPEN_DELAY_MS
-            ? (prompt_open_elapsed_ms - RESUME_PROMPT_OPEN_DELAY_MS)
-            : 0U;
+        uint8_t prompt_open_mix = !prompt_closing
+            ? ui_ease_out_cubic(prompt_open_elapsed_ms, RESUME_PROMPT_OPEN_MORPH_ANIM_MS)
+            : 0;
+        uint8_t prompt_header_mix = !prompt_closing
+            ? staggered_content_mix(prompt_open_elapsed_ms, RESUME_PROMPT_CONTENT_START_MS, RESUME_PROMPT_CONTENT_STAGGER_MS, 0, RESUME_PROMPT_CONTENT_ITEM_ANIM_MS)
+            : 0;
+        uint8_t prompt_title_mix = !prompt_closing
+            ? staggered_content_mix(prompt_open_elapsed_ms, RESUME_PROMPT_CONTENT_START_MS, RESUME_PROMPT_CONTENT_STAGGER_MS, 1, RESUME_PROMPT_CONTENT_ITEM_ANIM_MS)
+            : 0;
+        uint8_t prompt_preview_mix = !prompt_closing
+            ? staggered_content_mix(prompt_open_elapsed_ms, RESUME_PROMPT_CONTENT_START_MS, RESUME_PROMPT_CONTENT_STAGGER_MS, 2, RESUME_PROMPT_CONTENT_ITEM_ANIM_MS)
+            : 0;
+        uint8_t prompt_time_mix = !prompt_closing
+            ? staggered_content_mix(prompt_open_elapsed_ms, RESUME_PROMPT_CONTENT_START_MS, RESUME_PROMPT_CONTENT_STAGGER_MS, 3, RESUME_PROMPT_CONTENT_ITEM_ANIM_MS)
+            : 0;
+        uint8_t prompt_buttons_mix = !prompt_closing
+            ? staggered_content_mix(prompt_open_elapsed_ms, RESUME_PROMPT_CONTENT_START_MS, RESUME_PROMPT_CONTENT_STAGGER_MS, 4, RESUME_PROMPT_CONTENT_ITEM_ANIM_MS)
+            : 0;
+        uint8_t prompt_content_mix = max_u8(max_u8(prompt_header_mix, prompt_title_mix), max_u8(prompt_preview_mix, max_u8(prompt_time_mix, prompt_buttons_mix)));
+        uint8_t loading_text_mix = !prompt_closing
+            ? (uint8_t) (255U - ui_ease_out_cubic(prompt_open_elapsed_ms, RESUME_PROMPT_LOADING_TEXT_EXIT_MS))
+            : 0;
         uint8_t background_reveal_mix = (!prompt_closing && loading_snapshot && *loading_snapshot)
-            ? ui_ease_smoothstep(prompt_open_elapsed_ms, RESUME_BACKGROUND_REVEAL_ANIM_MS)
+            ? prompt_open_mix
             : 255;
-        uint8_t loading_mix = (uint8_t) (255U - background_reveal_mix);
+        uint8_t loading_mix = (uint8_t) (255U - prompt_open_mix);
         uint32_t prompt_close_elapsed_ms = prompt_closing ? (now_ms - prompt_close_started_ms) : 0;
         uint8_t close_mix = prompt_closing
-            ? ui_ease_out_cubic(prompt_close_elapsed_ms, RESUME_PROMPT_ANIM_MS)
+            ? ui_ease_out_cubic(prompt_close_elapsed_ms, prompt_canceling ? RESUME_PROMPT_ANIM_MS : RESUME_COMMIT_PROMPT_ANIM_MS)
             : 0;
         uint8_t morph_mix = prompt_closing
             ? (prompt_canceling
                 ? ui_ease_smoothstep(prompt_close_elapsed_ms, UI_RETURN_COLLAPSE_ANIM_MS)
-                : ui_ease_out_cubic(prompt_close_elapsed_ms, RESUME_MORPH_ANIM_MS))
+                : ui_ease_out_cubic(prompt_close_elapsed_ms, RESUME_COMMIT_MORPH_ANIM_MS))
             : 0;
         uint8_t prompt_mix = prompt_closing
             ? (uint8_t) (255U - close_mix)
-            : ui_ease_smoothstep(prompt_open_anim_elapsed_ms, RESUME_PROMPT_OPEN_ANIM_MS);
-        uint8_t prompt_style_mix = prompt_closing ? prompt_mix : 255;
-        bool draw_prompt_contents = prompt_closing ? prompt_mix > 40 : prompt_mix > 0;
-        int prompt_y_offset = ((255 - prompt_mix) * 5 + 127) / 255;
+            : prompt_open_mix;
+        uint8_t prompt_style_mix = 255;
+        bool draw_prompt_contents = prompt_closing
+            ? (prompt_canceling ? prompt_mix > 40 : true)
+            : prompt_content_mix > 0;
+        int prompt_y_offset = prompt_closing ? (((255 - prompt_mix) * 5 + 127) / 255) : 0;
         int dim_strength = prompt_closing
             ? ((RESUME_PROMPT_DIM_ALPHA * prompt_mix + 127) / 255)
             : ((UI_LOADING_DIM_ALPHA * (int) loading_mix + RESUME_PROMPT_DIM_ALPHA * (int) background_reveal_mix + 127) / 255);
@@ -16017,6 +16274,9 @@ static int prompt_resume_position(
         SDL_Rect draw_preview_border = preview_border;
         SDL_Rect draw_continue_button = continue_button;
         SDL_Rect draw_restart_button = restart_button;
+        SDL_Rect loading_border = {88, 92, 136, 30};
+        SDL_Rect loading_panel = {89, 93, 134, 28};
+        SDL_Rect loading_accent = {90, 93, 132, 1};
         int draw_title_y = title_y + prompt_y_offset;
         int draw_time_label_y = time_label_y + prompt_y_offset;
         int hovered_button = -1;
@@ -16045,6 +16305,19 @@ static int prompt_resume_position(
         draw_preview_border.y = (Sint16) (draw_preview_border.y + prompt_y_offset);
         draw_continue_button.y = (Sint16) (draw_continue_button.y + prompt_y_offset);
         draw_restart_button.y = (Sint16) (draw_restart_button.y + prompt_y_offset);
+        if (!prompt_closing) {
+            draw_border = mix_sdl_rects(&loading_border, &border, prompt_mix);
+            draw_panel = mix_sdl_rects(&loading_panel, &panel, prompt_mix);
+            draw_header = mix_sdl_rects(&loading_panel, &header, prompt_mix);
+            draw_accent = mix_sdl_rects(&loading_accent, &accent, prompt_mix);
+            draw_title_panel = title_panel;
+            draw_preview = preview;
+            draw_preview_border = preview_border;
+            draw_continue_button = continue_button;
+            draw_restart_button = restart_button;
+            draw_title_y = title_y;
+            draw_time_label_y = time_label_y;
+        }
 
         if (!prompt_closing) {
             if (pointer_hover_allowed) {
@@ -16138,23 +16411,198 @@ static int prompt_resume_position(
             draw_movie_frame_scaled_clipped(screen, movie, &background_src, &background_dst);
         }
         dim_rect_rgb565(screen, &full_screen, dim_strength);
-        if (!prompt_closing && loading_mix > 0) {
-            draw_loading_overlay_mix(
+        if (!prompt_closing && (prompt_mix > 0 || loading_text_mix > 0 || prompt_content_mix > 0)) {
+            Uint16 panel_base = rgb565_lerp(UI_COLOR_GUNMETAL, ui_theme()->modal_panel, prompt_mix, 255);
+
+            fill_soft_panel_backplate(
+                screen,
+                &draw_border,
+                rgb565_lerp(UI_COLOR_GUNMETAL, ui_theme()->menu_border, prompt_mix, 255)
+            );
+            draw_soft_glass_panel_body_from_y(
+                screen,
+                &draw_panel,
+                draw_accent.y + draw_accent.h,
+                panel_base
+            );
+            draw_soft_glass_panel_top_mix(
+                screen,
+                &draw_header,
+                UI_COLOR_GUNMETAL,
+                0
+            );
+            draw_vertical_gradient(
+                screen,
+                &draw_accent,
+                UI_COLOR_ACCENT,
+                UI_COLOR_ACCENT_DEEP
+            );
+            draw_loading_overlay_label_mix(
                 screen,
                 fonts,
+                &draw_border,
                 "Loading",
-                (int) ((now_ms / 180U) % 3U),
-                loading_mix,
-                false
+                (int) ((prompt_open_elapsed_ms / 180U) % 3U),
+                loading_text_mix
             );
-        }
-        if (prompt_mix > 0) {
+            if (draw_prompt_contents) {
+                if (prompt_header_mix > 0) {
+                    SDL_Surface *item_surface;
+                    SDL_Surface *item_target;
+                    SDL_Rect old_clip;
+                    int dx;
+                    int dy;
+                    int item_y_offset = ((255 - prompt_header_mix) * 4 + 127) / 255;
+
+                    item_surface = begin_faded_region_draw(screen, &draw_border, prompt_header_mix, &item_target, &old_clip, &dx, &dy);
+                    draw_ui_label(item_target, fonts, panel.x + 12 + dx, panel.y + 8 + dy + item_y_offset, "Continue Watching?");
+                    end_faded_region_draw(screen, item_surface, &draw_border, &old_clip, prompt_header_mix);
+                }
+                if (prompt_title_mix > 0) {
+                    SDL_Surface *item_surface;
+                    SDL_Surface *item_target;
+                    SDL_Rect old_clip;
+                    SDL_Rect content_title_panel;
+                    int dx;
+                    int dy;
+                    int item_y_offset = ((255 - prompt_title_mix) * 4 + 127) / 255;
+
+                    item_surface = begin_faded_region_draw(screen, &draw_border, prompt_title_mix, &item_target, &old_clip, &dx, &dy);
+                    content_title_panel = offset_sdl_rect(&draw_title_panel, dx, dy + item_y_offset);
+                    draw_soft_glass_panel_mix(item_target, &content_title_panel, ui_theme()->modal_title_panel, 0);
+                    draw_ui_label(item_target, fonts, panel.x + 12 + dx, draw_title_y + dy + item_y_offset, fitted_title_main);
+                    if (title_detail_height > 0) {
+                        draw_ui_label(item_target, fonts, panel.x + 12 + dx, draw_title_y + title_main_height + 2 + dy + item_y_offset, fitted_title_detail);
+                    }
+                    end_faded_region_draw(screen, item_surface, &draw_border, &old_clip, prompt_title_mix);
+                }
+                if (prompt_preview_mix > 0) {
+                    SDL_Surface *item_surface;
+                    SDL_Surface *item_target;
+                    SDL_Rect old_clip;
+                    SDL_Rect content_preview;
+                    SDL_Rect content_preview_border;
+                    int dx;
+                    int dy;
+                    int item_y_offset = ((255 - prompt_preview_mix) * 4 + 127) / 255;
+
+                    item_surface = begin_faded_region_draw(screen, &draw_border, prompt_preview_mix, &item_target, &old_clip, &dx, &dy);
+                    content_preview = offset_sdl_rect(&draw_preview, dx, dy + item_y_offset);
+                    content_preview_border = offset_sdl_rect(&draw_preview_border, dx, dy + item_y_offset);
+                    if (content_preview.x >= 0 &&
+                        content_preview.y >= 0 &&
+                        content_preview.x + content_preview.w <= item_target->w &&
+                        content_preview.y + content_preview.h <= item_target->h) {
+                        fill_rect_rgb565(item_target, &content_preview_border, UI_COLOR_WARM_WHITE);
+                        SDL_SoftStretch(movie->frame_surface, NULL, item_target, &content_preview);
+                    }
+                    end_faded_region_draw(screen, item_surface, &draw_border, &old_clip, prompt_preview_mix);
+                }
+                if (prompt_time_mix > 0) {
+                    SDL_Surface *item_surface;
+                    SDL_Surface *item_target;
+                    SDL_Rect old_clip;
+                    int dx;
+                    int dy;
+                    int item_y_offset = ((255 - prompt_time_mix) * 4 + 127) / 255;
+
+                    item_surface = begin_faded_region_draw(screen, &draw_border, prompt_time_mix, &item_target, &old_clip, &dx, &dy);
+                    draw_ui_label(item_target, fonts, panel.x + 12 + dx, draw_time_label_y + dy + item_y_offset, time_label);
+                    end_faded_region_draw(screen, item_surface, &draw_border, &old_clip, prompt_time_mix);
+                }
+                if (prompt_buttons_mix > 0) {
+                    SDL_Surface *item_surface;
+                    SDL_Surface *item_target;
+                    SDL_Rect old_clip;
+                    SDL_Rect content_continue_button;
+                    SDL_Rect content_restart_button;
+                    int dx;
+                    int dy;
+                    int item_y_offset = ((255 - prompt_buttons_mix) * 4 + 127) / 255;
+
+                    item_surface = begin_faded_region_draw(screen, &draw_border, prompt_buttons_mix, &item_target, &old_clip, &dx, &dy);
+                    content_continue_button = offset_sdl_rect(&draw_continue_button, dx, dy + item_y_offset);
+                    content_restart_button = offset_sdl_rect(&draw_restart_button, dx, dy + item_y_offset);
+                    draw_prompt_button(
+                        item_target,
+                        fonts,
+                        &content_continue_button,
+                        "CONTINUE",
+                        prompt_button_selection_mix(0, selected_button, previous_selected_button, button_anim_started_ms, now_ms),
+                        pressed_button == 0 ? button_press_mix : 0
+                    );
+                    draw_prompt_button(
+                        item_target,
+                        fonts,
+                        &content_restart_button,
+                        "START OVER",
+                        prompt_button_selection_mix(1, selected_button, previous_selected_button, button_anim_started_ms, now_ms),
+                        pressed_button == 1 ? button_press_mix : 0
+                    );
+                    end_faded_region_draw(screen, item_surface, &draw_border, &old_clip, prompt_buttons_mix);
+                }
+            }
+        } else if (prompt_canceling && prompt_mix > 0) {
+            Uint16 panel_base = rgb565_lerp(UI_COLOR_BLACK, ui_theme()->modal_panel, prompt_mix, 255);
+
+            fill_soft_panel_backplate(screen, &draw_border, ui_theme()->menu_border);
+            draw_soft_glass_panel_body_from_y(
+                screen,
+                &draw_panel,
+                draw_accent.y + draw_accent.h,
+                panel_base
+            );
+            draw_soft_glass_panel_top_mix(
+                screen,
+                &draw_header,
+                rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, prompt_mix, 255),
+                0
+            );
+            draw_vertical_gradient(
+                screen,
+                &draw_accent,
+                rgb565_lerp(ui_theme()->modal_panel, UI_COLOR_ACCENT, prompt_mix, 255),
+                rgb565_lerp(ui_theme()->modal_panel, UI_COLOR_ACCENT_DEEP, prompt_mix, 255)
+            );
+            draw_soft_glass_panel_mix(
+                screen,
+                &draw_title_panel,
+                rgb565_lerp(UI_COLOR_BLACK, ui_theme()->modal_title_panel, prompt_mix, 255),
+                0
+            );
+            fill_rect_rgb565(screen, &draw_preview_border, UI_COLOR_WARM_WHITE);
+            SDL_SoftStretch(movie->frame_surface, NULL, screen, &draw_preview);
+            if (draw_prompt_contents) {
+                draw_ui_label(screen, fonts, draw_panel.x + 12, draw_panel.y + 8, "Continue Watching?");
+                draw_ui_label(screen, fonts, draw_panel.x + 12, draw_title_y, fitted_title_main);
+                if (title_detail_height > 0) {
+                    draw_ui_label(screen, fonts, draw_panel.x + 12, draw_title_y + title_main_height + 2, fitted_title_detail);
+                }
+                draw_ui_label(screen, fonts, draw_panel.x + 12, draw_time_label_y, time_label);
+                draw_prompt_button(
+                    screen,
+                    fonts,
+                    &draw_continue_button,
+                    "CONTINUE",
+                    prompt_button_selection_mix(0, selected_button, previous_selected_button, button_anim_started_ms, now_ms),
+                    pressed_button == 0 ? button_press_mix : 0
+                );
+                draw_prompt_button(
+                    screen,
+                    fonts,
+                    &draw_restart_button,
+                    "START OVER",
+                    prompt_button_selection_mix(1, selected_button, previous_selected_button, button_anim_started_ms, now_ms),
+                    pressed_button == 1 ? button_press_mix : 0
+                );
+            }
+        } else if (prompt_mix > 0) {
             SDL_Surface *prompt_surface = NULL;
             SDL_Surface *prompt_target = screen;
             SDL_Rect prompt_blit = {0, 0, SCREEN_W, SCREEN_H};
             Uint16 panel_base = rgb565_lerp(UI_COLOR_BLACK, ui_theme()->modal_panel, prompt_style_mix, 255);
 
-            if (!prompt_closing && prompt_mix < 255) {
+            if (prompt_closing && !prompt_canceling && prompt_mix < 255) {
                 prompt_surface = capture_screen_surface(screen);
                 if (prompt_surface) {
                     prompt_target = prompt_surface;
@@ -16195,9 +16643,6 @@ static int prompt_resume_position(
                 rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_WARM_WHITE, prompt_style_mix, 255)
             );
             SDL_SoftStretch(movie->frame_surface, NULL, prompt_target, &draw_preview);
-            if (prompt_closing && prompt_mix < 255) {
-                dim_rect_rgb565(prompt_target, &draw_preview, 255 - prompt_mix);
-            }
             if (draw_prompt_contents) {
                 draw_ui_label(prompt_target, fonts, draw_panel.x + 12, draw_panel.y + 8, "Continue Watching?");
                 draw_ui_label(prompt_target, fonts, draw_panel.x + 12, draw_title_y, fitted_title_main);
@@ -16232,7 +16677,7 @@ static int prompt_resume_position(
             draw_cursor(screen, pointer.x, pointer.y);
         }
         present_screen(screen);
-        if (prompt_closing && (prompt_canceling ? morph_mix : close_mix) >= 255) {
+        if (prompt_closing && (prompt_canceling ? morph_mix >= 255 : (close_mix >= 255 && morph_mix >= 255))) {
             if (prompt_canceling) {
                 present_black_screen(screen);
             }
@@ -16387,6 +16832,7 @@ static int play_movie(
     bool playback_pointer_press_active = false;
     bool hover_preview_needs_rebuffer = false;
     SDL_Surface *loading_snapshot = NULL;
+    LoadingProgress loading_progress;
     const char *movie_filename = path;
     char *playback_title_alloc = NULL;
     char *playback_detail_alloc = NULL;
@@ -16434,10 +16880,15 @@ static int play_movie(
         loading_snapshot = capture_screen_surface(screen);
         animate_loading_transition(screen, loading_snapshot, fonts, "Loading", true);
     }
+    loading_progress_init(&loading_progress, screen, loading_snapshot, fonts, "Loading", true);
+    loading_progress_tick(&loading_progress, true);
     cleanup_deferred_playback_movie();
+    loading_progress_tick(&loading_progress, false);
     flush_queued_history_save(&g_pending_history_save, "loading");
+    loading_progress_tick(&loading_progress, false);
     flush_queued_theme_save("loading");
-    if (!load_movie(path, &movie)) {
+    loading_progress_tick(&loading_progress, false);
+    if (!load_movie(path, &movie, &loading_progress)) {
         finish_loading_transition(screen, &loading_snapshot, fonts, "Loading");
         report_movie_open_failure(path);
         return -1;
