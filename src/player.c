@@ -15449,8 +15449,7 @@ static int pick_movie(
             ? -1
             : picker_tooltip_hover_update(&tooltip_hover, hovered_index, &pointer, pointer_click, now_ms);
 
-        if (pointer.press_edge ||
-            (keyboard_resume_focused && pointer_hover_allowed && (hovered_index >= 0 || resume_hovered_index >= 0))) {
+        if (keyboard_resume_focused && pointer_hover_allowed && (hovered_index >= 0 || resume_hovered_index >= 0)) {
             keyboard_resume_focused = false;
         }
         if (hovered_index >= 0) {
@@ -15523,6 +15522,10 @@ static int pick_movie(
                 pressed_row_index = hovered_index;
                 pressed_resume_badge_index = -1;
                 pressed_selected_fallback = false;
+            } else if (count > 0 && keyboard_resume_focused && files[selected].has_resume) {
+                pressed_row_index = -1;
+                pressed_resume_badge_index = (int) selected;
+                pressed_selected_fallback = true;
             } else if (count > 0) {
                 pressed_row_index = (int) selected;
                 pressed_resume_badge_index = -1;
@@ -15535,7 +15538,11 @@ static int pick_movie(
         }
         if (enter_edge && count > 0 && enter_press_stage == 0) {
             enter_press_stage = 1;
-            if (keyboard_resume_focused && files[selected].has_resume) {
+            if (resume_hovered_index >= 0) {
+                pressed_row_index = -1;
+                pressed_resume_badge_index = resume_hovered_index;
+                pressed_selected_fallback = false;
+            } else if (keyboard_resume_focused && files[selected].has_resume) {
                 pressed_row_index = -1;
                 pressed_resume_badge_index = (int) selected;
                 pressed_selected_fallback = false;
@@ -15560,6 +15567,9 @@ static int pick_movie(
             if (pressed_resume_badge_index >= 0 && resume_hovered_index == pressed_resume_badge_index) {
                 activated_index = pressed_resume_badge_index;
                 activated_resume = true;
+            } else if (pressed_selected_fallback && pressed_resume_badge_index >= 0) {
+                activated_index = pressed_resume_badge_index;
+                activated_resume = true;
             } else if (pressed_row_index >= 0 && hovered_index == pressed_row_index) {
                 activated_index = pressed_row_index;
             } else if (pressed_selected_fallback && pressed_row_index >= 0) {
@@ -15571,7 +15581,10 @@ static int pick_movie(
             }
         }
         picker_press_hot = (enter_press_stage == 1 && (pressed_row_index >= 0 || pressed_resume_badge_index >= 0)) || (pointer.down && (
-            (pressed_resume_badge_index >= 0 && resume_hovered_index == pressed_resume_badge_index) ||
+            (pressed_resume_badge_index >= 0 && (
+                (pressed_selected_fallback && pressed_resume_badge_index == (int) selected) ||
+                resume_hovered_index == pressed_resume_badge_index
+            )) ||
             (pressed_row_index >= 0 && (
                 (pressed_selected_fallback && pressed_row_index == (int) selected) ||
                 hovered_index == pressed_row_index
