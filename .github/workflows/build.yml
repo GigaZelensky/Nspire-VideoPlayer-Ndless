@@ -20,16 +20,13 @@ on:
 permissions:
   contents: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   build:
     runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: ${{ github.event.release.tag_name || inputs.release_tag || github.ref }}
@@ -66,7 +63,7 @@ jobs:
             zlib1g-dev
 
       - name: Cache Ndless ARM toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         id: ndless-toolchain-cache
         with:
           path: external/Ndless-official/ndless-sdk/toolchain/install
@@ -90,7 +87,7 @@ jobs:
           make build-thirdparty
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
@@ -103,7 +100,7 @@ jobs:
         run: make SDKROOT=./external/Ndless-official/ndless-sdk
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ndvideo-${{ github.sha }}
           path: |
@@ -112,10 +109,43 @@ jobs:
             dist/ndvideo.elf
           if-no-files-found: error
 
+      - name: Resolve release target
+        id: release-target
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish=false
+          tag=""
+          rolling=false
+          default_branch="${{ github.event.repository.default_branch }}"
+          manual_tag="${{ inputs.release_tag }}"
+
+          if [[ "$GITHUB_EVENT_NAME" == "release" ]]; then
+            publish=true
+            tag="${{ github.event.release.tag_name }}"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            publish=true
+            tag="${GITHUB_REF_NAME}"
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && -n "$manual_tag" ]]; then
+            publish=true
+            tag="$manual_tag"
+          elif [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/heads/${default_branch}" ]]; then
+            publish=true
+            tag="latest"
+            rolling=true
+          fi
+
+          {
+            echo "publish=${publish}"
+            echo "tag=${tag}"
+            echo "rolling=${rolling}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Prepare release assets
-        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+        if: steps.release-target.outputs.publish == 'true'
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || github.ref_name }}
+          RELEASE_TAG: ${{ steps.release-target.outputs.tag }}
+          RELEASE_ROLLING: ${{ steps.release-target.outputs.rolling }}
         run: |
           set -euo pipefail
           build_sha="$(git rev-parse HEAD)"
@@ -132,6 +162,10 @@ jobs:
             echo "ND Video Player ${RELEASE_TAG}"
             echo
             echo "Built from commit ${build_sha}."
+            if [ "$RELEASE_ROLLING" = "true" ]; then
+              echo
+              echo "This is the rolling latest build from the default branch."
+            fi
             echo
             echo "## Assets"
             echo "- \`ndvideo-${release_name}.tns\` - calculator-ready app"
@@ -141,20 +175,34 @@ jobs:
           } > release/RELEASE_NOTES.md
 
       - name: Publish GitHub release
-        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+        if: steps.release-target.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || github.ref_name }}
+          RELEASE_TAG: ${{ steps.release-target.outputs.tag }}
+          RELEASE_ROLLING: ${{ steps.release-target.outputs.rolling }}
         run: |
           set -euo pipefail
+          build_sha="$(git rev-parse HEAD)"
           mapfile -t assets < <(find release -maxdepth 1 -type f ! -name RELEASE_NOTES.md | sort)
+          if [ "$RELEASE_ROLLING" = "true" ]; then
+            git tag -f "$RELEASE_TAG" "$build_sha"
+            git push origin "refs/tags/$RELEASE_TAG" --force
+          fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
             gh release edit "$RELEASE_TAG" \
               --title "ND Video Player ${RELEASE_TAG}" \
               --notes-file release/RELEASE_NOTES.md
           else
-            gh release create "$RELEASE_TAG" "${assets[@]}" \
-              --title "ND Video Player ${RELEASE_TAG}" \
-              --notes-file release/RELEASE_NOTES.md
+            if [ "$RELEASE_ROLLING" = "true" ]; then
+              gh release create "$RELEASE_TAG" "${assets[@]}" \
+                --title "ND Video Player ${RELEASE_TAG}" \
+                --notes-file release/RELEASE_NOTES.md \
+                --prerelease \
+                --target "$build_sha"
+            else
+              gh release create "$RELEASE_TAG" "${assets[@]}" \
+                --title "ND Video Player ${RELEASE_TAG}" \
+                --notes-file release/RELEASE_NOTES.md
+            fi
           fi
