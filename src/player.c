@@ -37,6 +37,13 @@
 #define PICKER_DESELECTION_ANIM_MS 90U
 #define PICKER_INTRO_ANIM_MS 360U
 #define PICKER_INTRO_ROW_STAGGER_MS 28U
+#define PICKER_INTRO_LAST_ROW_DELAY_MS (115U + ((uint32_t) (PICKER_VISIBLE_ROWS - 1U) * PICKER_INTRO_ROW_STAGGER_MS))
+#define PICKER_INTRO_TOTAL_ANIM_MS (PICKER_INTRO_LAST_ROW_DELAY_MS + (PICKER_INTRO_ANIM_MS - 120U))
+#define PICKER_EXIT_START_DELAY_DIVISOR 8U
+#define PICKER_EXIT_TOTAL_ANIM_MS 430U
+#define PICKER_EXIT_TO_LOADING_ANIM_MS PICKER_EXIT_TOTAL_ANIM_MS
+#define PICKER_EXIT_LOADING_DELAY_MS PICKER_EXIT_TO_LOADING_ANIM_MS
+#define PICKER_EXIT_INACTIVE UINT32_MAX
 #define PICKER_PRESS_RELEASE_ANIM_MS 94U
 #define PICKER_HOVER_SCROLL_EDGE_PX 18
 #define PICKER_HOVER_SCROLL_REPEAT_MS 145U
@@ -56,12 +63,16 @@
 #define UI_LOADING_DIM_ALPHA 112
 #define RESUME_PROMPT_DIM_ALPHA 112
 #define UI_RETURN_COLLAPSE_ANIM_MS 210U
+#define RESUME_BACKGROUND_REVEAL_ANIM_MS 150U
+#define RESUME_PROMPT_OPEN_DELAY_MS 190U
+#define RESUME_PROMPT_OPEN_ANIM_MS 245U
 #define RESUME_PROMPT_ANIM_MS 150U
 #define RESUME_MORPH_ANIM_MS 150U
 #define SCALE_MORPH_ANIM_MS RESUME_MORPH_ANIM_MS
 #define RESUME_INPUT_GUARD_MS 260U
 #define UI_WAKE_MIN_MIX 28U
-#define UI_PAUSE_QUIET_MS 160U
+#define UI_PAUSE_QUIET_MS (UI_PRESS_ANIM_MS + UI_PRESS_RELEASE_ANIM_MS + 24U)
+#define PLAYBACK_INPUT_PREFETCH_GRACE_MS 80U
 #define MAX_PATH_LEN 512
 #define MAX_SUBTITLE_LINES 3
 #define MAX_SUBTITLE_LINE_LEN 96
@@ -6852,7 +6863,7 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const Po
         return;
     }
     time_slice_ms = paused && spare_ms > PREFETCH_PAUSED_SLICE_MS ? PREFETCH_PAUSED_SLICE_MS : spare_ms;
-    deadline_ms = monotonic_clock_now_ms() + spare_ms;
+    deadline_ms = 0U;
     current_chunk = prefetch_target_chunk(movie);
     budget = prefetch_budget_for_state(movie, paused, spare_ms);
     ring_contig = movie_uses_h264(movie) ? h264_frame_ring_contiguous_ready_count(movie) : 0U;
@@ -6986,6 +6997,7 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const Po
             time_slice_ms = max_io_slice;
         }
     }
+    deadline_ms = monotonic_clock_now_ms() + time_slice_ms;
     if (allow_same_chunk_recovery) {
         same_chunk_slice_ms = spare_ms;
         if (same_chunk_slice_ms > PREFETCH_ACTIVE_H264_SLICE_MS) {
@@ -9914,6 +9926,11 @@ static Uint16 picker_background_color_at_y(int y)
     return rgb565_lerp(UI_COLOR_BG_TOP, UI_COLOR_BG_BOTTOM, clamp_int(y, 0, SCREEN_H - 1), SCREEN_H - 1);
 }
 
+static Uint16 picker_background_color_at_y_mix(int y, uint8_t mix)
+{
+    return rgb565_lerp(UI_COLOR_BLACK, picker_background_color_at_y(y), mix, 255);
+}
+
 static int ui_mix_int(int from, int to, uint8_t mix)
 {
     return from + (((to - from) * (int) mix + 127) / 255);
@@ -10112,6 +10129,34 @@ static void draw_glass_panel_mix(SDL_Surface *screen, const SDL_Rect *rect, Uint
 static void draw_glass_panel(SDL_Surface *screen, const SDL_Rect *rect, Uint16 base_color, bool is_selected)
 {
     draw_glass_panel_mix(screen, rect, base_color, is_selected ? 255 : 0);
+}
+
+static void draw_glass_panel_faded(SDL_Surface *screen, const SDL_Rect *rect, Uint16 base_color, bool is_selected, uint8_t mix)
+{
+    SDL_Surface *composite;
+
+    if (!screen || !rect || rect->w == 0 || rect->h == 0 || mix == 0) {
+        return;
+    }
+    if (mix >= 255) {
+        draw_glass_panel(screen, rect, base_color, is_selected);
+        return;
+    }
+    if (rect->x >= 0 && rect->y >= 0 &&
+        rect->x + rect->w <= screen->w && rect->y + rect->h <= screen->h) {
+        SDL_Rect source = *rect;
+        SDL_Rect local = {0, 0, rect->w, rect->h};
+
+        composite = create_rgb565_surface(rect->w, rect->h);
+        if (composite) {
+            SDL_BlitSurface(screen, &source, composite, NULL);
+            draw_glass_panel(composite, &local, base_color, is_selected);
+            blit_surface_rgb565_mix(screen, composite, rect, mix);
+            SDL_FreeSurface(composite);
+            return;
+        }
+    }
+    draw_glass_panel(screen, rect, rgb565_lerp(UI_COLOR_BLACK, base_color, mix, 255), is_selected);
 }
 
 static int soft_panel_inset_for_row(int row, int height)
@@ -10912,6 +10957,19 @@ static uint8_t ui_ease_out_cubic(uint32_t elapsed_ms, uint32_t duration_ms)
     inverse = 255U - t;
     inverse_squared = (inverse * inverse + 127U) / 255U;
     return (uint8_t) (255U - ((inverse_squared * inverse + 127U) / 255U));
+}
+
+static uint8_t ui_ease_in_cubic(uint32_t elapsed_ms, uint32_t duration_ms)
+{
+    uint32_t t;
+    uint32_t t_squared;
+
+    if (duration_ms == 0 || elapsed_ms >= duration_ms) {
+        return 255;
+    }
+    t = (elapsed_ms * 255U) / duration_ms;
+    t_squared = (t * t + 127U) / 255U;
+    return (uint8_t) ((t_squared * t + 127U) / 255U);
 }
 
 static uint8_t ui_ease_smoothstep(uint32_t elapsed_ms, uint32_t duration_ms)
@@ -13197,23 +13255,6 @@ static void draw_movie_frame_background(
     draw_movie_frame_background_rects(screen, movie, &src, &dst);
 }
 
-static void draw_resume_prompt_background(SDL_Surface *screen, Movie *movie)
-{
-    SDL_Rect full_screen = {0, 0, SCREEN_W, SCREEN_H};
-    SDL_Rect full_src;
-
-    if (!screen || !movie || !movie->frame_surface) {
-        return;
-    }
-    full_src.x = 0;
-    full_src.y = 0;
-    full_src.w = movie->header.video_width;
-    full_src.h = movie->header.video_height;
-    SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
-    SDL_SoftStretch(movie->frame_surface, &full_src, screen, &full_screen);
-    dim_rect_rgb565(screen, &full_screen, RESUME_PROMPT_DIM_ALPHA);
-}
-
 static SDL_Rect picker_row_rect_for_y(int row_y)
 {
     const int width = SCREEN_W - 24;
@@ -13523,11 +13564,6 @@ static void draw_loading_overlay_mix(
     draw_ui_label(screen, fonts, panel.x + panel.w - 18 - nSDL_GetStringWidth(fonts->white, spinner), panel.y + 10, spinner);
 }
 
-static void draw_loading_overlay(SDL_Surface *screen, const Fonts *fonts, const char *label, int phase)
-{
-    draw_loading_overlay_mix(screen, fonts, label, phase, 255, true);
-}
-
 static SDL_Surface *capture_screen_surface(SDL_Surface *screen)
 {
     SDL_Surface *snapshot;
@@ -13540,6 +13576,20 @@ static SDL_Surface *capture_screen_surface(SDL_Surface *screen)
         return NULL;
     }
     SDL_BlitSurface(screen, NULL, snapshot, NULL);
+    return snapshot;
+}
+
+static SDL_Surface *create_black_screen_snapshot(SDL_Surface *screen)
+{
+    SDL_Surface *snapshot;
+    int width = screen && screen->w > 0 ? screen->w : SCREEN_W;
+    int height = screen && screen->h > 0 ? screen->h : SCREEN_H;
+
+    snapshot = create_rgb565_surface(width, height);
+    if (!snapshot) {
+        return NULL;
+    }
+    SDL_FillRect(snapshot, NULL, SDL_MapRGB(snapshot->format, 0, 0, 0));
     return snapshot;
 }
 
@@ -13638,6 +13688,16 @@ static void finish_loading_transition(
     finish_loading_transition_ex(screen, snapshot, fonts, label, true);
 }
 
+static SDL_Rect movie_vertical_morph_dst(const SDL_Rect *base_dst, uint8_t visible_mix)
+{
+    SDL_Rect dst = *base_dst;
+    int visible_h = ((int) base_dst->h * (int) visible_mix + 127) / 255;
+
+    dst.y = (Sint16) (base_dst->y + (base_dst->h - visible_h) / 2);
+    dst.h = (Uint16) visible_h;
+    return dst;
+}
+
 static void animate_movie_collapse_to_black(
     SDL_Surface *screen,
     Movie *movie,
@@ -13665,13 +13725,11 @@ static void animate_movie_collapse_to_black(
         uint32_t now_ms = monotonic_clock_now_ms();
         uint32_t elapsed_ms = now_ms - started_ms;
         uint8_t collapse_mix = ui_ease_smoothstep(elapsed_ms, UI_RETURN_COLLAPSE_ANIM_MS);
-        int remaining_h = ((int) start_dst.h * (255 - (int) collapse_mix) + 127) / 255;
-        SDL_Rect dst = start_dst;
+        uint8_t visible_mix = (uint8_t) (255U - collapse_mix);
+        SDL_Rect dst = movie_vertical_morph_dst(&start_dst, visible_mix);
 
         SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
-        if (remaining_h > 0) {
-            dst.y = (Sint16) (start_dst.y + (start_dst.h - remaining_h) / 2);
-            dst.h = (Uint16) remaining_h;
+        if (dst.h > 0) {
             draw_movie_frame_scaled_clipped(screen, movie, &src, &dst);
         }
         if (overlay_surface && *overlay_surface && collapse_mix < 255) {
@@ -13826,7 +13884,8 @@ static void draw_resume_badge(
     const SDL_Rect *badge,
     uint8_t hover_mix,
     uint8_t press_mix,
-    uint8_t visible_mix
+    uint8_t visible_mix,
+    Uint16 background_color
 )
 {
     SDL_Rect draw_badge;
@@ -13842,7 +13901,7 @@ static void draw_resume_badge(
     press_offset_x = pressed_control_offset_x(press_mix);
     press_offset_y = pressed_control_offset_y(press_mix);
     base = animated_control_color(UI_COLOR_GUNMETAL, ui_theme()->resume_hover, hover_mix);
-    base = rgb565_lerp(picker_background_color_at_y(draw_badge.y), base, visible_mix, 255);
+    base = rgb565_lerp(background_color, base, visible_mix, 255);
     draw_soft_glass_panel_mix(
         screen,
         &draw_badge,
@@ -14059,6 +14118,50 @@ static uint8_t picker_intro_mix(uint32_t intro_started_ms, uint32_t now_ms, uint
     return ui_ease_out_cubic(elapsed_ms - delay_ms, duration_ms);
 }
 
+static uint32_t picker_exit_timeline_ms(uint32_t exit_elapsed_ms)
+{
+    uint64_t scaled_ms;
+
+    if (exit_elapsed_ms >= PICKER_EXIT_TOTAL_ANIM_MS) {
+        return PICKER_INTRO_TOTAL_ANIM_MS;
+    }
+    scaled_ms = (uint64_t) exit_elapsed_ms * (uint64_t) PICKER_INTRO_TOTAL_ANIM_MS;
+    return (uint32_t) ((scaled_ms + PICKER_EXIT_TOTAL_ANIM_MS / 2U) / PICKER_EXIT_TOTAL_ANIM_MS);
+}
+
+static uint8_t picker_intro_mix_for_transition(
+    uint32_t intro_started_ms,
+    uint32_t now_ms,
+    uint32_t delay_ms,
+    uint32_t duration_ms,
+    uint32_t exit_elapsed_ms
+)
+{
+    uint32_t timeline_ms;
+    uint32_t start_ms;
+    uint32_t end_ms;
+
+    if (exit_elapsed_ms == PICKER_EXIT_INACTIVE) {
+        return picker_intro_mix(intro_started_ms, now_ms, delay_ms, duration_ms);
+    }
+    timeline_ms = picker_exit_timeline_ms(exit_elapsed_ms);
+
+    start_ms = delay_ms + duration_ms >= PICKER_INTRO_TOTAL_ANIM_MS
+        ? 0U
+        : (PICKER_INTRO_TOTAL_ANIM_MS - (delay_ms + duration_ms)) / PICKER_EXIT_START_DELAY_DIVISOR;
+    end_ms = delay_ms >= PICKER_INTRO_TOTAL_ANIM_MS
+        ? start_ms
+        : PICKER_INTRO_TOTAL_ANIM_MS - delay_ms;
+
+    if (timeline_ms <= start_ms) {
+        return 255;
+    }
+    if (timeline_ms >= end_ms || end_ms <= start_ms) {
+        return 0;
+    }
+    return (uint8_t) (255 - ui_ease_in_cubic(timeline_ms - start_ms, end_ms - start_ms));
+}
+
 static int picker_intro_offset(uint8_t mix, int distance)
 {
     return ((255 - mix) * distance + 127) / 255;
@@ -14116,6 +14219,8 @@ static void render_picker(
     const ScreenshotPreviewState *screenshot_preview,
     uint32_t now_ms,
     uint32_t intro_started_ms,
+    uint32_t exit_elapsed_ms,
+    uint8_t loading_mix,
     const char *loading_label,
     int loading_phase
 )
@@ -14128,10 +14233,10 @@ static void render_picker(
     SDL_Rect background = {0, 0, SCREEN_W, SCREEN_H};
     SDL_Rect header = {0, 0, SCREEN_W, 32};
     SDL_Rect header_top = {0, 0, SCREEN_W, 1};
-    uint8_t background_mix = picker_intro_mix(intro_started_ms, now_ms, 0, PICKER_INTRO_ANIM_MS);
-    uint8_t header_mix = picker_intro_mix(intro_started_ms, now_ms, 18U, 230U);
-    uint8_t shortcuts_mix = picker_intro_mix(intro_started_ms, now_ms, 90U, 230U);
-    uint8_t footer_mix = picker_intro_mix(intro_started_ms, now_ms, 200U, 250U);
+    uint8_t background_mix = picker_intro_mix_for_transition(intro_started_ms, now_ms, 0, PICKER_INTRO_ANIM_MS, exit_elapsed_ms);
+    uint8_t header_mix = picker_intro_mix_for_transition(intro_started_ms, now_ms, 18U, 230U, exit_elapsed_ms);
+    uint8_t shortcuts_mix = picker_intro_mix_for_transition(intro_started_ms, now_ms, 90U, 230U, exit_elapsed_ms);
+    uint8_t footer_mix = picker_intro_mix_for_transition(intro_started_ms, now_ms, 200U, 250U, exit_elapsed_ms);
     int header_offset_y = -picker_intro_offset(header_mix, 8);
     int shortcuts_offset_y = -picker_intro_offset(shortcuts_mix, 5);
 
@@ -14143,8 +14248,12 @@ static void render_picker(
         rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_BG_TOP, background_mix, 255),
         rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_BG_BOTTOM, background_mix, 255)
     );
-    draw_glass_panel(screen, &header, rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, header_mix, 255), false);
-    fill_rect_rgb565(screen, &header_top, rgb565_lerp(UI_COLOR_GUNMETAL, UI_COLOR_ACCENT_HOT, header_mix, 255));
+    draw_glass_panel_faded(screen, &header, UI_COLOR_GUNMETAL, false, header_mix);
+    fill_rect_rgb565(
+        screen,
+        &header_top,
+        rgb565_lerp(picker_background_color_at_y_mix(header_top.y, background_mix), UI_COLOR_ACCENT_HOT, header_mix, 255)
+    );
     if (header_mix > 48) {
         draw_ui_label(
             screen,
@@ -14156,7 +14265,7 @@ static void render_picker(
     }
     draw_header_shortcuts(screen, fonts, 18 + shortcuts_offset_y, shortcuts_mix);
     if (count == 0) {
-        uint8_t empty_mix = picker_intro_mix(intro_started_ms, now_ms, 115U, 230U);
+        uint8_t empty_mix = picker_intro_mix_for_transition(intro_started_ms, now_ms, 115U, 230U, exit_elapsed_ms);
         int empty_offset_y = picker_intro_offset(empty_mix, 7);
         int footer_offset_y = picker_intro_offset(footer_mix, 10);
         SDL_Rect footer_panel = {6, (Sint16) (SCREEN_H - 22 + footer_offset_y), SCREEN_W - 12, 18};
@@ -14170,18 +14279,21 @@ static void render_picker(
         if (empty_mix > 48) {
             draw_ui_label(screen, fonts, 10, 54 + empty_offset_y, "No .nvp or .nvp.tns files found");
         }
-        draw_glass_panel(
+        draw_glass_panel_faded(
             screen,
             &footer_panel,
-            rgb565_lerp(picker_background_color_at_y(footer_panel.y), ui_theme()->footer_panel, footer_mix, 255),
-            false
+            ui_theme()->footer_panel,
+            false,
+            footer_mix
         );
-        cut_rect_corners(screen, &footer_panel, UI_COLOR_BLACK);
+        if (footer_mix > 0) {
+            cut_rect_corners(screen, &footer_panel, picker_background_color_at_y_mix(footer_panel.y, background_mix));
+        }
         draw_vertical_gradient(
             screen,
             &footer_accent,
-            rgb565_lerp(ui_theme()->footer_panel, ui_theme()->footer_accent_top, footer_mix, 255),
-            rgb565_lerp(ui_theme()->footer_panel, UI_COLOR_ACCENT_DEEP, footer_mix, 255)
+            rgb565_lerp(picker_background_color_at_y_mix(footer_accent.y, background_mix), ui_theme()->footer_accent_top, footer_mix, 255),
+            rgb565_lerp(picker_background_color_at_y_mix(footer_accent.y, background_mix), UI_COLOR_ACCENT_DEEP, footer_mix, 255)
         );
         if (footer_mix > 54) {
             draw_ui_label(screen, fonts, 12, SCREEN_H - 17 + footer_offset_y, credit);
@@ -14220,11 +14332,12 @@ static void render_picker(
         SDL_Rect divider = picker_row_divider_rect(&row);
         SDL_Rect resume_badge;
         bool has_resume_badge = picker_resume_badge_rect(fonts, &files[index], y, &resume_badge);
-        uint8_t row_intro_mix = picker_intro_mix(
+        uint8_t row_intro_mix = picker_intro_mix_for_transition(
             intro_started_ms,
             now_ms,
             115U + (uint32_t) (index - start_index) * PICKER_INTRO_ROW_STAGGER_MS,
-            PICKER_INTRO_ANIM_MS - 120U
+            PICKER_INTRO_ANIM_MS - 120U,
+            exit_elapsed_ms
         );
         int row_intro_offset_y = picker_intro_offset(row_intro_mix, 9);
         uint8_t resume_mix = resume_badge_hover_index == (int) index ? resume_badge_hover_mix : 0;
@@ -14263,12 +14376,12 @@ static void render_picker(
 
             draw_picker_selection_panel_mix(screen, &draw_row, row_color, selection_mix);
             draw_pressed_control_reflection(screen, &draw_row, row_press_mix);
-            cut_rect_corners(screen, &draw_row, picker_background_color_at_y(draw_row.y));
+            cut_rect_corners(screen, &draw_row, picker_background_color_at_y_mix(draw_row.y, background_mix));
         } else {
             fill_rect_rgb565(
                 screen,
                 &divider,
-                rgb565_lerp(picker_background_color_at_y(divider.y), ui_theme()->row_divider, row_intro_mix, 255)
+                rgb565_lerp(picker_background_color_at_y_mix(divider.y, background_mix), ui_theme()->row_divider, row_intro_mix, 255)
             );
         }
         if (row_intro_mix > 42) {
@@ -14276,14 +14389,22 @@ static void render_picker(
             draw_ui_label(screen, fonts, text_x, text_y, fitted_title);
         }
         if (has_resume_badge) {
-            draw_resume_badge(screen, fonts, &resume_badge, resume_mix, resume_press_mix, row_intro_mix);
+            draw_resume_badge(
+                screen,
+                fonts,
+                &resume_badge,
+                resume_mix,
+                resume_press_mix,
+                row_intro_mix,
+                picker_background_color_at_y_mix(resume_badge.y, background_mix)
+            );
         }
         y += 20;
     }
         SDL_SetClipRect(screen, &old_clip);
     }
     if (count > PICKER_VISIBLE_ROWS) {
-        uint8_t scroll_mix = picker_intro_mix(intro_started_ms, now_ms, 180U, 260U);
+        uint8_t scroll_mix = picker_intro_mix_for_transition(intro_started_ms, now_ms, 180U, 260U, exit_elapsed_ms);
         int scroll_offset_x = picker_intro_offset(scroll_mix, 5);
         SDL_Rect track = {SCREEN_W - 7, 42, 3, SCREEN_H - 76};
         size_t max_start = count - PICKER_VISIBLE_ROWS;
@@ -14315,13 +14436,13 @@ static void render_picker(
         track_gray_bottom = blend_rgb565(ui_theme()->scroll_thumb, UI_COLOR_BLACK, 112);
         track_gray_top = blend_rgb565(track_gray_top, UI_COLOR_WHITE, 8);
         track_bottom = rgb565_lerp(
-            picker_background_color_at_y(track.y + track.h - 1),
+            picker_background_color_at_y_mix(track.y + track.h - 1, background_mix),
             track_gray_bottom,
             scroll_mix,
             255
         );
         track_top = rgb565_lerp(
-            picker_background_color_at_y(track.y),
+            picker_background_color_at_y_mix(track.y, background_mix),
             track_gray_top,
             scroll_mix,
             255
@@ -14332,13 +14453,16 @@ static void render_picker(
             track_top,
             track_bottom
         );
-        draw_glass_panel(
+        draw_glass_panel_faded(
             screen,
             &thumb,
-            rgb565_lerp(picker_background_color_at_y(thumb.y), ui_theme()->scroll_thumb, scroll_mix, 255),
-            false
+            ui_theme()->scroll_thumb,
+            false,
+            scroll_mix
         );
-        cut_rect_corners(screen, &thumb, picker_background_color_at_y(thumb.y));
+        if (scroll_mix > 0) {
+            cut_rect_corners(screen, &thumb, picker_background_color_at_y_mix(thumb.y, background_mix));
+        }
     }
     {
         char footer[32];
@@ -14351,18 +14475,21 @@ static void render_picker(
             1
         };
 
-        draw_glass_panel(
+        draw_glass_panel_faded(
             screen,
             &footer_panel,
-            rgb565_lerp(picker_background_color_at_y(footer_panel.y), ui_theme()->footer_panel, footer_mix, 255),
-            false
+            ui_theme()->footer_panel,
+            false,
+            footer_mix
         );
-        cut_rect_corners(screen, &footer_panel, UI_COLOR_BLACK);
+        if (footer_mix > 0) {
+            cut_rect_corners(screen, &footer_panel, picker_background_color_at_y_mix(footer_panel.y, background_mix));
+        }
         draw_vertical_gradient(
             screen,
             &footer_accent,
-            rgb565_lerp(ui_theme()->footer_panel, ui_theme()->footer_accent_top, footer_mix, 255),
-            rgb565_lerp(ui_theme()->footer_panel, UI_COLOR_ACCENT_DEEP, footer_mix, 255)
+            rgb565_lerp(picker_background_color_at_y_mix(footer_accent.y, background_mix), ui_theme()->footer_accent_top, footer_mix, 255),
+            rgb565_lerp(picker_background_color_at_y_mix(footer_accent.y, background_mix), UI_COLOR_ACCENT_DEEP, footer_mix, 255)
         );
         snprintf(footer, sizeof(footer), "%lu %s", (unsigned long) count, count == 1 ? "file" : "files");
         if (footer_mix > 54) {
@@ -14370,11 +14497,11 @@ static void render_picker(
             draw_ui_label(screen, fonts, SCREEN_W - 12 - nSDL_GetStringWidth(fonts->white, footer), SCREEN_H - 17 + footer_offset_y, footer);
         }
     }
-    if (loading_label) {
+    if (loading_label && loading_mix > 0) {
         SDL_Rect full_screen = {0, 0, SCREEN_W, SCREEN_H};
 
-        dim_rect_rgb565(screen, &full_screen, UI_LOADING_DIM_ALPHA);
-        draw_loading_overlay(screen, fonts, loading_label, loading_phase);
+        dim_rect_rgb565(screen, &full_screen, (UI_LOADING_DIM_ALPHA * (int) loading_mix + 127) / 255);
+        draw_loading_overlay_mix(screen, fonts, loading_label, loading_phase, loading_mix, true);
     } else if (resume_tooltip_index >= 0 && (size_t) resume_tooltip_index < count && resume_tooltip_mix > 0) {
         draw_resume_hover_tooltip(screen, fonts, &files[resume_tooltip_index], pointer, resume_tooltip_mix);
     } else if (movie_tooltip_index >= 0 && (size_t) movie_tooltip_index < count && movie_tooltip_mix > 0) {
@@ -15286,8 +15413,8 @@ static int pick_movie(
         uint8_t movie_tooltip_mix;
         bool picker_press_hot;
         uint8_t picker_press_mix;
-        int pointer_release_activated_index = -1;
-        bool pointer_release_activated_resume = false;
+        int activated_index = -1;
+        bool activated_resume = false;
 
         if (next_hover_scroll_direction != hover_scroll_direction) {
             hover_scroll_direction = next_hover_scroll_direction;
@@ -15420,19 +15547,26 @@ static int pick_movie(
             ui_transition_init(&picker_press_anim, false);
         }
         if (enter_press_stage == 1 && !enter_down) {
-            enter_press_stage = 2;
             ui_transition_begin_press_release(&picker_press_anim, now_ms);
+            if (pressed_row_index >= 0 || pressed_resume_badge_index >= 0) {
+                activated_resume = pressed_resume_badge_index >= 0;
+                activated_index = activated_resume ? pressed_resume_badge_index : pressed_row_index;
+                selected = (size_t) activated_index;
+                keyboard_resume_focused = false;
+            }
+            enter_press_stage = 0;
         }
         if (enter_press_stage == 0 && pointer.release_edge && count > 0) {
             if (pressed_resume_badge_index >= 0 && resume_hovered_index == pressed_resume_badge_index) {
-                pointer_release_activated_index = pressed_resume_badge_index;
-                pointer_release_activated_resume = true;
+                activated_index = pressed_resume_badge_index;
+                activated_resume = true;
             } else if (pressed_row_index >= 0 && hovered_index == pressed_row_index) {
-                pointer_release_activated_index = pressed_row_index;
+                activated_index = pressed_row_index;
             } else if (pressed_selected_fallback && pressed_row_index >= 0) {
-                pointer_release_activated_index = pressed_row_index;
+                activated_index = pressed_row_index;
             }
-            if (pointer_release_activated_index >= 0) {
+            if (activated_index >= 0) {
+                selected = (size_t) activated_index;
                 ui_transition_begin_press_release(&picker_press_anim, now_ms);
             }
         }
@@ -15450,6 +15584,70 @@ static int pick_movie(
             UI_PRESS_ANIM_MS,
             PICKER_PRESS_RELEASE_ANIM_MS
         );
+        if (activated_index >= 0) {
+            uint32_t exit_started_ms = monotonic_clock_now_ms();
+            PointerState hidden_pointer = pointer;
+
+            hidden_pointer.visible = false;
+            clear_screenshot_preview(&screenshot_preview);
+            while (1) {
+                uint32_t exit_now_ms = monotonic_clock_now_ms();
+                uint32_t exit_elapsed_ms = exit_now_ms - exit_started_ms;
+                uint32_t loading_elapsed_ms = exit_elapsed_ms >= PICKER_EXIT_LOADING_DELAY_MS
+                    ? exit_elapsed_ms - PICKER_EXIT_LOADING_DELAY_MS
+                    : 0U;
+                uint8_t loading_mix = ui_ease_out_cubic(loading_elapsed_ms, UI_LOADING_ANIM_MS);
+                uint8_t exit_press_mix = ui_transition_update_press_ex(
+                    &picker_press_anim,
+                    false,
+                    exit_now_ms,
+                    UI_PRESS_ANIM_MS,
+                    PICKER_PRESS_RELEASE_ANIM_MS
+                );
+
+                picker_scroll_anim_view(&scroll_anim, scroll_start, exit_now_ms, &scroll_draw_start, &scroll_draw_offset_y);
+                render_picker(
+                    screen,
+                    fonts,
+                    files,
+                    count,
+                    scroll_draw_start,
+                    scroll_draw_offset_y,
+                    selected,
+                    previous_selected,
+                    selection_anim_started_ms,
+                    selected_start_mix,
+                    previous_start_mix,
+                    -1,
+                    0,
+                    -1,
+                    0,
+                    -1,
+                    0,
+                    pressed_row_index,
+                    pressed_resume_badge_index,
+                    exit_press_mix,
+                    &hidden_pointer,
+                    &screenshot_preview,
+                    exit_now_ms,
+                    intro_started_ms,
+                    exit_elapsed_ms,
+                    loading_mix,
+                    "Loading",
+                    (int) ((exit_now_ms / 180U) % 3U)
+                );
+                if (exit_elapsed_ms >= PICKER_EXIT_TO_LOADING_ANIM_MS && loading_mix >= 255) {
+                    break;
+                }
+                msleep(16);
+            }
+            strncpy(selected_path, files[activated_index].path, selected_size - 1);
+            selected_path[selected_size - 1] = '\0';
+            if (resume_without_prompt) {
+                *resume_without_prompt = activated_resume;
+            }
+            return 0;
+        }
         if (enter_press_stage == 0 && !pointer.down && !pointer.release_edge && picker_press_mix == 0) {
             pressed_row_index = -1;
             pressed_resume_badge_index = -1;
@@ -15484,6 +15682,8 @@ static int pick_movie(
             &screenshot_preview,
             now_ms,
             intro_started_ms,
+            PICKER_EXIT_INACTIVE,
+            0,
             NULL,
             0
         );
@@ -15552,85 +15752,6 @@ static int pick_movie(
                     now_ms
                 );
                 pointer_hover_guard_lock(&hover_guard, &pointer);
-            }
-        }
-        if (pointer_release_activated_index >= 0) {
-            int release_step;
-
-            for (release_step = 0; release_step < 9; ++release_step) {
-                uint32_t release_now_ms = monotonic_clock_now_ms();
-                uint8_t release_mix = ui_transition_update_press_ex(
-                    &picker_press_anim,
-                    false,
-                    release_now_ms,
-                    UI_PRESS_ANIM_MS,
-                    PICKER_PRESS_RELEASE_ANIM_MS
-                );
-
-                picker_scroll_anim_view(&scroll_anim, scroll_start, release_now_ms, &scroll_draw_start, &scroll_draw_offset_y);
-                render_picker(
-                    screen,
-                    fonts,
-                    files,
-                    count,
-                    scroll_draw_start,
-                    scroll_draw_offset_y,
-                    selected,
-                    previous_selected,
-                    selection_anim_started_ms,
-                    selected_start_mix,
-                    previous_start_mix,
-                    -1,
-                    0,
-                    -1,
-                    0,
-                    -1,
-                    0,
-                    pressed_row_index,
-                    pressed_resume_badge_index,
-                    release_mix,
-                    &pointer,
-                    &screenshot_preview,
-                    release_now_ms,
-                    0,
-                    NULL,
-                    0
-                );
-                if (release_mix == 0) {
-                    break;
-                }
-                msleep(16);
-            }
-            pressed_row_index = -1;
-            pressed_resume_badge_index = -1;
-            pressed_selected_fallback = false;
-            strncpy(selected_path, files[pointer_release_activated_index].path, selected_size - 1);
-            selected_path[selected_size - 1] = '\0';
-            if (resume_without_prompt) {
-                *resume_without_prompt = pointer_release_activated_resume;
-            }
-            clear_screenshot_preview(&screenshot_preview);
-            return 0;
-        }
-        if (enter_press_stage != 0) {
-            if (enter_press_stage == 2 && picker_press_mix == 0 &&
-                (pressed_row_index >= 0 || pressed_resume_badge_index >= 0)) {
-                bool activated_resume = pressed_resume_badge_index >= 0;
-                int activated_index = activated_resume ? pressed_resume_badge_index : pressed_row_index;
-
-                selected = (size_t) activated_index;
-                pressed_row_index = -1;
-                pressed_resume_badge_index = -1;
-                pressed_selected_fallback = false;
-                enter_press_stage = 0;
-                keyboard_resume_focused = false;
-                strncpy(selected_path, files[selected].path, selected_size - 1);
-                selected_path[selected_size - 1] = '\0';
-                if (resume_without_prompt) {
-                    *resume_without_prompt = activated_resume;
-                }
-                clear_screenshot_preview(&screenshot_preview);
-                return 0;
             }
         }
         if (key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc)) {
@@ -15765,10 +15886,6 @@ static int prompt_resume_position(
         finish_loading_transition(screen, loading_snapshot, fonts, "Loading");
         return 0;
     }
-    if (loading_snapshot && *loading_snapshot) {
-        draw_resume_prompt_background(*loading_snapshot, movie);
-    }
-    finish_loading_transition_ex(screen, loading_snapshot, fonts, "Loading", false);
     compute_video_rects(movie, scale_mode, video_align_x, video_align_y, &playback_src, &playback_dst);
     full_src.x = 0;
     full_src.y = 0;
@@ -15850,6 +15967,14 @@ static int prompt_resume_position(
         bool left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || (!ctrl_down && keypad_4_edge);
         bool right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right) || (!ctrl_down && keypad_6_edge);
         bool prompt_canceling = prompt_closing && prompt_closing_result < 0;
+        uint32_t prompt_open_elapsed_ms = now_ms - prompt_open_started_ms;
+        uint32_t prompt_open_anim_elapsed_ms = prompt_open_elapsed_ms > RESUME_PROMPT_OPEN_DELAY_MS
+            ? (prompt_open_elapsed_ms - RESUME_PROMPT_OPEN_DELAY_MS)
+            : 0U;
+        uint8_t background_reveal_mix = (!prompt_closing && loading_snapshot && *loading_snapshot)
+            ? ui_ease_smoothstep(prompt_open_elapsed_ms, RESUME_BACKGROUND_REVEAL_ANIM_MS)
+            : 255;
+        uint8_t loading_mix = (uint8_t) (255U - background_reveal_mix);
         uint32_t prompt_close_elapsed_ms = prompt_closing ? (now_ms - prompt_close_started_ms) : 0;
         uint8_t close_mix = prompt_closing
             ? ui_ease_out_cubic(prompt_close_elapsed_ms, RESUME_PROMPT_ANIM_MS)
@@ -15861,11 +15986,13 @@ static int prompt_resume_position(
             : 0;
         uint8_t prompt_mix = prompt_closing
             ? (uint8_t) (255U - close_mix)
-            : ui_ease_out_cubic(now_ms - prompt_open_started_ms, RESUME_PROMPT_ANIM_MS);
+            : ui_ease_smoothstep(prompt_open_anim_elapsed_ms, RESUME_PROMPT_OPEN_ANIM_MS);
+        uint8_t prompt_style_mix = prompt_closing ? prompt_mix : 255;
+        bool draw_prompt_contents = prompt_closing ? prompt_mix > 40 : prompt_mix > 0;
         int prompt_y_offset = ((255 - prompt_mix) * 5 + 127) / 255;
         int dim_strength = prompt_closing
             ? ((RESUME_PROMPT_DIM_ALPHA * prompt_mix + 127) / 255)
-            : RESUME_PROMPT_DIM_ALPHA;
+            : ((UI_LOADING_DIM_ALPHA * (int) loading_mix + RESUME_PROMPT_DIM_ALPHA * (int) background_reveal_mix + 127) / 255);
         SDL_Rect background_src = full_src;
         SDL_Rect background_dst = full_screen;
         SDL_Rect draw_border = border;
@@ -15885,12 +16012,7 @@ static int prompt_resume_position(
 
         if (prompt_closing) {
             if (prompt_canceling) {
-                int remaining_h = (SCREEN_H * (255 - (int) morph_mix) + 127) / 255;
-
-                background_dst.x = 0;
-                background_dst.y = (Sint16) ((SCREEN_H - remaining_h) / 2);
-                background_dst.w = SCREEN_W;
-                background_dst.h = (Uint16) remaining_h;
+                background_dst = movie_vertical_morph_dst(&full_screen, (uint8_t) (255U - morph_mix));
             } else if (morph_mix >= 255) {
                 background_src = playback_src;
                 background_dst = playback_dst;
@@ -15898,6 +16020,8 @@ static int prompt_resume_position(
                 background_src = mix_sdl_rects(&full_src, &playback_src, morph_mix);
                 background_dst = mix_sdl_rects(&full_screen, &playback_dst, morph_mix);
             }
+        } else if (background_reveal_mix < 255) {
+            background_dst = movie_vertical_morph_dst(&full_screen, background_reveal_mix);
         }
         draw_border.y = (Sint16) (draw_border.y + prompt_y_offset);
         draw_panel.y = (Sint16) (draw_panel.y + prompt_y_offset);
@@ -15992,50 +16116,84 @@ static int prompt_resume_position(
             ui_cycle_theme();
             ui_save_theme_for_movie(path);
         }
-        SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
+        if (!prompt_closing && loading_snapshot && *loading_snapshot) {
+            SDL_BlitSurface(*loading_snapshot, NULL, screen, NULL);
+        } else {
+            SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
+        }
         if (background_dst.w > 0 && background_dst.h > 0) {
             draw_movie_frame_scaled_clipped(screen, movie, &background_src, &background_dst);
         }
         dim_rect_rgb565(screen, &full_screen, dim_strength);
-        if (prompt_mix > 0) {
-            Uint16 panel_base = rgb565_lerp(UI_COLOR_BLACK, ui_theme()->modal_panel, prompt_mix, 255);
-
-            fill_soft_panel_backplate(screen, &draw_border, ui_theme()->menu_border);
-            draw_soft_glass_panel_body_from_y(
+        if (!prompt_closing && loading_mix > 0) {
+            draw_loading_overlay_mix(
                 screen,
+                fonts,
+                "Loading",
+                (int) ((now_ms / 180U) % 3U),
+                loading_mix,
+                false
+            );
+        }
+        if (prompt_mix > 0) {
+            SDL_Surface *prompt_surface = NULL;
+            SDL_Surface *prompt_target = screen;
+            SDL_Rect prompt_blit = {0, 0, SCREEN_W, SCREEN_H};
+            Uint16 panel_base = rgb565_lerp(UI_COLOR_BLACK, ui_theme()->modal_panel, prompt_style_mix, 255);
+
+            if (!prompt_closing && prompt_mix < 255) {
+                prompt_surface = capture_screen_surface(screen);
+                if (prompt_surface) {
+                    prompt_target = prompt_surface;
+                }
+            }
+            fill_soft_panel_backplate(
+                prompt_target,
+                &draw_border,
+                rgb565_lerp(UI_COLOR_BLACK, ui_theme()->menu_border, prompt_style_mix, 255)
+            );
+            draw_soft_glass_panel_body_from_y(
+                prompt_target,
                 &draw_panel,
                 draw_accent.y + draw_accent.h,
                 panel_base
             );
             draw_soft_glass_panel_top_mix(
-                screen,
+                prompt_target,
                 &draw_header,
-                rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, prompt_mix, 255),
+                rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, prompt_style_mix, 255),
                 0
             );
             draw_vertical_gradient(
-                screen,
+                prompt_target,
                 &draw_accent,
-                rgb565_lerp(ui_theme()->modal_panel, UI_COLOR_ACCENT, prompt_mix, 255),
-                rgb565_lerp(ui_theme()->modal_panel, UI_COLOR_ACCENT_DEEP, prompt_mix, 255)
+                rgb565_lerp(ui_theme()->modal_panel, UI_COLOR_ACCENT, prompt_style_mix, 255),
+                rgb565_lerp(ui_theme()->modal_panel, UI_COLOR_ACCENT_DEEP, prompt_style_mix, 255)
             );
             draw_soft_glass_panel_mix(
-                screen,
+                prompt_target,
                 &draw_title_panel,
-                rgb565_lerp(UI_COLOR_BLACK, ui_theme()->modal_title_panel, prompt_mix, 255),
+                rgb565_lerp(UI_COLOR_BLACK, ui_theme()->modal_title_panel, prompt_style_mix, 255),
                 0
             );
-            fill_rect_rgb565(screen, &draw_preview_border, UI_COLOR_WARM_WHITE);
-            SDL_SoftStretch(movie->frame_surface, NULL, screen, &draw_preview);
-            if (prompt_mix > 40) {
-                draw_ui_label(screen, fonts, draw_panel.x + 12, draw_panel.y + 8, "Continue Watching?");
-                draw_ui_label(screen, fonts, draw_panel.x + 12, draw_title_y, fitted_title_main);
+            fill_rect_rgb565(
+                prompt_target,
+                &draw_preview_border,
+                rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_WARM_WHITE, prompt_style_mix, 255)
+            );
+            SDL_SoftStretch(movie->frame_surface, NULL, prompt_target, &draw_preview);
+            if (prompt_closing && prompt_mix < 255) {
+                dim_rect_rgb565(prompt_target, &draw_preview, 255 - prompt_mix);
+            }
+            if (draw_prompt_contents) {
+                draw_ui_label(prompt_target, fonts, draw_panel.x + 12, draw_panel.y + 8, "Continue Watching?");
+                draw_ui_label(prompt_target, fonts, draw_panel.x + 12, draw_title_y, fitted_title_main);
                 if (title_detail_height > 0) {
-                    draw_ui_label(screen, fonts, draw_panel.x + 12, draw_title_y + title_main_height + 2, fitted_title_detail);
+                    draw_ui_label(prompt_target, fonts, draw_panel.x + 12, draw_title_y + title_main_height + 2, fitted_title_detail);
                 }
-                draw_ui_label(screen, fonts, draw_panel.x + 12, draw_time_label_y, time_label);
+                draw_ui_label(prompt_target, fonts, draw_panel.x + 12, draw_time_label_y, time_label);
                 draw_prompt_button(
-                    screen,
+                    prompt_target,
                     fonts,
                     &draw_continue_button,
                     "CONTINUE",
@@ -16043,13 +16201,17 @@ static int prompt_resume_position(
                     pressed_button == 0 ? button_press_mix : 0
                 );
                 draw_prompt_button(
-                    screen,
+                    prompt_target,
                     fonts,
                     &draw_restart_button,
                     "START OVER",
                     prompt_button_selection_mix(1, selected_button, previous_selected_button, button_anim_started_ms, now_ms),
                     pressed_button == 1 ? button_press_mix : 0
                 );
+            }
+            if (prompt_surface) {
+                blit_surface_rgb565_mix(screen, prompt_surface, &prompt_blit, prompt_mix);
+                SDL_FreeSurface(prompt_surface);
             }
         }
         draw_screenshot_preview_osd(screen, fonts, &screenshot_preview, now_ms);
@@ -16071,6 +16233,10 @@ static int prompt_resume_position(
             if (save_screenshot_bitmap(screen, path, saved_path, sizeof(saved_path))) {
                 prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
             }
+        }
+        if (loading_snapshot && *loading_snapshot && background_reveal_mix >= 255) {
+            SDL_FreeSurface(*loading_snapshot);
+            *loading_snapshot = NULL;
         }
 
         if (prompt_closing) {
@@ -16102,7 +16268,8 @@ static int play_movie(
     const char *path,
     char *next_path,
     size_t next_path_size,
-    bool resume_without_prompt
+    bool resume_without_prompt,
+    bool loading_already_open
 )
 {
     static Movie movie;
@@ -16199,6 +16366,7 @@ static int play_movie(
     uint32_t seek_preroll_started_ms = 0;
     size_t seek_preroll_target_ready_count = 0;
     uint32_t paused_ui_quiet_until_ms = 0;
+    uint32_t playback_input_prefetch_quiet_until_ms = 0;
     uint32_t playback_badge_press_until_ms = 0;
     uint32_t scale_badge_press_until_ms = 0;
     uint32_t speed_badge_press_until_ms = 0;
@@ -16244,8 +16412,15 @@ static int play_movie(
         release_debug_ring_storage();
     }
     debug_clear_last_error();
-    loading_snapshot = capture_screen_surface(screen);
-    animate_loading_transition(screen, loading_snapshot, fonts, "Loading", true);
+    if (loading_already_open) {
+        loading_snapshot = create_black_screen_snapshot(screen);
+        if (!loading_snapshot) {
+            loading_snapshot = capture_screen_surface(screen);
+        }
+    } else {
+        loading_snapshot = capture_screen_surface(screen);
+        animate_loading_transition(screen, loading_snapshot, fonts, "Loading", true);
+    }
     cleanup_deferred_playback_movie();
     flush_queued_history_save(&g_pending_history_save, "loading");
     flush_queued_theme_save("loading");
@@ -16505,6 +16680,25 @@ static int play_movie(
             pointer_click = true;
         }
         pointer_release_edge = pointer.release_edge || (enter_release_edge && pointer.visible);
+        if (pointer_click ||
+            pointer_release_edge ||
+            enter_edge ||
+            enter_release_edge ||
+            space_edge ||
+            tab_edge ||
+            cat_edge ||
+            divide_edge ||
+            speed_down_edge ||
+            speed_up_edge ||
+            seek_left_edge ||
+            seek_right_edge ||
+            brightness_up_edge ||
+            brightness_down_edge ||
+            screenshot_edge ||
+            playback_mode_edge ||
+            theme_edge) {
+            playback_input_prefetch_quiet_until_ms = now_ms + PLAYBACK_INPUT_PREFETCH_GRACE_MS;
+        }
         if (!space_down) {
             playback_pause_key_press_active = false;
         }
@@ -16919,7 +17113,8 @@ static int play_movie(
                 }
             }
             if (!playback_ui_mixes_animating(&ui_mixes) &&
-                !ui_time_before(monotonic_clock_now_ms(), paused_ui_quiet_until_ms)) {
+                !ui_time_before(monotonic_clock_now_ms(), paused_ui_quiet_until_ms) &&
+                !ui_time_before(monotonic_clock_now_ms(), playback_input_prefetch_quiet_until_ms)) {
                 prefetch_tick(&movie, true, 1000, &pointer);
             }
             msleep(16);
@@ -17658,8 +17853,9 @@ static int play_movie(
         if (paused || frame_interval_ticks == 0 || seek_preroll_active) {
             uint32_t idle_now_ms = monotonic_clock_now_ms();
             bool paused_input_grace = paused && ui_time_before(idle_now_ms, paused_ui_quiet_until_ms);
+            bool playback_input_grace = ui_time_before(idle_now_ms, playback_input_prefetch_quiet_until_ms);
 
-            if (paused && !paused_input_grace && seek_bar_preview_decode_active(&seek_preview)) {
+            if (paused && !paused_input_grace && !playback_input_grace && seek_bar_preview_decode_active(&seek_preview)) {
                 step_seek_bar_preview_decode(
                     &movie,
                     &seek_preview,
@@ -17672,7 +17868,8 @@ static int play_movie(
                 scale_morph_animating(&scale_morph, idle_now_ms) ||
                 seek_bar_preview_decode_active(&seek_preview) ||
                 seek_preview_surface_animating(&seek_preview, idle_now_ms) ||
-                paused_input_grace
+                paused_input_grace ||
+                playback_input_grace
             );
 
             if (!paused_ui_busy) {
@@ -17684,19 +17881,20 @@ static int play_movie(
                 movie.diag_last_snapshot_ms = now_ms;
                 debug_trace_runtime_snapshot(&movie, true, 1000U, playback_rate, "paused");
             }
-            msleep(paused_input_grace ? 2 : 16);
+            msleep((paused_input_grace || playback_input_grace) ? 2 : 16);
         } else {
             uint64_t after_render_ticks = monotonic_clock_now_ticks();
             uint64_t spare_ticks = next_frame_due_ticks > after_render_ticks ? (next_frame_due_ticks - after_render_ticks) : 0;
             uint32_t spare_ms = monotonic_clock_ticks_to_ms(spare_ticks);
             uint64_t wait_target_ticks = next_frame_due_ticks;
+            bool playback_input_grace = ui_time_before(monotonic_clock_ticks_to_ms(after_render_ticks), playback_input_prefetch_quiet_until_ms);
             if (debug_should_collect_metrics()) {
                 if (spare_ms > movie.diag_max_spare_ms) {
                     movie.diag_max_spare_ms = spare_ms;
                 }
                 movie.diag_last_spare_ms = spare_ms;
             }
-            if (!playback_wait_input_pending(&pointer)) {
+            if (!playback_input_grace && !playback_wait_input_pending(&pointer)) {
                 prefetch_tick(&movie, false, spare_ms, &pointer);
             }
             if (debug_is_runtime_logging_enabled() &&
@@ -17769,6 +17967,7 @@ int main(int argc, char **argv)
     int result = 0;
     bool have_queued_movie = false;
     bool resume_without_prompt = false;
+    bool picker_opened_loading = false;
 
     if (argc < 1) {
         show_msgbox("ND Video Player", "Ndless did not provide argv[0].");
@@ -17816,6 +18015,7 @@ int main(int argc, char **argv)
 
     while (1) {
         resume_without_prompt = false;
+        picker_opened_loading = false;
         if (have_queued_movie) {
             strncpy(movie_path, queued_movie_path, sizeof(movie_path) - 1);
             movie_path[sizeof(movie_path) - 1] = '\0';
@@ -17833,6 +18033,7 @@ int main(int argc, char **argv)
                     &resume_without_prompt) != 0) {
                 break;
             }
+            picker_opened_loading = true;
         }
         result = play_movie(
             screen,
@@ -17840,7 +18041,8 @@ int main(int argc, char **argv)
             movie_path,
             queued_movie_path,
             sizeof(queued_movie_path),
-            resume_without_prompt
+            resume_without_prompt,
+            picker_opened_loading
         );
         argc = 1;
         if (result == PLAY_MOVIE_RESULT_AUTO_NEXT) {
