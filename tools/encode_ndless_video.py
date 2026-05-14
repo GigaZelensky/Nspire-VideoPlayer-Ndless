@@ -37,6 +37,45 @@ START_CODE_RE = re.compile(rb"\x00\x00(?:\x00)?\x01")
 SUBTITLE_LINE_BREAK_RE = re.compile(r"(?i)<br\s*/?>|\\N|\\n")
 SUBTITLE_TAG_RE = re.compile(r"(?s)<[^>]+>")
 SUBTITLE_ASS_OVERRIDE_RE = re.compile(r"\{\\[^}]*\}")
+MOJIBAKE_MARKERS = ("Ã", "Â", "â", "Å", "Ð", "Ñ")
+MOJIBAKE_PENALTY_RE = re.compile(r"[ÃÂâÅÐÑ]|\ufffd")
+ASCII_TRANSLITERATION = str.maketrans({
+    "Æ": "AE",
+    "æ": "ae",
+    "Œ": "OE",
+    "œ": "oe",
+    "ß": "ss",
+    "ẞ": "SS",
+    "Ø": "O",
+    "ø": "o",
+    "Ł": "L",
+    "ł": "l",
+    "Đ": "D",
+    "đ": "d",
+    "Ð": "D",
+    "ð": "d",
+    "Þ": "Th",
+    "þ": "th",
+    "İ": "I",
+    "ı": "i",
+    "ª": "a",
+    "º": "o",
+    "“": "\"",
+    "”": "\"",
+    "„": "\"",
+    "‟": "\"",
+    "‘": "'",
+    "’": "'",
+    "‚": "'",
+    "‛": "'",
+    "–": "-",
+    "—": "-",
+    "―": "-",
+    "…": "...",
+    " ": " ",
+    "¿": "?",
+    "¡": "!",
+})
 ASS_OVERRIDE_BLOCK_RE = re.compile(r"\{([^}]*)\}")
 ASS_POS_RE = re.compile(r"\\pos\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)")
 ASS_MOVE_RE = re.compile(
@@ -640,14 +679,44 @@ def normalize_output_path(output_arg: str) -> Path:
     return path.with_name(path.name + ".nvp.tns")
 
 
+def mojibake_score(text: str) -> int:
+    return len(MOJIBAKE_PENALTY_RE.findall(text))
+
+
 def repair_mojibake(text: str) -> str:
-    if not any(marker in text for marker in ("Ãƒ", "Ã¢", "â‚¬", "â„¢", "Å“", "Å¾")):
+    if not any(marker in text for marker in MOJIBAKE_MARKERS):
         return text
-    try:
-        repaired = text.encode("latin-1").decode("utf-8")
-    except UnicodeError:
-        return text
-    return repaired if "\ufffd" not in repaired else text
+
+    best = text
+    best_score = mojibake_score(text)
+    for encoding in ("cp1252", "latin-1"):
+        try:
+            repaired = text.encode(encoding).decode("utf-8")
+        except UnicodeError:
+            continue
+        if "\ufffd" in repaired:
+            continue
+        score = mojibake_score(repaired)
+        if score < best_score:
+            best = repaired
+            best_score = score
+    return best
+
+
+def ascii_fold_text(text: str) -> str:
+    text = text.translate(ASCII_TRANSLITERATION)
+    text = unicodedata.normalize("NFKD", text)
+    return text.encode("ascii", "ignore").decode("ascii")
+
+
+def read_subtitle_text(path: Path) -> str:
+    payload = path.read_bytes()
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return payload.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return payload.decode("utf-8-sig", errors="replace")
 
 
 def sanitize_subtitle_text(text: str) -> str:
@@ -657,7 +726,7 @@ def sanitize_subtitle_text(text: str) -> str:
     text = SUBTITLE_LINE_BREAK_RE.sub("\n", text)
     text = SUBTITLE_ASS_OVERRIDE_RE.sub("", text)
     text = SUBTITLE_TAG_RE.sub("", text)
-    text = text.encode("ascii", "ignore").decode("ascii")
+    text = ascii_fold_text(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
     text = re.sub(r"[ \t]+", " ", text)
@@ -809,7 +878,7 @@ def build_ass_cue(
 
 
 def parse_srt(path: Path) -> list[SubtitleCue]:
-    raw = path.read_text(encoding="utf-8-sig", errors="replace").replace("\r\n", "\n")
+    raw = read_subtitle_text(path).replace("\r\n", "\n")
     entries = re.split(r"\n\s*\n", raw.strip())
     cues: list[SubtitleCue] = []
     for entry in entries:
@@ -845,7 +914,7 @@ def parse_srt(path: Path) -> list[SubtitleCue]:
 
 
 def parse_ass(path: Path) -> list[SubtitleCue]:
-    lines = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    lines = read_subtitle_text(path).splitlines()
     cues: list[SubtitleCue] = []
     styles: dict[str, AssStyle] = {}
     play_res_x = ASS_DEFAULT_PLAYRES_X
@@ -2669,7 +2738,7 @@ def build_ffmpeg_command(
         raise RuntimeError(f"Unsupported burn subtitle mode: {burn_subtitle.kind}")
     command += [
         "-threads",
-        "1",
+        "0",
         "-c:v",
         "libx264",
         "-preset",
