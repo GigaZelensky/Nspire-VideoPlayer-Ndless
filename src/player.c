@@ -10872,9 +10872,9 @@ static bool clip_scaled_rects_to_screen(
     return true;
 }
 
-static void draw_movie_frame_scaled_clipped(
+static void draw_surface_frame_scaled_clipped(
     SDL_Surface *screen,
-    Movie *movie,
+    SDL_Surface *surface,
     const SDL_Rect *src,
     const SDL_Rect *dst
 )
@@ -10882,22 +10882,86 @@ static void draw_movie_frame_scaled_clipped(
     SDL_Rect clipped_src;
     SDL_Rect clipped_dst;
 
-    if (!screen || !movie || !movie->frame_surface ||
+    if (!screen || !surface ||
         !clip_scaled_rects_to_screen(
             src,
             dst,
-            movie->frame_surface->w,
-            movie->frame_surface->h,
+            surface->w,
+            surface->h,
             &clipped_src,
             &clipped_dst)) {
         return;
     }
 
     if (clipped_src.w == clipped_dst.w && clipped_src.h == clipped_dst.h) {
-        SDL_BlitSurface(movie->frame_surface, &clipped_src, screen, &clipped_dst);
+        SDL_BlitSurface(surface, &clipped_src, screen, &clipped_dst);
     } else {
-        SDL_SoftStretch(movie->frame_surface, &clipped_src, screen, &clipped_dst);
+        SDL_SoftStretch(surface, &clipped_src, screen, &clipped_dst);
     }
+}
+
+static void draw_surface_frame_scaled_clipped_mix(
+    SDL_Surface *screen,
+    SDL_Surface *surface,
+    const SDL_Rect *src,
+    const SDL_Rect *dst,
+    uint8_t mix
+)
+{
+    SDL_Rect clipped_src;
+    SDL_Rect clipped_dst;
+    SDL_Rect local_dst;
+    SDL_Surface *scaled;
+
+    if (mix == 0) {
+        return;
+    }
+    if (mix >= 255) {
+        draw_surface_frame_scaled_clipped(screen, surface, src, dst);
+        return;
+    }
+    if (!screen || !surface ||
+        !clip_scaled_rects_to_screen(
+            src,
+            dst,
+            surface->w,
+            surface->h,
+            &clipped_src,
+            &clipped_dst)) {
+        return;
+    }
+
+    scaled = create_rgb565_surface(clipped_dst.w, clipped_dst.h);
+    if (!scaled) {
+        if (mix >= 128) {
+            draw_surface_frame_scaled_clipped(screen, surface, src, dst);
+        }
+        return;
+    }
+    local_dst.x = 0;
+    local_dst.y = 0;
+    local_dst.w = clipped_dst.w;
+    local_dst.h = clipped_dst.h;
+    if (clipped_src.w == clipped_dst.w && clipped_src.h == clipped_dst.h) {
+        SDL_BlitSurface(surface, &clipped_src, scaled, &local_dst);
+    } else {
+        SDL_SoftStretch(surface, &clipped_src, scaled, &local_dst);
+    }
+    blit_surface_rgb565_mix(screen, scaled, &clipped_dst, mix);
+    SDL_FreeSurface(scaled);
+}
+
+static void draw_movie_frame_scaled_clipped(
+    SDL_Surface *screen,
+    Movie *movie,
+    const SDL_Rect *src,
+    const SDL_Rect *dst
+)
+{
+    if (!movie) {
+        return;
+    }
+    draw_surface_frame_scaled_clipped(screen, movie->frame_surface, src, dst);
 }
 
 static void draw_movie_frame_background_rects(
@@ -16125,6 +16189,7 @@ static int prompt_resume_position(
     int button_y;
     bool prompt_closing = false;
     int prompt_closing_result = 0;
+    SDL_Surface *start_over_source_frame = NULL;
 
     memset(&screenshot_preview, 0, sizeof(screenshot_preview));
     memset(&button_press_anim, 0, sizeof(button_press_anim));
@@ -16408,7 +16473,16 @@ static int prompt_resume_position(
             SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
         }
         if (background_dst.w > 0 && background_dst.h > 0) {
-            draw_movie_frame_scaled_clipped(screen, movie, &background_src, &background_dst);
+            if (prompt_closing &&
+                !prompt_canceling &&
+                prompt_closing_result == 0 &&
+                start_over_source_frame &&
+                morph_mix < 255) {
+                draw_surface_frame_scaled_clipped(screen, start_over_source_frame, &background_src, &background_dst);
+                draw_surface_frame_scaled_clipped_mix(screen, movie->frame_surface, &background_src, &background_dst, morph_mix);
+            } else {
+                draw_movie_frame_scaled_clipped(screen, movie, &background_src, &background_dst);
+            }
         }
         dim_rect_rgb565(screen, &full_screen, dim_strength);
         if (!prompt_closing && (prompt_mix > 0 || loading_text_mix > 0 || prompt_content_mix > 0)) {
@@ -16683,6 +16757,9 @@ static int prompt_resume_position(
             }
             free(title_main);
             free(title_detail);
+            if (start_over_source_frame) {
+                SDL_FreeSurface(start_over_source_frame);
+            }
             clear_screenshot_preview(&screenshot_preview);
             return prompt_closing_result;
         }
@@ -16703,9 +16780,29 @@ static int prompt_resume_position(
         }
         if (enter_button_press_stage != 0) {
             if (enter_button_press_stage == 2 && button_press_mix == 0 && pressed_button >= 0) {
+                uint32_t close_started_ms;
+
+                if (pressed_button == 1) {
+                    SDL_Rect frame_rect = {0, 0, 0, 0};
+
+                    if (start_over_source_frame) {
+                        SDL_FreeSurface(start_over_source_frame);
+                        start_over_source_frame = NULL;
+                    }
+                    if (movie->frame_surface) {
+                        frame_rect.w = movie->frame_surface->w;
+                        frame_rect.h = movie->frame_surface->h;
+                        start_over_source_frame = capture_rect_surface(movie->frame_surface, &frame_rect);
+                    }
+                    if (!decode_to_frame(movie, 0) && start_over_source_frame) {
+                        SDL_FreeSurface(start_over_source_frame);
+                        start_over_source_frame = NULL;
+                    }
+                }
+                close_started_ms = monotonic_clock_now_ms();
                 prompt_closing = true;
                 prompt_closing_result = pressed_button == 0 ? 1 : 0;
-                prompt_close_started_ms = now_ms ? now_ms : 1U;
+                prompt_close_started_ms = close_started_ms ? close_started_ms : 1U;
                 enter_button_press_stage = 0;
                 continue;
             }
@@ -16950,7 +17047,9 @@ static int play_movie(
             resume_prompt_returned = true;
         }
         if (resume_choice == 0) {
-            decode_to_frame(&movie, 0);
+            if (movie.current_frame != 0) {
+                decode_to_frame(&movie, 0);
+            }
         } else {
             if (resume_without_prompt && !decode_to_frame(&movie, resume_frame)) {
                 finish_loading_transition(screen, &loading_snapshot, fonts, "Loading");
