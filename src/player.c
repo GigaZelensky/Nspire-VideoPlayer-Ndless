@@ -15512,7 +15512,7 @@ static bool save_screenshot_bitmap_in_directory(SDL_Surface *screen, const char 
     for (index = 1; index <= 9999; ++index) {
         char candidate[MAX_PATH_LEN];
         FILE *existing;
-        int candidate_len = snprintf(candidate, sizeof(candidate), "%s/ndvideo-shot-%04d.bmp", screenshot_directory, index);
+        int candidate_len = snprintf(candidate, sizeof(candidate), "%s/ndvideo-shot-%04d.bmp.tns", screenshot_directory, index);
 
         if (candidate_len < 0 || (size_t) candidate_len >= sizeof(candidate)) {
             return false;
@@ -16639,14 +16639,20 @@ static int prompt_resume_position(
                 UI_COLOR_ACCENT,
                 UI_COLOR_ACCENT_DEEP
             );
-            draw_loading_overlay_label_mix(
-                screen,
-                fonts,
-                &draw_border,
-                "Loading",
-                (int) ((prompt_open_elapsed_ms / 180U) % 3U),
-                loading_text_mix
-            );
+            if (loading_text_mix > 0) {
+                SDL_Rect loading_label_border = loading_border;
+                int loading_label_offset_y = -(((255 - loading_text_mix) * 8 + 127) / 255);
+
+                loading_label_border.y = (Sint16) (loading_label_border.y + loading_label_offset_y);
+                draw_loading_overlay_label_mix(
+                    screen,
+                    fonts,
+                    &loading_label_border,
+                    "Loading",
+                    (int) ((prompt_open_elapsed_ms / 180U) % 3U),
+                    loading_text_mix
+                );
+            }
             if (draw_prompt_contents) {
                 if (prompt_header_mix > 0) {
                     SDL_Surface *item_surface;
