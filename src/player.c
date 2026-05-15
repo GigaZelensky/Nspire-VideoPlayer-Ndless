@@ -2576,7 +2576,7 @@ static bool playback_wait_key_pending(void)
         isKeyPressed(KEY_NSPIRE_SPACE) ||
         isKeyPressed(KEY_NSPIRE_TAB) ||
         isKeyPressed(KEY_NSPIRE_CAT) ||
-        isKeyPressed(KEY_NSPIRE_DOC) ||
+        isKeyPressed(KEY_NSPIRE_SCRATCHPAD) ||
         isKeyPressed(KEY_NSPIRE_LEFT) ||
         isKeyPressed(KEY_NSPIRE_RIGHT) ||
         isKeyPressed(KEY_NSPIRE_UP) ||
@@ -12526,7 +12526,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu
         {"D", "Toggle debug logging"},
         {"S", "Save BMP screenshot"},
         {"TOUCHPAD", "Move cursor / show UI"},
-        {"DOC", "Return to OS home"},
+        {"SCRATCH", "Open OS Scratchpad"},
         {"ESC", "Close menu or exit"},
     };
     int max_shortcut_w = 0;
@@ -15709,7 +15709,7 @@ static int pick_movie(
     bool prev_right = false;
     bool prev_enter = false;
     bool prev_esc = false;
-    bool prev_doc = false;
+    bool prev_scratchpad = false;
     bool prev_c = false;
     bool prev_s = false;
     bool prev_2 = false;
@@ -15776,7 +15776,7 @@ static int pick_movie(
     prev_right = isKeyPressed(KEY_NSPIRE_RIGHT);
     prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
-    prev_doc = isKeyPressed(KEY_NSPIRE_DOC);
+    prev_scratchpad = isKeyPressed(KEY_NSPIRE_SCRATCHPAD);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     prev_2 = isKeyPressed(KEY_NSPIRE_2);
@@ -15798,7 +15798,7 @@ static int pick_movie(
         bool keypad_6_edge = key_pressed_edge(KEY_NSPIRE_6, &prev_6);
         bool keypad_8_edge = key_pressed_edge(KEY_NSPIRE_8, &prev_8);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
-        bool doc_edge = key_pressed_edge(KEY_NSPIRE_DOC, &prev_doc);
+        bool scratchpad_edge = key_pressed_edge(KEY_NSPIRE_SCRATCHPAD, &prev_scratchpad);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) || (!ctrl_down && keypad_5_edge);
         bool enter_down = prev_enter || (!ctrl_down && prev_5);
         bool up_edge = key_pressed_edge(KEY_NSPIRE_UP, &prev_up) || (!ctrl_down && keypad_8_edge);
@@ -15825,7 +15825,7 @@ static int pick_movie(
         int activated_index = -1;
         bool activated_resume = false;
 
-        if (doc_edge) {
+        if (scratchpad_edge) {
             clear_screenshot_preview(&screenshot_preview);
             return PLAY_MOVIE_RESULT_HOME_EXIT;
         }
@@ -16257,7 +16257,7 @@ static int prompt_resume_position(
     bool prev_5 = false;
     bool prev_6 = false;
     bool prev_esc = false;
-    bool prev_doc = false;
+    bool prev_scratchpad = false;
     bool prev_c = false;
     bool prev_s = false;
     PointerState pointer;
@@ -16378,7 +16378,7 @@ static int prompt_resume_position(
     prev_5 = isKeyPressed(KEY_NSPIRE_5);
     prev_6 = isKeyPressed(KEY_NSPIRE_6);
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
-    prev_doc = isKeyPressed(KEY_NSPIRE_DOC);
+    prev_scratchpad = isKeyPressed(KEY_NSPIRE_SCRATCHPAD);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     pointer_hover_guard_reset(&hover_guard);
@@ -16393,7 +16393,7 @@ static int prompt_resume_position(
         bool keypad_5_edge = key_pressed_edge(KEY_NSPIRE_5, &prev_5);
         bool keypad_6_edge = key_pressed_edge(KEY_NSPIRE_6, &prev_6);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
-        bool doc_edge = key_pressed_edge(KEY_NSPIRE_DOC, &prev_doc);
+        bool scratchpad_edge = key_pressed_edge(KEY_NSPIRE_SCRATCHPAD, &prev_scratchpad);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) || (!ctrl_down && keypad_5_edge);
         bool enter_down = prev_enter || (!ctrl_down && prev_5);
         bool left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || (!ctrl_down && keypad_4_edge);
@@ -16466,7 +16466,7 @@ static int prompt_resume_position(
         bool button_press_hot;
         uint8_t button_press_mix;
 
-        if (doc_edge) {
+        if (scratchpad_edge) {
             free(title_main);
             free(title_detail);
             if (start_over_source_frame) {
@@ -16973,7 +16973,7 @@ static int play_movie(
     bool prev_9 = false;
     bool prev_tab = false;
     bool prev_esc = false;
-    bool prev_doc = false;
+    bool prev_scratchpad = false;
     bool prev_cat = false;
     bool prev_divide = false;
     bool prev_exp = false;
@@ -17231,7 +17231,7 @@ static int play_movie(
     prev_r = isKeyPressed(KEY_NSPIRE_R);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
-    prev_doc = isKeyPressed(KEY_NSPIRE_DOC);
+    prev_scratchpad = isKeyPressed(KEY_NSPIRE_SCRATCHPAD);
     prev_on = on_key_pressed() ? true : false;
     debug_set_metrics_collection(debug_is_runtime_logging_enabled());
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
@@ -17267,15 +17267,15 @@ static int play_movie(
 
     while (1) {
         bool esc_down = isKeyPressed(KEY_NSPIRE_ESC) ? true : false;
-        bool doc_down = isKeyPressed(KEY_NSPIRE_DOC) ? true : false;
+        bool scratchpad_down = isKeyPressed(KEY_NSPIRE_SCRATCHPAD) ? true : false;
         bool esc_edge = esc_down && !prev_esc;
-        bool doc_edge = doc_down && !prev_doc;
+        bool scratchpad_edge = scratchpad_down && !prev_scratchpad;
         prev_esc = esc_down;
-        prev_doc = doc_down;
+        prev_scratchpad = scratchpad_down;
         if (!esc_down) {
             esc_exit_suppressed_until_release = false;
         }
-        if (doc_edge) {
+        if (scratchpad_edge) {
             result = PLAY_MOVIE_RESULT_HOME_EXIT;
             break;
         }
