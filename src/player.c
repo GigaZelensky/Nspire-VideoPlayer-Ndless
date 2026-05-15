@@ -389,7 +389,12 @@ typedef enum {
     PLAY_MOVIE_RESULT_EXIT = 0,
     PLAY_MOVIE_RESULT_AUTO_NEXT = 1,
     PLAY_MOVIE_RESULT_APP_EXIT = 2,
+    PLAY_MOVIE_RESULT_HOME_EXIT = 3,
 } PlayMovieResult;
+
+enum {
+    RESUME_PROMPT_RESULT_HOME_EXIT = -2,
+};
 
 typedef struct {
     bool valid;
@@ -2571,6 +2576,7 @@ static bool playback_wait_key_pending(void)
         isKeyPressed(KEY_NSPIRE_SPACE) ||
         isKeyPressed(KEY_NSPIRE_TAB) ||
         isKeyPressed(KEY_NSPIRE_CAT) ||
+        isKeyPressed(KEY_NSPIRE_DOC) ||
         isKeyPressed(KEY_NSPIRE_LEFT) ||
         isKeyPressed(KEY_NSPIRE_RIGHT) ||
         isKeyPressed(KEY_NSPIRE_UP) ||
@@ -7862,6 +7868,48 @@ static bool on_key_pressed_edge(bool *previous_state)
     return pressed;
 }
 
+static unsigned os_close_document_addr(void)
+{
+    /* Same OS-specific close_document table Ndless uses after installer launch. */
+    static const unsigned close_document_addrs[] = {
+        0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+        0x0, 0x0, 0x0, 0x0,
+        0x0, 0x0, 0x0, 0x0,
+        0x0, 0x0, 0x0, 0x0,
+        0x0, 0x0,
+        0x0, 0x0,
+        0x0, 0x0,
+        0x0, 0x0,
+        0x0, 0x0,
+        0x1000b240, 0x1000b23c,
+        0x0, 0x0,
+        0x1000b278, 0x1000b2b0,
+        0x100265d4, 0x10026614, 0x1002660c,
+        0x1000b4e4, 0x1000b524,
+        0x10028610, 0x10028770, 0x100287a0,
+        0x1000b4e0, 0x1000b514,
+        0x10028560, 0x10028664, 0x1002867c
+    };
+
+    return nl_osvalue(
+        close_document_addrs,
+        (unsigned) (sizeof(close_document_addrs) / sizeof(close_document_addrs[0]))
+    );
+}
+
+static void yes_teacher_im_mathing(void)
+{
+    unsigned close_document_addr = os_close_document_addr();
+
+    if (close_document_addr != 0 && !nl_loaded_by_3rd_party_loader()) {
+        ((void (*)(void)) close_document_addr)();
+    }
+
+    if (nl_hassyscall(refresh_homescr)) {
+        refresh_homescr();
+    }
+}
+
 static int compare_movie_files(const void *lhs, const void *rhs)
 {
     const MovieFile *a = (const MovieFile *) lhs;
@@ -12457,6 +12505,7 @@ static void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu
         {"D", "Toggle debug logging"},
         {"S", "Save BMP screenshot"},
         {"TOUCHPAD", "Move cursor / show UI"},
+        {"DOC", "Return to OS home"},
         {"ESC", "Close menu or exit"},
     };
     int max_shortcut_w = 0;
@@ -15639,6 +15688,7 @@ static int pick_movie(
     bool prev_right = false;
     bool prev_enter = false;
     bool prev_esc = false;
+    bool prev_doc = false;
     bool prev_c = false;
     bool prev_s = false;
     bool prev_2 = false;
@@ -15705,6 +15755,7 @@ static int pick_movie(
     prev_right = isKeyPressed(KEY_NSPIRE_RIGHT);
     prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
+    prev_doc = isKeyPressed(KEY_NSPIRE_DOC);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     prev_2 = isKeyPressed(KEY_NSPIRE_2);
@@ -15726,6 +15777,7 @@ static int pick_movie(
         bool keypad_6_edge = key_pressed_edge(KEY_NSPIRE_6, &prev_6);
         bool keypad_8_edge = key_pressed_edge(KEY_NSPIRE_8, &prev_8);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
+        bool doc_edge = key_pressed_edge(KEY_NSPIRE_DOC, &prev_doc);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) || (!ctrl_down && keypad_5_edge);
         bool enter_down = prev_enter || (!ctrl_down && prev_5);
         bool up_edge = key_pressed_edge(KEY_NSPIRE_UP, &prev_up) || (!ctrl_down && keypad_8_edge);
@@ -15751,6 +15803,11 @@ static int pick_movie(
         uint8_t picker_press_mix;
         int activated_index = -1;
         bool activated_resume = false;
+
+        if (doc_edge) {
+            clear_screenshot_preview(&screenshot_preview);
+            return PLAY_MOVIE_RESULT_HOME_EXIT;
+        }
 
         if (next_hover_scroll_direction != hover_scroll_direction) {
             hover_scroll_direction = next_hover_scroll_direction;
@@ -16179,6 +16236,7 @@ static int prompt_resume_position(
     bool prev_5 = false;
     bool prev_6 = false;
     bool prev_esc = false;
+    bool prev_doc = false;
     bool prev_c = false;
     bool prev_s = false;
     PointerState pointer;
@@ -16299,6 +16357,7 @@ static int prompt_resume_position(
     prev_5 = isKeyPressed(KEY_NSPIRE_5);
     prev_6 = isKeyPressed(KEY_NSPIRE_6);
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
+    prev_doc = isKeyPressed(KEY_NSPIRE_DOC);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     pointer_hover_guard_reset(&hover_guard);
@@ -16313,6 +16372,7 @@ static int prompt_resume_position(
         bool keypad_5_edge = key_pressed_edge(KEY_NSPIRE_5, &prev_5);
         bool keypad_6_edge = key_pressed_edge(KEY_NSPIRE_6, &prev_6);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
+        bool doc_edge = key_pressed_edge(KEY_NSPIRE_DOC, &prev_doc);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) || (!ctrl_down && keypad_5_edge);
         bool enter_down = prev_enter || (!ctrl_down && prev_5);
         bool left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || (!ctrl_down && keypad_4_edge);
@@ -16384,6 +16444,16 @@ static int prompt_resume_position(
         int hovered_button = -1;
         bool button_press_hot;
         uint8_t button_press_mix;
+
+        if (doc_edge) {
+            free(title_main);
+            free(title_detail);
+            if (start_over_source_frame) {
+                SDL_FreeSurface(start_over_source_frame);
+            }
+            clear_screenshot_preview(&screenshot_preview);
+            return RESUME_PROMPT_RESULT_HOME_EXIT;
+        }
 
         if (prompt_closing) {
             if (prompt_canceling) {
@@ -16882,6 +16952,7 @@ static int play_movie(
     bool prev_9 = false;
     bool prev_tab = false;
     bool prev_esc = false;
+    bool prev_doc = false;
     bool prev_cat = false;
     bool prev_divide = false;
     bool prev_exp = false;
@@ -17074,6 +17145,14 @@ static int play_movie(
                 video_align_y,
                 &loading_snapshot
             );
+            if (resume_choice == RESUME_PROMPT_RESULT_HOME_EXIT) {
+                if (loading_snapshot) {
+                    SDL_FreeSurface(loading_snapshot);
+                    loading_snapshot = NULL;
+                }
+                defer_playback_movie_cleanup(&movie);
+                return PLAY_MOVIE_RESULT_HOME_EXIT;
+            }
             if (resume_choice < 0) {
                 if (debug_is_runtime_logging_enabled()) {
                     char log_path[MAX_PATH_LEN];
@@ -17131,6 +17210,7 @@ static int play_movie(
     prev_r = isKeyPressed(KEY_NSPIRE_R);
     prev_c = isKeyPressed(KEY_NSPIRE_C);
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
+    prev_doc = isKeyPressed(KEY_NSPIRE_DOC);
     prev_on = on_key_pressed() ? true : false;
     debug_set_metrics_collection(debug_is_runtime_logging_enabled());
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
@@ -17166,13 +17246,20 @@ static int play_movie(
 
     while (1) {
         bool esc_down = isKeyPressed(KEY_NSPIRE_ESC) ? true : false;
+        bool doc_down = isKeyPressed(KEY_NSPIRE_DOC) ? true : false;
         bool esc_edge = esc_down && !prev_esc;
+        bool doc_edge = doc_down && !prev_doc;
         prev_esc = esc_down;
+        prev_doc = doc_down;
         if (!esc_down) {
             esc_exit_suppressed_until_release = false;
         }
+        if (doc_edge) {
+            result = PLAY_MOVIE_RESULT_HOME_EXIT;
+            break;
+        }
         if (display_power_state.off && esc_down) {
-            result = PLAY_MOVIE_RESULT_APP_EXIT;
+            result = PLAY_MOVIE_RESULT_HOME_EXIT;
             break;
         }
         if (!display_power_state.off && !help_menu_open && esc_down && !esc_exit_suppressed_until_release) {
@@ -18536,7 +18623,9 @@ static int play_movie(
     }
 
     display_power_on(&display_power_state);
-    if (result == PLAY_MOVIE_RESULT_EXIT || result == PLAY_MOVIE_RESULT_APP_EXIT) {
+    if (result == PLAY_MOVIE_RESULT_EXIT ||
+        result == PLAY_MOVIE_RESULT_APP_EXIT ||
+        result == PLAY_MOVIE_RESULT_HOME_EXIT) {
         queue_history_save_from_movie(
             &g_pending_history_save,
             &g_picker_cache,
@@ -18553,7 +18642,9 @@ static int play_movie(
         );
     }
     if (debug_is_runtime_logging_enabled() ||
-        (result != PLAY_MOVIE_RESULT_EXIT && result != PLAY_MOVIE_RESULT_APP_EXIT)) {
+        (result != PLAY_MOVIE_RESULT_EXIT &&
+            result != PLAY_MOVIE_RESULT_APP_EXIT &&
+            result != PLAY_MOVIE_RESULT_HOME_EXIT)) {
         char log_path[MAX_PATH_LEN];
         const char *exit_reason = "normal-exit";
 
@@ -18561,6 +18652,8 @@ static int play_movie(
             exit_reason = "auto-next";
         } else if (result == PLAY_MOVIE_RESULT_APP_EXIT) {
             exit_reason = "app-exit";
+        } else if (result == PLAY_MOVIE_RESULT_HOME_EXIT) {
+            exit_reason = "home-exit";
         } else if (result != PLAY_MOVIE_RESULT_EXIT) {
             exit_reason = "aborted";
         }
@@ -18589,6 +18682,7 @@ int main(int argc, char **argv)
     bool have_queued_movie = false;
     bool resume_without_prompt = false;
     bool picker_opened_loading = false;
+    bool return_home_after_exit = false;
 
     if (argc < 1) {
         show_msgbox("ND Video Player", "Ndless did not provide argv[0].");
@@ -18645,13 +18739,20 @@ int main(int argc, char **argv)
             strncpy(movie_path, argv[1], sizeof(movie_path) - 1);
             movie_path[sizeof(movie_path) - 1] = '\0';
         } else {
-            if (pick_movie(
+            int picker_result = pick_movie(
                     screen,
                     &fonts,
                     directory,
                     movie_path,
                     sizeof(movie_path),
-                    &resume_without_prompt) != 0) {
+                    &resume_without_prompt);
+
+            if (picker_result == PLAY_MOVIE_RESULT_HOME_EXIT) {
+                result = PLAY_MOVIE_RESULT_HOME_EXIT;
+                return_home_after_exit = true;
+                break;
+            }
+            if (picker_result != 0) {
                 break;
             }
             picker_opened_loading = true;
@@ -18670,6 +18771,10 @@ int main(int argc, char **argv)
             have_queued_movie = true;
             continue;
         }
+        if (result == PLAY_MOVIE_RESULT_HOME_EXIT) {
+            return_home_after_exit = true;
+            break;
+        }
         if (result == PLAY_MOVIE_RESULT_APP_EXIT) {
             break;
         }
@@ -18680,6 +18785,9 @@ int main(int argc, char **argv)
 
     flush_queued_history_save(&g_pending_history_save, "shutdown");
     flush_queued_theme_save("shutdown");
+    if (return_home_after_exit) {
+        yes_teacher_im_mathing();
+    }
     cleanup_deferred_playback_movie();
     clear_movie_picker_cache(&g_picker_cache);
     free_fonts(&fonts);
@@ -18687,5 +18795,7 @@ int main(int argc, char **argv)
     SDL_Quit();
     sram_shutdown();
     monotonic_clock_shutdown();
-    return (result == PLAY_MOVIE_RESULT_EXIT || result == PLAY_MOVIE_RESULT_APP_EXIT) ? 0 : 1;
+    return (result == PLAY_MOVIE_RESULT_EXIT ||
+        result == PLAY_MOVIE_RESULT_APP_EXIT ||
+        result == PLAY_MOVIE_RESULT_HOME_EXIT) ? 0 : 1;
 }

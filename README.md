@@ -65,6 +65,7 @@ Battery Life: ~9.5 hours of continuous H.264 playback at 100% brightness on a CX
 - `Enter` or keypad `5`: open movie
 - `C`: cycle theme color
 - `S`: save a BMP screenshot
+- `Doc`: save state and return to the OS home screen
 - `Esc`: exit
 
 ### Movie Filename Metadata
@@ -101,6 +102,7 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 - `D`: toggle verbose debug logging
 - `S`: save a BMP screenshot
 - `Catalog`: open / close the help overlay
+- `Doc`: save state and return to the OS home screen
 - `Esc`: close help, or leave the movie if help is not open
 - `On`: turn the display black; while black, `Esc` exits the app after saving history
 
@@ -112,6 +114,7 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 - `Enter` or keypad `5`: confirm the selected button
 - `C`: cycle theme color
 - `S`: save a BMP screenshot
+- `Doc`: save state and return to the OS home screen
 - `Esc`: cancel and return
 
 ## Subtitle Fonts
