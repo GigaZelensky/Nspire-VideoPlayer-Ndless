@@ -601,6 +601,9 @@ typedef struct {
     uint32_t diag_chunk_boundary_miss_count;
     uint32_t diag_bg_chunk_cross_blocked_count;
     uint32_t diag_last_spare_ms;
+    uint32_t diag_post_prefetch_ready_count;
+    uint32_t diag_post_prefetch_target_count;
+    uint32_t diag_post_prefetch_frame;
     size_t h264_frame_bytes;
     size_t h264_frame_ring_capacity;
     H264FrameSlot h264_frame_ring[H264_FRAME_RING_MAX_COUNT];
@@ -3482,7 +3485,7 @@ static void debug_trace_runtime_snapshot(
         ? h264_prefetch_target_ready_count(movie, spare_ms)
         : 0U;
     debug_tracef(
-        "snap %s pause=%u rate=%s frame=%lu chunk=%d contig=%lu/%lu ring=%lu/%lu backoff=%u spare=%lu mem=%u fg=%u/%u bg=%u/%u replay=%lu miss=%lu/%lu/%lu/%lu chunkpref=%lu",
+        "snap %s pause=%u rate=%s frame=%lu chunk=%d contig=%lu/%lu post=%lu/%lu@%lu ring=%lu/%lu backoff=%u spare=%lu mem=%u fg=%u/%u bg=%u/%u replay=%lu miss=%lu/%lu/%lu/%lu chunkpref=%lu",
         tag ? tag : "-",
         paused ? 1U : 0U,
         playback_rate ? playback_rate->label : "-",
@@ -3490,6 +3493,9 @@ static void debug_trace_runtime_snapshot(
         movie->loaded_chunk,
         (unsigned long) ring_contig,
         (unsigned long) ready_target,
+        (unsigned long) movie->diag_post_prefetch_ready_count,
+        (unsigned long) movie->diag_post_prefetch_target_count,
+        (unsigned long) movie->diag_post_prefetch_frame,
         (unsigned long) ring_valid,
         (unsigned long) active_h264_frame_ring_capacity(movie),
         (unsigned) movie->h264_active_prefetch_backoff,
@@ -3560,11 +3566,14 @@ static void debug_dump_session(const char *path, const Movie *movie, const char 
         );
         fprintf(
             log_file,
-            "ring_valid=%lu ring_contig=%lu ring_cap=%lu ready_target=%lu chunk_prefetched=%lu active_backoff=%u\n",
+            "ring_valid=%lu ring_contig=%lu ring_cap=%lu ready_target=%lu post_ready=%lu post_target=%lu post_frame=%lu chunk_prefetched=%lu active_backoff=%u\n",
             (unsigned long) h264_frame_ring_valid_count(movie),
             (unsigned long) h264_frame_ring_contiguous_ready_count(movie),
             (unsigned long) active_h264_frame_ring_capacity(movie),
             (unsigned long) h264_prefetch_target_ready_count(movie, 0U),
+            (unsigned long) movie->diag_post_prefetch_ready_count,
+            (unsigned long) movie->diag_post_prefetch_target_count,
+            (unsigned long) movie->diag_post_prefetch_frame,
             (unsigned long) total_prefetched_chunk_bytes(movie),
             (unsigned) movie->h264_active_prefetch_backoff
         );
@@ -6873,6 +6882,20 @@ static void prefetch_h264_boundary_idr(
     }
 }
 
+static void note_h264_post_prefetch_runway(Movie *movie, uint32_t spare_ms)
+{
+    if (!movie || !movie_uses_h264(movie)) {
+        return;
+    }
+    if (!debug_should_collect_metrics()) {
+        return;
+    }
+
+    movie->diag_post_prefetch_ready_count = (uint32_t) h264_frame_ring_contiguous_ready_count(movie);
+    movie->diag_post_prefetch_target_count = (uint32_t) h264_prefetch_target_ready_count(movie, spare_ms);
+    movie->diag_post_prefetch_frame = movie->current_frame;
+}
+
 static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerState *abort_pointer)
 {
     uint32_t time_slice_ms;
@@ -6895,7 +6918,11 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const Po
     int max_work_distance = PREFETCH_CHUNK_COUNT;
     size_t ring_growth;
 
-    if (!movie || spare_ms == 0 || prefetch_abort_requested(abort_pointer)) {
+    if (!movie) {
+        return;
+    }
+    if (spare_ms == 0 || prefetch_abort_requested(abort_pointer)) {
+        note_h264_post_prefetch_runway(movie, spare_ms);
         return;
     }
     time_slice_ms = paused && spare_ms > PREFETCH_PAUSED_SLICE_MS ? PREFETCH_PAUSED_SLICE_MS : spare_ms;
@@ -7145,7 +7172,9 @@ static void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const Po
             prefetch_h264_frames(movie, paused, spare_ms, deadline_ms, abort_pointer);
         }
     }
+    note_h264_post_prefetch_runway(movie, spare_ms);
 }
+
 static int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index)
 {
     uint32_t left = 0;
@@ -12388,6 +12417,11 @@ static void draw_memory_badge(
     size_t ring_contig;
     size_t ring_cap;
     size_t ready_target;
+    size_t post_ready = 0U;
+    size_t post_target = 0U;
+    size_t displayed_ready;
+    bool post_ready_recent = false;
+    char runway_text[24];
     char app_text[16];
     char prefetched_text[16];
     char total_text[16];
@@ -12395,7 +12429,7 @@ static void draw_memory_badge(
     char label_full[80];
     char label_medium[64];
     char label_short[48];
-    char perf_full[96];
+    char perf_full[104];
     char perf_medium[80];
     char perf_short[48];
     const char *label = NULL;
@@ -12414,16 +12448,35 @@ static void draw_memory_badge(
     ring_contig = movie && movie_uses_h264(movie) ? h264_frame_ring_contiguous_ready_count(movie) : 0U;
     ring_cap = movie && movie_uses_h264(movie) ? active_h264_frame_ring_capacity(movie) : 0U;
     ready_target = movie && movie_uses_h264(movie) ? h264_prefetch_target_ready_count(movie, 0U) : 0U;
+    if (movie && movie_uses_h264(movie) && movie->current_frame >= movie->diag_post_prefetch_frame) {
+        uint32_t sample_age = movie->current_frame - movie->diag_post_prefetch_frame;
+
+        post_ready_recent = sample_age <= 2U;
+        if (post_ready_recent) {
+            post_ready = movie->diag_post_prefetch_ready_count;
+            post_target = movie->diag_post_prefetch_target_count;
+            if (post_target > 0U) {
+                ready_target = post_target;
+            }
+        }
+    }
+    displayed_ready = (post_ready_recent && post_ready > ring_contig) ? post_ready : ring_contig;
+    snprintf(
+        runway_text,
+        sizeof(runway_text),
+        "R%lu/%lu",
+        (unsigned long) displayed_ready,
+        (unsigned long) ring_cap
+    );
     snprintf(label_full, sizeof(label_full), "RAM %s/%s C%s %u%% F%s", app_text, total_text, prefetched_text, stats.percent_used, free_text);
     snprintf(label_medium, sizeof(label_medium), "RAM %s/%s C%s", app_text, total_text, prefetched_text);
     snprintf(label_short, sizeof(label_short), "RAM %s/%s", app_text, total_text);
     snprintf(
         perf_full,
         sizeof(perf_full),
-        "F%lu R%lu/%lu T%lu L%lu H%lu D%lu%s",
+        "F%lu %s T%lu L%lu H%lu D%lu%s",
         movie ? (unsigned long) movie->current_frame : 0UL,
-        (unsigned long) ring_contig,
-        (unsigned long) ring_cap,
+        runway_text,
         (unsigned long) ready_target,
         movie ? (unsigned long) movie->diag_lag_event_count : 0UL,
         movie ? (unsigned long) movie->diag_foreground_ring_hit_count : 0UL,
@@ -12433,10 +12486,9 @@ static void draw_memory_badge(
     snprintf(
         perf_medium,
         sizeof(perf_medium),
-        "F%lu R%lu/%lu L%lu%s",
+        "F%lu %s L%lu%s",
         movie ? (unsigned long) movie->current_frame : 0UL,
-        (unsigned long) ring_contig,
-        (unsigned long) ring_cap,
+        runway_text,
         movie ? (unsigned long) movie->diag_lag_event_count : 0UL,
         debug_is_runtime_logging_enabled() ? " DBG ON" : ""
     );
