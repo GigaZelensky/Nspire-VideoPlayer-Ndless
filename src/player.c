@@ -7897,6 +7897,25 @@ static unsigned os_close_document_addr(void)
     );
 }
 
+static void queue_os_home_calculator_shortcut(void)
+{
+    if (!nl_hassyscall(send_key_event)) {
+        return;
+    }
+
+    const unsigned short a_shortcut = (unsigned short) (('a' << 8) | 'a');
+    struct s_ns_event event;
+    memset(&event, 0, sizeof(event));
+    event.ascii = 'a';
+    event.key = 'a';
+
+    event.type = 0x8;
+    send_key_event(&event, a_shortcut, FALSE, FALSE);
+
+    event.type = 0x10;
+    send_key_event(&event, a_shortcut, TRUE, FALSE);
+}
+
 static void yes_teacher_im_mathing(void)
 {
     unsigned close_document_addr = os_close_document_addr();
@@ -7908,6 +7927,8 @@ static void yes_teacher_im_mathing(void)
     if (nl_hassyscall(refresh_homescr)) {
         refresh_homescr();
     }
+
+    queue_os_home_calculator_shortcut();
 }
 
 static int compare_movie_files(const void *lhs, const void *rhs)
