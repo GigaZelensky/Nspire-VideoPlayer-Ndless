@@ -390,10 +390,12 @@ typedef enum {
     PLAY_MOVIE_RESULT_AUTO_NEXT = 1,
     PLAY_MOVIE_RESULT_APP_EXIT = 2,
     PLAY_MOVIE_RESULT_HOME_EXIT = 3,
+    PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT = 4,
 } PlayMovieResult;
 
 enum {
     RESUME_PROMPT_RESULT_HOME_EXIT = -2,
+    RESUME_PROMPT_RESULT_SCRATCHPAD_EXIT = -3,
 };
 
 typedef struct {
@@ -7916,7 +7918,7 @@ static void queue_os_home_calculator_shortcut(void)
     send_key_event(&event, a_shortcut, TRUE, FALSE);
 }
 
-static void yes_teacher_im_mathing(void)
+static void return_to_os_home_menu(void)
 {
     unsigned close_document_addr = os_close_document_addr();
 
@@ -7927,7 +7929,11 @@ static void yes_teacher_im_mathing(void)
     if (nl_hassyscall(refresh_homescr)) {
         refresh_homescr();
     }
+}
 
+static void yes_teacher_im_mathing(void)
+{
+    return_to_os_home_menu();
     queue_os_home_calculator_shortcut();
 }
 
@@ -15827,7 +15833,7 @@ static int pick_movie(
 
         if (scratchpad_edge) {
             clear_screenshot_preview(&screenshot_preview);
-            return PLAY_MOVIE_RESULT_HOME_EXIT;
+            return PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT;
         }
 
         if (next_hover_scroll_direction != hover_scroll_direction) {
@@ -16473,7 +16479,7 @@ static int prompt_resume_position(
                 SDL_FreeSurface(start_over_source_frame);
             }
             clear_screenshot_preview(&screenshot_preview);
-            return RESUME_PROMPT_RESULT_HOME_EXIT;
+            return RESUME_PROMPT_RESULT_SCRATCHPAD_EXIT;
         }
 
         if (prompt_closing) {
@@ -17172,13 +17178,16 @@ static int play_movie(
                 video_align_y,
                 &loading_snapshot
             );
-            if (resume_choice == RESUME_PROMPT_RESULT_HOME_EXIT) {
+            if (resume_choice == RESUME_PROMPT_RESULT_HOME_EXIT ||
+                resume_choice == RESUME_PROMPT_RESULT_SCRATCHPAD_EXIT) {
                 if (loading_snapshot) {
                     SDL_FreeSurface(loading_snapshot);
                     loading_snapshot = NULL;
                 }
                 defer_playback_movie_cleanup(&movie);
-                return PLAY_MOVIE_RESULT_HOME_EXIT;
+                return resume_choice == RESUME_PROMPT_RESULT_SCRATCHPAD_EXIT
+                    ? PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT
+                    : PLAY_MOVIE_RESULT_HOME_EXIT;
             }
             if (resume_choice < 0) {
                 if (debug_is_runtime_logging_enabled()) {
@@ -17282,7 +17291,7 @@ static int play_movie(
             esc_exit_suppressed_until_release = false;
         }
         if (scratchpad_edge) {
-            result = PLAY_MOVIE_RESULT_HOME_EXIT;
+            result = PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT;
             break;
         }
         if (display_power_state.off && esc_down) {
@@ -18652,7 +18661,8 @@ static int play_movie(
     display_power_on(&display_power_state);
     if (result == PLAY_MOVIE_RESULT_EXIT ||
         result == PLAY_MOVIE_RESULT_APP_EXIT ||
-        result == PLAY_MOVIE_RESULT_HOME_EXIT) {
+        result == PLAY_MOVIE_RESULT_HOME_EXIT ||
+        result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) {
         queue_history_save_from_movie(
             &g_pending_history_save,
             &g_picker_cache,
@@ -18671,7 +18681,8 @@ static int play_movie(
     if (debug_is_runtime_logging_enabled() ||
         (result != PLAY_MOVIE_RESULT_EXIT &&
             result != PLAY_MOVIE_RESULT_APP_EXIT &&
-            result != PLAY_MOVIE_RESULT_HOME_EXIT)) {
+            result != PLAY_MOVIE_RESULT_HOME_EXIT &&
+            result != PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT)) {
         char log_path[MAX_PATH_LEN];
         const char *exit_reason = "normal-exit";
 
@@ -18681,6 +18692,8 @@ static int play_movie(
             exit_reason = "app-exit";
         } else if (result == PLAY_MOVIE_RESULT_HOME_EXIT) {
             exit_reason = "home-exit";
+        } else if (result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) {
+            exit_reason = "scratchpad-exit";
         } else if (result != PLAY_MOVIE_RESULT_EXIT) {
             exit_reason = "aborted";
         }
@@ -18710,6 +18723,7 @@ int main(int argc, char **argv)
     bool resume_without_prompt = false;
     bool picker_opened_loading = false;
     bool return_home_after_exit = false;
+    bool open_scratchpad_after_exit = false;
 
     if (argc < 1) {
         show_msgbox("ND Video Player", "Ndless did not provide argv[0].");
@@ -18774,9 +18788,11 @@ int main(int argc, char **argv)
                     sizeof(movie_path),
                     &resume_without_prompt);
 
-            if (picker_result == PLAY_MOVIE_RESULT_HOME_EXIT) {
-                result = PLAY_MOVIE_RESULT_HOME_EXIT;
+            if (picker_result == PLAY_MOVIE_RESULT_HOME_EXIT ||
+                picker_result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) {
+                result = picker_result;
                 return_home_after_exit = true;
+                open_scratchpad_after_exit = picker_result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT;
                 break;
             }
             if (picker_result != 0) {
@@ -18798,8 +18814,10 @@ int main(int argc, char **argv)
             have_queued_movie = true;
             continue;
         }
-        if (result == PLAY_MOVIE_RESULT_HOME_EXIT) {
+        if (result == PLAY_MOVIE_RESULT_HOME_EXIT ||
+            result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) {
             return_home_after_exit = true;
+            open_scratchpad_after_exit = result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT;
             break;
         }
         if (result == PLAY_MOVIE_RESULT_APP_EXIT) {
@@ -18813,7 +18831,11 @@ int main(int argc, char **argv)
     flush_queued_history_save(&g_pending_history_save, "shutdown");
     flush_queued_theme_save("shutdown");
     if (return_home_after_exit) {
-        yes_teacher_im_mathing();
+        if (open_scratchpad_after_exit) {
+            yes_teacher_im_mathing();
+        } else {
+            return_to_os_home_menu();
+        }
     }
     cleanup_deferred_playback_movie();
     clear_movie_picker_cache(&g_picker_cache);
@@ -18824,5 +18846,6 @@ int main(int argc, char **argv)
     monotonic_clock_shutdown();
     return (result == PLAY_MOVIE_RESULT_EXIT ||
         result == PLAY_MOVIE_RESULT_APP_EXIT ||
-        result == PLAY_MOVIE_RESULT_HOME_EXIT) ? 0 : 1;
+        result == PLAY_MOVIE_RESULT_HOME_EXIT ||
+        result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) ? 0 : 1;
 }

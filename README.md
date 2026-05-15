@@ -104,7 +104,7 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 - `Catalog`: open / close the help overlay
 - `Scratchpad`: save state and open OS Scratchpad
 - `Esc`: close help, or leave the movie if help is not open
-- `On`: turn the display black; while black, `Esc` exits the app after saving history
+- `On`: turn the display black; while black, `Esc` saves history and returns to the OS home menu
 
 ### Resume Prompt
 
