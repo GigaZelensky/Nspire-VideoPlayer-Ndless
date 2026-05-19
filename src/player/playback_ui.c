@@ -485,6 +485,11 @@ uint8_t max_u8(uint8_t a, uint8_t b)
     return a > b ? a : b;
 }
 
+static uint8_t mix_product_u8(uint8_t a, uint8_t b)
+{
+    return (uint8_t) (((uint16_t) a * (uint16_t) b + 127U) / 255U);
+}
+
 Uint16 pressed_control_base(Uint16 base, uint8_t press_mix)
 {
     return rgb565_lerp(base, UI_COLOR_BLACK, (uint8_t) ((42U * press_mix) / 255U), 255);
@@ -572,6 +577,52 @@ void draw_pressed_control_reflection(SDL_Surface *screen, const SDL_Rect *rect, 
     fill_rect_rgb565_mix(screen, &line, UI_COLOR_BLACK, (uint8_t) ((24U * press_mix) / 255U));
 }
 
+static int draw_text_badge_visible(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    int right_x,
+    int y,
+    const char *label,
+    uint8_t hover_mix,
+    uint8_t press_mix,
+    uint8_t visible_mix
+)
+{
+    SDL_Rect badge = text_badge_rect(fonts, right_x, y, label);
+    uint8_t visible_hover_mix;
+    uint8_t visible_press_mix;
+    int press_offset_x;
+    int press_offset_y;
+    Uint16 base;
+
+    if (visible_mix == 0) {
+        return badge.x - 6;
+    }
+    visible_hover_mix = mix_product_u8(hover_mix, visible_mix);
+    visible_press_mix = mix_product_u8(press_mix, visible_mix);
+    press_offset_x = pressed_control_offset_x(visible_press_mix);
+    press_offset_y = pressed_control_offset_y(visible_press_mix);
+    base = rgb565_lerp(
+        UI_COLOR_BLACK,
+        animated_control_color(UI_COLOR_GUNMETAL, ui_theme()->row_selected, visible_hover_mix),
+        visible_mix,
+        255
+    );
+
+    draw_soft_glass_panel_mix(
+        screen,
+        &badge,
+        pressed_control_base(base, visible_press_mix),
+        visible_hover_mix
+    );
+    draw_pressed_control_reflection(screen, &badge, visible_press_mix);
+    draw_soft_glass_panel_rim(screen, &badge, base, max_u8(visible_hover_mix, visible_press_mix));
+    if (visible_mix > 48) {
+        draw_ui_label(screen, fonts, badge.x + 6 + press_offset_x, badge.y + 4 + press_offset_y, label);
+    }
+    return badge.x - 6;
+}
+
 int draw_text_badge(
     SDL_Surface *screen,
     const Fonts *fonts,
@@ -582,21 +633,7 @@ int draw_text_badge(
     uint8_t press_mix
 )
 {
-    SDL_Rect badge = text_badge_rect(fonts, right_x, y, label);
-    int press_offset_x = pressed_control_offset_x(press_mix);
-    int press_offset_y = pressed_control_offset_y(press_mix);
-    Uint16 base = animated_control_color(UI_COLOR_GUNMETAL, ui_theme()->row_selected, hover_mix);
-
-    draw_soft_glass_panel_mix(
-        screen,
-        &badge,
-        pressed_control_base(base, press_mix),
-        hover_mix
-    );
-    draw_pressed_control_reflection(screen, &badge, press_mix);
-    draw_soft_glass_panel_rim(screen, &badge, base, max_u8(hover_mix, press_mix));
-    draw_ui_label(screen, fonts, badge.x + 6 + press_offset_x, badge.y + 4 + press_offset_y, label);
-    return badge.x - 6;
+    return draw_text_badge_visible(screen, fonts, right_x, y, label, hover_mix, press_mix, 255);
 }
 
 int draw_left_text_badge(SDL_Surface *screen, const Fonts *fonts, int left_x, int y, const char *label)
@@ -706,8 +743,9 @@ void draw_status_overlay_badge(
 {
     uint8_t mix;
     int offset_x;
+    int offset_y;
 
-    if (!label || label[0] == '\0' || started_ms == 0U || until_ms == 0U || chrome_mix <= 48) {
+    if (!label || label[0] == '\0' || started_ms == 0U || until_ms == 0U || chrome_mix == 0) {
         return;
     }
     if ((int32_t) (now_ms - until_ms) <= 0) {
@@ -721,7 +759,9 @@ void draw_status_overlay_badge(
     } else {
         return;
     }
-    draw_left_text_badge_animated(screen, fonts, left_x, y, label, mix, offset_x);
+    mix = mix_product_u8(mix, chrome_mix);
+    offset_y = -(((255 - chrome_mix) * 4 + 127) / 255);
+    draw_left_text_badge_animated(screen, fonts, left_x, y + offset_y, label, mix, offset_x);
 }
 
 SDL_Rect playback_badge_rect(const SDL_Rect *video_rect);
@@ -1096,8 +1136,8 @@ int draw_status_badges(
     int y_offset = -(((255 - chrome_mix) * 4 + 127) / 255);
 
     status_badge_rects(fonts, video_rect, scale_mode, playback_rate, &scale_badge, &speed_badge);
-    draw_text_badge(screen, fonts, speed_badge.x + speed_badge.w, speed_badge.y + y_offset, playback_rate ? playback_rate->label : "1.0x", speed_mix, speed_press);
-    draw_text_badge(screen, fonts, scale_badge.x + scale_badge.w, scale_badge.y + y_offset, scale_mode_text(scale_mode), scale_mix, scale_press);
+    draw_text_badge_visible(screen, fonts, speed_badge.x + speed_badge.w, speed_badge.y + y_offset, playback_rate ? playback_rate->label : "1.0x", speed_mix, speed_press, chrome_mix);
+    draw_text_badge_visible(screen, fonts, scale_badge.x + scale_badge.w, scale_badge.y + y_offset, scale_mode_text(scale_mode), scale_mix, scale_press, chrome_mix);
     return scale_badge.x - 6;
 }
 
@@ -1205,10 +1245,11 @@ void update_playback_ui_mixes(
         now_ms,
         UI_TITLE_ANIM_MS
     );
-    mixes->help_menu = ui_transition_update(
+    mixes->help_menu = ui_transition_update_press_ex(
         &transitions->help_menu,
         help_menu_open,
         now_ms,
+        UI_MENU_ANIM_MS,
         UI_MENU_ANIM_MS
     );
 }
@@ -1290,7 +1331,8 @@ void draw_memory_badge(
     const Movie *movie,
     const SDL_Rect *video_rect,
     int right_limit,
-    bool playback_badge_visible
+    bool playback_badge_visible,
+    uint8_t chrome_mix
 )
 {
     MemoryStats stats = query_memory_stats(movie);
@@ -1309,8 +1351,9 @@ void draw_memory_badge(
     uint32_t fps_x10 = movie ? movie->diag_display_fps_x10 : 0U;
     int left_x;
     int y;
+    int y_offset;
 
-    if (!stats.valid) {
+    if (!stats.valid || chrome_mix == 0) {
         return;
     }
 
@@ -1355,7 +1398,8 @@ void draw_memory_badge(
     } else {
         left_x = chrome_left_x_for_margin(8);
     }
-    y = top_overlay_y_for_rect(video_rect, 16);
+    y_offset = -(((255 - chrome_mix) * 4 + 127) / 255);
+    y = top_overlay_y_for_rect(video_rect, 16) + y_offset;
 
     if (left_x + nSDL_GetStringWidth(fonts->white, label_full) + 10 <= right_limit) {
         label = label_full;
@@ -1366,7 +1410,7 @@ void draw_memory_badge(
     }
 
     if (label) {
-        draw_left_text_badge(screen, fonts, left_x, y, label);
+        draw_left_text_badge_animated(screen, fonts, left_x, y, label, chrome_mix, 0);
     }
     if (left_x + nSDL_GetStringWidth(fonts->white, perf_full) + 10 <= right_limit) {
         perf_label = perf_full;
@@ -1377,7 +1421,7 @@ void draw_memory_badge(
     }
 
     if (perf_label) {
-        draw_left_text_badge(screen, fonts, left_x, y + 18, perf_label);
+        draw_left_text_badge_animated(screen, fonts, left_x, y + 18, perf_label, chrome_mix, 0);
     }
 }
 
@@ -1399,15 +1443,12 @@ void draw_help_row(
     draw_ui_label(screen, fonts, description_x, y, description);
 }
 
-void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu_mix)
+static void draw_help_menu_contents(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *menu_border, uint8_t style_mix)
 {
-    const int menu_w = 296;
-    const int safe_h = SCREEN_H - UI_BAR_H;
-    const int menu_h = safe_h;
-    SDL_Rect border = {(SCREEN_W - menu_w) / 2, 0, menu_w, menu_h};
-    SDL_Rect panel = {border.x + 1, border.y + 1, border.w - 2, border.h - 2};
-    SDL_Rect header = {panel.x, panel.y, panel.w, 24};
-    SDL_Rect accent = {panel.x, panel.y + header.h, panel.w, 2};
+    SDL_Rect border;
+    SDL_Rect panel;
+    SDL_Rect header;
+    SDL_Rect accent;
     const char *title_text = "Playback Controls";
     const struct {
         const char *shortcut;
@@ -1444,28 +1485,41 @@ void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu_mix)
     size_t row_count = sizeof(rows) / sizeof(rows[0]);
     size_t index;
 
-    if (menu_mix == 0) {
+    if (!screen || !fonts || !menu_border || style_mix == 0) {
         return;
     }
-    draw_overlay_backdrop_dim(screen, menu_mix);
+    border = *menu_border;
+    panel.x = (Sint16) (border.x + 1);
+    panel.y = (Sint16) (border.y + 1);
+    panel.w = (Uint16) (border.w - 2);
+    panel.h = (Uint16) (border.h - 2);
+    header.x = panel.x;
+    header.y = panel.y;
+    header.w = panel.w;
+    header.h = 24;
+    accent.x = panel.x;
+    accent.y = (Sint16) (panel.y + header.h);
+    accent.w = panel.w;
+    accent.h = 2;
+
     fill_soft_panel_backplate(screen, &border, ui_theme()->menu_border);
     draw_soft_glass_panel_mix(
         screen,
         &panel,
-        rgb565_lerp(UI_COLOR_BLACK, ui_theme()->menu_panel, menu_mix, 255),
+        rgb565_lerp(UI_COLOR_BLACK, ui_theme()->menu_panel, style_mix, 255),
         0
     );
     draw_soft_glass_panel_mix(
         screen,
         &header,
-        rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, menu_mix, 255),
+        rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, style_mix, 255),
         0
     );
     draw_vertical_gradient(
         screen,
         &accent,
-        rgb565_lerp(ui_theme()->menu_panel, UI_COLOR_ACCENT, menu_mix, 255),
-        rgb565_lerp(ui_theme()->menu_panel, UI_COLOR_ACCENT_DEEP, menu_mix, 255)
+        rgb565_lerp(ui_theme()->menu_panel, UI_COLOR_ACCENT, style_mix, 255),
+        rgb565_lerp(ui_theme()->menu_panel, UI_COLOR_ACCENT_DEEP, style_mix, 255)
     );
 
     draw_ui_label(screen, fonts, panel.x + 10, panel.y + 6, title_text);
@@ -1498,6 +1552,164 @@ void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu_mix)
             y += (row_span * (int) index + row_intervals / 2) / row_intervals;
         }
         draw_help_row(screen, fonts, shortcut_x, max_shortcut_w, description_x, y, rows[index].shortcut, rows[index].description);
+    }
+}
+
+static SDL_Surface *cached_help_menu_surface(const Fonts *fonts, int menu_w, int menu_h)
+{
+    static SDL_Surface *menu_surface = NULL;
+    static UiThemeId menu_theme = UI_THEME_COUNT;
+
+    if (!fonts || menu_w <= 0 || menu_h <= 0) {
+        return NULL;
+    }
+    if (menu_surface && menu_theme == g_ui_theme_id &&
+        menu_surface->w == menu_w && menu_surface->h == menu_h) {
+        return menu_surface;
+    }
+    if (menu_surface) {
+        SDL_FreeSurface(menu_surface);
+        menu_surface = NULL;
+    }
+
+    menu_surface = create_rgb565_surface(menu_w, menu_h);
+    if (menu_surface) {
+        SDL_Rect local_border = {0, 0, (Uint16) menu_w, (Uint16) menu_h};
+
+        SDL_FillRect(menu_surface, NULL, map_rgb565(menu_surface, UI_CURSOR_KEY));
+        SDL_SetColorKey(menu_surface, SDL_SRCCOLORKEY, map_rgb565(menu_surface, UI_CURSOR_KEY));
+        draw_help_menu_contents(menu_surface, fonts, &local_border, 255);
+        menu_theme = g_ui_theme_id;
+    }
+    return menu_surface;
+}
+
+static inline Uint16 blend_rgb565_fast_alpha(Uint16 base, Uint16 overlay, uint8_t alpha)
+{
+    int br = (base >> 11) & 0x1F;
+    int bg = (base >> 5) & 0x3F;
+    int bb = base & 0x1F;
+    int or = (overlay >> 11) & 0x1F;
+    int og = (overlay >> 5) & 0x3F;
+    int ob = overlay & 0x1F;
+
+    br += (((or - br) * (int) alpha + 128) >> 8);
+    bg += (((og - bg) * (int) alpha + 128) >> 8);
+    bb += (((ob - bb) * (int) alpha + 128) >> 8);
+    return (Uint16) ((br << 11) | (bg << 5) | bb);
+}
+
+static void blit_help_menu_surface_faded(SDL_Surface *screen, SDL_Surface *surface, const SDL_Rect *dst_rect, uint8_t mix)
+{
+    int dst_x0;
+    int dst_y0;
+    int dst_x1;
+    int dst_y1;
+    int src_x0;
+    int src_y0;
+    int y;
+    Uint16 color_key = UI_CURSOR_KEY;
+    bool screen_locked = false;
+    bool surface_locked = false;
+
+    if (!screen || !surface || !dst_rect || mix == 0) {
+        return;
+    }
+    if (mix >= 255) {
+        SDL_BlitSurface(surface, NULL, screen, (SDL_Rect *) dst_rect);
+        return;
+    }
+    if (!surface_is_rgb565(screen) || !surface_is_rgb565(surface)) {
+        SDL_BlitSurface(surface, NULL, screen, (SDL_Rect *) dst_rect);
+        return;
+    }
+    if ((surface->flags & SDL_SRCCOLORKEY) != 0) {
+        color_key = (Uint16) surface->format->colorkey;
+    }
+
+    dst_x0 = clamp_int(dst_rect->x, 0, screen->w);
+    dst_y0 = clamp_int(dst_rect->y, 0, screen->h);
+    dst_x1 = clamp_int(dst_rect->x + surface->w, 0, screen->w);
+    dst_y1 = clamp_int(dst_rect->y + surface->h, 0, screen->h);
+    if (dst_x0 >= dst_x1 || dst_y0 >= dst_y1) {
+        return;
+    }
+    src_x0 = dst_x0 - dst_rect->x;
+    src_y0 = dst_y0 - dst_rect->y;
+
+    if (SDL_MUSTLOCK(screen)) {
+        if (SDL_LockSurface(screen) != 0) {
+            return;
+        }
+        screen_locked = true;
+    }
+    if (SDL_MUSTLOCK(surface)) {
+        if (SDL_LockSurface(surface) != 0) {
+            if (screen_locked) {
+                SDL_UnlockSurface(screen);
+            }
+            return;
+        }
+        surface_locked = true;
+    }
+
+    {
+        Uint16 *dst_pixels = (Uint16 *) screen->pixels;
+        Uint16 *src_pixels = (Uint16 *) surface->pixels;
+        int dst_pitch = screen->pitch / 2;
+        int src_pitch = surface->pitch / 2;
+
+        for (y = dst_y0; y < dst_y1; ++y) {
+            int local_y = src_y0 + (y - dst_y0);
+            Uint16 *dst_row = dst_pixels + (y * dst_pitch) + dst_x0;
+            Uint16 *src_row = src_pixels + (local_y * src_pitch) + src_x0;
+            int x;
+
+            for (x = dst_x0; x < dst_x1; ++x) {
+                Uint16 src = *src_row;
+
+                if (src != color_key) {
+                    *dst_row = blend_rgb565_fast_alpha(*dst_row, src, mix);
+                }
+                ++dst_row;
+                ++src_row;
+            }
+        }
+    }
+
+    if (surface_locked) {
+        SDL_UnlockSurface(surface);
+    }
+    if (screen_locked) {
+        SDL_UnlockSurface(screen);
+    }
+}
+
+void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu_mix)
+{
+    const int menu_w = 296;
+    const int safe_h = SCREEN_H - UI_BAR_H;
+    const int menu_h = safe_h;
+    int offset_y;
+    SDL_Rect border;
+    SDL_Surface *menu_surface;
+
+    if (!screen || !fonts || menu_mix == 0) {
+        return;
+    }
+
+    offset_y = ((255 - menu_mix) * UI_BAR_H + 127) / 255;
+    border.x = (Sint16) ((SCREEN_W - menu_w) / 2);
+    border.y = (Sint16) offset_y;
+    border.w = (Uint16) menu_w;
+    border.h = (Uint16) menu_h;
+
+    draw_overlay_backdrop_dim(screen, menu_mix);
+    menu_surface = cached_help_menu_surface(fonts, menu_w, menu_h);
+    if (menu_surface) {
+        blit_help_menu_surface_faded(screen, menu_surface, &border, menu_mix);
+    } else {
+        draw_help_menu_contents(screen, fonts, &border, menu_mix);
     }
 }
 
@@ -2051,16 +2263,18 @@ void render_movie(
     uint32_t current_ms = movie_frame_time_ms(movie, movie->current_frame);
     uint8_t chrome_mix = ui_mixes ? ui_mixes->chrome : (show_ui ? 255 : 0);
     uint8_t help_menu_mix = ui_mixes ? ui_mixes->help_menu : (help_menu_open ? 255 : 0);
+    uint8_t top_chrome_mix = help_menu_mix > 0 ? mix_product_u8(chrome_mix, (uint8_t) (255U - help_menu_mix)) : chrome_mix;
     bool help_menu_visible = help_menu_mix > 0 || help_menu_open;
     bool chrome_visible = chrome_mix > 0 || show_ui;
+    bool top_chrome_visible = top_chrome_mix > 0 && chrome_visible;
     const SubtitleCue *subtitle_cue = active_subtitle_cue(movie, current_ms);
     const char *subtitle = subtitle_cue ? subtitle_cue->text : NULL;
     SubtitlePlacement effective_subtitle_placement = subtitle_normalize_placement(
         subtitle_placement,
         selected_subtitle_track_supports_auto_positioning(movie)
     );
-    bool playback_badge_visible = chrome_visible && !help_menu_visible;
-    bool memory_badge_visible = !help_menu_visible && (memory_overlay_mode == MEMORY_OVERLAY_ALWAYS);
+    bool playback_badge_visible = top_chrome_visible;
+    bool memory_badge_visible = top_chrome_visible && (memory_overlay_mode == MEMORY_OVERLAY_ALWAYS);
 
     scale_morph_current_rects(movie, scale_morph, scale_mode, video_align_x, video_align_y, now_ms, &src, &dst);
     draw_movie_frame_background_rects(screen, movie, &src, &dst);
@@ -2107,8 +2321,8 @@ void render_movie(
         }
     }
     if (chrome_visible) {
-        if (!help_menu_visible) {
-            memory_right_limit = draw_status_badges(screen, fonts, &dst, scale_mode, playback_rate, ui_mixes, chrome_mix);
+        if (top_chrome_visible) {
+            memory_right_limit = draw_status_badges(screen, fonts, &dst, scale_mode, playback_rate, ui_mixes, top_chrome_mix);
             if (playback_badge_visible) {
                 draw_playback_badge(
                     screen,
@@ -2116,7 +2330,7 @@ void render_movie(
                     paused,
                     ui_mixes ? ui_mixes->playback_badge : 0,
                     ui_mixes ? ui_mixes->playback_press : 0,
-                    chrome_mix
+                    top_chrome_mix
                 );
             }
             if (ui_mixes && ui_mixes->title_strip > 0) {
@@ -2128,7 +2342,7 @@ void render_movie(
                     playback_rate,
                     movie_title_text,
                     movie_detail_text,
-                    ui_mixes->title_strip
+                    mix_product_u8(ui_mixes->title_strip, top_chrome_mix)
                 );
             }
             {
@@ -2146,7 +2360,7 @@ void render_movie(
                     status_overlay_started_ms,
                     status_overlay_until_ms,
                     now_ms,
-                    chrome_mix
+                    top_chrome_mix
                 );
             }
         }
@@ -2171,7 +2385,7 @@ void render_movie(
         }
     }
     if (memory_badge_visible) {
-        draw_memory_badge(screen, fonts, movie, &dst, memory_right_limit, playback_badge_visible);
+        draw_memory_badge(screen, fonts, movie, &dst, memory_right_limit, playback_badge_visible, top_chrome_mix);
     }
     if (help_menu_visible) {
         draw_help_menu(screen, fonts, help_menu_mix);

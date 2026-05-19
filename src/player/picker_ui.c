@@ -13,9 +13,9 @@ SDL_Rect picker_row_divider_rect(const SDL_Rect *row)
     SDL_Rect divider = {chrome_centered_x_for_width(width), 0, width, 1};
 
     if (row) {
-        divider.x = (Sint16) (row->x + 4);
+        divider.x = (Sint16) (row->x + 1);
         divider.y = (Sint16) (row->y + row->h - 1);
-        divider.w = (Uint16) (row->w - 8);
+        divider.w = (Uint16) (row->w - 2);
     }
     return divider;
 }
@@ -1318,7 +1318,12 @@ void render_picker(
             fill_rect_rgb565(
                 screen,
                 &divider,
-                rgb565_lerp(picker_background_color_at_y_mix(divider.y, background_mix), ui_theme()->row_divider, row_intro_mix, 255)
+                rgb565_lerp(
+                    picker_background_color_at_y_mix(divider.y, background_mix),
+                    blend_rgb565(ui_theme()->row_divider, UI_COLOR_WARM_WHITE, 88),
+                    row_intro_mix,
+                    255
+                )
             );
         }
         if (row_intro_mix > 42) {
