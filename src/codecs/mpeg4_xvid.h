@@ -16,7 +16,8 @@ bool mpeg4_xvid_decode_frame(
     uint16_t *rgb565,
     int width,
     int height,
-    bool output
+    bool output,
+    bool discontinuity
 );
 const char *mpeg4_xvid_last_error(void);
 

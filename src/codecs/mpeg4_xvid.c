@@ -138,6 +138,7 @@ static bool mpeg4_xvid_decode_iteration(
     int width,
     int height,
     bool output,
+    bool discontinuity,
     int *out_consumed,
     int *out_type
 )
@@ -155,7 +156,7 @@ static bool mpeg4_xvid_decode_iteration(
     memset(&stats, 0, sizeof(stats));
     frame.version = XVID_VERSION;
     stats.version = XVID_VERSION;
-    frame.general = XVID_LOWDELAY | XVID_DEC_FAST;
+    frame.general = XVID_LOWDELAY | XVID_DEC_FAST | (discontinuity ? XVID_DISCONTINUITY : 0);
     frame.bitstream = (void *) data;
     frame.length = data_size > (size_t) INT32_MAX ? INT32_MAX : (int) data_size;
     if (output) {
@@ -211,7 +212,8 @@ bool mpeg4_xvid_decode_frame(
     uint16_t *rgb565,
     int width,
     int height,
-    bool output
+    bool output,
+    bool discontinuity
 )
 {
     size_t offset = 0;
@@ -229,6 +231,7 @@ bool mpeg4_xvid_decode_frame(
                 width,
                 height,
                 output,
+                discontinuity && offset == 0,
                 &consumed,
                 &type)) {
             return false;

@@ -286,7 +286,15 @@ bool reset_mpeg4_decoder(Movie *movie)
         return false;
     }
     movie->mpeg4.chunk_dirty = false;
+    movie->mpeg4.discontinuity = false;
     return true;
+}
+
+static void clear_movie_codec_chunk_progress(Movie *movie)
+{
+    movie->decoded_local_frame = -1;
+    movie->h264.chunk_dirty = false;
+    movie->mpeg4.chunk_dirty = false;
 }
 
 static bool reset_movie_codec_for_chunk(Movie *movie)
@@ -298,9 +306,25 @@ static bool reset_movie_codec_for_chunk(Movie *movie)
     if (!movie->codec_ops->reset(movie)) {
         return false;
     }
-    movie->h264.chunk_dirty = false;
-    movie->mpeg4.chunk_dirty = false;
+    clear_movie_codec_chunk_progress(movie);
     return true;
+}
+
+static bool prepare_movie_codec_for_loaded_chunk(Movie *movie, int previous_chunk, int chunk_index)
+{
+    if (!movie) {
+        debug_failf("codec chunk prepare failed: movie missing");
+        return false;
+    }
+    if (movie->codec == MOVIE_CODEC_MPEG4 &&
+        movie->mpeg4.decoder &&
+        previous_chunk >= 0 &&
+        chunk_index == previous_chunk + 1) {
+        clear_movie_codec_chunk_progress(movie);
+        movie->mpeg4.discontinuity = true;
+        return true;
+    }
+    return reset_movie_codec_for_chunk(movie);
 }
 
 static inline uint32_t h264_pack_rgb565_pair(uint16_t left_pixel, uint16_t right_pixel)
@@ -1163,6 +1187,7 @@ bool prefetch_finish_chunk(Movie *movie, PrefetchedChunk *chunk)
 bool load_chunk_from_file(Movie *movie, int chunk_index, bool allow_prefetch_retry)
 {
     const ChunkIndexEntry *entry = movie->chunk_index + chunk_index;
+    int previous_chunk = movie->loaded_chunk;
 
 retry:
     release_movie_chunk_storage(movie);
@@ -1218,8 +1243,7 @@ retry:
         return false;
     }
     movie->loaded_chunk = chunk_index;
-    movie->decoded_local_frame = -1;
-    if (!reset_movie_codec_for_chunk(movie)) {
+    if (!prepare_movie_codec_for_loaded_chunk(movie, previous_chunk, chunk_index)) {
         return false;
     }
     if (debug_should_collect_metrics()) {
@@ -1239,6 +1263,7 @@ bool load_chunk(Movie *movie, int chunk_index)
 {
     const ChunkIndexEntry *entry;
     PrefetchedChunk *prefetched;
+    int previous_chunk;
     if (chunk_index < 0 || (uint32_t) chunk_index >= movie->header.chunk_count) {
         return false;
     }
@@ -1247,6 +1272,7 @@ bool load_chunk(Movie *movie, int chunk_index)
     }
 
     entry = movie->chunk_index + chunk_index;
+    previous_chunk = movie->loaded_chunk;
     prefetched = find_prefetched_chunk(movie, chunk_index);
     if (prefetched) {
         if (prefetched->state != PREFETCH_READY) {
@@ -1278,8 +1304,7 @@ bool load_chunk(Movie *movie, int chunk_index)
             return load_chunk_from_file(movie, chunk_index, false);
         }
         movie->loaded_chunk = chunk_index;
-        movie->decoded_local_frame = -1;
-        if (!reset_movie_codec_for_chunk(movie)) {
+        if (!prepare_movie_codec_for_loaded_chunk(movie, previous_chunk, chunk_index)) {
             return false;
         }
         if (debug_should_collect_metrics()) {
@@ -2310,6 +2335,7 @@ bool decode_mpeg4_frame(
         uint32_t decoded_frame_index = entry->first_frame + replay_index;
         bool is_target_frame = decoded_frame_index == frame_index;
         bool should_blit = blit_output && is_target_frame;
+        bool discontinuity = movie->mpeg4.discontinuity && replay_index == 0;
 
         if (end <= start || end > movie->chunk_size) {
             debug_failf(
@@ -2331,7 +2357,8 @@ bool decode_mpeg4_frame(
                 movie->framebuffer,
                 (int) movie->header.video_width,
                 (int) movie->header.video_height,
-                should_blit)) {
+                should_blit,
+                discontinuity)) {
             debug_failf(
                 "mpeg4 frame decode fail frame=%lu chunk=%d local=%lu: %s",
                 (unsigned long) decoded_frame_index,
@@ -2341,6 +2368,7 @@ bool decode_mpeg4_frame(
             );
             return false;
         }
+        movie->mpeg4.discontinuity = false;
         movie->decoded_local_frame = (int) replay_index;
     }
 
@@ -2360,6 +2388,7 @@ void invalidate_loaded_chunk_state(Movie *movie)
     movie->decoded_local_frame = -1;
     movie->h264.chunk_dirty = false;
     movie->mpeg4.chunk_dirty = false;
+    movie->mpeg4.discontinuity = false;
 }
 
 bool recover_failed_h264_playback_state(Movie *movie)

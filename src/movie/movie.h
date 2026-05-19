@@ -67,6 +67,7 @@ typedef struct {
 typedef struct {
     void *decoder;
     bool chunk_dirty;
+    bool discontinuity;
 } Mpeg4DecoderContext;
 
 typedef struct Movie {
