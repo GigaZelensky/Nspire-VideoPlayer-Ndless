@@ -24,8 +24,8 @@ The `.nvp` format used by the current player is:
 - H.264 Annex B video bitstream in legacy version 9/10 containers
 - H.264 or MPEG-4 Part 2 video in version 11 codec-tagged containers
 - chunked container with per-chunk frame tables
-- raw stored chunk payloads (no zlib layer)
 - optional text subtitle tracks stored in the container
+- raw stored chunk payloads
 
 ## Features
 
