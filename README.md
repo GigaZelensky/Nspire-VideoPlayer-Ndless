@@ -33,7 +33,7 @@ The `.nvp` format used by the current player is:
 - CX and CX II LCD paths through Ndless' native framebuffer modes
 - streamed playback from calculator storage
 - H.264 decode through `h264bsd`
-- MPEG-4 Part 2 decode through vendored Xvid sources from `giraf-fe/nvid2`
+- MPEG-4 Part 2 decode through vendored Xvid sources
 - RGB565 output
 - chunk-byte prefetching for smoother playback
 - accurate frame pacing from a hardware-backed monotonic timer

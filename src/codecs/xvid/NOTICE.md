@@ -1,7 +1,6 @@
 # Xvid MPEG-4 Part 2 Decoder
 
-The sources in this directory are vendored from `giraf-fe/nvid2` commit
-`1358252e8a3adf5317f93a0ab97cd29792c737e1`, path `src/xvid`.
+The sources in this directory are vendored Xvid decoder sources.
 
 They are derived from the Xvid MPEG-4 video codec project. Preserve the
 upstream copyright and license notices in each file and in `LICENSE` when
