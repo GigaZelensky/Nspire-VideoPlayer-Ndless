@@ -1,13 +1,5 @@
 #include "player_internal.h"
 
-            return true;
-        }
-        return false;
-    }
-    movie->current_frame = frame_index;
-    return true;
-}
-
 bool load_subtitles(
     Movie *movie,
     FILE *file,

@@ -17,7 +17,7 @@ export PATH := $(abspath $(SDKROOT)/bin):$(PATH)
 GCC = nspire-gcc
 AS  = nspire-as
 GXX = nspire-g++
-LD  = nspire-ld
+LD  = nspire-gcc -nodefaultlibs
 
 GCCFLAGS_BASE = -Wall -Wextra -Wno-unused-parameter -Wno-incompatible-pointer-types -std=c99 -marm -mcpu=arm926ej-s -mtune=arm926ej-s -mfloat-abi=soft -ffunction-sections -fdata-sections -Isrc -Isrc/codecs/h264bsd -Isrc/codecs -Isrc/codecs/xvid -DARCH_IS_32BIT -DARCH_IS_ARM -DXVID_DECODER_ONLY
 LDFLAGS = -Wl,--gc-sections -lSDL -flto -O3
@@ -49,6 +49,7 @@ XVID_DECODER_SRCS = \
 	src/codecs/xvid/image/postprocessing.c \
 	src/codecs/xvid/image/qpel.c \
 	src/codecs/xvid/image/reduced.c \
+	src/codecs/xvid/motion/estimation_common.c \
 	src/codecs/xvid/motion/gmc.c \
 	src/codecs/xvid/motion/motion_comp.c \
 	src/codecs/xvid/motion/sad.c \
@@ -63,10 +64,10 @@ XVID_DECODER_SRCS = \
 	src/codecs/xvid/utils/sram_tables.c \
 	src/codecs/xvid/utils/timer.c
 
-OBJS = $(patsubst %.c, %.o, $(shell find src -name \*.c -not -path 'src/codecs/xvid/*'))
+OBJS = $(patsubst %.c, %.o, $(shell find src -name "*.c" -not -path "src/codecs/xvid/*"))
 OBJS += $(patsubst %.c, %.o, $(XVID_DECODER_SRCS))
-OBJS += $(patsubst %.cpp, %.o, $(shell find src -name \*.cpp))
-OBJS += $(patsubst %.S, %.o, $(shell find src -name \*.S))
+OBJS += $(patsubst %.cpp, %.o, $(shell find src -name "*.cpp"))
+OBJS += $(patsubst %.S, %.o, $(shell find src -name "*.S"))
 EXE = ndvideo
 DISTDIR = dist
 LEGACY_OBJS = src/player.o

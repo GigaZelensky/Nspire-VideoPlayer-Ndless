@@ -676,6 +676,16 @@ static inline void h264_compute_chroma_terms(uint8_t u_sample, uint8_t v_sample,
 #endif
 
 /* Cross-module declarations for the player translation units. */
+/* movie_open_scan.c */
+void return_to_os_home_menu(void);
+void yes_teacher_im_mathing(void);
+bool key_pressed_edge(t_key key, bool *previous_state);
+bool on_key_pressed_edge(bool *previous_state);
+bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progress);
+void ensure_movie_picker_cache(MoviePickerCache *cache, const char *directory);
+bool find_next_movie_path(const char *current_path, char *next_path, size_t next_path_size);
+const SubtitleCue *active_subtitle_cue(const Movie *movie, uint32_t now_ms);
+
 /* codec_streaming.c */
 const PrefetchedChunk *find_prefetched_chunk_const(const Movie *movie, int chunk_index);
 uint32_t h264_frame_size_from_offsets(const uint32_t *frame_offsets, uint32_t frame_count, size_t chunk_size, uint32_t local_index);
@@ -711,6 +721,9 @@ bool seek_bar_preview_decode_active(const SeekBarPreviewState *preview);
 bool begin_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, int chunk_index, uint32_t target_frame);
 bool read_seek_bar_preview_chunk_step(Movie *movie, SeekPreviewDecodeJob *job, uint32_t deadline_ms);
 bool publish_seek_bar_preview_picture(Movie *movie, SeekBarPreviewState *preview, uint32_t frame_index, const uint8_t *picture);
+uint32_t h264_incremental_total_mbs(const Movie *movie, const storage_t *decoder);
+void update_h264_incremental_rate(uint16_t *avg_mbs_per_ms_q8, uint32_t elapsed_ms, uint32_t decoded_mbs);
+uint32_t h264_incremental_budget( const Movie *movie, const storage_t *decoder, uint16_t avg_mbs_per_ms_q8, uint32_t spare_ms );
 uint32_t seek_bar_preview_macroblock_budget( const Movie *movie, const storage_t *decoder, uint16_t avg_mbs_per_ms_q8, uint32_t spare_ms );
 void step_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, uint32_t deadline_ms);
 bool finish_seek_bar_preview_pending_frame(Movie *movie, SeekBarPreviewState *preview);

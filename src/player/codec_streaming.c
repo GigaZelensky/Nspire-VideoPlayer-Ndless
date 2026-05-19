@@ -2490,3 +2490,10 @@ bool decode_to_frame_with_progress(
         if (recover_failed_h264_playback_state(movie) &&
             decode_h264_frame_with_progress(movie, frame_index, true, predicate, hook, userdata)) {
             movie->current_frame = frame_index;
+            return true;
+        }
+        return false;
+    }
+    movie->current_frame = frame_index;
+    return true;
+}
