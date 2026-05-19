@@ -1,6 +1,6 @@
 # Nspire-VideoPlayer-Ndless
 
-Native Ndless video player and PC-side H.264 encoder for the TI-Nspire CX and CX II line.
+Native Ndless video player and PC-side encoder for the TI-Nspire CX and CX II line.
 
 This project targets the **TI-Nspire CX**, **TI-Nspire CX II**, and **TI-Nspire CX II-T**, and plays streamed `.nvp` movies from calculator storage. The player binary and the movie data stay separate:
 
@@ -21,7 +21,8 @@ This project targets the **TI-Nspire CX**, **TI-Nspire CX II**, and **TI-Nspire 
 
 The `.nvp` format used by the current player is:
 
-- H.264 Annex B video bitstream
+- H.264 Annex B video bitstream in legacy version 9/10 containers
+- H.264 or MPEG-4 Part 2 video in version 11 codec-tagged containers
 - chunked container with per-chunk frame tables
 - raw stored chunk payloads (no zlib layer)
 - optional text subtitle tracks stored in the container
@@ -32,6 +33,7 @@ The `.nvp` format used by the current player is:
 - CX and CX II LCD paths through Ndless' native framebuffer modes
 - streamed playback from calculator storage
 - H.264 decode through `h264bsd`
+- MPEG-4 Part 2 decode through vendored Xvid sources from `giraf-fe/nvid2`
 - RGB565 output
 - chunk-byte prefetching for smoother playback
 - accurate frame pacing from a hardware-backed monotonic timer
@@ -129,14 +131,16 @@ The built-in subtitle font cycle currently includes:
 
 ## Repository Layout
 
-- [src/player.c](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/src/player.c): native player
-- [src/h264bsd](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/src/h264bsd): H.264 decoder sources
-- [src/initfini.c](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/src/initfini.c): startup / shutdown glue
-- [tools/encode_ndless_video.py](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/tools/encode_ndless_video.py): PC-side encoder
-- [tools/pack_zehn.py](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/tools/pack_zehn.py): Zehn packer used by the build
-- [examples/screenshots](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/examples/screenshots): README screenshot assets
-- [examples](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/examples): packaged sample files for quick calculator-side testing
-- [Makefile](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/Makefile): build entry point
+- [src/player](src/player): native player shell and playback/UI implementation
+- [src/movie](src/movie): `.nvp` container format definitions
+- [src/codecs](src/codecs): codec adapters and vendored MPEG-4/Xvid decoder sources
+- [src/codecs/h264bsd](src/codecs/h264bsd): H.264 decoder sources
+- [src/initfini.c](src/initfini.c): startup / shutdown glue
+- [tools/encode_ndless_video.py](tools/encode_ndless_video.py): PC-side encoder
+- [tools/pack_zehn.py](tools/pack_zehn.py): Zehn packer used by the build
+- [examples/screenshots](examples/screenshots): README screenshot assets
+- [examples](examples): packaged sample files for quick calculator-side testing
+- [Makefile](Makefile): build entry point
 
 ## Build
 
@@ -159,7 +163,7 @@ make
 
 ### Build Output
 
-The build writes to [dist](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/dist):
+The build writes to [dist](dist):
 
 - `ndvideo.tns`
 - `ndvideo.elf`
@@ -167,7 +171,7 @@ The build writes to [dist](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoP
 
 ## Encoder
 
-The encoder turns a normal video file into a streamed H.264 `.nvp.tns` movie.
+The encoder turns a normal video file into a streamed `.nvp.tns` movie. H.264 is still the default and writes legacy version 10 containers for compatibility. MPEG-4 Part 2 can be selected with `--codec mpeg4` and writes version 11 codec-tagged containers.
 
 ### Python Requirements
 
@@ -179,6 +183,12 @@ pip install imageio-ffmpeg numpy pillow
 
 ```powershell
 python .\tools\encode_ndless_video.py "C:\path\to\video.mp4" --output ".\dist\video.nvp.tns"
+```
+
+### MPEG-4 Part 2 Example
+
+```powershell
+python .\tools\encode_ndless_video.py "C:\path\to\video.mp4" --codec mpeg4 --output ".\dist\video-mpeg4.nvp.tns"
 ```
 
 ### Embedded Subtitles
@@ -278,7 +288,7 @@ The `M` overlay shows:
 
 Verbose debug logging is off by default. Press `D` during playback to enable it; normal playback exits do not write `ndvideo-debug.log` unless logging was enabled or the player hits an error.
 
-The [examples](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/examples) folder also includes a short packaged sample movie and a matching `ndvideo.tns` for quick on-device smoke testing.
+The [examples](examples) folder also includes a short packaged sample movie and a matching `ndvideo.tns` for quick on-device smoke testing.
 
 ## Install On Calculator
 
@@ -290,4 +300,4 @@ The [examples](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless
 
 ## License
 
-Unless noted otherwise, the software in this repository is licensed under the GNU General Public License, version 3. See [LICENSE](/C:/Users/GigaZelensky/Documents/GitHub/Nspire-VideoPlayer-Ndless/LICENSE).
+Unless noted otherwise, the software in this repository is licensed under the GNU General Public License, version 3. See [LICENSE](LICENSE).

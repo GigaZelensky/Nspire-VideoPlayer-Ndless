@@ -56,7 +56,7 @@
 
 #include <string.h>
 
-#include "../sram.h"
+#include "sram.h"
 
 #ifdef H264DEC_OMXDL
 #include "omxtypes.h"
