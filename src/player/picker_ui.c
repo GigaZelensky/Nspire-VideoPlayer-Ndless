@@ -20,12 +20,6 @@ SDL_Rect picker_row_divider_rect(const SDL_Rect *row)
     return divider;
 }
 
-typedef struct {
-    size_t from_start;
-    size_t to_start;
-    uint32_t started_ms;
-} PickerScrollAnim;
-
 size_t picker_scroll_start_centered(size_t count, size_t selected)
 {
     if (count == 0) {

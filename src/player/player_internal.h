@@ -354,6 +354,12 @@ typedef struct {
 } PickerTooltipHoverState;
 
 typedef struct {
+    size_t from_start;
+    size_t to_start;
+    uint32_t started_ms;
+} PickerScrollAnim;
+
+typedef struct {
     bool initialized;
     bool target_active;
     uint8_t start_mix;
