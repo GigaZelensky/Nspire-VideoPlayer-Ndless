@@ -29,11 +29,16 @@ except ImportError:
 
 MAGIC = b"NVP1"
 VERSION = 10
+CODEC_TAGGED_VERSION = 11
+CODEC_FLAG_H264 = 0
+CODEC_FLAG_MPEG4 = 1
+CODEC_NAMES = ("h264", "mpeg4")
 SCREEN_W = 320
 SCREEN_H = 240
 HEADER_STRUCT = struct.Struct("<4sHHHHHHHHHHHHIIIII")
 CHUNK_INDEX_STRUCT = struct.Struct("<IIIIII")
 START_CODE_RE = re.compile(rb"\x00\x00(?:\x00)?\x01")
+MPEG4_START_CODE_RE = re.compile(rb"\x00\x00\x01(.)", re.DOTALL)
 SUBTITLE_LINE_BREAK_RE = re.compile(r"(?i)<br\s*/?>|\\N|\\n")
 SUBTITLE_TAG_RE = re.compile(r"(?s)<[^>]+>")
 SUBTITLE_ASS_OVERRIDE_RE = re.compile(r"\{\\[^}]*\}")
@@ -115,6 +120,10 @@ NAL_AUD = 9
 VCL_NAL_TYPES = {1, NAL_IDR}
 CHUNK_BOUNDARY_NAL_TYPES = {NAL_SPS, NAL_PPS, NAL_IDR}
 STREAM_PROFILES = ("fast", "balanced", "quality", "intra")
+MPEG4_VOP_START_CODE = 0xB6
+MPEG4_VOL_START_CODE_MIN = 0x20
+MPEG4_VOL_START_CODE_MAX = 0x2F
+MPEG4_DEFAULT_BITRATE_KBPS = 500
 DEFAULT_MAX_CHUNK_KIB = 256
 DEFAULT_MAX_IDR_FRAMES = 24
 DEFAULT_MAX_CHUNK_OVERSHOOT_PERCENT = 8.0
@@ -194,6 +203,7 @@ class BurnSubtitleSource:
 
 @dataclass(slots=True)
 class EncodeStats:
+    codec: str
     input_path: str
     output_path: str
     width: int
@@ -211,6 +221,7 @@ class EncodeStats:
     timeline_drift_ms: float
     chunk_count: int
     idr_chunks: int
+    raw_video_bytes: int
     raw_h264_bytes: int
     bytes_written: int
     average_bytes_per_frame: float
@@ -258,6 +269,17 @@ class AccessUnit:
 
     def bytes(self) -> bytes:
         return b"".join(unit.data for unit in self.nal_units)
+
+
+@dataclass(slots=True)
+class Mpeg4Frame:
+    data: bytes
+    vop_type: int
+    has_vol: bool
+
+    @property
+    def is_i_vop(self) -> bool:
+        return self.vop_type == 0
 
 
 @dataclass(slots=True)
@@ -2340,6 +2362,8 @@ def probe_video(input_path: Path) -> VideoProbe:
 def write_header(
     handle,
     *,
+    version: int = VERSION,
+    flags: int = 0,
     max_width: int,
     max_height: int,
     video_x: int,
@@ -2358,8 +2382,8 @@ def write_header(
     handle.write(
         HEADER_STRUCT.pack(
             MAGIC,
-            VERSION,
-            0,
+            version,
+            flags,
             max_width,
             max_height,
             video_x,
@@ -2595,6 +2619,7 @@ def build_ffmpeg_command(
     passlog_path: Path | None,
     quiet: bool,
     forced_keyframe_frames: list[int] | None,
+    codec: str = "h264",
 ) -> tuple[list[str], str | None]:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     video_filters: list[str] = []
@@ -2609,11 +2634,15 @@ def build_ffmpeg_command(
         forced_keyframe_times_for_frames(forced_keyframe_frames, fps)
         if forced_keyframe_frames is not None else f"expr:gte(n,n_forced*{idr_frames})"
     )
-    tune, x264_params, bitstream_filters = h264_stream_profile_options(
-        idr_frames,
-        stream_profile,
-        flexible_keyframes=flexible_keyframes,
-    )
+    tune: str | None = None
+    x264_params = ""
+    bitstream_filters: list[str] = []
+    if codec == "h264":
+        tune, x264_params, bitstream_filters = h264_stream_profile_options(
+            idr_frames,
+            stream_profile,
+            flexible_keyframes=flexible_keyframes,
+        )
     subtitle_font_size, subtitle_margin_v, subtitle_outline = compute_burn_subtitle_metrics(height, burn_subtitle_size)
     command = [ffmpeg, "-y"]
     filter_complex_script: str | None = None
@@ -2736,58 +2765,92 @@ def build_ffmpeg_command(
         ]
     else:
         raise RuntimeError(f"Unsupported burn subtitle mode: {burn_subtitle.kind}")
-    command += [
-        "-threads",
-        "0",
-        "-c:v",
-        "libx264",
-        "-preset",
-        preset,
-    ]
-    if tune:
-        command += ["-tune", tune]
-    command += [
-        "-profile:v",
-        "baseline",
-        "-level:v",
-        level,
-        "-pix_fmt",
-        "yuv420p",
-        "-g",
-        str(idr_frames),
-        "-keyint_min",
-        "1" if flexible_keyframes else str(idr_frames),
-        "-sc_threshold",
-        "0",
-        "-bf",
-        "0",
-        "-refs",
-        "1",
-        "-x264-params",
-        x264_params,
-    ]
-    if force_keyframes_value:
-        command += ["-force_key_frames", force_keyframes_value]
-        if flexible_keyframes:
-            command += ["-forced-idr", "1"]
-    if pass_number is not None:
-        if bitrate_kbps is None or passlog_path is None:
-            raise RuntimeError("Two-pass encoding requires both bitrate_kbps and passlog_path.")
+    command += ["-threads", "0"]
+    if codec == "h264":
         command += [
-            "-pass",
-            str(pass_number),
-            "-passlogfile",
-            str(passlog_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
         ]
-    for bitstream_filter in bitstream_filters:
-        command += ["-bsf:v", bitstream_filter]
-    if bitrate_kbps is not None:
-        command += ["-b:v", f"{bitrate_kbps}k"]
+        if tune:
+            command += ["-tune", tune]
+        command += [
+            "-profile:v",
+            "baseline",
+            "-level:v",
+            level,
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            str(idr_frames),
+            "-keyint_min",
+            "1" if flexible_keyframes else str(idr_frames),
+            "-sc_threshold",
+            "0",
+            "-bf",
+            "0",
+            "-refs",
+            "1",
+            "-x264-params",
+            x264_params,
+        ]
+        if force_keyframes_value:
+            command += ["-force_key_frames", force_keyframes_value]
+            if flexible_keyframes:
+                command += ["-forced-idr", "1"]
+        if pass_number is not None:
+            if bitrate_kbps is None or passlog_path is None:
+                raise RuntimeError("Two-pass encoding requires both bitrate_kbps and passlog_path.")
+            command += [
+                "-pass",
+                str(pass_number),
+                "-passlogfile",
+                str(passlog_path),
+            ]
+        for bitstream_filter in bitstream_filters:
+            command += ["-bsf:v", bitstream_filter]
+        if bitrate_kbps is not None:
+            command += ["-b:v", f"{bitrate_kbps}k"]
+        else:
+            if crf is None:
+                raise RuntimeError("CRF rate control selected without a CRF value.")
+            command += ["-crf", str(crf)]
+        command += ["-f", "h264", str(output_path)]
+    elif codec == "mpeg4":
+        command += [
+            "-c:v",
+            "libxvid",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            str(idr_frames),
+            "-bf",
+            "0",
+            "-gmc",
+            "0",
+            "-me_quality",
+            "6",
+            "-mbd",
+            "rd",
+            "-trellis",
+            "1",
+        ]
+        if force_keyframes_value:
+            command += ["-force_key_frames", force_keyframes_value]
+        if pass_number is not None:
+            if passlog_path is None:
+                raise RuntimeError("Two-pass encoding requires passlog_path.")
+            command += [
+                "-pass",
+                str(pass_number),
+                "-passlogfile",
+                str(passlog_path),
+            ]
+        command += ["-b:v", f"{bitrate_kbps if bitrate_kbps is not None else MPEG4_DEFAULT_BITRATE_KBPS}k"]
+        command += ["-f", "m4v", str(output_path)]
     else:
-        if crf is None:
-            raise RuntimeError("CRF rate control selected without a CRF value.")
-        command += ["-crf", str(crf)]
-    command += ["-f", "h264", str(output_path)]
+        raise RuntimeError(f"Unsupported codec: {codec}")
     return command, filter_complex_script
 
 
@@ -2994,6 +3057,150 @@ def encode_h264_bitstream(
                 quiet=quiet,
             )
             for passlog_candidate in temp_dir_path.glob("x264-passlog*"):
+                passlog_candidate.unlink(missing_ok=True)
+        else:
+            run_ffmpeg_encode(
+                materialize_filter_complex_script(command, filter_complex_script, temp_dir_path),
+                label=label_prefix,
+                total_duration=encode_duration,
+                quiet=quiet,
+            )
+        if preview_output_path is not None:
+            write_preview_mp4(bitstream_path, preview_output_path, fps, quiet=quiet)
+        return bitstream_path.read_bytes()
+
+
+def encode_mpeg4_bitstream(
+    *,
+    input_path: Path,
+    source_width: int,
+    source_height: int,
+    source_fps: float | None,
+    width: int,
+    height: int,
+    fps: float,
+    crop_rect: CropRect | None,
+    idr_frames: int,
+    bitrate_kbps: int | None,
+    two_pass: bool,
+    preset: str,
+    level: str,
+    stream_profile: str,
+    start: float,
+    duration: float | None,
+    encode_duration: float | None,
+    hdr_to_sdr: bool,
+    burn_subtitle: BurnSubtitleSource | None,
+    burn_subtitle_size: float,
+    preview_output_path: Path | None,
+    quiet: bool,
+    label_prefix: str = "FFmpeg MPEG-4",
+) -> bytes:
+    with tempfile.TemporaryDirectory(prefix="nvp-mpeg4-") as temp_dir:
+        temp_dir_path = Path(temp_dir)
+        bitstream_path = temp_dir_path / "video.m4v"
+        command, filter_complex_script = build_ffmpeg_command(
+            input_path=input_path,
+            output_path=bitstream_path,
+            source_width=source_width,
+            source_height=source_height,
+            source_fps=source_fps,
+            width=width,
+            height=height,
+            fps=fps,
+            crop_rect=crop_rect,
+            idr_frames=idr_frames,
+            forced_keyframe_frames=None,
+            crf=None,
+            bitrate_kbps=bitrate_kbps,
+            preset=preset,
+            level=level,
+            stream_profile=stream_profile,
+            start=start,
+            duration=duration,
+            encode_duration=encode_duration,
+            hdr_to_sdr=hdr_to_sdr,
+            burn_subtitle=burn_subtitle,
+            burn_subtitle_size=burn_subtitle_size,
+            pass_number=None,
+            passlog_path=None,
+            quiet=quiet,
+            codec="mpeg4",
+        )
+        if two_pass:
+            passlog_path = temp_dir_path / "mpeg4-passlog"
+            pass1_output_path = temp_dir_path / "pass1.m4v"
+            pass1_command, pass1_filter_script = build_ffmpeg_command(
+                input_path=input_path,
+                output_path=pass1_output_path,
+                source_width=source_width,
+                source_height=source_height,
+                source_fps=source_fps,
+                width=width,
+                height=height,
+                fps=fps,
+                crop_rect=crop_rect,
+                idr_frames=idr_frames,
+                forced_keyframe_frames=None,
+                crf=None,
+                bitrate_kbps=bitrate_kbps or MPEG4_DEFAULT_BITRATE_KBPS,
+                preset=preset,
+                level=level,
+                stream_profile=stream_profile,
+                start=start,
+                duration=duration,
+                encode_duration=encode_duration,
+                hdr_to_sdr=hdr_to_sdr,
+                burn_subtitle=burn_subtitle,
+                burn_subtitle_size=burn_subtitle_size,
+                pass_number=1,
+                passlog_path=passlog_path,
+                quiet=quiet,
+                codec="mpeg4",
+            )
+            run_ffmpeg_encode(
+                materialize_filter_complex_script(pass1_command, pass1_filter_script, temp_dir_path),
+                label=f"{label_prefix} pass 1/2",
+                total_duration=encode_duration,
+                quiet=quiet,
+            )
+            pass1_output_path.unlink(missing_ok=True)
+
+            pass2_command, pass2_filter_script = build_ffmpeg_command(
+                input_path=input_path,
+                output_path=bitstream_path,
+                source_width=source_width,
+                source_height=source_height,
+                source_fps=source_fps,
+                width=width,
+                height=height,
+                fps=fps,
+                crop_rect=crop_rect,
+                idr_frames=idr_frames,
+                forced_keyframe_frames=None,
+                crf=None,
+                bitrate_kbps=bitrate_kbps or MPEG4_DEFAULT_BITRATE_KBPS,
+                preset=preset,
+                level=level,
+                stream_profile=stream_profile,
+                start=start,
+                duration=duration,
+                encode_duration=encode_duration,
+                hdr_to_sdr=hdr_to_sdr,
+                burn_subtitle=burn_subtitle,
+                burn_subtitle_size=burn_subtitle_size,
+                pass_number=2,
+                passlog_path=passlog_path,
+                quiet=quiet,
+                codec="mpeg4",
+            )
+            run_ffmpeg_encode(
+                materialize_filter_complex_script(pass2_command, pass2_filter_script, temp_dir_path),
+                label=f"{label_prefix} pass 2/2",
+                total_duration=encode_duration,
+                quiet=quiet,
+            )
+            for passlog_candidate in temp_dir_path.glob("mpeg4-passlog*"):
                 passlog_candidate.unlink(missing_ok=True)
         else:
             run_ffmpeg_encode(
@@ -3445,6 +3652,145 @@ def build_chunk_blob(access_units: list[AccessUnit], stream_profile: str) -> tup
     return bytes(payload), frame_offsets
 
 
+def parse_mpeg4_vop_type(vop_unit: bytes) -> int:
+    if len(vop_unit) < 5 or vop_unit[:4] != b"\x00\x00\x01\xb6":
+        raise RuntimeError("Invalid MPEG-4 VOP start code while parsing encoded stream.")
+    return (vop_unit[4] >> 6) & 0x03
+
+
+def parse_mpeg4_frames(bitstream: bytes) -> tuple[list[Mpeg4Frame], bytes]:
+    matches = list(MPEG4_START_CODE_RE.finditer(bitstream))
+    if not matches:
+        raise RuntimeError("FFmpeg did not produce a raw MPEG-4 Part 2 start-code stream.")
+
+    frames: list[Mpeg4Frame] = []
+    pending_headers: list[bytes] = []
+    sequence_headers = b""
+    seen_vop = False
+
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(bitstream)
+        code = match.group(1)[0]
+        unit = bitstream[start:end]
+        if code == MPEG4_VOP_START_CODE:
+            header_blob = b"".join(pending_headers)
+            if not seen_vop:
+                sequence_headers = header_blob
+                seen_vop = True
+            has_vol = any(
+                MPEG4_VOL_START_CODE_MIN <= header[3] <= MPEG4_VOL_START_CODE_MAX
+                for header in pending_headers
+                if len(header) >= 4
+            )
+            frames.append(Mpeg4Frame(
+                data=header_blob + unit,
+                vop_type=parse_mpeg4_vop_type(unit),
+                has_vol=has_vol,
+            ))
+            pending_headers = []
+        else:
+            pending_headers.append(unit)
+
+    if not frames:
+        raise RuntimeError("No MPEG-4 VOP frames were found in the encoded bitstream.")
+    if not sequence_headers or not any(
+        MPEG4_VOL_START_CODE_MIN <= header[3] <= MPEG4_VOL_START_CODE_MAX
+        for header in parse_mpeg4_start_code_units(sequence_headers)
+    ):
+        raise RuntimeError("Encoded MPEG-4 stream is missing an initial VOL header.")
+    unsupported_types = sorted({frame.vop_type for frame in frames if frame.vop_type not in {0, 1}})
+    if unsupported_types:
+        raise RuntimeError(
+            "Encoded MPEG-4 stream contains unsupported VOP type(s) "
+            f"{unsupported_types}; encode without B-frames, sprites, GMC, or qpel."
+        )
+    return frames, sequence_headers
+
+
+def parse_mpeg4_start_code_units(blob: bytes) -> list[bytes]:
+    matches = list(MPEG4_START_CODE_RE.finditer(blob))
+    return [
+        blob[match.start():(matches[index + 1].start() if index + 1 < len(matches) else len(blob))]
+        for index, match in enumerate(matches)
+    ]
+
+
+def mpeg4_frame_payload(frame: Mpeg4Frame, *, first_in_chunk: bool, sequence_headers: bytes) -> bytes:
+    if first_in_chunk and not frame.has_vol:
+        return sequence_headers + frame.data
+    return frame.data
+
+
+def estimate_mpeg4_chunk_blob_size(frames: list[Mpeg4Frame], sequence_headers: bytes) -> int:
+    payload_size = sum(
+        len(mpeg4_frame_payload(frame, first_in_chunk=index == 0, sequence_headers=sequence_headers))
+        for index, frame in enumerate(frames)
+    )
+    return align4(4 + (len(frames) * 4) + payload_size)
+
+
+def group_mpeg4_frames_into_chunks(
+    frames: list[Mpeg4Frame],
+    sequence_headers: bytes,
+    chunk_frames: int,
+    max_chunk_bytes: int | None,
+    hard_max_chunk_bytes: int | None,
+) -> list[list[Mpeg4Frame]]:
+    chunks: list[list[Mpeg4Frame]] = []
+    current: list[Mpeg4Frame] = []
+    frame_cap = chunk_frames if chunk_frames > 0 else None
+
+    for frame_index, frame in enumerate(frames):
+        if not current and not frame.is_i_vop:
+            raise RuntimeError(
+                f"MPEG-4 chunk would start at non-I-VOP frame {frame_index}; lower --idr-frames or re-encode."
+            )
+
+        candidate = current + [frame]
+        candidate_size = estimate_mpeg4_chunk_blob_size(candidate, sequence_headers)
+        exceeds_frame_cap = frame_cap is not None and len(candidate) > frame_cap
+        exceeds_byte_cap = max_chunk_bytes is not None and current and candidate_size > max_chunk_bytes
+        if current and frame.is_i_vop and (exceeds_frame_cap or exceeds_byte_cap):
+            chunks.append(current)
+            current = [frame]
+            candidate_size = estimate_mpeg4_chunk_blob_size(current, sequence_headers)
+        else:
+            current = candidate
+
+        if hard_max_chunk_bytes and candidate_size > hard_max_chunk_bytes:
+            raise ChunkTooLargeError(
+                first_frame=frame_index - len(current) + 1,
+                frame_count=len(current),
+                blob_size=candidate_size,
+                max_bytes=hard_max_chunk_bytes,
+                label="MPEG-4 chunk",
+            )
+
+    if current:
+        chunks.append(current)
+    if not chunks:
+        raise RuntimeError("The MPEG-4 bitstream did not produce any `.nvp` chunks.")
+    for index, chunk in enumerate(chunks):
+        if not chunk or not chunk[0].is_i_vop:
+            raise RuntimeError(f"MPEG-4 chunk {index} does not start on an I-VOP.")
+    return chunks
+
+
+def build_mpeg4_chunk_blob(frames: list[Mpeg4Frame], sequence_headers: bytes) -> tuple[bytes, list[int]]:
+    payload = bytearray()
+    frame_offsets: list[int] = []
+    for index, frame in enumerate(frames):
+        frame_offsets.append(len(payload))
+        payload.extend(mpeg4_frame_payload(frame, first_in_chunk=index == 0, sequence_headers=sequence_headers))
+    return bytes(payload), frame_offsets
+
+
+def estimate_mpeg4_total_output_size(chunks: list[list[Mpeg4Frame]], sequence_headers: bytes, subtitle_tracks: list[SubtitleTrack]) -> int:
+    chunk_bytes = sum(estimate_mpeg4_chunk_blob_size(chunk, sequence_headers) for chunk in chunks)
+    return HEADER_STRUCT.size + chunk_bytes + (len(chunks) * CHUNK_INDEX_STRUCT.size) + estimate_subtitle_storage_size(subtitle_tracks)
+
+
 def encode(args: argparse.Namespace) -> EncodeStats:
     input_path = Path(args.input).resolve()
     if not input_path.is_file():
@@ -3494,10 +3840,23 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             args.max_height,
         )
 
+        if args.codec == "h264":
+            encode_profile_label = f"profile {args.stream_profile}"
+            encode_rate_label = format_rate_control_label(
+                crf=args.crf,
+                bitrate_kbps=args.bitrate_kbps,
+                two_pass=args.two_pass,
+            )
+        else:
+            encode_profile_label = "codec MPEG-4 Part 2"
+            encode_rate_label = f"{args.bitrate_kbps or MPEG4_DEFAULT_BITRATE_KBPS} kb/s"
+            if args.two_pass:
+                encode_rate_label += " 2-pass"
+
         log(
             f"Encoding {input_path.name} -> {target_width}x{target_height} @ {fps:.3f}fps "
             f"(source {video_probe.storage_width}x{video_probe.storage_height}, display {source_width}x{source_height}, "
-            f"profile {args.stream_profile}, {format_rate_control_label(crf=args.crf, bitrate_kbps=args.bitrate_kbps, two_pass=args.two_pass)})",
+            f"{encode_profile_label}, {encode_rate_label})",
             quiet=args.quiet,
         )
         if crop_rect is not None:
@@ -3523,51 +3882,116 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             )
         start_time = time.time()
         idr_mode = args.idr_frames.lower()
-        if idr_mode == BYTE_AUTO_IDR_MODE and args.stream_profile != "intra":
-            if max_chunk_bytes is None:
-                raise RuntimeError("--idr-frames byte-auto requires --max-chunk-kib > 0.")
+        sequence_headers = b""
+        header_version = VERSION
+        header_flags = CODEC_FLAG_H264
+
+        if args.codec == "h264":
+            if idr_mode == BYTE_AUTO_IDR_MODE and args.stream_profile != "intra":
+                if max_chunk_bytes is None:
+                    raise RuntimeError("--idr-frames byte-auto requires --max-chunk-kib > 0.")
+                log(
+                    f"IDR cadence: byte-auto from measured {format_binary_size(max_chunk_bytes)} chunk boundaries.",
+                    quiet=args.quiet,
+                )
+                bitstream, idr_frames, idr_frame_reason = encode_h264_bitstream_byte_auto(
+                    input_path=input_path,
+                    source_width=video_probe.storage_width,
+                    source_height=video_probe.storage_height,
+                    source_fps=video_probe.fps,
+                    width=target_width,
+                    height=target_height,
+                    fps=fps,
+                    crop_rect=crop_rect,
+                    crf=args.crf,
+                    bitrate_kbps=args.bitrate_kbps,
+                    two_pass=args.two_pass,
+                    preset=args.preset,
+                    level=args.level,
+                    stream_profile=args.stream_profile,
+                    start=args.start,
+                    duration=args.duration,
+                    encode_duration=encode_duration,
+                    hdr_to_sdr=args.hdr_to_sdr,
+                    burn_subtitle=burn_subtitle,
+                    burn_subtitle_size=args.burn_subtitle_size,
+                    preview_output_path=preview_output_path,
+                    max_chunk_bytes=max_chunk_bytes,
+                    hard_max_chunk_bytes=hard_max_chunk_bytes,
+                    chunk_frames=args.chunk_frames,
+                    quiet=args.quiet,
+                )
+            else:
+                idr_frames, idr_frame_reason = resolve_idr_frames(
+                    args.chunk_frames,
+                    args.idr_frames,
+                    args.stream_profile,
+                    fps=fps,
+                    max_chunk_bytes=max_chunk_bytes,
+                    bitrate_kbps=args.bitrate_kbps,
+                )
+                log(f"IDR cadence: every {idr_frames} frame(s) ({idr_frame_reason}).", quiet=args.quiet)
+                bitstream = encode_h264_bitstream(
+                    input_path=input_path,
+                    source_width=video_probe.storage_width,
+                    source_height=video_probe.storage_height,
+                    source_fps=video_probe.fps,
+                    width=target_width,
+                    height=target_height,
+                    fps=fps,
+                    crop_rect=crop_rect,
+                    idr_frames=idr_frames,
+                    crf=args.crf,
+                    bitrate_kbps=args.bitrate_kbps,
+                    two_pass=args.two_pass,
+                    preset=args.preset,
+                    level=args.level,
+                    stream_profile=args.stream_profile,
+                    start=args.start,
+                    duration=args.duration,
+                    encode_duration=encode_duration,
+                    hdr_to_sdr=args.hdr_to_sdr,
+                    burn_subtitle=burn_subtitle,
+                    burn_subtitle_size=args.burn_subtitle_size,
+                    preview_output_path=preview_output_path,
+                    quiet=args.quiet,
+                )
             log(
-                f"IDR cadence: byte-auto from measured {format_binary_size(max_chunk_bytes)} chunk boundaries.",
+                f"FFmpeg produced {len(bitstream) / 1024:.1f} KiB of Annex B H.264 in {time.time() - start_time:.1f}s "
+                f"({idr_frame_reason}).",
                 quiet=args.quiet,
             )
-            bitstream, idr_frames, idr_frame_reason = encode_h264_bitstream_byte_auto(
-                input_path=input_path,
-                source_width=video_probe.storage_width,
-                source_height=video_probe.storage_height,
-                source_fps=video_probe.fps,
-                width=target_width,
-                height=target_height,
-                fps=fps,
-                crop_rect=crop_rect,
-                crf=args.crf,
-                bitrate_kbps=args.bitrate_kbps,
-                two_pass=args.two_pass,
-                preset=args.preset,
-                level=args.level,
+            access_units = bitstream_access_units(bitstream)
+            if not access_units:
+                raise RuntimeError("No frames were found in the encoded H.264 bitstream.")
+            chunks = group_access_units_into_chunks(
+                access_units,
+                args.chunk_frames,
+                max_chunk_bytes,
+                hard_max_chunk_bytes,
+                args.stream_profile,
+            )
+            chunk_blob_sizes = [estimate_chunk_blob_size(chunk, args.stream_profile) for chunk in chunks]
+            expected_output_size = estimate_total_output_size(
+                chunks,
                 stream_profile=args.stream_profile,
-                start=args.start,
-                duration=args.duration,
-                encode_duration=encode_duration,
-                hdr_to_sdr=args.hdr_to_sdr,
-                burn_subtitle=burn_subtitle,
-                burn_subtitle_size=args.burn_subtitle_size,
-                preview_output_path=preview_output_path,
-                max_chunk_bytes=max_chunk_bytes,
-                hard_max_chunk_bytes=hard_max_chunk_bytes,
-                chunk_frames=args.chunk_frames,
-                quiet=args.quiet,
+                subtitle_tracks=subtitle_tracks,
             )
+            frame_count = len(access_units)
+            raw_video_label = "raw H.264"
         else:
+            if idr_mode == BYTE_AUTO_IDR_MODE:
+                raise RuntimeError("--idr-frames byte-auto is only supported for H.264.")
             idr_frames, idr_frame_reason = resolve_idr_frames(
                 args.chunk_frames,
                 args.idr_frames,
                 args.stream_profile,
                 fps=fps,
                 max_chunk_bytes=max_chunk_bytes,
-                bitrate_kbps=args.bitrate_kbps,
+                bitrate_kbps=args.bitrate_kbps or MPEG4_DEFAULT_BITRATE_KBPS,
             )
-            log(f"IDR cadence: every {idr_frames} frame(s) ({idr_frame_reason}).", quiet=args.quiet)
-            bitstream = encode_h264_bitstream(
+            log(f"MPEG-4 I-VOP cadence: every {idr_frames} frame(s) ({idr_frame_reason}).", quiet=args.quiet)
+            bitstream = encode_mpeg4_bitstream(
                 input_path=input_path,
                 source_width=video_probe.storage_width,
                 source_height=video_probe.storage_height,
@@ -3577,7 +4001,6 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                 fps=fps,
                 crop_rect=crop_rect,
                 idr_frames=idr_frames,
-                crf=args.crf,
                 bitrate_kbps=args.bitrate_kbps,
                 two_pass=args.two_pass,
                 preset=args.preset,
@@ -3592,22 +4015,27 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                 preview_output_path=preview_output_path,
                 quiet=args.quiet,
             )
-        log(
-            f"FFmpeg produced {len(bitstream) / 1024:.1f} KiB of Annex B H.264 in {time.time() - start_time:.1f}s "
-            f"({idr_frame_reason}).",
-            quiet=args.quiet,
-        )
+            log(
+                f"FFmpeg produced {len(bitstream) / 1024:.1f} KiB of raw MPEG-4 Part 2 in {time.time() - start_time:.1f}s "
+                f"({idr_frame_reason}).",
+                quiet=args.quiet,
+            )
+            access_units, sequence_headers = parse_mpeg4_frames(bitstream)
+            chunks = group_mpeg4_frames_into_chunks(
+                access_units,
+                sequence_headers,
+                args.chunk_frames,
+                max_chunk_bytes,
+                hard_max_chunk_bytes,
+            )
+            chunk_blob_sizes = [estimate_mpeg4_chunk_blob_size(chunk, sequence_headers) for chunk in chunks]
+            expected_output_size = estimate_mpeg4_total_output_size(chunks, sequence_headers, subtitle_tracks)
+            frame_count = len(access_units)
+            raw_video_label = "raw MPEG-4"
+            header_version = CODEC_TAGGED_VERSION
+            header_flags = CODEC_FLAG_MPEG4
 
-        access_units = bitstream_access_units(bitstream)
-        chunks = group_access_units_into_chunks(
-            access_units,
-            args.chunk_frames,
-            max_chunk_bytes,
-            hard_max_chunk_bytes,
-            args.stream_profile,
-        )
         chunk_frame_counts = [len(chunk) for chunk in chunks]
-        chunk_blob_sizes = [estimate_chunk_blob_size(chunk, args.stream_profile) for chunk in chunks]
         max_observed_chunk_frames = max(chunk_frame_counts) if chunk_frame_counts else 0
         header_chunk_frames = min(max_observed_chunk_frames, 0xFFFF)
         chunk_frame_cap_label = str(args.chunk_frames) if args.chunk_frames > 0 else "off"
@@ -3617,21 +4045,12 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             if max_chunk_bytes is not None else 0
         )
 
-        if not access_units:
-            raise RuntimeError("No frames were found in the encoded H.264 bitstream.")
-
         timeline_check = validate_encoded_timeline(
-            frame_count=len(access_units),
+            frame_count=frame_count,
             fps=fps,
             target_duration=encode_duration,
             tolerance_ms=args.timeline_drift_tolerance_ms,
             quiet=args.quiet,
-        )
-
-        expected_output_size = estimate_total_output_size(
-            chunks,
-            stream_profile=args.stream_profile,
-            subtitle_tracks=subtitle_tracks,
         )
         log(
             f"Expected output size {format_binary_size(expected_output_size)} "
@@ -3660,8 +4079,11 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             chunk_index: list[tuple[int, int, int, int, int, int]] = []
             frame_cursor = 0
             pack_start_time = time.time()
-            for chunk_number, access_unit_chunk in enumerate(chunks, start=1):
-                chunk_payload, frame_offsets = build_chunk_blob(access_unit_chunk, args.stream_profile)
+            for chunk_number, frame_chunk in enumerate(chunks, start=1):
+                if args.codec == "h264":
+                    chunk_payload, frame_offsets = build_chunk_blob(frame_chunk, args.stream_profile)
+                else:
+                    chunk_payload, frame_offsets = build_mpeg4_chunk_blob(frame_chunk, sequence_headers)
                 stored_chunk_blob = bytearray()
                 stored_chunk_blob += struct.pack("<I", len(chunk_payload))
                 for frame_offset in frame_offsets:
@@ -3678,13 +4100,13 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                     len(stored_blob),
                     len(stored_chunk_blob),
                     frame_cursor,
-                    len(access_unit_chunk),
+                    len(frame_chunk),
                     0,
                 ))
 
                 elapsed = time.time() - start_time
                 pack_elapsed = time.time() - pack_start_time
-                frame_end = frame_cursor + len(access_unit_chunk) - 1
+                frame_end = frame_cursor + len(frame_chunk) - 1
                 progress = (chunk_number / len(chunks)) * 100.0
                 written_size = output_handle.tell()
                 remaining_size = max(0, expected_output_size - written_size)
@@ -3697,7 +4119,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                     f"total size {format_binary_size(written_size)}/{format_binary_size(expected_output_size)}",
                     quiet=args.quiet,
                 )
-                frame_cursor += len(access_unit_chunk)
+                frame_cursor += len(frame_chunk)
 
             index_offset = output_handle.tell()
             for entry in chunk_index:
@@ -3732,6 +4154,8 @@ def encode(args: argparse.Namespace) -> EncodeStats:
 
             write_header(
                 output_handle,
+                version=header_version,
+                flags=header_flags,
                 max_width=args.max_width,
                 max_height=args.max_height,
                 video_x=video_x,
@@ -3740,7 +4164,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                 video_height=target_height,
                 fps=fps,
                 chunk_frames=header_chunk_frames,
-                frame_count=len(access_units),
+                frame_count=frame_count,
                 chunk_count=len(chunks),
                 subtitle_count=subtitle_count,
                 index_offset=index_offset,
@@ -3749,6 +4173,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
 
         bytes_written = output_path.stat().st_size
         stats = EncodeStats(
+            codec=args.codec,
             input_path=str(input_path),
             output_path=str(output_path),
             width=target_width,
@@ -3761,21 +4186,22 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             target_duration=timeline_check.target_duration,
             encoded_duration=timeline_check.encoded_duration,
             expected_frame_count=timeline_check.expected_frame_count,
-            frame_count=len(access_units),
+            frame_count=frame_count,
             frame_count_delta=timeline_check.frame_count_delta,
             timeline_drift_ms=timeline_check.drift_ms,
             chunk_count=len(chunks),
             idr_chunks=len(chunks),
-            raw_h264_bytes=len(bitstream),
+            raw_video_bytes=len(bitstream),
+            raw_h264_bytes=len(bitstream) if args.codec == "h264" else 0,
             bytes_written=bytes_written,
-            average_bytes_per_frame=bytes_written / len(access_units),
+            average_bytes_per_frame=bytes_written / frame_count,
         )
         with stats_path.open("w", encoding="utf-8") as stats_handle:
             stats_started = True
             json.dump(asdict(stats), stats_handle, indent=2)
         log(
             f"Wrote {output_path.name}: {bytes_written / (1024 * 1024):.2f} MiB | "
-            f"{len(access_units)} frames | {len(chunks)} chunks | raw H.264 {len(bitstream) / 1024:.1f} KiB",
+            f"{frame_count} frames | {len(chunks)} chunks | {raw_video_label} {len(bitstream) / 1024:.1f} KiB",
             quiet=args.quiet,
         )
         if preview_output_path is not None:
@@ -3803,13 +4229,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--crop", help="Crop active video before scaling, as WIDTH:HEIGHT:X:Y or WIDTHxHEIGHT+X+Y")
     parser.add_argument("--active-aspect", help="Center-crop the source to an active-picture aspect ratio before scaling, e.g. 2.39 or 239:100")
     parser.add_argument("--hdr-to-sdr", action="store_true", help="Tonemap HDR BT.2020/PQ video into SDR BT.709 before scaling")
+    parser.add_argument("--codec", choices=CODEC_NAMES, default="h264", help="Video codec to store in the .nvp container")
     parser.add_argument("--chunk-frames", type=int, default=0, help="Maximum frames per streamed chunk; 0 disables the frame cap and packs chunks by --max-chunk-kib")
     parser.add_argument("--idr-frames", default="auto", help="Maximum frames between forced IDR access units; use 'auto' for bitrate-derived cadence or 'byte-auto' to refine IDRs from measured chunk byte boundaries")
     parser.add_argument("--max-chunk-kib", type=int, default=DEFAULT_MAX_CHUNK_KIB, help="Maximum stored chunk size target in KiB; 0 disables the byte cap")
     parser.add_argument("--max-chunk-overshoot-percent", type=float, default=DEFAULT_MAX_CHUNK_OVERSHOOT_PERCENT, help="Allowed single-GOP chunk overshoot above --max-chunk-kib before failing; set 0 for a hard cap")
     parser.add_argument("--crf", type=float, default=24.0, help="libx264 CRF quality target (fractional values allowed, ignored when --bitrate-kbps is set)")
     parser.add_argument("--bitrate-kbps", type=int, help="Target average video bitrate in kb/s for ABR mode")
-    parser.add_argument("--two-pass", action="store_true", help="Run libx264 in 2-pass ABR mode; requires --bitrate-kbps")
+    parser.add_argument("--two-pass", action="store_true", help="Run a 2-pass ABR encode; H.264 requires --bitrate-kbps, MPEG-4 defaults to 500 kb/s")
     parser.add_argument("--preset", default="slow", help="libx264 preset")
     parser.add_argument("--level", default="1.3", help="Target H.264 level")
     parser.add_argument("--stream-profile", choices=STREAM_PROFILES, default="fast", help="Decoder-complexity profile: fast is smoothest, balanced/quality trade more CPU for better image quality")
@@ -3837,10 +4264,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             parser.error("--idr-frames must be greater than zero.")
     if idr_mode == BYTE_AUTO_IDR_MODE and args.max_chunk_kib == 0:
         parser.error("--idr-frames byte-auto requires --max-chunk-kib > 0.")
+    if args.codec != "h264" and idr_mode == BYTE_AUTO_IDR_MODE:
+        parser.error("--idr-frames byte-auto is only supported with --codec h264.")
     if args.bitrate_kbps is not None and args.bitrate_kbps <= 0:
         parser.error("--bitrate-kbps must be greater than zero.")
-    if args.two_pass and args.bitrate_kbps is None:
-        parser.error("--two-pass requires --bitrate-kbps.")
+    if args.two_pass and args.codec == "h264" and args.bitrate_kbps is None:
+        parser.error("--two-pass requires --bitrate-kbps with --codec h264.")
     if args.timeline_drift_tolerance_ms < 0:
         parser.error("--timeline-drift-tolerance-ms must be zero or greater.")
     if args.crop and args.active_aspect:

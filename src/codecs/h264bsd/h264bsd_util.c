@@ -40,7 +40,7 @@
 
 #include <string.h>
 
-#include "../sram.h"
+#include "sram.h"
 
 /*------------------------------------------------------------------------------
     2. External compiler flags
