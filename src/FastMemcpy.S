@@ -1,6 +1,7 @@
 .global FastMemcpy
 @ void FastMemcpy(void* dest, const void* src, uint32_t chunks_32byte)
 @ dest and src must be aligned
+@ Copy loop credited to https://github.com/giraf-fe/nvid2
 FastMemcpy:
     push {r4-r11, lr}
     @ r0 = dest
