@@ -16,6 +16,7 @@ int pick_movie(
     bool prev_enter = false;
     bool prev_esc = false;
     bool prev_scratchpad = false;
+    bool prev_on = false;
     bool prev_c = false;
     bool prev_s = false;
     bool prev_2 = false;
@@ -83,6 +84,7 @@ int pick_movie(
     prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
     prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
     prev_scratchpad = isKeyPressed(KEY_NSPIRE_SCRATCHPAD);
+    prev_on = on_key_pressed() ? true : false;
     prev_c = isKeyPressed(KEY_NSPIRE_C);
     prev_s = isKeyPressed(KEY_NSPIRE_S);
     prev_2 = isKeyPressed(KEY_NSPIRE_2);
@@ -105,6 +107,10 @@ int pick_movie(
         bool keypad_8_edge = key_pressed_edge(KEY_NSPIRE_8, &prev_8);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool scratchpad_edge = key_pressed_edge(KEY_NSPIRE_SCRATCHPAD, &prev_scratchpad);
+        bool esc_edge = key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc);
+        bool esc_down = prev_esc;
+        bool theme_edge = key_pressed_edge(KEY_NSPIRE_C, &prev_c);
+        bool on_edge = on_key_pressed_edge(&prev_on);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) || (!ctrl_down && keypad_5_edge);
         bool enter_down = prev_enter || (!ctrl_down && prev_5);
         bool up_edge = key_pressed_edge(KEY_NSPIRE_UP, &prev_up) || (!ctrl_down && keypad_8_edge);
@@ -130,10 +136,58 @@ int pick_movie(
         uint8_t picker_press_mix;
         int activated_index = -1;
         bool activated_resume = false;
+        bool input_activity =
+            pointer_click ||
+            pointer.release_edge ||
+            pointer.moved ||
+            pointer.down ||
+            scratchpad_edge ||
+            esc_edge ||
+            esc_down ||
+            theme_edge ||
+            screenshot_edge ||
+            on_edge ||
+            enter_edge ||
+            enter_down ||
+            up_edge ||
+            down_edge ||
+            up_down ||
+            down_down ||
+            left_edge ||
+            right_edge;
+
+        if ((g_display_power_state.idle_dim_active ||
+                (g_display_power_state.off && g_display_power_state.off_from_idle)) &&
+            input_activity) {
+            display_power_restore(&g_display_power_state, now_ms);
+            msleep(16);
+            continue;
+        }
 
         if (scratchpad_edge) {
+            display_power_off_for_exit(&g_display_power_state, screen, true);
             clear_screenshot_preview(&screenshot_preview);
             return PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT;
+        }
+        if (g_display_power_state.off) {
+            if (esc_down) {
+                clear_screenshot_preview(&screenshot_preview);
+                return PLAY_MOVIE_RESULT_HOME_EXIT;
+            }
+            if (on_edge) {
+                display_power_restore(&g_display_power_state, now_ms);
+            }
+            msleep(16);
+            continue;
+        }
+        if (on_edge) {
+            display_power_off(&g_display_power_state, true);
+            present_black_screen(screen);
+            msleep(16);
+            continue;
+        }
+        if (input_activity) {
+            display_power_note_activity(&g_display_power_state, now_ms);
         }
 
         if (next_hover_scroll_direction != hover_scroll_direction) {
@@ -387,7 +441,7 @@ int pick_movie(
             pressed_resume_badge_index = -1;
             pressed_selected_fallback = false;
         }
-        if (key_pressed_edge(KEY_NSPIRE_C, &prev_c)) {
+        if (theme_edge) {
             ui_cycle_theme();
             ui_save_theme_for_directory(directory);
         }
@@ -426,6 +480,10 @@ int pick_movie(
             if (save_screenshot_bitmap_in_directory(screen, directory, saved_path, sizeof(saved_path))) {
                 prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
             }
+        }
+        if (display_power_tick_idle(&g_display_power_state, screen, monotonic_clock_now_ms(), true, true)) {
+            msleep(16);
+            continue;
         }
         if (!deferred_movie_cleanup_done &&
             g_deferred_playback_movie &&
@@ -488,7 +546,7 @@ int pick_movie(
                 pointer_hover_guard_lock(&hover_guard, &pointer);
             }
         }
-        if (key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc)) {
+        if (esc_edge) {
             clear_screenshot_preview(&screenshot_preview);
             return -1;
         }

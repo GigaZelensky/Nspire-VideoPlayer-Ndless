@@ -685,6 +685,38 @@ uint32_t brightness_raw_to_cx_level(uint32_t raw_value)
         ((uint32_t) LCD_BRIGHTNESS_MAX / 2U)) / (uint32_t) LCD_BRIGHTNESS_MAX);
 }
 
+static const uint32_t g_lcd_manual_brightness_raw[] = {
+    0U, 26U, 51U, 77U, 102U, 128U, 153U, 179U, 204U, 230U, LCD_BRIGHTNESS_LOWEST_NORMAL
+};
+
+static const unsigned g_lcd_manual_brightness_percent[] = {
+    100U, 90U, 80U, 70U, 60U, 50U, 40U, 30U, 20U, 10U, 1U
+};
+
+static size_t lcd_manual_brightness_step_count(void)
+{
+    return sizeof(g_lcd_manual_brightness_raw) / sizeof(g_lcd_manual_brightness_raw[0]);
+}
+
+static size_t lcd_manual_brightness_nearest_index(uint32_t raw_value)
+{
+    size_t count = lcd_manual_brightness_step_count();
+    size_t best_index = 0;
+    uint32_t best_distance = UINT32_MAX;
+    size_t index;
+
+    for (index = 0; index < count; ++index) {
+        uint32_t step = g_lcd_manual_brightness_raw[index];
+        uint32_t distance = raw_value > step ? (raw_value - step) : (step - raw_value);
+
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_index = index;
+        }
+    }
+    return best_index;
+}
+
 uint32_t current_lcd_brightness(void)
 {
     if (!has_colors) {
@@ -725,27 +757,129 @@ void set_lcd_dark_for_power_off(void)
     }
 }
 
+uint32_t lcd_brightness_step_target_from(uint32_t raw_value, int delta)
+{
+    size_t index = lcd_manual_brightness_nearest_index(raw_value);
+
+    if (delta < 0 && raw_value >= (uint32_t) LCD_BRIGHTNESS_MAX) {
+        return LCD_BRIGHTNESS_LOWEST_NORMAL;
+    }
+    if (delta > 0 && raw_value >= LCD_BRIGHTNESS_LOWEST_NORMAL) {
+        return LCD_BRIGHTNESS_MAX;
+    }
+    if (delta < 0) {
+        if (index > 0) {
+            --index;
+        }
+    } else if (delta > 0) {
+        size_t count = lcd_manual_brightness_step_count();
+
+        if (index + 1U < count) {
+            ++index;
+        }
+    }
+    return g_lcd_manual_brightness_raw[index];
+}
+
 uint32_t adjust_lcd_brightness(int delta)
 {
-    uint32_t current = current_lcd_brightness();
-
-    if (delta > 0 && current >= LCD_BRIGHTNESS_LOWEST_NORMAL) {
-        return set_lcd_brightness(LCD_BRIGHTNESS_MAX);
-    }
-    if (delta < 0 && current > LCD_BRIGHTNESS_LOWEST_NORMAL) {
-        return set_lcd_brightness(LCD_BRIGHTNESS_LOWEST_NORMAL);
-    }
-    return set_lcd_brightness((int) current + delta);
+    return set_lcd_brightness((int) lcd_brightness_step_target_from(current_lcd_brightness(), delta));
 }
 
 unsigned lcd_brightness_percent(uint32_t raw_value)
 {
     uint32_t clamped = (uint32_t) clamp_int((int) raw_value, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
-    unsigned percent;
 
-    percent = (unsigned) ((((uint32_t) LCD_BRIGHTNESS_MAX - clamped) * 100U) +
-        ((uint32_t) LCD_BRIGHTNESS_MAX / 2U)) / (uint32_t) LCD_BRIGHTNESS_MAX;
-    return percent == 0U ? 1U : percent;
+    if (clamped >= (uint32_t) LCD_BRIGHTNESS_MAX) {
+        return 0U;
+    }
+    return g_lcd_manual_brightness_percent[lcd_manual_brightness_nearest_index(clamped)];
+}
+
+void display_power_init(DisplayPowerState *state, uint32_t now_ms)
+{
+    uint32_t brightness;
+
+    if (!state) {
+        return;
+    }
+    brightness = current_lcd_brightness();
+    memset(state, 0, sizeof(*state));
+    state->saved_brightness = brightness;
+    state->idle_base_brightness = brightness;
+    state->last_activity_ms = now_ms;
+}
+
+static void display_power_restore_idle_dim(DisplayPowerState *state)
+{
+    if (!state || !state->idle_dim_active) {
+        return;
+    }
+    set_lcd_brightness((int) state->idle_base_brightness);
+    state->idle_dim_active = false;
+}
+
+void display_power_note_activity(DisplayPowerState *state, uint32_t now_ms)
+{
+    if (!state) {
+        return;
+    }
+    state->last_activity_ms = now_ms;
+    if (!state->off) {
+        display_power_restore_idle_dim(state);
+    }
+}
+
+bool display_power_tick_idle(DisplayPowerState *state, SDL_Surface *screen, uint32_t now_ms, bool allow_idle_dim, bool was_paused)
+{
+    uint32_t elapsed_ms;
+    uint32_t dim_elapsed_ms;
+    uint32_t dim_duration_ms;
+    uint32_t base;
+    uint32_t target;
+
+    if (!state) {
+        return false;
+    }
+    if (state->off) {
+        return true;
+    }
+    if (!allow_idle_dim || DISPLAY_IDLE_DIM_OFF_MS <= DISPLAY_IDLE_DIM_START_MS) {
+        display_power_note_activity(state, now_ms);
+        return false;
+    }
+
+    elapsed_ms = now_ms - state->last_activity_ms;
+    if (elapsed_ms < DISPLAY_IDLE_DIM_START_MS) {
+        return false;
+    }
+
+    if (!state->idle_dim_active) {
+        state->idle_base_brightness = current_lcd_brightness();
+        state->idle_dim_active = true;
+    }
+
+    if (elapsed_ms >= DISPLAY_IDLE_DIM_OFF_MS) {
+        state->saved_brightness = state->idle_base_brightness;
+        state->resume_playback_on_wake = !was_paused;
+        state->idle_dim_active = false;
+        state->off_from_idle = true;
+        set_lcd_dark_for_power_off();
+        state->off = true;
+        present_black_screen(screen);
+        return true;
+    }
+
+    base = (uint32_t) clamp_int((int) state->idle_base_brightness, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
+    dim_elapsed_ms = elapsed_ms - DISPLAY_IDLE_DIM_START_MS;
+    dim_duration_ms = DISPLAY_IDLE_DIM_OFF_MS - DISPLAY_IDLE_DIM_START_MS;
+    target = base + (uint32_t) ((((uint64_t) ((uint32_t) LCD_BRIGHTNESS_MAX - base) * dim_elapsed_ms) +
+        (dim_duration_ms / 2U)) / dim_duration_ms);
+    if (target >= (uint32_t) LCD_BRIGHTNESS_MAX) {
+        target = (uint32_t) LCD_BRIGHTNESS_MAX - 1U;
+    }
+    set_lcd_brightness((int) target);
+    return false;
 }
 
 void display_power_off(DisplayPowerState *state, bool was_paused)
@@ -755,9 +889,34 @@ void display_power_off(DisplayPowerState *state, bool was_paused)
     }
 
     state->resume_playback_on_wake = !was_paused;
-    state->saved_brightness = current_lcd_brightness();
+    state->saved_brightness = state->idle_dim_active
+        ? state->idle_base_brightness
+        : current_lcd_brightness();
+    state->idle_dim_active = false;
+    state->off_from_idle = false;
     set_lcd_dark_for_power_off();
     state->off = true;
+}
+
+void display_power_off_with_saved_brightness(DisplayPowerState *state, SDL_Surface *screen, uint32_t saved_brightness, bool was_paused)
+{
+    if (!state) {
+        return;
+    }
+
+    state->resume_playback_on_wake = !was_paused;
+    state->saved_brightness = (uint32_t) clamp_int((int) saved_brightness, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
+    state->idle_dim_active = false;
+    state->off_from_idle = false;
+    set_lcd_dark_for_power_off();
+    state->off = true;
+    present_black_screen(screen);
+}
+
+void display_power_off_for_exit(DisplayPowerState *state, SDL_Surface *screen, bool was_paused)
+{
+    display_power_off(state, was_paused);
+    present_black_screen(screen);
 }
 
 void display_power_on(DisplayPowerState *state)
@@ -768,6 +927,22 @@ void display_power_on(DisplayPowerState *state)
 
     set_lcd_brightness((int) state->saved_brightness);
     state->off = false;
+    state->off_from_idle = false;
+    state->idle_dim_active = false;
+    state->idle_base_brightness = state->saved_brightness;
+}
+
+void display_power_restore(DisplayPowerState *state, uint32_t now_ms)
+{
+    if (!state) {
+        return;
+    }
+    if (state->off) {
+        display_power_on(state);
+    } else {
+        display_power_restore_idle_dim(state);
+    }
+    state->last_activity_ms = now_ms;
 }
 
 const char *filename_from_path(const char *path)

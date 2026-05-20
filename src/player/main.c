@@ -40,6 +40,7 @@ int main(int argc, char **argv)
         return 1;
     }
     patch_cx2_lcd_edge_timing();
+    display_power_init(&g_display_power_state, monotonic_clock_now_ms());
     if (!init_fonts(&fonts)) {
         show_msgbox("ND Video Player", "Failed to load fonts.");
         lcd_init(SCR_TYPE_INVALID);
@@ -117,6 +118,7 @@ int main(int argc, char **argv)
 
     flush_queued_history_save(&g_pending_history_save, "shutdown");
     flush_queued_theme_save("shutdown");
+    display_power_restore(&g_display_power_state, monotonic_clock_now_ms());
     if (return_home_after_exit) {
         if (open_scratchpad_after_exit) {
             yes_teacher_im_mathing();

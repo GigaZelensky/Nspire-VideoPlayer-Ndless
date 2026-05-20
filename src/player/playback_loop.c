@@ -1,5 +1,122 @@
 #include "player_internal.h"
 
+typedef struct {
+    bool active;
+    bool off_when_complete;
+    bool off_was_paused;
+    uint32_t started_ms;
+    uint32_t from_raw;
+    uint32_t to_raw;
+    uint32_t off_saved_brightness;
+    unsigned from_percent;
+    unsigned to_percent;
+    unsigned current_percent;
+} BrightnessAnimation;
+
+static void format_brightness_status(char *buffer, size_t buffer_size, unsigned percent)
+{
+    snprintf(buffer, buffer_size, "BRIGHT %3u%%", percent);
+}
+
+static uint32_t mix_u32(uint32_t from, uint32_t to, uint8_t mix)
+{
+    if (to >= from) {
+        return from + (uint32_t) ((((uint64_t) (to - from) * mix) + 127U) / 255U);
+    }
+    return from - (uint32_t) ((((uint64_t) (from - to) * mix) + 127U) / 255U);
+}
+
+static unsigned mix_percent(unsigned from, unsigned to, uint8_t mix)
+{
+    if (to >= from) {
+        return from + (unsigned) ((((uint32_t) (to - from) * mix) + 127U) / 255U);
+    }
+    return from - (unsigned) ((((uint32_t) (from - to) * mix) + 127U) / 255U);
+}
+
+static void brightness_animation_begin(
+    BrightnessAnimation *animation,
+    uint32_t now_ms,
+    uint32_t from_raw,
+    uint32_t to_raw,
+    bool off_when_complete,
+    uint32_t off_saved_brightness,
+    bool off_was_paused
+)
+{
+    if (!animation) {
+        return;
+    }
+
+    animation->from_percent = animation->active
+        ? animation->current_percent
+        : lcd_brightness_percent(from_raw);
+    animation->active = true;
+    animation->off_when_complete = off_when_complete;
+    animation->off_was_paused = off_was_paused;
+    animation->started_ms = now_ms ? now_ms : 1U;
+    animation->from_raw = from_raw;
+    animation->to_raw = to_raw;
+    animation->off_saved_brightness = off_saved_brightness;
+    animation->to_percent = lcd_brightness_percent(to_raw);
+    animation->current_percent = animation->from_percent;
+}
+
+static void brightness_animation_cancel(BrightnessAnimation *animation)
+{
+    if (!animation) {
+        return;
+    }
+    memset(animation, 0, sizeof(*animation));
+}
+
+static uint32_t brightness_animation_logical_raw(const BrightnessAnimation *animation)
+{
+    return animation && animation->active ? animation->to_raw : current_lcd_brightness();
+}
+
+static void brightness_animation_tick(
+    BrightnessAnimation *animation,
+    SDL_Surface *screen,
+    uint32_t now_ms,
+    char *status_overlay_text,
+    size_t status_overlay_text_size
+)
+{
+    uint32_t elapsed_ms;
+    uint8_t mix;
+    uint32_t raw;
+    unsigned percent;
+
+    if (!animation || !animation->active) {
+        return;
+    }
+
+    elapsed_ms = now_ms - animation->started_ms;
+    if (elapsed_ms >= LCD_BRIGHTNESS_FADE_MS) {
+        set_lcd_brightness((int) animation->to_raw);
+        animation->current_percent = animation->to_percent;
+        format_brightness_status(status_overlay_text, status_overlay_text_size, animation->to_percent);
+        if (animation->off_when_complete) {
+            display_power_off_with_saved_brightness(
+                &g_display_power_state,
+                screen,
+                animation->off_saved_brightness,
+                animation->off_was_paused
+            );
+        }
+        brightness_animation_cancel(animation);
+        return;
+    }
+
+    mix = ui_ease_smoothstep(elapsed_ms, LCD_BRIGHTNESS_FADE_MS);
+    raw = mix_u32(animation->from_raw, animation->to_raw, mix);
+    percent = mix_percent(animation->from_percent, animation->to_percent, mix);
+    set_lcd_brightness((int) raw);
+    animation->current_percent = percent;
+    format_brightness_status(status_overlay_text, status_overlay_text_size, percent);
+}
+
 int play_movie(
     SDL_Surface *screen,
     const Fonts *fonts,
@@ -87,9 +204,9 @@ int play_movie(
     PlaybackUiTransitions ui_transitions;
     PlaybackUiMixes ui_mixes;
     ScaleMorphState scale_morph;
+    BrightnessAnimation brightness_animation;
     PlaybackPressTarget playback_press_target = PLAYBACK_PRESS_NONE;
     PointerState pointer;
-    DisplayPowerState display_power_state;
     bool help_menu_open = false;
     bool help_resume_playback = false;
     uint32_t resume_frame = 0;
@@ -123,7 +240,7 @@ int play_movie(
     memset(&ui_transitions, 0, sizeof(ui_transitions));
     memset(&ui_mixes, 0, sizeof(ui_mixes));
     memset(&scale_morph, 0, sizeof(scale_morph));
-    memset(&display_power_state, 0, sizeof(display_power_state));
+    memset(&brightness_animation, 0, sizeof(brightness_animation));
     seek_preview.decoded_chunk_index = -1;
     seek_preview.decoded_frame_index = UINT32_MAX;
     seek_preview.last_pointer_x = -1;
@@ -262,6 +379,7 @@ int play_movie(
     finish_loading_transition(screen, &loading_snapshot, fonts, "Loading");
     pointer_init(&pointer);
     pointer_update(&pointer);
+    display_power_restore(&g_display_power_state, monotonic_clock_now_ms());
     prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
     prev_space = isKeyPressed(KEY_NSPIRE_SPACE);
     prev_tab = isKeyPressed(KEY_NSPIRE_TAB);
@@ -326,15 +444,23 @@ int play_movie(
         if (!esc_down) {
             esc_exit_suppressed_until_release = false;
         }
+        if ((scratchpad_edge || esc_down) &&
+            (g_display_power_state.idle_dim_active ||
+                (g_display_power_state.off && g_display_power_state.off_from_idle))) {
+            display_power_restore(&g_display_power_state, monotonic_clock_now_ms());
+            msleep(16);
+            continue;
+        }
         if (scratchpad_edge) {
+            display_power_off_for_exit(&g_display_power_state, screen, true);
             result = PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT;
             break;
         }
-        if (display_power_state.off && esc_down) {
+        if (g_display_power_state.off && !g_display_power_state.off_from_idle && esc_down) {
             result = PLAY_MOVIE_RESULT_HOME_EXIT;
             break;
         }
-        if (!display_power_state.off && !help_menu_open && esc_down && !esc_exit_suppressed_until_release) {
+        if (!g_display_power_state.off && !help_menu_open && esc_down && !esc_exit_suppressed_until_release) {
             SDL_Surface *collapse_overlay = capture_screen_surface(screen);
 
             animate_movie_collapse_to_black(
@@ -415,6 +541,8 @@ int play_movie(
         bool playback_mode_edge = key_pressed_edge(KEY_NSPIRE_P, &prev_p);
         bool frame_skip_mode_edge = key_pressed_edge(KEY_NSPIRE_R, &prev_r);
         bool theme_edge = key_pressed_edge(KEY_NSPIRE_C, &prev_c);
+        bool subtitle_size_up_edge = key_pressed_edge(KEY_NSPIRE_PLUS, &prev_plus);
+        bool subtitle_size_down_edge = key_pressed_edge(KEY_NSPIRE_MINUS, &prev_minus);
         bool on_edge = on_key_pressed_edge(&prev_on);
         bool take_screenshot = false;
         bool tab_repeat_step = false;
@@ -425,6 +553,7 @@ int play_movie(
         int speed_delta = 0;
         bool pointer_release_edge;
         bool show_ui_before_pointer_activation;
+        bool input_activity;
 
         esc_exit_request = esc_edge || (!help_menu_open && esc_down && !esc_exit_suppressed_until_release);
 
@@ -443,6 +572,63 @@ int play_movie(
             pointer_click = true;
         }
         pointer_release_edge = pointer.release_edge || (enter_release_edge && pointer.visible);
+        input_activity =
+            pointer_click ||
+            pointer_release_edge ||
+            pointer.moved ||
+            pointer.down ||
+            enter_edge ||
+            enter_release_edge ||
+            enter_down ||
+            space_edge ||
+            space_down ||
+            tab_edge ||
+            tab_down ||
+            cat_edge ||
+            esc_edge ||
+            esc_down ||
+            divide_edge ||
+            divide_down ||
+            speed_key_down ||
+            seek_left_edge ||
+            seek_right_edge ||
+            seek_left_down ||
+            seek_right_down ||
+            brightness_up_edge ||
+            brightness_down_edge ||
+            brightness_up_down ||
+            brightness_down_down ||
+            video_down_left_edge ||
+            video_down_edge ||
+            video_down_right_edge ||
+            video_left_edge ||
+            video_center_edge ||
+            video_right_edge ||
+            video_up_left_edge ||
+            video_up_edge ||
+            video_up_right_edge ||
+            subtitle_font_edge ||
+            subtitle_track_edge ||
+            subtitle_size_up_edge ||
+            subtitle_size_down_edge ||
+            memory_overlay_edge ||
+            debug_logging_edge ||
+            screenshot_edge ||
+            playback_mode_edge ||
+            frame_skip_mode_edge ||
+            theme_edge ||
+            on_edge;
+        if ((g_display_power_state.idle_dim_active ||
+                (g_display_power_state.off && g_display_power_state.off_from_idle)) &&
+            input_activity) {
+            display_power_restore(&g_display_power_state, now_ms);
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+            msleep(16);
+            continue;
+        }
+        if (input_activity) {
+            display_power_note_activity(&g_display_power_state, now_ms);
+        }
         if (pointer_click ||
             pointer_release_edge ||
             enter_edge ||
@@ -473,7 +659,7 @@ int play_movie(
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
 
-        if (theme_edge) {
+        if (!g_display_power_state.off && theme_edge) {
             ui_cycle_theme();
             ui_save_theme_for_movie(path);
             snprintf(status_overlay_text, sizeof(status_overlay_text), "THEME %s", ui_theme_name(g_ui_theme_id));
@@ -482,15 +668,45 @@ int play_movie(
             show_ui = true;
         }
 
-        if (display_power_state.off) {
+        if (g_display_power_state.off) {
+            bool off_input_activity =
+                pointer_click ||
+                pointer_release_edge ||
+                pointer.moved ||
+                enter_edge ||
+                enter_release_edge ||
+                space_edge ||
+                tab_edge ||
+                cat_edge ||
+                divide_edge ||
+                speed_down_edge ||
+                speed_up_edge ||
+                seek_left_edge ||
+                seek_right_edge ||
+                brightness_up_edge ||
+                brightness_down_edge ||
+                screenshot_edge ||
+                playback_mode_edge ||
+                frame_skip_mode_edge ||
+                theme_edge ||
+                esc_edge ||
+                on_edge;
+
+            if (g_display_power_state.off_from_idle && off_input_activity) {
+                display_power_restore(&g_display_power_state, now_ms);
+                ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+                msleep(16);
+                continue;
+            }
             if (on_edge || brightness_up_edge) {
-                bool resume_playback = display_power_state.resume_playback_on_wake;
+                bool resume_playback = g_display_power_state.resume_playback_on_wake;
                 bool keep_brightness_badge =
                     brightness_up_edge &&
                     strncmp(status_overlay_text, "BRIGHT ", 7) == 0 &&
                     (int32_t) (now_ms - (status_overlay_until + STATUS_BADGE_EXIT_ANIM_MS)) < 0;
 
-                display_power_on(&display_power_state);
+                brightness_animation_cancel(&brightness_animation);
+                display_power_on(&g_display_power_state);
                 paused = !resume_playback;
                 if (!paused) {
                     paused_ui_quiet_until_ms = 0;
@@ -500,11 +716,21 @@ int play_movie(
                 }
                 if (brightness_up_edge) {
                     set_lcd_brightness(LCD_BRIGHTNESS_MAX);
-                    snprintf(
+                    brightness_animation_begin(
+                        &brightness_animation,
+                        now_ms,
+                        LCD_BRIGHTNESS_MAX,
+                        LCD_BRIGHTNESS_LOWEST_NORMAL,
+                        false,
+                        0,
+                        false
+                    );
+                    brightness_animation_tick(
+                        &brightness_animation,
+                        screen,
+                        now_ms,
                         status_overlay_text,
-                        sizeof(status_overlay_text),
-                        "BRIGHT %u%%",
-                        lcd_brightness_percent(current_lcd_brightness())
+                        sizeof(status_overlay_text)
                     );
                 } else if (resume_playback) {
                     snprintf(status_overlay_text, sizeof(status_overlay_text), "PLAY");
@@ -538,6 +764,7 @@ int play_movie(
         if (on_edge) {
             bool was_paused = paused;
 
+            brightness_animation_cancel(&brightness_animation);
             paused = true;
             seek_repeat_direction = 0;
             seek_repeat_next_ms = 0;
@@ -550,8 +777,20 @@ int play_movie(
                 &playback_anchor_frame,
                 &next_frame_due_ticks
             );
-            display_power_off(&display_power_state, was_paused);
+            display_power_off(&g_display_power_state, was_paused);
             present_black_screen(screen);
+            continue;
+        }
+
+        brightness_animation_tick(
+            &brightness_animation,
+            screen,
+            now_ms,
+            status_overlay_text,
+            sizeof(status_overlay_text)
+        );
+        if (g_display_power_state.off) {
+            msleep(16);
             continue;
         }
 
@@ -851,6 +1090,10 @@ int play_movie(
                     prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
                 }
             }
+            if (display_power_tick_idle(&g_display_power_state, screen, monotonic_clock_now_ms(), true, true)) {
+                msleep(16);
+                continue;
+            }
             if (!playback_ui_mixes_animating(&ui_mixes) &&
                 !ui_time_before(monotonic_clock_now_ms(), paused_ui_quiet_until_ms) &&
                 !ui_time_before(monotonic_clock_now_ms(), playback_input_prefetch_quiet_until_ms)) {
@@ -954,12 +1197,14 @@ int play_movie(
             brightness_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_FALLBACK_INTERVAL_MS;
         }
         if (brightness_delta != 0) {
-            uint32_t brightness_raw;
+            uint32_t brightness_from_raw = current_lcd_brightness();
+            uint32_t brightness_logical_raw = brightness_animation_logical_raw(&brightness_animation);
+            uint32_t brightness_target_raw;
             bool keep_brightness_badge =
                 strncmp(status_overlay_text, "BRIGHT ", 7) == 0 &&
                 (int32_t) (now_ms - (status_overlay_until + STATUS_BADGE_EXIT_ANIM_MS)) < 0;
 
-            if (brightness_delta > 0 && current_lcd_brightness() >= LCD_BRIGHTNESS_MAX) {
+            if (brightness_delta > 0 && brightness_logical_raw >= LCD_BRIGHTNESS_LOWEST_NORMAL) {
                 bool was_paused = paused;
 
                 paused = true;
@@ -969,8 +1214,24 @@ int play_movie(
                 seek_repeat_next_ms = 0;
                 speed_repeat_direction = 0;
                 speed_repeat_next_ms = 0;
-                display_power_off(&display_power_state, was_paused);
-                present_black_screen(screen);
+                brightness_animation_begin(
+                    &brightness_animation,
+                    now_ms,
+                    brightness_from_raw,
+                    LCD_BRIGHTNESS_MAX,
+                    true,
+                    brightness_logical_raw,
+                    was_paused
+                );
+                brightness_animation_tick(
+                    &brightness_animation,
+                    screen,
+                    now_ms,
+                    status_overlay_text,
+                    sizeof(status_overlay_text)
+                );
+                status_overlay_show(now_ms, !keep_brightness_badge, &status_overlay_started_ms, &status_overlay_until);
+                ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
                 reset_playback_timeline(
                     &movie,
                     playback_rate,
@@ -981,14 +1242,35 @@ int play_movie(
                 continue;
             }
 
-            brightness_raw = adjust_lcd_brightness(brightness_delta);
+            brightness_target_raw = lcd_brightness_step_target_from(brightness_logical_raw, brightness_delta);
+            if (brightness_target_raw != brightness_from_raw ||
+                lcd_brightness_percent(brightness_target_raw) != lcd_brightness_percent(brightness_from_raw)) {
+                brightness_animation_begin(
+                    &brightness_animation,
+                    now_ms,
+                    brightness_from_raw,
+                    brightness_target_raw,
+                    false,
+                    0,
+                    false
+                );
+                brightness_animation_tick(
+                    &brightness_animation,
+                    screen,
+                    now_ms,
+                    status_overlay_text,
+                    sizeof(status_overlay_text)
+                );
+            } else {
+                brightness_animation_cancel(&brightness_animation);
+                set_lcd_brightness((int) brightness_target_raw);
+                format_brightness_status(
+                    status_overlay_text,
+                    sizeof(status_overlay_text),
+                    lcd_brightness_percent(brightness_target_raw)
+                );
+            }
 
-            snprintf(
-                status_overlay_text,
-                sizeof(status_overlay_text),
-                "BRIGHT %u%%",
-                lcd_brightness_percent(brightness_raw)
-            );
             status_overlay_show(now_ms, !keep_brightness_badge, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
@@ -1078,11 +1360,11 @@ int play_movie(
             status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
-        if (key_pressed_edge(KEY_NSPIRE_PLUS, &prev_plus) && subtitle_size < 3) {
+        if (subtitle_size_up_edge && subtitle_size < 3) {
             subtitle_size++;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
-        if (key_pressed_edge(KEY_NSPIRE_MINUS, &prev_minus) && subtitle_size > -1) {
+        if (subtitle_size_down_edge && subtitle_size > -1) {
             subtitle_size--;
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
@@ -1562,6 +1844,17 @@ int play_movie(
                     prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
                 }
             }
+            if (display_power_tick_idle(
+                    &g_display_power_state,
+                    screen,
+                    render_now_ms,
+                    paused || help_menu_open || frame_interval_ticks == 0,
+                    true)) {
+                paused = true;
+                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+                msleep(16);
+                continue;
+            }
             if (seek_badge_hide_elapsed_ms >= SEEK_BADGE_EXIT_ANIM_MS) {
                 seek_badge_ms = 0;
                 seek_badge_started_ms = 0;
@@ -1633,7 +1926,10 @@ int play_movie(
         }
     }
 
-    display_power_on(&display_power_state);
+    if (result != PLAY_MOVIE_RESULT_HOME_EXIT &&
+        result != PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) {
+        display_power_restore(&g_display_power_state, monotonic_clock_now_ms());
+    }
     if (result == PLAY_MOVIE_RESULT_EXIT ||
         result == PLAY_MOVIE_RESULT_APP_EXIT ||
         result == PLAY_MOVIE_RESULT_HOME_EXIT ||

@@ -125,8 +125,11 @@
 #define LCD_BRIGHTNESS_CX_LEVEL_MIN 0U
 #define LCD_BRIGHTNESS_CX_LEVEL_MAX 0xFFU
 #define LCD_BRIGHTNESS_CX_BACKLIGHT_OFF 0x100U
-#define LCD_BRIGHTNESS_LOWEST_NORMAL 225
+#define LCD_BRIGHTNESS_LOWEST_NORMAL 252
 #define LCD_BRIGHTNESS_STEP 25
+#define LCD_BRIGHTNESS_FADE_MS 160U
+#define DISPLAY_IDLE_DIM_START_MS 60000U
+#define DISPLAY_IDLE_DIM_OFF_MS 300000U
 #define DEBUG_RING_SIZE 8192
 #define DEBUG_LINE_LEN 192
 #define DEBUG_SNAPSHOT_INTERVAL_MS 1000U
@@ -216,8 +219,12 @@ typedef struct {
 
 typedef struct {
     bool off;
+    bool off_from_idle;
+    bool idle_dim_active;
     bool resume_playback_on_wake;
     uint32_t saved_brightness;
+    uint32_t idle_base_brightness;
+    uint32_t last_activity_ms;
 } DisplayPowerState;
 
 typedef struct {
@@ -629,6 +636,7 @@ extern size_t g_sram_movie_chunk_buffer_size;
 extern Movie *g_deferred_playback_movie;
 extern MoviePickerCache g_picker_cache;
 extern DeferredHistorySave g_pending_history_save;
+extern DisplayPowerState g_display_power_state;
 extern char g_pending_theme_directory[MAX_PATH_LEN];
 extern bool g_pending_theme_save;
 extern const PlaybackRate g_playback_rates[PLAYBACK_RATE_COUNT];
@@ -933,10 +941,17 @@ uint32_t brightness_raw_to_cx_level(uint32_t raw_value);
 uint32_t current_lcd_brightness(void);
 uint32_t set_lcd_brightness(int value);
 void set_lcd_dark_for_power_off(void);
+uint32_t lcd_brightness_step_target_from(uint32_t raw_value, int delta);
 uint32_t adjust_lcd_brightness(int delta);
 unsigned lcd_brightness_percent(uint32_t raw_value);
+void display_power_init(DisplayPowerState *state, uint32_t now_ms);
+void display_power_note_activity(DisplayPowerState *state, uint32_t now_ms);
+bool display_power_tick_idle(DisplayPowerState *state, SDL_Surface *screen, uint32_t now_ms, bool allow_idle_dim, bool was_paused);
 void display_power_off(DisplayPowerState *state, bool was_paused);
+void display_power_off_with_saved_brightness(DisplayPowerState *state, SDL_Surface *screen, uint32_t saved_brightness, bool was_paused);
+void display_power_off_for_exit(DisplayPowerState *state, SDL_Surface *screen, bool was_paused);
 void display_power_on(DisplayPowerState *state);
+void display_power_restore(DisplayPowerState *state, uint32_t now_ms);
 const char *filename_from_path(const char *path);
 SDL_Surface *create_rgb565_surface(int width, int height);
 SDL_Surface *create_scaled_surface_from_surface(SDL_Surface *source, int max_width, int max_height);

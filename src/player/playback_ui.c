@@ -675,6 +675,73 @@ int draw_left_text_badge_animated(
     return badge.x + badge.w + 6;
 }
 
+static bool parse_brightness_status_label(const char *label, unsigned *out_percent)
+{
+    const char *cursor;
+    unsigned percent = 0;
+    bool saw_digit = false;
+
+    if (!label || strncmp(label, "BRIGHT ", 7) != 0) {
+        return false;
+    }
+    cursor = label + 7;
+    while (*cursor == ' ') {
+        ++cursor;
+    }
+    while (*cursor >= '0' && *cursor <= '9') {
+        saw_digit = true;
+        percent = (percent * 10U) + (unsigned) (*cursor - '0');
+        ++cursor;
+    }
+    if (!saw_digit || *cursor != '%') {
+        return false;
+    }
+    if (out_percent) {
+        *out_percent = percent;
+    }
+    return true;
+}
+
+static int draw_left_brightness_badge_animated(
+    SDL_Surface *screen,
+    const Fonts *fonts,
+    int left_x,
+    int y,
+    unsigned percent,
+    uint8_t mix,
+    int offset_x
+)
+{
+    const char *label_text = "BRIGHT";
+    char percent_text[8];
+    int label_w;
+    int digit_w;
+    int gap_w;
+    int percent_w;
+    SDL_Rect badge;
+
+    if (!screen || !fonts || mix == 0) {
+        return left_x;
+    }
+
+    snprintf(percent_text, sizeof(percent_text), "%u%%", percent);
+    label_w = nSDL_GetStringWidth(fonts->white, label_text);
+    digit_w = nSDL_GetStringWidth(fonts->white, "100%");
+    gap_w = nSDL_GetStringWidth(fonts->white, "  ");
+    percent_w = nSDL_GetStringWidth(fonts->white, percent_text);
+    badge.x = (Sint16) (left_x + offset_x);
+    badge.y = (Sint16) y;
+    badge.w = (Uint16) (label_w + gap_w + digit_w + 12);
+    badge.h = 16;
+
+    draw_soft_glass_panel(screen, &badge, rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_GUNMETAL, mix, 255), false);
+    if (mix > 48) {
+        draw_ui_label(screen, fonts, badge.x + 6, badge.y + 4, label_text);
+        draw_ui_label(screen, fonts, badge.x + badge.w - 6 - percent_w, badge.y + 4, percent_text);
+    }
+    return badge.x + badge.w + 6;
+}
+
 void format_seek_delta(int32_t delta_ms, char *buffer, size_t buffer_size);
 void copy_fitted_text(nSDL_Font *font, const char *text, char *buffer, size_t buffer_size, int max_width);
 
@@ -744,6 +811,7 @@ void draw_status_overlay_badge(
     uint8_t mix;
     int offset_x;
     int offset_y;
+    unsigned brightness_percent;
 
     if (!label || label[0] == '\0' || started_ms == 0U || until_ms == 0U || chrome_mix == 0) {
         return;
@@ -761,7 +829,11 @@ void draw_status_overlay_badge(
     }
     mix = mix_product_u8(mix, chrome_mix);
     offset_y = -(((255 - chrome_mix) * 4 + 127) / 255);
-    draw_left_text_badge_animated(screen, fonts, left_x, y + offset_y, label, mix, offset_x);
+    if (parse_brightness_status_label(label, &brightness_percent)) {
+        draw_left_brightness_badge_animated(screen, fonts, left_x, y + offset_y, brightness_percent, mix, offset_x);
+    } else {
+        draw_left_text_badge_animated(screen, fonts, left_x, y + offset_y, label, mix, offset_x);
+    }
 }
 
 SDL_Rect playback_badge_rect(const SDL_Rect *video_rect);
