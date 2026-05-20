@@ -1529,6 +1529,7 @@ static void draw_help_menu_contents(SDL_Surface *screen, const Fonts *fonts, con
         {"SPACE", "Play or pause"},
         {"ENTER/5", "Toggle / click / seek"},
         {"L/R 4/6", "Seek -/+5s"},
+        {"7 / 9", "Prev / next video"},
         {"TAB", "Step one frame"},
         {"P", "Playback mode"},
         {"R", "Realtime frame skip"},
@@ -1551,6 +1552,9 @@ static void draw_help_menu_contents(SDL_Surface *screen, const Fonts *fonts, con
     int max_shortcut_w = 0;
     int shortcut_x;
     int description_x;
+    int body_top_y;
+    int body_bottom_y;
+    int row_span;
     int first_row_y;
     int last_row_y;
     int close_badge_w;
@@ -1568,7 +1572,7 @@ static void draw_help_menu_contents(SDL_Surface *screen, const Fonts *fonts, con
     header.x = panel.x;
     header.y = panel.y;
     header.w = panel.w;
-    header.h = 24;
+    header.h = 22;
     accent.x = panel.x;
     accent.y = (Sint16) (panel.y + header.h);
     accent.w = panel.w;
@@ -1614,14 +1618,20 @@ static void draw_help_menu_contents(SDL_Surface *screen, const Fonts *fonts, con
     }
     shortcut_x = panel.x + 12;
     description_x = shortcut_x + max_shortcut_w + 16;
-    first_row_y = accent.y + accent.h + 5;
-    last_row_y = panel.y + panel.h - 12;
+    body_top_y = accent.y + accent.h + 5;
+    body_bottom_y = panel.y + panel.h - 12;
+    row_span = row_count > 1 ? ((int) row_count - 1) * 8 : 0;
+    if (row_span > body_bottom_y - body_top_y) {
+        row_span = body_bottom_y - body_top_y;
+    }
+    first_row_y = body_top_y + ((body_bottom_y - body_top_y - row_span) / 2);
+    last_row_y = first_row_y + row_span;
     for (index = 0; index < row_count; ++index) {
         int y = first_row_y;
         if (row_count > 1) {
-            int row_span = last_row_y - first_row_y;
+            int current_row_span = last_row_y - first_row_y;
             int row_intervals = (int) row_count - 1;
-            y += (row_span * (int) index + row_intervals / 2) / row_intervals;
+            y += (current_row_span * (int) index + row_intervals / 2) / row_intervals;
         }
         draw_help_row(screen, fonts, shortcut_x, max_shortcut_w, description_x, y, rows[index].shortcut, rows[index].description);
     }
@@ -2347,6 +2357,7 @@ void render_movie(
     );
     bool playback_badge_visible = top_chrome_visible;
     bool memory_badge_visible = top_chrome_visible && (memory_overlay_mode == MEMORY_OVERLAY_ALWAYS);
+    bool cursor_visible = chrome_visible && !help_menu_visible && pointer && pointer->visible;
 
     scale_morph_current_rects(movie, scale_morph, scale_mode, video_align_x, video_align_y, now_ms, &src, &dst);
     draw_movie_frame_background_rects(screen, movie, &src, &dst);
@@ -2405,18 +2416,6 @@ void render_movie(
                     top_chrome_mix
                 );
             }
-            if (ui_mixes && ui_mixes->title_strip > 0) {
-                draw_playback_title_strip(
-                    screen,
-                    fonts,
-                    &dst,
-                    scale_mode,
-                    playback_rate,
-                    movie_title_text,
-                    movie_detail_text,
-                    mix_product_u8(ui_mixes->title_strip, top_chrome_mix)
-                );
-            }
             {
                 SDL_Rect playback_badge = playback_badge_rect(&dst);
                 int status_left_x = playback_badge_visible
@@ -2452,12 +2451,24 @@ void render_movie(
             ui_mixes ? ui_mixes->seek_preview : 0,
             chrome_mix
         );
-        if (!help_menu_visible && pointer && pointer->visible) {
-            draw_cursor(screen, pointer->x, pointer->y);
-        }
     }
     if (memory_badge_visible) {
         draw_memory_badge(screen, fonts, movie, &dst, memory_right_limit, playback_badge_visible, top_chrome_mix);
+    }
+    if (top_chrome_visible && ui_mixes && ui_mixes->title_strip > 0) {
+        draw_playback_title_strip(
+            screen,
+            fonts,
+            &dst,
+            scale_mode,
+            playback_rate,
+            movie_title_text,
+            movie_detail_text,
+            mix_product_u8(ui_mixes->title_strip, top_chrome_mix)
+        );
+    }
+    if (cursor_visible) {
+        draw_cursor(screen, pointer->x, pointer->y);
     }
     if (help_menu_visible) {
         draw_help_menu(screen, fonts, help_menu_mix);

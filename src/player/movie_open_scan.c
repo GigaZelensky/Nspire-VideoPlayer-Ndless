@@ -553,7 +553,7 @@ void ensure_movie_picker_cache(MoviePickerCache *cache, const char *directory)
     cache->valid = true;
 }
 
-bool find_next_movie_path(const char *current_path, char *next_path, size_t next_path_size)
+static bool find_adjacent_movie_path(const char *current_path, char *target_path, size_t target_path_size, int direction)
 {
     char directory[MAX_PATH_LEN];
     const char *current_filename;
@@ -563,7 +563,7 @@ bool find_next_movie_path(const char *current_path, char *next_path, size_t next
     bool found = false;
     bool using_picker_cache = false;
 
-    if (!current_path || current_path[0] == '\0' || !next_path || next_path_size == 0) {
+    if (!current_path || current_path[0] == '\0' || !target_path || target_path_size == 0 || direction == 0) {
         return false;
     }
 
@@ -583,9 +583,13 @@ bool find_next_movie_path(const char *current_path, char *next_path, size_t next
 
     for (index = 0; index < count; ++index) {
         if (strings_equal_ignore_case(filename_from_path(files[index].path), current_filename)) {
-            if (index + 1 < count) {
-                strncpy(next_path, files[index + 1].path, next_path_size - 1);
-                next_path[next_path_size - 1] = '\0';
+            if (direction > 0 && index + 1 < count) {
+                strncpy(target_path, files[index + 1].path, target_path_size - 1);
+                target_path[target_path_size - 1] = '\0';
+                found = true;
+            } else if (direction < 0 && index > 0) {
+                strncpy(target_path, files[index - 1].path, target_path_size - 1);
+                target_path[target_path_size - 1] = '\0';
                 found = true;
             }
             break;
@@ -596,6 +600,16 @@ bool find_next_movie_path(const char *current_path, char *next_path, size_t next
         free_movie_files(files, count);
     }
     return found;
+}
+
+bool find_next_movie_path(const char *current_path, char *next_path, size_t next_path_size)
+{
+    return find_adjacent_movie_path(current_path, next_path, next_path_size, 1);
+}
+
+bool find_previous_movie_path(const char *current_path, char *previous_path, size_t previous_path_size)
+{
+    return find_adjacent_movie_path(current_path, previous_path, previous_path_size, -1);
 }
 
 const SubtitleCue *active_subtitle_cue(const Movie *movie, uint32_t now_ms)

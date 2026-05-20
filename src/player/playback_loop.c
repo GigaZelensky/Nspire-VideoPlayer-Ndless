@@ -186,7 +186,7 @@ int play_movie(
     ScaleMode scale_mode = SCALE_FIT;
     size_t playback_rate_index = PLAYBACK_RATE_DEFAULT_INDEX;
     size_t subtitle_font_index = SUBTITLE_FONT_DEFAULT_INDEX;
-    PlaybackMode playback_mode = PLAYBACK_MODE_ONCE;
+    PlaybackMode playback_mode = PLAYBACK_MODE_AUTO_NEXT;
     MemoryOverlayMode memory_overlay_mode = MEMORY_OVERLAY_OFF;
     bool realtime_frame_skip = false;
     int subtitle_size = 0;
@@ -292,10 +292,9 @@ int play_movie(
     }
     if (load_history_store(path, &startup_history)) {
         ui_set_theme(startup_history.theme_id);
-        startup_history_index = history_find_entry_index(&startup_history, path);
-        if (startup_history_index >= 0) {
+        if (startup_history.has_default_settings) {
             apply_history_entry_settings(
-                &startup_history.entries[startup_history_index],
+                &startup_history.default_settings,
                 &movie,
                 &scale_mode,
                 &playback_rate_index,
@@ -307,6 +306,27 @@ int play_movie(
                 &video_align_x,
                 &video_align_y
             );
+        }
+        startup_history_index = history_find_entry_index(&startup_history, path);
+        if (startup_history_index >= 0) {
+            if (startup_history.has_default_settings) {
+                apply_history_entry_subtitle_track(&startup_history.entries[startup_history_index], &movie);
+            } else {
+                apply_history_entry_settings(
+                    &startup_history.entries[startup_history_index],
+                    &movie,
+                    &scale_mode,
+                    &playback_rate_index,
+                    &playback_mode,
+                    &realtime_frame_skip,
+                    &subtitle_font_index,
+                    &subtitle_size,
+                    &subtitle_placement,
+                    &video_align_x,
+                    &video_align_y
+                );
+                playback_mode = PLAYBACK_MODE_AUTO_NEXT;
+            }
             if (startup_history.entries[startup_history_index].has_resume) {
                 startup_has_resume = true;
                 resume_frame = startup_history.entries[startup_history_index].frame;
@@ -435,6 +455,7 @@ int play_movie(
     }
 
     while (1) {
+        bool woke_from_idle_off = false;
         bool esc_down = isKeyPressed(KEY_NSPIRE_ESC) ? true : false;
         bool scratchpad_down = isKeyPressed(KEY_NSPIRE_SCRATCHPAD) ? true : false;
         bool esc_edge = esc_down && !prev_esc;
@@ -447,9 +468,8 @@ int play_movie(
         if ((scratchpad_edge || esc_down) &&
             (g_display_power_state.idle_dim_active ||
                 (g_display_power_state.off && g_display_power_state.off_from_idle))) {
+            woke_from_idle_off = g_display_power_state.off && g_display_power_state.off_from_idle;
             display_power_restore(&g_display_power_state, monotonic_clock_now_ms());
-            msleep(16);
-            continue;
         }
         if (scratchpad_edge) {
             display_power_off_for_exit(&g_display_power_state, screen, true);
@@ -493,6 +513,8 @@ int play_movie(
         bool keypad_7_edge = key_pressed_edge(KEY_NSPIRE_7, &prev_7);
         bool keypad_8_edge = key_pressed_edge(KEY_NSPIRE_8, &prev_8);
         bool keypad_9_edge = key_pressed_edge(KEY_NSPIRE_9, &prev_9);
+        bool previous_video_edge = !ctrl_down && keypad_7_edge;
+        bool next_video_edge = !ctrl_down && keypad_9_edge;
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) || (!ctrl_down && keypad_5_edge);
         bool enter_down = prev_enter || (!ctrl_down && prev_5);
         bool enter_was_down = enter_key_was_down || (!ctrl_down && keypad_5_was_down);
@@ -594,6 +616,8 @@ int play_movie(
             seek_right_edge ||
             seek_left_down ||
             seek_right_down ||
+            previous_video_edge ||
+            next_video_edge ||
             brightness_up_edge ||
             brightness_down_edge ||
             brightness_up_down ||
@@ -621,10 +645,9 @@ int play_movie(
         if ((g_display_power_state.idle_dim_active ||
                 (g_display_power_state.off && g_display_power_state.off_from_idle)) &&
             input_activity) {
+            woke_from_idle_off = g_display_power_state.off && g_display_power_state.off_from_idle;
             display_power_restore(&g_display_power_state, now_ms);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
-            msleep(16);
-            continue;
         }
         if (input_activity) {
             display_power_note_activity(&g_display_power_state, now_ms);
@@ -641,6 +664,8 @@ int play_movie(
             speed_up_edge ||
             seek_left_edge ||
             seek_right_edge ||
+            previous_video_edge ||
+            next_video_edge ||
             brightness_up_edge ||
             brightness_down_edge ||
             screenshot_edge ||
@@ -683,6 +708,8 @@ int play_movie(
                 speed_up_edge ||
                 seek_left_edge ||
                 seek_right_edge ||
+                previous_video_edge ||
+                next_video_edge ||
                 brightness_up_edge ||
                 brightness_down_edge ||
                 screenshot_edge ||
@@ -693,12 +720,10 @@ int play_movie(
                 on_edge;
 
             if (g_display_power_state.off_from_idle && off_input_activity) {
+                woke_from_idle_off = true;
                 display_power_restore(&g_display_power_state, now_ms);
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
-                msleep(16);
-                continue;
-            }
-            if (on_edge || brightness_up_edge) {
+            } else if (on_edge || brightness_up_edge) {
                 bool resume_playback = g_display_power_state.resume_playback_on_wake;
                 bool keep_brightness_badge =
                     brightness_up_edge &&
@@ -756,12 +781,16 @@ int play_movie(
                     &playback_anchor_frame,
                     &next_frame_due_ticks
                 );
+                msleep(16);
+                continue;
             }
-            msleep(16);
-            continue;
+            if (g_display_power_state.off) {
+                msleep(16);
+                continue;
+            }
         }
 
-        if (on_edge) {
+        if (on_edge && !woke_from_idle_off) {
             bool was_paused = paused;
 
             brightness_animation_cancel(&brightness_animation);
@@ -1101,6 +1130,19 @@ int play_movie(
             }
             msleep(16);
             continue;
+        }
+        if (previous_video_edge || next_video_edge) {
+            bool found_adjacent = previous_video_edge
+                ? find_previous_movie_path(path, next_path, next_path_size)
+                : find_next_movie_path(path, next_path, next_path_size);
+
+            if (found_adjacent) {
+                result = PLAY_MOVIE_RESULT_SWITCH_MOVIE;
+                break;
+            }
+            snprintf(status_overlay_text, sizeof(status_overlay_text), "%s OF LIST", previous_video_edge ? "START" : "END");
+            status_overlay_show(now_ms, true, &status_overlay_started_ms, &status_overlay_until);
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (playback_mode_edge) {
             playback_mode = (PlaybackMode) ((playback_mode + 1) % PLAYBACK_MODE_COUNT);
@@ -1931,6 +1973,8 @@ int play_movie(
         display_power_restore(&g_display_power_state, monotonic_clock_now_ms());
     }
     if (result == PLAY_MOVIE_RESULT_EXIT ||
+        result == PLAY_MOVIE_RESULT_AUTO_NEXT ||
+        result == PLAY_MOVIE_RESULT_SWITCH_MOVIE ||
         result == PLAY_MOVIE_RESULT_APP_EXIT ||
         result == PLAY_MOVIE_RESULT_HOME_EXIT ||
         result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) {
@@ -1952,6 +1996,8 @@ int play_movie(
     }
     if (debug_is_runtime_logging_enabled() ||
         (result != PLAY_MOVIE_RESULT_EXIT &&
+            result != PLAY_MOVIE_RESULT_AUTO_NEXT &&
+            result != PLAY_MOVIE_RESULT_SWITCH_MOVIE &&
             result != PLAY_MOVIE_RESULT_APP_EXIT &&
             result != PLAY_MOVIE_RESULT_HOME_EXIT &&
             result != PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT)) {
@@ -1960,6 +2006,8 @@ int play_movie(
 
         if (result == PLAY_MOVIE_RESULT_AUTO_NEXT) {
             exit_reason = "auto-next";
+        } else if (result == PLAY_MOVIE_RESULT_SWITCH_MOVIE) {
+            exit_reason = "switch-movie";
         } else if (result == PLAY_MOVIE_RESULT_APP_EXIT) {
             exit_reason = "app-exit";
         } else if (result == PLAY_MOVIE_RESULT_HOME_EXIT) {

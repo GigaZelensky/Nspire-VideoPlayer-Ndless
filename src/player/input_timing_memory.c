@@ -641,6 +641,9 @@ void free_history_store(HistoryStore *history)
     if (!history) {
         return;
     }
+    free(history->default_settings.path);
+    history->default_settings.path = NULL;
+    history->has_default_settings = false;
     for (index = 0; index < history->count && index < HISTORY_MAX_ENTRIES; ++index) {
         free(history->entries[index].path);
         history->entries[index].path = NULL;

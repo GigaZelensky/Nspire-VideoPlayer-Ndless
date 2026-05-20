@@ -98,7 +98,8 @@ int main(int argc, char **argv)
             picker_opened_loading
         );
         argc = 1;
-        if (result == PLAY_MOVIE_RESULT_AUTO_NEXT) {
+        if (result == PLAY_MOVIE_RESULT_AUTO_NEXT ||
+            result == PLAY_MOVIE_RESULT_SWITCH_MOVIE) {
             have_queued_movie = true;
             continue;
         }
@@ -134,6 +135,8 @@ int main(int argc, char **argv)
     sram_shutdown();
     monotonic_clock_shutdown();
     return (result == PLAY_MOVIE_RESULT_EXIT ||
+        result == PLAY_MOVIE_RESULT_AUTO_NEXT ||
+        result == PLAY_MOVIE_RESULT_SWITCH_MOVIE ||
         result == PLAY_MOVIE_RESULT_APP_EXIT ||
         result == PLAY_MOVIE_RESULT_HOME_EXIT ||
         result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) ? 0 : 1;

@@ -136,6 +136,7 @@ int pick_movie(
         uint8_t picker_press_mix;
         int activated_index = -1;
         bool activated_resume = false;
+        bool woke_from_idle_off = false;
         bool input_activity =
             pointer_click ||
             pointer.release_edge ||
@@ -159,9 +160,8 @@ int pick_movie(
         if ((g_display_power_state.idle_dim_active ||
                 (g_display_power_state.off && g_display_power_state.off_from_idle)) &&
             input_activity) {
+            woke_from_idle_off = g_display_power_state.off && g_display_power_state.off_from_idle;
             display_power_restore(&g_display_power_state, now_ms);
-            msleep(16);
-            continue;
         }
 
         if (scratchpad_edge) {
@@ -180,7 +180,7 @@ int pick_movie(
             msleep(16);
             continue;
         }
-        if (on_edge) {
+        if (on_edge && !woke_from_idle_off) {
             display_power_off(&g_display_power_state, true);
             present_black_screen(screen);
             msleep(16);

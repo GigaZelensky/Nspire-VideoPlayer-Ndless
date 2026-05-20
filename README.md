@@ -88,6 +88,7 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 - touchpad: move cursor and show the UI
 - `Enter` / keypad `5` / touchpad click: play / pause, restart at end, click hovered controls, or seek inside the bottom UI band
 - `Left` / `Right` or keypad `4` / `6`: seek `-5s` / `+5s`
+- keypad `7` / `9`: switch to the previous / next video in the current directory
 - `Up` / `Down` or keypad `8` / `2`: increase / decrease screen brightness
 - `Tab`: single-frame step while paused, hold to repeat
 - `P`: cycle playback mode: `PLAY ONCE`, `REPLAY`, `AUTO NEXT`

@@ -255,6 +255,7 @@ int prompt_resume_position(
         int hovered_button = -1;
         bool button_press_hot;
         uint8_t button_press_mix;
+        bool woke_from_idle_off = false;
         bool input_activity =
             pointer_click ||
             pointer.release_edge ||
@@ -274,9 +275,8 @@ int prompt_resume_position(
         if ((g_display_power_state.idle_dim_active ||
                 (g_display_power_state.off && g_display_power_state.off_from_idle)) &&
             input_activity) {
+            woke_from_idle_off = g_display_power_state.off && g_display_power_state.off_from_idle;
             display_power_restore(&g_display_power_state, now_ms);
-            msleep(16);
-            continue;
         }
 
         if (scratchpad_edge) {
@@ -305,7 +305,7 @@ int prompt_resume_position(
             msleep(16);
             continue;
         }
-        if (on_edge) {
+        if (on_edge && !woke_from_idle_off) {
             display_power_off(&g_display_power_state, true);
             present_black_screen(screen);
             msleep(16);

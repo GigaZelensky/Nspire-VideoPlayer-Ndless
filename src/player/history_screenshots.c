@@ -45,12 +45,35 @@ void history_entry_init_defaults(HistoryEntry *entry)
     memset(entry, 0, sizeof(*entry));
     entry->scale_mode = (uint8_t) SCALE_FIT;
     entry->playback_rate_index = (uint8_t) PLAYBACK_RATE_DEFAULT_INDEX;
-    entry->playback_mode = (uint8_t) PLAYBACK_MODE_ONCE;
+    entry->playback_mode = (uint8_t) PLAYBACK_MODE_AUTO_NEXT;
     entry->subtitle_font_index = (uint8_t) SUBTITLE_FONT_DEFAULT_INDEX;
     entry->subtitle_size = 0;
     entry->subtitle_placement = (uint8_t) SUBTITLE_POS_BAR_BOTTOM;
     entry->video_align_x = (int8_t) VIDEO_ALIGN_CENTER;
     entry->video_align_y = (int8_t) VIDEO_ALIGN_CENTER;
+}
+
+static void history_store_init_defaults(HistoryStore *history)
+{
+    if (!history) {
+        return;
+    }
+    memset(history, 0, sizeof(*history));
+    history_entry_init_defaults(&history->default_settings);
+    history->theme_id = UI_THEME_DORFIC;
+}
+
+void apply_history_entry_subtitle_track(const HistoryEntry *entry, Movie *movie)
+{
+    if (!entry || !movie) {
+        return;
+    }
+    if (movie->subtitle_track_count == 0) {
+        movie->selected_subtitle_track = 0;
+    } else {
+        uint16_t max_track = (uint16_t) (movie->subtitle_track_count - 1U);
+        movie->selected_subtitle_track = (uint16_t) clamp_int((int) entry->selected_subtitle_track, 0, (int) max_track);
+    }
 }
 
 void apply_history_entry_settings(
@@ -82,16 +105,77 @@ void apply_history_entry_settings(
     *video_align_x = clamp_video_align((int) entry->video_align_x);
     *video_align_y = clamp_video_align((int) entry->video_align_y);
 
-    if (movie->subtitle_track_count == 0) {
-        movie->selected_subtitle_track = 0;
-    } else {
-        uint16_t max_track = (uint16_t) (movie->subtitle_track_count - 1U);
-        movie->selected_subtitle_track = (uint16_t) clamp_int((int) entry->selected_subtitle_track, 0, (int) max_track);
-    }
+    apply_history_entry_subtitle_track(entry, movie);
     *subtitle_placement = subtitle_normalize_placement(
         (SubtitlePlacement) clamp_int((int) entry->subtitle_placement, SUBTITLE_POS_BAR_BOTTOM, SUBTITLE_POS_COUNT - 1),
         selected_subtitle_track_supports_auto_positioning(movie)
     );
+}
+
+static bool history_parse_settings_line(char *line, HistoryEntry *settings)
+{
+    char *fields[9];
+    size_t field_index;
+
+    if (!line || !settings) {
+        return false;
+    }
+
+    history_entry_init_defaults(settings);
+    fields[0] = line;
+    for (field_index = 1; field_index < sizeof(fields) / sizeof(fields[0]); ++field_index) {
+        char *separator = strchr(fields[field_index - 1], '\t');
+        if (!separator) {
+            return false;
+        }
+        *separator = '\0';
+        fields[field_index] = separator + 1;
+    }
+    fields[(sizeof(fields) / sizeof(fields[0])) - 1U][strcspn(fields[(sizeof(fields) / sizeof(fields[0])) - 1U], "\r\n")] = '\0';
+
+    settings->scale_mode = (uint8_t) clamp_int((int) strtol(fields[0], NULL, 10), SCALE_FIT, SCALE_NATIVE);
+    settings->playback_rate_index = (uint8_t) clamp_int((int) strtol(fields[1], NULL, 10), 0, (int) (PLAYBACK_RATE_COUNT - 1U));
+    settings->playback_mode = (uint8_t) clamp_int((int) strtol(fields[2], NULL, 10), PLAYBACK_MODE_ONCE, PLAYBACK_MODE_COUNT - 1);
+    settings->realtime_frame_skip = strtoul(fields[3], NULL, 10) != 0;
+    settings->subtitle_font_index = (uint8_t) clamp_int((int) strtol(fields[4], NULL, 10), 0, (int) (SUBTITLE_FONT_CHOICE_COUNT - 1U));
+    settings->subtitle_size = (int8_t) clamp_int((int) strtol(fields[5], NULL, 10), -1, 3);
+    settings->subtitle_placement = (uint8_t) clamp_int((int) strtol(fields[6], NULL, 10), SUBTITLE_POS_BAR_BOTTOM, SUBTITLE_POS_COUNT - 1);
+    settings->video_align_x = (int8_t) clamp_video_align((int) strtol(fields[7], NULL, 10));
+    settings->video_align_y = (int8_t) clamp_video_align((int) strtol(fields[8], NULL, 10));
+    return true;
+}
+
+static void history_store_set_default_settings(
+    HistoryStore *history,
+    ScaleMode scale_mode,
+    size_t playback_rate_index,
+    PlaybackMode playback_mode,
+    bool realtime_frame_skip,
+    size_t subtitle_font_index,
+    int subtitle_size,
+    SubtitlePlacement subtitle_placement,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y
+)
+{
+    HistoryEntry *settings;
+
+    if (!history) {
+        return;
+    }
+
+    settings = &history->default_settings;
+    history_entry_init_defaults(settings);
+    settings->scale_mode = (uint8_t) clamp_int((int) scale_mode, SCALE_FIT, SCALE_NATIVE);
+    settings->playback_rate_index = (uint8_t) clamp_int((int) playback_rate_index, 0, (int) (PLAYBACK_RATE_COUNT - 1U));
+    settings->playback_mode = (uint8_t) clamp_int((int) playback_mode, PLAYBACK_MODE_ONCE, PLAYBACK_MODE_COUNT - 1);
+    settings->realtime_frame_skip = realtime_frame_skip;
+    settings->subtitle_font_index = (uint8_t) clamp_int((int) subtitle_font_index, 0, (int) (SUBTITLE_FONT_CHOICE_COUNT - 1U));
+    settings->subtitle_size = (int8_t) clamp_int(subtitle_size, -1, 3);
+    settings->subtitle_placement = (uint8_t) clamp_int((int) subtitle_placement, SUBTITLE_POS_BAR_BOTTOM, SUBTITLE_POS_COUNT - 1);
+    settings->video_align_x = (int8_t) clamp_video_align((int) video_align_x);
+    settings->video_align_y = (int8_t) clamp_video_align((int) video_align_y);
+    history->has_default_settings = true;
 }
 
 bool load_history_store_from_path(const char *history_path, HistoryStore *history)
@@ -100,8 +184,7 @@ bool load_history_store_from_path(const char *history_path, HistoryStore *histor
     char line[MAX_PATH_LEN + 128];
     int version = 1;
 
-    memset(history, 0, sizeof(*history));
-    history->theme_id = UI_THEME_DORFIC;
+    history_store_init_defaults(history);
     file = fopen(history_path, "rb");
     if (!file) {
         return true;
@@ -131,6 +214,15 @@ bool load_history_store_from_path(const char *history_path, HistoryStore *histor
         history_entry_init_defaults(&entry);
         if (version >= 5 && strncmp(line, "@theme\t", 7) == 0) {
             history->theme_id = ui_theme_clamp((int) strtol(line + 7, NULL, 10));
+            continue;
+        }
+        if (version >= 5 && strncmp(line, "@settings\t", 10) == 0) {
+            if (history_parse_settings_line(line + 10, &history->default_settings)) {
+                history->has_default_settings = true;
+            }
+            continue;
+        }
+        if (line[0] == '@') {
             continue;
         }
         if (version >= 2) {
@@ -234,6 +326,19 @@ bool save_history_store_to_path(const char *history_path, const HistoryStore *hi
     }
     fputs(HISTORY_MAGIC_V6 "\n", file);
     fprintf(file, "@theme\t%u\n", (unsigned) ui_theme_clamp((int) history->theme_id));
+    fprintf(
+        file,
+        "@settings\t%u\t%u\t%u\t%u\t%u\t%d\t%u\t%d\t%d\n",
+        (unsigned) clamp_int((int) history->default_settings.scale_mode, SCALE_FIT, SCALE_NATIVE),
+        (unsigned) clamp_int((int) history->default_settings.playback_rate_index, 0, (int) (PLAYBACK_RATE_COUNT - 1U)),
+        (unsigned) clamp_int((int) history->default_settings.playback_mode, PLAYBACK_MODE_ONCE, PLAYBACK_MODE_COUNT - 1),
+        history->default_settings.realtime_frame_skip ? 1U : 0U,
+        (unsigned) clamp_int((int) history->default_settings.subtitle_font_index, 0, (int) (SUBTITLE_FONT_CHOICE_COUNT - 1U)),
+        (int) clamp_int((int) history->default_settings.subtitle_size, -1, 3),
+        (unsigned) clamp_int((int) history->default_settings.subtitle_placement, SUBTITLE_POS_BAR_BOTTOM, SUBTITLE_POS_COUNT - 1),
+        (int) clamp_video_align((int) history->default_settings.video_align_x),
+        (int) clamp_video_align((int) history->default_settings.video_align_y)
+    );
     for (index = 0; index < history->count && index < HISTORY_MAX_ENTRIES; ++index) {
         fprintf(
             file,
@@ -283,7 +388,7 @@ void ui_write_theme_for_directory(const char *directory)
     HistoryStore history;
 
     history_path_for_directory(directory, history_path, sizeof(history_path));
-    memset(&history, 0, sizeof(history));
+    history_store_init_defaults(&history);
     history.theme_id = g_ui_theme_id;
     if (load_history_store_from_path(history_path, &history)) {
         history.theme_id = g_ui_theme_id;
@@ -553,6 +658,18 @@ void flush_queued_history_save(DeferredHistorySave *request, const char *reason)
     }
     has_resume = should_save_history_snapshot(&request->header, frame);
     history.theme_id = g_ui_theme_id;
+    history_store_set_default_settings(
+        &history,
+        request->scale_mode,
+        request->playback_rate_index,
+        request->playback_mode,
+        request->realtime_frame_skip,
+        request->subtitle_font_index,
+        request->subtitle_size,
+        request->subtitle_placement,
+        request->video_align_x,
+        request->video_align_y
+    );
 
     start_ms = monotonic_clock_now_ms();
     history_upsert_entry(

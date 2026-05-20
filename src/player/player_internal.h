@@ -214,6 +214,8 @@ typedef enum {
 typedef struct {
     HistoryEntry entries[HISTORY_MAX_ENTRIES];
     size_t count;
+    HistoryEntry default_settings;
+    bool has_default_settings;
     UiThemeId theme_id;
 } HistoryStore;
 
@@ -314,6 +316,7 @@ typedef enum {
     PLAY_MOVIE_RESULT_APP_EXIT = 2,
     PLAY_MOVIE_RESULT_HOME_EXIT = 3,
     PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT = 4,
+    PLAY_MOVIE_RESULT_SWITCH_MOVIE = 5,
 } PlayMovieResult;
 
 enum {
@@ -692,6 +695,7 @@ bool on_key_pressed_edge(bool *previous_state);
 bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progress);
 void ensure_movie_picker_cache(MoviePickerCache *cache, const char *directory);
 bool find_next_movie_path(const char *current_path, char *next_path, size_t next_path_size);
+bool find_previous_movie_path(const char *current_path, char *previous_path, size_t previous_path_size);
 const SubtitleCue *active_subtitle_cue(const Movie *movie, uint32_t now_ms);
 
 /* codec_streaming.c */
@@ -762,6 +766,7 @@ void strip_filename(char *path);
 void history_path_for_directory(const char *directory, char *history_path, size_t history_path_size);
 void history_path_for_movie(const char *movie_path, char *history_path, size_t history_path_size);
 void history_entry_init_defaults(HistoryEntry *entry);
+void apply_history_entry_subtitle_track(const HistoryEntry *entry, Movie *movie);
 void apply_history_entry_settings( const HistoryEntry *entry, Movie *movie, ScaleMode *scale_mode, size_t *playback_rate_index, PlaybackMode *playback_mode, bool *realtime_frame_skip, size_t *subtitle_font_index, int *subtitle_size, SubtitlePlacement *subtitle_placement, VideoAlign *video_align_x, VideoAlign *video_align_y );
 bool load_history_store_from_path(const char *history_path, HistoryStore *history);
 bool load_history_store(const char *movie_path, HistoryStore *history);
