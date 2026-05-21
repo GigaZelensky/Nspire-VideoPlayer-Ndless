@@ -172,7 +172,7 @@ int prompt_resume_position(
 
     while (1) {
         bool pointer_click = pointer_update(&pointer);
-        bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
+        bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer);
         uint32_t now_ms = monotonic_clock_now_ms();
         bool ctrl_down = isKeyPressed(KEY_NSPIRE_CTRL) ? true : false;
         bool keypad_4_edge = key_pressed_edge(KEY_NSPIRE_4, &prev_4);

@@ -120,7 +120,7 @@ void pointer_hover_guard_lock(PointerHoverGuard *guard, const PointerState *poin
     guard->anchor_y = pointer->y;
 }
 
-bool pointer_hover_guard_allows(PointerHoverGuard *guard, const PointerState *pointer, bool pointer_click)
+bool pointer_hover_guard_allows(PointerHoverGuard *guard, const PointerState *pointer)
 {
     int dx;
     int dy;
@@ -131,10 +131,6 @@ bool pointer_hover_guard_allows(PointerHoverGuard *guard, const PointerState *po
         return false;
     }
     if (!guard->locked) {
-        return true;
-    }
-    if (pointer_click) {
-        pointer_hover_guard_reset(guard);
         return true;
     }
     if (!pointer->moved) {

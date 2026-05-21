@@ -119,7 +119,7 @@ int pick_movie(
         bool down_down = prev_down || (!ctrl_down && prev_2);
         bool left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || (!ctrl_down && keypad_4_edge);
         bool right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right) || (!ctrl_down && keypad_6_edge);
-        bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer, pointer_click);
+        bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer);
         int next_hover_scroll_direction = pointer_hover_allowed && !pointer.down
             ? picker_hover_scroll_direction(count, scroll_start, &pointer)
             : 0;

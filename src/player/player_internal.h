@@ -839,7 +839,7 @@ void pointer_init(PointerState *pointer);
 bool pointer_update(PointerState *pointer);
 void pointer_hover_guard_reset(PointerHoverGuard *guard);
 void pointer_hover_guard_lock(PointerHoverGuard *guard, const PointerState *pointer);
-bool pointer_hover_guard_allows(PointerHoverGuard *guard, const PointerState *pointer, bool pointer_click);
+bool pointer_hover_guard_allows(PointerHoverGuard *guard, const PointerState *pointer);
 void picker_tooltip_hover_reset(PickerTooltipHoverState *state);
 int picker_tooltip_hover_update(PickerTooltipHoverState *state, int hovered_index, const PointerState *pointer, bool pointer_click, uint32_t now_ms);
 char *append_uint_decimal_raw(char *out, uint32_t value);
