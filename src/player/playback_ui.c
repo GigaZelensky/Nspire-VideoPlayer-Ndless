@@ -2495,6 +2495,30 @@ bool render_committed_seek_frame(Movie *movie, uint32_t frame_index, void *userd
     }
 
     now_ms = monotonic_clock_now_ms();
+    if (context->abort_on_input &&
+        (playback_key_snapshot_new_press(&context->abort_key_snapshot) ||
+            playback_wait_touchpad_click_pending(context->pointer))) {
+        context->abort_requested = true;
+        return false;
+    }
+    if (context->pointer) {
+        bool pointer_click = pointer_update(context->pointer);
+
+        if (pointer_click && context->abort_on_input) {
+            context->abort_requested = true;
+            return false;
+        }
+        if (context->pointer->moved ||
+            context->pointer->down ||
+            context->pointer->press_edge ||
+            context->pointer->release_edge) {
+            context->show_ui = true;
+        }
+        context->title_strip_active =
+            context->show_ui &&
+            context->pointer->visible &&
+            context->pointer->y < PLAYBACK_TITLE_TOP_EDGE_PX;
+    }
     movie->current_frame = frame_index;
     update_playback_ui_mixes(
         context->ui_transitions,

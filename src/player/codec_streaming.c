@@ -2468,7 +2468,8 @@ bool decode_to_frame_with_progress(
     uint32_t frame_index,
     H264FramePublishPredicate predicate,
     H264DecodedFrameHook hook,
-    void *userdata
+    void *userdata,
+    bool *abort_requested
 )
 {
     int chunk_index;
@@ -2515,11 +2516,17 @@ bool decode_to_frame_with_progress(
         movie->diag_foreground_direct_decode_count++;
     }
     if (!decode_h264_frame_with_progress(movie, frame_index, true, predicate, hook, userdata)) {
+        if (abort_requested && *abort_requested) {
+            return false;
+        }
         debug_tracef("progress seek frame=%lu retry after h264 recovery", (unsigned long) frame_index);
         if (recover_failed_h264_playback_state(movie) &&
             decode_h264_frame_with_progress(movie, frame_index, true, predicate, hook, userdata)) {
             movie->current_frame = frame_index;
             return true;
+        }
+        if (abort_requested && *abort_requested) {
+            return false;
         }
         return false;
     }

@@ -352,6 +352,46 @@ typedef struct {
 } PointerState;
 
 typedef struct {
+    bool esc;
+    bool enter;
+    bool space;
+    bool tab;
+    bool cat;
+    bool scratchpad;
+    bool keypad_1;
+    bool keypad_2;
+    bool keypad_3;
+    bool keypad_4;
+    bool keypad_5;
+    bool keypad_6;
+    bool keypad_7;
+    bool keypad_8;
+    bool keypad_9;
+    bool left;
+    bool right;
+    bool up;
+    bool down;
+    bool divide;
+    bool exp;
+    bool tenx;
+    bool lp;
+    bool rp;
+    bool lthan;
+    bool gthan;
+    bool plus;
+    bool minus;
+    bool f;
+    bool t;
+    bool m;
+    bool d;
+    bool s;
+    bool c;
+    bool p;
+    bool r;
+    bool on;
+} PlaybackKeySnapshot;
+
+typedef struct {
     bool locked;
     int anchor_x;
     int anchor_y;
@@ -524,6 +564,9 @@ typedef struct {
     bool scale_press_active;
     bool speed_press_active;
     bool title_strip_active;
+    PlaybackKeySnapshot abort_key_snapshot;
+    bool abort_on_input;
+    bool abort_requested;
     uint32_t target_frame;
 } CommittedSeekRenderContext;
 
@@ -759,7 +802,7 @@ bool decode_mpeg4_frame( Movie *movie, uint32_t frame_index, bool blit_output );
 void invalidate_loaded_chunk_state(Movie *movie);
 bool recover_failed_h264_playback_state(Movie *movie);
 bool decode_to_frame(Movie *movie, uint32_t frame_index);
-bool decode_to_frame_with_progress( Movie *movie, uint32_t frame_index, H264FramePublishPredicate predicate, H264DecodedFrameHook hook, void *userdata );
+bool decode_to_frame_with_progress( Movie *movie, uint32_t frame_index, H264FramePublishPredicate predicate, H264DecodedFrameHook hook, void *userdata, bool *abort_requested );
 
 /* history_screenshots.c */
 void strip_filename(char *path);
@@ -821,7 +864,10 @@ uint16_t rolling_u16_average(uint16_t current, uint32_t sample_ms);
 void record_h264_foreground_decode_time(Movie *movie, uint32_t elapsed_ms);
 void record_debug_displayed_frame(Movie *movie, uint32_t now_ms);
 bool playback_wait_key_pending(void);
+void playback_key_snapshot_init(PlaybackKeySnapshot *snapshot);
+bool playback_key_snapshot_new_press(PlaybackKeySnapshot *snapshot);
 bool playback_wait_touchpad_pending(const PointerState *pointer);
+bool playback_wait_touchpad_click_pending(const PointerState *pointer);
 bool playback_wait_input_pending(const PointerState *pointer);
 bool prefetch_abort_requested(const PointerState *pointer);
 void wait_until_ticks_playback(uint64_t target_ticks, const PointerState *pointer);

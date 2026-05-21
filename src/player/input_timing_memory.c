@@ -528,22 +528,148 @@ bool playback_wait_key_pending(void)
         isKeyPressed(KEY_NSPIRE_TAB) ||
         isKeyPressed(KEY_NSPIRE_CAT) ||
         isKeyPressed(KEY_NSPIRE_SCRATCHPAD) ||
+        isKeyPressed(KEY_NSPIRE_1) ||
+        isKeyPressed(KEY_NSPIRE_2) ||
+        isKeyPressed(KEY_NSPIRE_3) ||
+        isKeyPressed(KEY_NSPIRE_4) ||
+        isKeyPressed(KEY_NSPIRE_5) ||
+        isKeyPressed(KEY_NSPIRE_6) ||
+        isKeyPressed(KEY_NSPIRE_7) ||
+        isKeyPressed(KEY_NSPIRE_8) ||
+        isKeyPressed(KEY_NSPIRE_9) ||
         isKeyPressed(KEY_NSPIRE_LEFT) ||
         isKeyPressed(KEY_NSPIRE_RIGHT) ||
         isKeyPressed(KEY_NSPIRE_UP) ||
         isKeyPressed(KEY_NSPIRE_DOWN) ||
         isKeyPressed(KEY_NSPIRE_DIVIDE) ||
+        isKeyPressed(KEY_NSPIRE_EXP) ||
+        isKeyPressed(KEY_NSPIRE_TENX) ||
         isKeyPressed(KEY_NSPIRE_LP) ||
         isKeyPressed(KEY_NSPIRE_RP) ||
         isKeyPressed(KEY_NSPIRE_LTHAN) ||
         isKeyPressed(KEY_NSPIRE_GTHAN) ||
         isKeyPressed(KEY_NSPIRE_PLUS) ||
         isKeyPressed(KEY_NSPIRE_MINUS) ||
+        isKeyPressed(KEY_NSPIRE_F) ||
+        isKeyPressed(KEY_NSPIRE_T) ||
+        isKeyPressed(KEY_NSPIRE_M) ||
+        isKeyPressed(KEY_NSPIRE_D) ||
         isKeyPressed(KEY_NSPIRE_S) ||
         isKeyPressed(KEY_NSPIRE_C) ||
         isKeyPressed(KEY_NSPIRE_P) ||
         isKeyPressed(KEY_NSPIRE_R) ||
         on_key_pressed();
+}
+
+static bool key_snapshot_new_press(t_key key, bool *previous)
+{
+    bool down = isKeyPressed(key) ? true : false;
+    bool pressed = down && !*previous;
+
+    *previous = down;
+    return pressed;
+}
+
+static bool on_key_snapshot_new_press(bool *previous)
+{
+    bool down = on_key_pressed() ? true : false;
+    bool pressed = down && !*previous;
+
+    *previous = down;
+    return pressed;
+}
+
+void playback_key_snapshot_init(PlaybackKeySnapshot *snapshot)
+{
+    if (!snapshot) {
+        return;
+    }
+
+    snapshot->esc = isKeyPressed(KEY_NSPIRE_ESC);
+    snapshot->enter = isKeyPressed(KEY_NSPIRE_ENTER);
+    snapshot->space = isKeyPressed(KEY_NSPIRE_SPACE);
+    snapshot->tab = isKeyPressed(KEY_NSPIRE_TAB);
+    snapshot->cat = isKeyPressed(KEY_NSPIRE_CAT);
+    snapshot->scratchpad = isKeyPressed(KEY_NSPIRE_SCRATCHPAD);
+    snapshot->keypad_1 = isKeyPressed(KEY_NSPIRE_1);
+    snapshot->keypad_2 = isKeyPressed(KEY_NSPIRE_2);
+    snapshot->keypad_3 = isKeyPressed(KEY_NSPIRE_3);
+    snapshot->keypad_4 = isKeyPressed(KEY_NSPIRE_4);
+    snapshot->keypad_5 = isKeyPressed(KEY_NSPIRE_5);
+    snapshot->keypad_6 = isKeyPressed(KEY_NSPIRE_6);
+    snapshot->keypad_7 = isKeyPressed(KEY_NSPIRE_7);
+    snapshot->keypad_8 = isKeyPressed(KEY_NSPIRE_8);
+    snapshot->keypad_9 = isKeyPressed(KEY_NSPIRE_9);
+    snapshot->left = isKeyPressed(KEY_NSPIRE_LEFT);
+    snapshot->right = isKeyPressed(KEY_NSPIRE_RIGHT);
+    snapshot->up = isKeyPressed(KEY_NSPIRE_UP);
+    snapshot->down = isKeyPressed(KEY_NSPIRE_DOWN);
+    snapshot->divide = isKeyPressed(KEY_NSPIRE_DIVIDE);
+    snapshot->exp = isKeyPressed(KEY_NSPIRE_EXP);
+    snapshot->tenx = isKeyPressed(KEY_NSPIRE_TENX);
+    snapshot->lp = isKeyPressed(KEY_NSPIRE_LP);
+    snapshot->rp = isKeyPressed(KEY_NSPIRE_RP);
+    snapshot->lthan = isKeyPressed(KEY_NSPIRE_LTHAN);
+    snapshot->gthan = isKeyPressed(KEY_NSPIRE_GTHAN);
+    snapshot->plus = isKeyPressed(KEY_NSPIRE_PLUS);
+    snapshot->minus = isKeyPressed(KEY_NSPIRE_MINUS);
+    snapshot->f = isKeyPressed(KEY_NSPIRE_F);
+    snapshot->t = isKeyPressed(KEY_NSPIRE_T);
+    snapshot->m = isKeyPressed(KEY_NSPIRE_M);
+    snapshot->d = isKeyPressed(KEY_NSPIRE_D);
+    snapshot->s = isKeyPressed(KEY_NSPIRE_S);
+    snapshot->c = isKeyPressed(KEY_NSPIRE_C);
+    snapshot->p = isKeyPressed(KEY_NSPIRE_P);
+    snapshot->r = isKeyPressed(KEY_NSPIRE_R);
+    snapshot->on = on_key_pressed() ? true : false;
+}
+
+bool playback_key_snapshot_new_press(PlaybackKeySnapshot *snapshot)
+{
+    bool pending = false;
+
+    if (!snapshot) {
+        return playback_wait_key_pending();
+    }
+
+    pending = key_snapshot_new_press(KEY_NSPIRE_ESC, &snapshot->esc) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_ENTER, &snapshot->enter) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_SPACE, &snapshot->space) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_TAB, &snapshot->tab) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_CAT, &snapshot->cat) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_SCRATCHPAD, &snapshot->scratchpad) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_1, &snapshot->keypad_1) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_2, &snapshot->keypad_2) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_3, &snapshot->keypad_3) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_4, &snapshot->keypad_4) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_5, &snapshot->keypad_5) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_6, &snapshot->keypad_6) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_7, &snapshot->keypad_7) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_8, &snapshot->keypad_8) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_9, &snapshot->keypad_9) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_LEFT, &snapshot->left) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_RIGHT, &snapshot->right) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_UP, &snapshot->up) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_DOWN, &snapshot->down) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_DIVIDE, &snapshot->divide) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_EXP, &snapshot->exp) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_TENX, &snapshot->tenx) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_LP, &snapshot->lp) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_RP, &snapshot->rp) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_LTHAN, &snapshot->lthan) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_GTHAN, &snapshot->gthan) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_PLUS, &snapshot->plus) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_MINUS, &snapshot->minus) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_F, &snapshot->f) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_T, &snapshot->t) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_M, &snapshot->m) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_D, &snapshot->d) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_S, &snapshot->s) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_C, &snapshot->c) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_P, &snapshot->p) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_R, &snapshot->r) || pending;
+    pending = on_key_snapshot_new_press(&snapshot->on) || pending;
+    return pending;
 }
 
 bool playback_wait_touchpad_pending(const PointerState *pointer)
@@ -580,6 +706,18 @@ bool playback_wait_touchpad_pending(const PointerState *pointer)
         dy = -dy;
     }
     return dx > POINTER_JITTER_THRESHOLD || dy > POINTER_JITTER_THRESHOLD;
+}
+
+bool playback_wait_touchpad_click_pending(const PointerState *pointer)
+{
+    touchpad_report_t report;
+    bool current_down;
+
+    if (!pointer || !pointer->info || touchpad_scan(&report) != 0) {
+        return false;
+    }
+    current_down = (report.pressed && report.arrow == TPAD_ARROW_CLICK) ? true : false;
+    return current_down && !pointer->down;
 }
 
 bool playback_wait_input_pending(const PointerState *pointer)

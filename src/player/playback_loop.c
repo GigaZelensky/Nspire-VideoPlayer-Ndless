@@ -982,13 +982,33 @@ int play_movie(
                 !help_menu_open &&
                 pointer.visible &&
                 pointer.y < PLAYBACK_TITLE_TOP_EDGE_PX;
+            seek_context.abort_on_input = true;
+            playback_key_snapshot_init(&seek_context.abort_key_snapshot);
             seek_context.target_frame = target_frame;
             if (!decode_to_frame_with_progress(
                     &movie,
                     target_frame,
                     should_publish_committed_seek_frame,
                     render_committed_seek_frame,
-                    &seek_context)) {
+                    &seek_context,
+                    &seek_context.abort_requested)) {
+                if (seek_context.abort_requested) {
+                    uint32_t abort_now_ms = monotonic_clock_now_ms();
+
+                    pending_seek_ms = 0;
+                    pending_seek_commit_at_ms = 0;
+                    seek_badge_hide_elapsed_ms = seek_badge_ms != 0 ? SEEK_BADGE_HIDE_PENDING : 0;
+                    reset_playback_timeline(
+                        &movie,
+                        playback_rate,
+                        &playback_anchor_ticks,
+                        &playback_anchor_frame,
+                        &next_frame_due_ticks
+                    );
+                    show_ui = true;
+                    ui_visible_until = abort_now_ms + POINTER_UI_TIMEOUT_MS;
+                    continue;
+                }
                 report_movie_decode_failure(&movie, path, "seek");
                 result = -1;
                 break;
@@ -1633,6 +1653,8 @@ int play_movie(
                         !help_menu_open &&
                         pointer.visible &&
                         pointer.y < PLAYBACK_TITLE_TOP_EDGE_PX;
+                    seek_context.abort_on_input = true;
+                    playback_key_snapshot_init(&seek_context.abort_key_snapshot);
                     seek_context.target_frame = target_frame;
                     used_preview_frame = commit_seek_bar_preview_to_movie(&movie, &seek_preview, target_frame);
                     clear_seek_bar_preview(&seek_preview);
@@ -1646,7 +1668,23 @@ int play_movie(
                             target_frame,
                             should_publish_committed_seek_frame,
                             render_committed_seek_frame,
-                            &seek_context)) {
+                            &seek_context,
+                            &seek_context.abort_requested)) {
+                        if (seek_context.abort_requested) {
+                            uint32_t abort_now_ms = monotonic_clock_now_ms();
+
+                            hover_preview_needs_rebuffer = false;
+                            reset_playback_timeline(
+                                &movie,
+                                playback_rate,
+                                &playback_anchor_ticks,
+                                &playback_anchor_frame,
+                                &next_frame_due_ticks
+                            );
+                            show_ui = true;
+                            ui_visible_until = abort_now_ms + POINTER_UI_TIMEOUT_MS;
+                            continue;
+                        }
                         report_movie_decode_failure(&movie, path, "pointer seek");
                         result = -1;
                         break;
