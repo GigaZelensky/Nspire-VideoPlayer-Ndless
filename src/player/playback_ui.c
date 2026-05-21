@@ -2111,12 +2111,26 @@ void draw_progress_overlay(SDL_Surface *screen, const SDL_Rect *overlay)
     fill_rect_rgb565(screen, &pixel, aa_side);
 }
 
+static uint32_t playback_rate_scaled_remaining_ms(uint32_t remaining_ms, const PlaybackRate *playback_rate)
+{
+    uint64_t scaled_ms;
+
+    if (!playback_rate || playback_rate->numerator == 0U) {
+        return remaining_ms;
+    }
+
+    scaled_ms = ((uint64_t) remaining_ms * playback_rate->denominator + (playback_rate->numerator / 2U)) /
+        playback_rate->numerator;
+    return scaled_ms > UINT32_MAX ? UINT32_MAX : (uint32_t) scaled_ms;
+}
+
 void draw_progress(
     SDL_Surface *screen,
     const Fonts *fonts,
     Movie *movie,
     uint32_t current_ms,
     bool paused,
+    const PlaybackRate *playback_rate,
     uint32_t now_ms,
     const PointerState *pointer,
     int32_t pending_seek_ms,
@@ -2141,6 +2155,8 @@ void draw_progress(
     char right_text[32];
     char hover_text[24];
     uint32_t duration_ms = movie_duration_ms(movie);
+    uint32_t remaining_ms = duration_ms > current_ms ? (duration_ms - current_ms) : 0;
+    uint32_t scaled_remaining_ms = playback_rate_scaled_remaining_ms(remaining_ms, playback_rate);
     bool hover_bar = false;
     uint32_t hover_ms = 0;
     int preview_y;
@@ -2278,7 +2294,7 @@ void draw_progress(
     }
     format_clock(current_ms, current_text, sizeof(current_text));
     format_clock(duration_ms, total_text, sizeof(total_text));
-    format_clock(duration_ms > current_ms ? (duration_ms - current_ms) : 0, remaining_text, sizeof(remaining_text));
+    format_clock(scaled_remaining_ms, remaining_text, sizeof(remaining_text));
     {
         char *left_out = left_text;
         char *left_end = left_text + sizeof(left_text) - 1;
@@ -2441,6 +2457,7 @@ void render_movie(
             movie,
             current_ms,
             paused,
+            playback_rate,
             now_ms,
             pointer,
             pending_seek_ms,
