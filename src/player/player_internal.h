@@ -1111,6 +1111,7 @@ const UiThemePalette *ui_theme(void);
 const char *ui_theme_name(UiThemeId theme_id);
 void ui_set_theme(UiThemeId theme_id);
 UiThemeId ui_cycle_theme(void);
+bool ui_theme_transition_active(void);
 bool surface_is_rgb565(const SDL_Surface *surface);
 void rgb565_to_rgb888(Uint16 color, int *r, int *g, int *b);
 Uint32 map_rgb565(SDL_Surface *screen, Uint16 color);

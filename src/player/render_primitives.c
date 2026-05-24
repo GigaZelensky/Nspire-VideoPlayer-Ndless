@@ -262,6 +262,13 @@ static const UiThemePalette g_ui_themes[UI_THEME_COUNT] = {
 
 UiThemeId g_ui_theme_id = UI_THEME_DORFIC;
 
+#define UI_THEME_TRANSITION_MS 180U
+
+static UiThemePalette g_ui_theme_transition_from;
+static UiThemePalette g_ui_theme_transition_palette;
+static uint32_t g_ui_theme_transition_started_ms = 0;
+static bool g_ui_theme_transition_running = false;
+
 UiThemeId ui_theme_clamp(int theme_id)
 {
     if (theme_id < 0 || theme_id >= UI_THEME_COUNT) {
@@ -270,8 +277,103 @@ UiThemeId ui_theme_clamp(int theme_id)
     return (UiThemeId) theme_id;
 }
 
+static int ui_theme_transition_ease(int step)
+{
+    int inverse = 255 - clamp_int(step, 0, 255);
+    int eased_inverse = (inverse * inverse * inverse + 255 * 255 / 2) / (255 * 255);
+    return 255 - eased_inverse;
+}
+
+static void ui_theme_blend_palette(
+    UiThemePalette *out,
+    const UiThemePalette *from,
+    const UiThemePalette *to,
+    int mix
+)
+{
+    out->name = to->name;
+#define BLEND_THEME_FIELD(field) out->field = rgb565_lerp(from->field, to->field, mix, 255)
+    BLEND_THEME_FIELD(accent_hot);
+    BLEND_THEME_FIELD(accent_mid);
+    BLEND_THEME_FIELD(accent_deep);
+    BLEND_THEME_FIELD(bg_top);
+    BLEND_THEME_FIELD(bg_bottom);
+    BLEND_THEME_FIELD(carbon);
+    BLEND_THEME_FIELD(gunmetal);
+    BLEND_THEME_FIELD(warm_white);
+    BLEND_THEME_FIELD(shortcut_base);
+    BLEND_THEME_FIELD(shortcut_glint);
+    BLEND_THEME_FIELD(tooltip_base);
+    BLEND_THEME_FIELD(resume_hover);
+    BLEND_THEME_FIELD(row_selected);
+    BLEND_THEME_FIELD(row_divider);
+    BLEND_THEME_FIELD(footer_panel);
+    BLEND_THEME_FIELD(footer_accent_top);
+    BLEND_THEME_FIELD(scroll_track_top);
+    BLEND_THEME_FIELD(scroll_track_bottom);
+    BLEND_THEME_FIELD(scroll_thumb);
+    BLEND_THEME_FIELD(help_key);
+    BLEND_THEME_FIELD(help_key_cut);
+    BLEND_THEME_FIELD(menu_border);
+    BLEND_THEME_FIELD(menu_panel);
+    BLEND_THEME_FIELD(modal_panel);
+    BLEND_THEME_FIELD(modal_cut);
+    BLEND_THEME_FIELD(modal_title_panel);
+    BLEND_THEME_FIELD(progress_track_top);
+    BLEND_THEME_FIELD(progress_track_bottom);
+    BLEND_THEME_FIELD(progress_cap_top);
+    BLEND_THEME_FIELD(progress_cap_bottom);
+    BLEND_THEME_FIELD(progress_edge_top);
+    BLEND_THEME_FIELD(progress_edge_bottom);
+    BLEND_THEME_FIELD(buffer_top);
+    BLEND_THEME_FIELD(buffer_bottom);
+    BLEND_THEME_FIELD(buffer_separator);
+    BLEND_THEME_FIELD(progress_fill_top);
+    BLEND_THEME_FIELD(progress_fill_bottom);
+    BLEND_THEME_FIELD(progress_fill_glow);
+    BLEND_THEME_FIELD(progress_fill_cap);
+    BLEND_THEME_FIELD(progress_overlay_base);
+    BLEND_THEME_FIELD(preview_outer);
+    BLEND_THEME_FIELD(surface_outer);
+    BLEND_THEME_FIELD(cursor_pale);
+    BLEND_THEME_FIELD(cursor_mid);
+    BLEND_THEME_FIELD(cursor_deep);
+    BLEND_THEME_FIELD(cursor_dark);
+    BLEND_THEME_FIELD(cursor_shadow);
+#undef BLEND_THEME_FIELD
+}
+
+static void ui_theme_transition_tick(void)
+{
+    uint32_t elapsed_ms;
+    int mix;
+
+    if (!g_ui_theme_transition_running) {
+        return;
+    }
+
+    elapsed_ms = monotonic_clock_now_ms() - g_ui_theme_transition_started_ms;
+    if (elapsed_ms >= UI_THEME_TRANSITION_MS) {
+        g_ui_theme_transition_running = false;
+        return;
+    }
+
+    mix = (int) ((elapsed_ms * 255U + UI_THEME_TRANSITION_MS / 2U) / UI_THEME_TRANSITION_MS);
+    mix = ui_theme_transition_ease(mix);
+    ui_theme_blend_palette(
+        &g_ui_theme_transition_palette,
+        &g_ui_theme_transition_from,
+        &g_ui_themes[g_ui_theme_id],
+        mix
+    );
+}
+
 const UiThemePalette *ui_theme(void)
 {
+    ui_theme_transition_tick();
+    if (g_ui_theme_transition_running) {
+        return &g_ui_theme_transition_palette;
+    }
     return &g_ui_themes[g_ui_theme_id];
 }
 
@@ -283,12 +385,35 @@ const char *ui_theme_name(UiThemeId theme_id)
 void ui_set_theme(UiThemeId theme_id)
 {
     g_ui_theme_id = ui_theme_clamp((int) theme_id);
+    g_ui_theme_transition_running = false;
 }
 
 UiThemeId ui_cycle_theme(void)
 {
-    g_ui_theme_id = (UiThemeId) ((g_ui_theme_id + 1) % UI_THEME_COUNT);
+    UiThemeId next_theme;
+
+    ui_theme_transition_tick();
+    g_ui_theme_transition_from = g_ui_theme_transition_running ?
+        g_ui_theme_transition_palette :
+        g_ui_themes[g_ui_theme_id];
+
+    next_theme = (UiThemeId) ((g_ui_theme_id + 1) % UI_THEME_COUNT);
+    g_ui_theme_id = next_theme;
+    g_ui_theme_transition_started_ms = monotonic_clock_now_ms();
+    g_ui_theme_transition_running = true;
+    ui_theme_blend_palette(
+        &g_ui_theme_transition_palette,
+        &g_ui_theme_transition_from,
+        &g_ui_themes[g_ui_theme_id],
+        0
+    );
     return g_ui_theme_id;
+}
+
+bool ui_theme_transition_active(void)
+{
+    ui_theme_transition_tick();
+    return g_ui_theme_transition_running;
 }
 
 
@@ -1390,7 +1515,7 @@ void draw_cursor(SDL_Surface *screen, int x, int y)
     if (!screen) {
         return;
     }
-    if (cursor_theme != g_ui_theme_id) {
+    if (cursor_theme != g_ui_theme_id || ui_theme_transition_active()) {
         const Uint16 pale = ui_theme()->cursor_pale;
         const Uint16 mid = ui_theme()->cursor_mid;
         const Uint16 deep = ui_theme()->cursor_deep;
@@ -1412,7 +1537,7 @@ void draw_cursor(SDL_Surface *screen, int x, int y)
             UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, outer, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY, UI_CURSOR_KEY
         };
         memcpy(cursor_pixels, themed_pixels, sizeof(cursor_pixels));
-        cursor_theme = g_ui_theme_id;
+        cursor_theme = ui_theme_transition_active() ? UI_THEME_COUNT : g_ui_theme_id;
     }
     if (!cursor_surface) {
         cursor_surface = SDL_CreateRGBSurfaceFrom(

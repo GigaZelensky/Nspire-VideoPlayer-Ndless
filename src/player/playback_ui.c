@@ -1645,7 +1645,7 @@ static SDL_Surface *cached_help_menu_surface(const Fonts *fonts, int menu_w, int
     if (!fonts || menu_w <= 0 || menu_h <= 0) {
         return NULL;
     }
-    if (menu_surface && menu_theme == g_ui_theme_id &&
+    if (menu_surface && !ui_theme_transition_active() && menu_theme == g_ui_theme_id &&
         menu_surface->w == menu_w && menu_surface->h == menu_h) {
         return menu_surface;
     }
@@ -1661,7 +1661,7 @@ static SDL_Surface *cached_help_menu_surface(const Fonts *fonts, int menu_w, int
         SDL_FillRect(menu_surface, NULL, map_rgb565(menu_surface, UI_CURSOR_KEY));
         SDL_SetColorKey(menu_surface, SDL_SRCCOLORKEY, map_rgb565(menu_surface, UI_CURSOR_KEY));
         draw_help_menu_contents(menu_surface, fonts, &local_border, 255);
-        menu_theme = g_ui_theme_id;
+        menu_theme = ui_theme_transition_active() ? UI_THEME_COUNT : g_ui_theme_id;
     }
     return menu_surface;
 }
