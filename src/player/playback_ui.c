@@ -2365,6 +2365,7 @@ void render_movie(
     bool help_menu_visible = help_menu_mix > 0 || help_menu_open;
     bool chrome_visible = chrome_mix > 0 || show_ui;
     bool top_chrome_visible = top_chrome_mix > 0 && chrome_visible;
+    uint8_t memory_badge_mix = (memory_overlay_mode == MEMORY_OVERLAY_ALWAYS) ? 255U : 0U;
     const SubtitleCue *subtitle_cue = active_subtitle_cue(movie, current_ms);
     const char *subtitle = subtitle_cue ? subtitle_cue->text : NULL;
     SubtitlePlacement effective_subtitle_placement = subtitle_normalize_placement(
@@ -2372,7 +2373,7 @@ void render_movie(
         selected_subtitle_track_supports_auto_positioning(movie)
     );
     bool playback_badge_visible = top_chrome_visible;
-    bool memory_badge_visible = top_chrome_visible && (memory_overlay_mode == MEMORY_OVERLAY_ALWAYS);
+    bool memory_badge_visible = memory_badge_mix > 0;
     bool cursor_visible = chrome_visible && !help_menu_visible && pointer && pointer->visible;
 
     scale_morph_current_rects(movie, scale_morph, scale_mode, video_align_x, video_align_y, now_ms, &src, &dst);
@@ -2470,7 +2471,7 @@ void render_movie(
         );
     }
     if (memory_badge_visible) {
-        draw_memory_badge(screen, fonts, movie, &dst, memory_right_limit, playback_badge_visible, top_chrome_mix);
+        draw_memory_badge(screen, fonts, movie, &dst, memory_right_limit, playback_badge_visible, memory_badge_mix);
     }
     if (top_chrome_visible && ui_mixes && ui_mixes->title_strip > 0) {
         draw_playback_title_strip(
