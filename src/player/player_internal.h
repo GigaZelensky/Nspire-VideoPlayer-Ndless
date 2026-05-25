@@ -1104,7 +1104,7 @@ int draw_status_badges( SDL_Surface *screen, const Fonts *fonts, const SDL_Rect 
 void update_playback_ui_mixes( PlaybackUiTransitions *transitions, PlaybackUiMixes *mixes, const Fonts *fonts, const Movie *movie, ScaleMode scale_mode, ScaleMorphState *scale_morph, VideoAlign video_align_x, VideoAlign video_align_y, const PlaybackRate *playback_rate, bool show_ui, bool help_menu_open, PlaybackPressTarget pressed_target, bool force_playback_press, bool force_scale_press, bool force_speed_press, bool show_title_strip, const PointerState *pointer, uint32_t now_ms );
 SDL_Rect playback_badge_rect(const SDL_Rect *video_rect);
 void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect, bool paused, uint8_t hover_mix, uint8_t press_mix, uint8_t chrome_mix);
-void draw_memory_badge( SDL_Surface *screen, const Fonts *fonts, const Movie *movie, const SDL_Rect *video_rect, int right_limit, bool playback_badge_visible, uint8_t chrome_mix );
+void draw_memory_badge( SDL_Surface *screen, const Fonts *fonts, Movie *movie, const SDL_Rect *video_rect, int right_limit, bool playback_badge_visible, uint8_t chrome_mix );
 void draw_help_row( SDL_Surface *screen, const Fonts *fonts, int shortcut_x, int shortcut_w, int description_x, int y, const char *shortcut, const char *description );
 void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu_mix);
 bool chunk_list_contains(const int *chunks, size_t count, int chunk_index);

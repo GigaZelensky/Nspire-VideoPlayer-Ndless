@@ -1397,10 +1397,161 @@ void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect, bool p
     }
 }
 
+static bool h264_frame_payload_contains_idr(const uint8_t *data, size_t size)
+{
+    size_t index = 0;
+
+    while (index + 3U < size) {
+        if (data[index] == 0 && data[index + 1U] == 0) {
+            size_t header_index = size;
+
+            if (data[index + 2U] == 1) {
+                header_index = index + 3U;
+            } else if (index + 4U < size && data[index + 2U] == 0 && data[index + 3U] == 1) {
+                header_index = index + 4U;
+            }
+
+            if (header_index < size) {
+                if ((data[header_index] & 0x1FU) == 5U) {
+                    return true;
+                }
+                index = header_index + 1U;
+                continue;
+            }
+        }
+        ++index;
+    }
+
+    return false;
+}
+
+static bool movie_h264_local_frame_bounds(
+    const Movie *movie,
+    const ChunkIndexEntry *entry,
+    uint32_t local_index,
+    size_t *out_start,
+    size_t *out_end
+)
+{
+    size_t start;
+    size_t end;
+
+    if (!movie || !entry || !movie->frame_offsets || !movie->chunk_bytes ||
+            !out_start || !out_end || local_index >= entry->frame_count) {
+        return false;
+    }
+
+    start = movie->frame_offsets[local_index];
+    end = (local_index + 1U < entry->frame_count)
+        ? movie->frame_offsets[local_index + 1U]
+        : movie->chunk_size;
+    if (start >= end || end > movie->chunk_size) {
+        return false;
+    }
+
+    *out_start = start;
+    *out_end = end;
+    return true;
+}
+
+static bool movie_h264_local_frame_is_idr(const Movie *movie, const ChunkIndexEntry *entry, uint32_t local_index)
+{
+    size_t start;
+    size_t end;
+
+    if (!movie_h264_local_frame_bounds(movie, entry, local_index, &start, &end)) {
+        return false;
+    }
+    return h264_frame_payload_contains_idr(movie->chunk_bytes + start, end - start);
+}
+
+static void movie_debug_frame_progress(
+    Movie *movie,
+    uint32_t *chunk_frame,
+    uint32_t *chunk_total,
+    uint32_t *idr_frame,
+    uint32_t *idr_total
+)
+{
+    int chunk_index;
+    const ChunkIndexEntry *entry;
+    uint32_t local_index;
+    uint32_t segment_start = 0;
+    uint32_t segment_end;
+    uint32_t index;
+
+    *chunk_frame = 0;
+    *chunk_total = 0;
+    *idr_frame = 0;
+    *idr_total = 0;
+
+    if (!movie || !movie->chunk_index || movie->header.frame_count == 0) {
+        return;
+    }
+
+    chunk_index = movie_chunk_for_frame(movie, movie->current_frame);
+    if (chunk_index < 0 || (uint32_t) chunk_index >= movie->header.chunk_count) {
+        return;
+    }
+
+    entry = movie->chunk_index + chunk_index;
+    if (entry->frame_count == 0 || movie->current_frame < entry->first_frame) {
+        return;
+    }
+
+    local_index = movie->current_frame - entry->first_frame;
+    if (local_index >= entry->frame_count) {
+        local_index = entry->frame_count - 1U;
+    }
+
+    *chunk_frame = local_index + 1U;
+    *chunk_total = entry->frame_count;
+    segment_end = entry->frame_count;
+
+    if (movie_uses_h264(movie) &&
+            movie->loaded_chunk == chunk_index &&
+            movie->frame_offsets &&
+            movie->chunk_bytes &&
+            movie->debug_idr_cache_valid &&
+            movie->debug_idr_cache_chunk == chunk_index &&
+            movie->debug_idr_cache_start_local <= local_index &&
+            local_index < movie->debug_idr_cache_end_local &&
+            movie->debug_idr_cache_end_local <= entry->frame_count) {
+        segment_start = movie->debug_idr_cache_start_local;
+        segment_end = movie->debug_idr_cache_end_local;
+    } else if (movie_uses_h264(movie) &&
+            movie->loaded_chunk == chunk_index &&
+            movie->frame_offsets &&
+            movie->chunk_bytes) {
+        for (index = 0; index <= local_index && index < entry->frame_count; ++index) {
+            if (movie_h264_local_frame_is_idr(movie, entry, index)) {
+                segment_start = index;
+            }
+        }
+        for (index = local_index + 1U; index < entry->frame_count; ++index) {
+            if (movie_h264_local_frame_is_idr(movie, entry, index)) {
+                segment_end = index;
+                break;
+            }
+        }
+        if (segment_end <= segment_start) {
+            segment_start = 0;
+            segment_end = entry->frame_count;
+        }
+        movie->debug_idr_cache_valid = true;
+        movie->debug_idr_cache_chunk = chunk_index;
+        movie->debug_idr_cache_start_local = segment_start;
+        movie->debug_idr_cache_end_local = segment_end;
+    }
+
+    *idr_frame = local_index - segment_start + 1U;
+    *idr_total = segment_end - segment_start;
+}
+
 void draw_memory_badge(
     SDL_Surface *screen,
     const Fonts *fonts,
-    const Movie *movie,
+    Movie *movie,
     const SDL_Rect *video_rect,
     int right_limit,
     bool playback_badge_visible,
@@ -1421,6 +1572,10 @@ void draw_memory_badge(
     const char *label = NULL;
     const char *perf_label = NULL;
     uint32_t fps_x10 = movie ? movie->diag_display_fps_x10 : 0U;
+    uint32_t chunk_frame = 0;
+    uint32_t chunk_total = 0;
+    uint32_t idr_frame = 0;
+    uint32_t idr_total = 0;
     int left_x;
     int y;
     int y_offset;
@@ -1436,13 +1591,16 @@ void draw_memory_badge(
     snprintf(label_full, sizeof(label_full), "RAM %s/%s C%s %u%% F%s", app_text, total_text, prefetched_text, stats.percent_used, free_text);
     snprintf(label_medium, sizeof(label_medium), "RAM %s/%s C%s", app_text, total_text, prefetched_text);
     snprintf(label_short, sizeof(label_short), "RAM %s/%s", app_text, total_text);
+    movie_debug_frame_progress(movie, &chunk_frame, &chunk_total, &idr_frame, &idr_total);
     snprintf(
         perf_full,
         sizeof(perf_full),
-        "F%lu L%lu D%lu %lu.%luFPS%s",
-        movie ? (unsigned long) movie->current_frame : 0UL,
+        "C%lu/%lu IDR%lu/%lu L%lu %lu.%luFPS%s",
+        (unsigned long) chunk_frame,
+        (unsigned long) chunk_total,
+        (unsigned long) idr_frame,
+        (unsigned long) idr_total,
         movie ? (unsigned long) movie->diag_lag_event_count : 0UL,
-        movie ? (unsigned long) movie->diag_foreground_direct_decode_count : 0UL,
         (unsigned long) (fps_x10 / 10U),
         (unsigned long) (fps_x10 % 10U),
         debug_is_runtime_logging_enabled() ? " DBG ON" : ""
@@ -1450,18 +1608,22 @@ void draw_memory_badge(
     snprintf(
         perf_medium,
         sizeof(perf_medium),
-        "L%lu D%lu %luFPS%s",
+        "C%lu/%lu I%lu/%lu L%lu%s",
+        (unsigned long) chunk_frame,
+        (unsigned long) chunk_total,
+        (unsigned long) idr_frame,
+        (unsigned long) idr_total,
         movie ? (unsigned long) movie->diag_lag_event_count : 0UL,
-        movie ? (unsigned long) movie->diag_foreground_direct_decode_count : 0UL,
-        (unsigned long) ((fps_x10 + 5U) / 10U),
         debug_is_runtime_logging_enabled() ? " DBG ON" : ""
     );
     snprintf(
         perf_short,
         sizeof(perf_short),
-        "%luFPS%s",
-        (unsigned long) ((fps_x10 + 5U) / 10U),
-        debug_is_runtime_logging_enabled() ? " DBG" : ""
+        "C%lu/%lu I%lu/%lu",
+        (unsigned long) chunk_frame,
+        (unsigned long) chunk_total,
+        (unsigned long) idr_frame,
+        (unsigned long) idr_total
     );
 
     if (playback_badge_visible) {

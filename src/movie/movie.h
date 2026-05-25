@@ -124,6 +124,10 @@ typedef struct Movie {
     uint32_t diag_h264_replay_frames_total;
     uint32_t diag_h264_replay_max_distance;
     uint32_t diag_last_spare_ms;
+    bool debug_idr_cache_valid;
+    int debug_idr_cache_chunk;
+    uint32_t debug_idr_cache_start_local;
+    uint32_t debug_idr_cache_end_local;
 } Movie;
 
 #endif
