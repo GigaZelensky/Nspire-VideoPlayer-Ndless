@@ -332,6 +332,27 @@ static inline uint32_t h264_pack_rgb565_pair(uint16_t left_pixel, uint16_t right
     return ((uint32_t) right_pixel << 16) | left_pixel;
 }
 
+static inline void h264_prefetch_yuv420_rows(
+    const uint8_t *restrict y_row0,
+    const uint8_t *restrict y_row1,
+    const uint8_t *restrict u_row,
+    const uint8_t *restrict v_row,
+    size_t x,
+    size_t crop_width
+)
+{
+    const size_t prefetch_x = x + 64U;
+
+    if (prefetch_x >= crop_width) {
+        return;
+    }
+
+    player_prefetch_data(y_row0 + prefetch_x);
+    player_prefetch_data(y_row1 + prefetch_x);
+    player_prefetch_data(u_row + (prefetch_x / 2U));
+    player_prefetch_data(v_row + (prefetch_x / 2U));
+}
+
 bool blit_h264_planes_to_rgb565_target_with_crop(
     const Movie *movie,
     const uint8_t *restrict y_plane,
@@ -385,6 +406,10 @@ bool blit_h264_planes_to_rgb565_target_with_crop(
                 uint16_t p3;
                 int32_t luma0;
                 int32_t luma1;
+
+                if ((x & 31U) == 0U) {
+                    h264_prefetch_yuv420_rows(y_row0, y_row1, u_row, v_row, x, crop_width);
+                }
 
                 h264_compute_chroma_terms(
                     u_row[chroma_index],
@@ -518,6 +543,10 @@ bool blit_h264_planes_to_rgb565_target_with_crop(
                 uint16_t p3;
                 int32_t luma0;
                 int32_t luma1;
+
+                if ((x & 31U) == 0U) {
+                    h264_prefetch_yuv420_rows(y_row0, y_row1, u_row, v_row, x, crop_width);
+                }
 
                 h264_compute_chroma_terms(
                     u_row[chroma_index],
@@ -1005,6 +1034,7 @@ void reset_prefetched_chunk(PrefetchedChunk *chunk)
         return;
     }
     chunk->chunk_storage = NULL;
+    chunk->chunk_allocation = NULL;
     chunk->chunk_storage_size = 0;
     chunk->chunk_index = -1;
     chunk->state = PREFETCH_IDLE;
@@ -1016,7 +1046,14 @@ void clear_prefetched_chunk(PrefetchedChunk *chunk)
     if (!chunk) {
         return;
     }
-    free(chunk->chunk_storage);
+    if (chunk->chunk_storage) {
+        player_free_aligned(
+            chunk->chunk_storage,
+            chunk->chunk_allocation ? chunk->chunk_allocation : chunk->chunk_storage
+        );
+    } else {
+        free(chunk->chunk_allocation);
+    }
     reset_prefetched_chunk(chunk);
 }
 
@@ -1287,7 +1324,11 @@ bool load_chunk(Movie *movie, int chunk_index)
                 return load_chunk_from_file(movie, chunk_index, true);
             }
         }
-        if (!adopt_movie_chunk_storage(movie, &prefetched->chunk_storage, prefetched->chunk_storage_size)) {
+        if (!adopt_movie_chunk_storage_owned(
+                movie,
+                &prefetched->chunk_storage,
+                &prefetched->chunk_allocation,
+                prefetched->chunk_storage_size)) {
             clear_prefetched_chunk(prefetched);
             return load_chunk_from_file(movie, chunk_index, true);
         }
@@ -1711,7 +1752,11 @@ bool prefetch_chunk(Movie *movie, int chunk_index)
         return false;
     }
     clear_prefetched_chunk(slot);
-    slot->chunk_storage = (uint8_t *) malloc(entry->unpacked_size);
+    slot->chunk_storage = (uint8_t *) player_malloc_aligned(
+        entry->unpacked_size,
+        PLAYER_CACHE_LINE_SIZE,
+        &slot->chunk_allocation
+    );
     if (!slot->chunk_storage) {
         debug_tracef(
             "prefetch alloc fail chunk=%d unpacked=%lu total=%lu",

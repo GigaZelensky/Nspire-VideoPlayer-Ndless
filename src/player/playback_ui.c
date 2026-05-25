@@ -2657,7 +2657,7 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
     movie->loaded_chunk = job->chunk_index;
     movie->decoded_local_frame = (int) (decoded_frame - entry->first_frame);
     movie->h264.chunk_dirty = true;
-    memcpy(movie->framebuffer, job->pixels, frame_pixels * sizeof(uint16_t));
+    player_copy_maybe_fast(movie->framebuffer, job->pixels, frame_pixels * sizeof(uint16_t));
     movie->current_frame = decoded_frame;
 
     job->decoder = NULL;

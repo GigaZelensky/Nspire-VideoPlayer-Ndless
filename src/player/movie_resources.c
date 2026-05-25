@@ -1,5 +1,98 @@
 #include "player_internal.h"
 
+static bool player_is_power_of_two(size_t value)
+{
+    return value != 0 && (value & (value - 1U)) == 0;
+}
+
+void *player_malloc_aligned(size_t size, size_t alignment, uint8_t **allocation)
+{
+    uint8_t *raw;
+    uintptr_t aligned_address;
+    size_t extra;
+
+    if (allocation) {
+        *allocation = NULL;
+    }
+    if (size == 0 || !player_is_power_of_two(alignment) || alignment > 255U) {
+        return NULL;
+    }
+
+    extra = alignment;
+    if (size + extra < size) {
+        return NULL;
+    }
+
+    raw = (uint8_t *) malloc(size + extra);
+    if (!raw) {
+        return NULL;
+    }
+
+    aligned_address = ((uintptr_t) raw + alignment - 1U) & ~((uintptr_t) alignment - 1U);
+    if ((uint8_t *) aligned_address == raw) {
+        aligned_address += alignment;
+    }
+
+    ((uint8_t *) aligned_address)[-1] = (uint8_t) ((uint8_t *) aligned_address - raw);
+    if (allocation) {
+        *allocation = raw;
+    }
+    return (void *) aligned_address;
+}
+
+void *player_calloc_aligned(size_t count, size_t element_size, size_t alignment, uint8_t **allocation)
+{
+    size_t total_size;
+    void *ptr;
+
+    if (element_size != 0 && count > ((size_t) -1) / element_size) {
+        return NULL;
+    }
+
+    total_size = count * element_size;
+    ptr = player_malloc_aligned(total_size, alignment, allocation);
+    if (ptr) {
+        memset(ptr, 0, total_size);
+    }
+    return ptr;
+}
+
+void player_free_aligned(void *ptr, uint8_t *allocation)
+{
+    if (!ptr) {
+        return;
+    }
+    if (allocation) {
+        free(allocation);
+    } else {
+        uint8_t *aligned = (uint8_t *) ptr;
+        free(aligned - aligned[-1]);
+    }
+}
+
+void player_copy_maybe_fast(void *dest, const void *src, size_t size)
+{
+#if defined(__arm__) || defined(__ARM_ARCH)
+    size_t chunk_count;
+    size_t chunk_bytes;
+
+    if (dest && src && size >= PLAYER_CACHE_LINE_SIZE &&
+            ((((uintptr_t) dest) | ((uintptr_t) src)) & (PLAYER_CACHE_LINE_SIZE - 1U)) == 0) {
+        chunk_count = size / PLAYER_CACHE_LINE_SIZE;
+        if (chunk_count <= UINT32_MAX) {
+            chunk_bytes = chunk_count * PLAYER_CACHE_LINE_SIZE;
+            FastMemcpy(dest, src, (uint32_t) chunk_count);
+            if (chunk_bytes < size) {
+                memcpy((uint8_t *) dest + chunk_bytes, (const uint8_t *) src + chunk_bytes, size - chunk_bytes);
+            }
+            return;
+        }
+    }
+#endif
+
+    memcpy(dest, src, size);
+}
+
 bool sram_movie_chunk_buffer_can_hold(size_t size)
 {
     return g_sram_movie_chunk_buffer && size > 0 && size <= g_sram_movie_chunk_buffer_size;
@@ -11,9 +104,10 @@ void release_movie_chunk_storage(Movie *movie)
         return;
     }
     if (movie->chunk_storage && !movie->chunk_storage_in_sram) {
-        free(movie->chunk_storage);
+        player_free_aligned(movie->chunk_storage, movie->chunk_storage_allocation);
     }
     movie->chunk_storage = NULL;
+    movie->chunk_storage_allocation = NULL;
     movie->chunk_storage_size = 0;
     movie->chunk_storage_in_sram = false;
 }
@@ -30,33 +124,50 @@ bool allocate_movie_chunk_storage(Movie *movie, size_t size)
         return true;
     }
 
-    movie->chunk_storage = (uint8_t *) malloc(size);
+    movie->chunk_storage = (uint8_t *) player_malloc_aligned(
+        size,
+        PLAYER_CACHE_LINE_SIZE,
+        &movie->chunk_storage_allocation
+    );
     movie->chunk_storage_in_sram = false;
     return movie->chunk_storage != NULL;
 }
 
-bool adopt_movie_chunk_storage(Movie *movie, uint8_t **storage, size_t size)
+bool adopt_movie_chunk_storage_owned(Movie *movie, uint8_t **storage, uint8_t **allocation, size_t size)
 {
     uint8_t *owned_storage;
+    uint8_t *owned_allocation = NULL;
 
     if (!movie || !storage || !*storage || size == 0) {
         return false;
     }
 
     owned_storage = *storage;
+    if (allocation) {
+        owned_allocation = *allocation;
+    }
     release_movie_chunk_storage(movie);
     if (sram_movie_chunk_buffer_can_hold(size)) {
-        memcpy(g_sram_movie_chunk_buffer, owned_storage, size);
-        free(owned_storage);
+        player_copy_maybe_fast(g_sram_movie_chunk_buffer, owned_storage, size);
+        player_free_aligned(owned_storage, owned_allocation ? owned_allocation : owned_storage);
         movie->chunk_storage = g_sram_movie_chunk_buffer;
         movie->chunk_storage_in_sram = true;
     } else {
         movie->chunk_storage = owned_storage;
+        movie->chunk_storage_allocation = owned_allocation ? owned_allocation : owned_storage;
         movie->chunk_storage_in_sram = false;
     }
     movie->chunk_storage_size = size;
     *storage = NULL;
+    if (allocation) {
+        *allocation = NULL;
+    }
     return true;
+}
+
+bool adopt_movie_chunk_storage(Movie *movie, uint8_t **storage, size_t size)
+{
+    return adopt_movie_chunk_storage_owned(movie, storage, NULL, size);
 }
 
 static bool h264_codec_global_init(void)
@@ -190,7 +301,7 @@ void destroy_movie(Movie *movie)
     free(movie->subtitles);
     free(movie->subtitle_tracks);
     free(movie->chunk_index);
-    free(movie->framebuffer);
+    player_free_aligned(movie->framebuffer, movie->framebuffer_allocation);
     release_movie_chunk_storage(movie);
     free(movie->frame_offsets);
     if (movie->codec_ops && movie->codec_ops->destroy) {

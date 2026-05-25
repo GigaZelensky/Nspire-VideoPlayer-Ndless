@@ -271,7 +271,12 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
     debug_tracef("open index loaded chunks=%lu", (unsigned long) movie->header.chunk_count);
     loading_progress_tick(loading_progress, false);
     framebuffer_words = (size_t) movie->header.video_width * movie->header.video_height;
-    movie->framebuffer = (uint16_t *) calloc(framebuffer_words, sizeof(uint16_t));
+    movie->framebuffer = (uint16_t *) player_calloc_aligned(
+        framebuffer_words,
+        sizeof(uint16_t),
+        PLAYER_CACHE_LINE_SIZE,
+        &movie->framebuffer_allocation
+    );
     if (!movie->framebuffer) {
         debug_failf("open failed: framebuffer alloc words=%lu", (unsigned long) framebuffer_words);
         return false;

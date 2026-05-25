@@ -43,6 +43,7 @@ typedef enum {
 
 typedef struct {
     uint8_t *chunk_storage;
+    uint8_t *chunk_allocation;
     size_t chunk_storage_size;
     int chunk_index;
     PrefetchState state;
@@ -82,7 +83,9 @@ typedef struct Movie {
     uint16_t subtitle_track_count;
     uint16_t selected_subtitle_track;
     uint16_t *framebuffer;
+    uint8_t *framebuffer_allocation;
     uint8_t *chunk_storage;
+    uint8_t *chunk_storage_allocation;
     size_t chunk_storage_size;
     bool chunk_storage_in_sram;
     uint8_t *chunk_bytes;

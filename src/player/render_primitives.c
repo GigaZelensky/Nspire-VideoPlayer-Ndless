@@ -1682,6 +1682,73 @@ bool clip_scaled_rects_to_screen(
     return true;
 }
 
+static bool surfaces_have_same_16bit_format(const SDL_Surface *left, const SDL_Surface *right)
+{
+    const SDL_PixelFormat *left_format;
+    const SDL_PixelFormat *right_format;
+
+    if (!left || !right || !left->format || !right->format) {
+        return false;
+    }
+
+    left_format = left->format;
+    right_format = right->format;
+    return left_format->BitsPerPixel == 16 &&
+        right_format->BitsPerPixel == 16 &&
+        left_format->BytesPerPixel == 2 &&
+        right_format->BytesPerPixel == 2 &&
+        left_format->Rmask == right_format->Rmask &&
+        left_format->Gmask == right_format->Gmask &&
+        left_format->Bmask == right_format->Bmask &&
+        left_format->Amask == right_format->Amask;
+}
+
+static bool blit_surface_direct_copy_1to1(
+    SDL_Surface *screen,
+    SDL_Surface *surface,
+    const SDL_Rect *src,
+    const SDL_Rect *dst
+)
+{
+    size_t row_bytes;
+    uint8_t *dst_row;
+    const uint8_t *src_row;
+    int row;
+
+    if (!screen || !surface || !src || !dst ||
+            src->w != dst->w || src->h != dst->h ||
+            SDL_MUSTLOCK(screen) || SDL_MUSTLOCK(surface) ||
+            (surface->flags & (SDL_SRCCOLORKEY | SDL_SRCALPHA)) != 0 ||
+            screen->clip_rect.x != 0 || screen->clip_rect.y != 0 ||
+            screen->clip_rect.w != screen->w || screen->clip_rect.h != screen->h ||
+            !surfaces_have_same_16bit_format(screen, surface)) {
+        return false;
+    }
+
+    row_bytes = (size_t) src->w * 2U;
+    if (row_bytes == 0 || src->h <= 0 ||
+            surface->pitch < (int) row_bytes || screen->pitch < (int) row_bytes) {
+        return false;
+    }
+
+    src_row = (const uint8_t *) surface->pixels + ((size_t) src->y * (size_t) surface->pitch) + ((size_t) src->x * 2U);
+    dst_row = (uint8_t *) screen->pixels + ((size_t) dst->y * (size_t) screen->pitch) + ((size_t) dst->x * 2U);
+
+    if (src->x == 0 && dst->x == 0 &&
+            row_bytes == (size_t) surface->pitch &&
+            row_bytes == (size_t) screen->pitch) {
+        player_copy_maybe_fast(dst_row, src_row, row_bytes * (size_t) src->h);
+        return true;
+    }
+
+    for (row = 0; row < src->h; ++row) {
+        player_copy_maybe_fast(dst_row, src_row, row_bytes);
+        src_row += surface->pitch;
+        dst_row += screen->pitch;
+    }
+    return true;
+}
+
 void draw_surface_frame_scaled_clipped(
     SDL_Surface *screen,
     SDL_Surface *surface,
@@ -1704,7 +1771,9 @@ void draw_surface_frame_scaled_clipped(
     }
 
     if (clipped_src.w == clipped_dst.w && clipped_src.h == clipped_dst.h) {
-        SDL_BlitSurface(surface, &clipped_src, screen, &clipped_dst);
+        if (!blit_surface_direct_copy_1to1(screen, surface, &clipped_src, &clipped_dst)) {
+            SDL_BlitSurface(surface, &clipped_src, screen, &clipped_dst);
+        }
     } else {
         SDL_SoftStretch(surface, &clipped_src, screen, &clipped_dst);
     }

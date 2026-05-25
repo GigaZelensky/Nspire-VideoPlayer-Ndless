@@ -22,6 +22,22 @@
 
 #define SCREEN_W 320
 #define SCREEN_H 240
+#define PLAYER_CACHE_LINE_SIZE 32U
+
+#if defined(__arm__) || defined(__ARM_ARCH)
+void FastMemcpy(void *dest, const void *src, uint32_t chunks_32byte);
+
+static inline void player_prefetch_data(const void *ptr)
+{
+    __asm__ volatile ("pld [%0]" :: "r" (ptr));
+}
+#else
+static inline void player_prefetch_data(const void *ptr)
+{
+    (void) ptr;
+}
+#endif
+
 #define UI_CHROME_VISUAL_X_OFFSET 0
 #define UI_CHROME_CENTER_X ((SCREEN_W / 2) + UI_CHROME_VISUAL_X_OFFSET)
 #define UI_SOFT_PANEL_RIGHT_PERCEIVED_EDGE_INSET 1
@@ -877,9 +893,14 @@ void free_history_store(HistoryStore *history);
 
 /* movie_resources.c */
 bool sram_movie_chunk_buffer_can_hold(size_t size);
+void *player_malloc_aligned(size_t size, size_t alignment, uint8_t **allocation);
+void *player_calloc_aligned(size_t count, size_t element_size, size_t alignment, uint8_t **allocation);
+void player_free_aligned(void *ptr, uint8_t *allocation);
+void player_copy_maybe_fast(void *dest, const void *src, size_t size);
 void release_movie_chunk_storage(Movie *movie);
 bool allocate_movie_chunk_storage(Movie *movie, size_t size);
 bool adopt_movie_chunk_storage(Movie *movie, uint8_t **storage, size_t size);
+bool adopt_movie_chunk_storage_owned(Movie *movie, uint8_t **storage, uint8_t **allocation, size_t size);
 void destroy_movie(Movie *movie);
 void defer_playback_movie_cleanup(Movie *movie);
 void cleanup_deferred_playback_movie(void);

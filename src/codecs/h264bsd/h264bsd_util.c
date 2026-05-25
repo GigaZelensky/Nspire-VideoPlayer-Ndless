@@ -107,18 +107,36 @@ u32 h264bsdCountLeadingZeros(u32 value, u32 length)
 
 /* Variables */
 
-    u32 zeros = 0;
-    u32 mask = 1 << (length - 1);
+    u32 zeros;
+    u32 skippedBits;
 
 /* Code */
 
-    ASSERT(length <= 32);
+    ASSERT(length > 0 && length <= 32);
 
-    while (mask && !(value & mask))
+    if (value == 0)
+        return length;
+
+#if defined(__GNUC__)
+    zeros = (u32) __builtin_clz(value);
+    skippedBits = 32U - length;
+    if (zeros > skippedBits)
+        zeros -= skippedBits;
+    else
+        zeros = 0;
+#else
+    zeros = 0;
     {
-        zeros++;
-        mask >>= 1;
+        u32 mask = 1U << (length - 1U);
+
+        while (mask && !(value & mask))
+        {
+            zeros++;
+            mask >>= 1;
+        }
     }
+#endif
+
     return(zeros);
 
 }

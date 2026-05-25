@@ -209,6 +209,25 @@ void yv12_to_rgb565_concept(
             dst1 += 2;
         }
 
+        if (rem2) {
+            const uint8_t* y0_tail = (const uint8_t*) y0_32;
+            const uint8_t* y1_tail = (const uint8_t*) y1_32;
+            const uint8_t* u_tail = (const uint8_t*) u16p;
+            const uint8_t* v_tail = (const uint8_t*) v16p;
+            uint8_t u0 = u_tail[0];
+            uint8_t v0 = v_tail[0];
+            int32_t vr0 = VtoR[v0];
+            int32_t ub0 = UtoB[u0];
+            int32_t ugvg0 = UtoG[u0] + VtoG[v0];
+            uint16_t p00 = yuv_to_rgb565_pixel(y0_tail[0], vr0, ugvg0, ub0, Ytab, clamp_centered);
+            uint16_t p01 = yuv_to_rgb565_pixel(y0_tail[1], vr0, ugvg0, ub0, Ytab, clamp_centered);
+            uint16_t p10 = yuv_to_rgb565_pixel(y1_tail[0], vr0, ugvg0, ub0, Ytab, clamp_centered);
+            uint16_t p11 = yuv_to_rgb565_pixel(y1_tail[1], vr0, ugvg0, ub0, Ytab, clamp_centered);
+
+            dst0[0] = (uint32_t) p00 | ((uint32_t) p01 << 16);
+            dst1[0] = (uint32_t) p10 | ((uint32_t) p11 << 16);
+        }
+
         // Advance to next 2-row block
         y_row  += 2 * y_stride;
         u_row  += uv_stride;
