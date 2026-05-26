@@ -1,5 +1,9 @@
 #include "player_internal.h"
 
+#define SUBTITLE_OUTLINE_PX 1
+#define SUBTITLE_SCALE_PAD_PX 1
+#define SUBTITLE_LINE_GAP_PX 2
+
 const char *active_subtitle_track_name(const Movie *movie)
 {
     if (!movie || movie->subtitle_track_count == 0 || movie->selected_subtitle_track >= movie->subtitle_track_count) {
@@ -13,11 +17,124 @@ const char *active_subtitle_track_name(const Movie *movie)
 
 void draw_outlined_text(SDL_Surface *surface, nSDL_Font *white_font, nSDL_Font *outline_font, int x, int y, const char *text)
 {
-    nSDL_DrawString(surface, outline_font, x - 1, y, text);
-    nSDL_DrawString(surface, outline_font, x + 1, y, text);
-    nSDL_DrawString(surface, outline_font, x, y - 1, text);
-    nSDL_DrawString(surface, outline_font, x, y + 1, text);
-    nSDL_DrawString(surface, white_font, x, y, text);
+    nSDL_DrawString(surface, outline_font, x - 1, y, "%s", text);
+    nSDL_DrawString(surface, outline_font, x + 1, y, "%s", text);
+    nSDL_DrawString(surface, outline_font, x, y - 1, "%s", text);
+    nSDL_DrawString(surface, outline_font, x, y + 1, "%s", text);
+    nSDL_DrawString(surface, white_font, x, y, "%s", text);
+}
+
+static int subtitle_text_padding_px(int scale_num, int scale_den)
+{
+    if (scale_num == scale_den) {
+        return SUBTITLE_OUTLINE_PX * 2;
+    }
+    return SUBTITLE_SCALE_PAD_PX * 2;
+}
+
+static int subtitle_text_draw_inset_px(int scale_num, int scale_den)
+{
+    if (scale_num == scale_den) {
+        return SUBTITLE_OUTLINE_PX;
+    }
+    return 0;
+}
+
+static int subtitle_scaled_extent(int value, int scale_num, int scale_den)
+{
+    if (value <= 0 || scale_num <= 0 || scale_den <= 0) {
+        return 0;
+    }
+    if (scale_num == scale_den) {
+        return value;
+    }
+    return (value * scale_num) / scale_den;
+}
+
+static int subtitle_rendered_text_width(nSDL_Font *font, const char *text, int scale_num, int scale_den)
+{
+    int text_w;
+
+    if (!font || !text) {
+        return 0;
+    }
+    text_w = nSDL_GetStringWidth(font, text);
+    return subtitle_scaled_extent(text_w + subtitle_text_padding_px(scale_num, scale_den), scale_num, scale_den);
+}
+
+static int subtitle_rendered_text_height(nSDL_Font *font, const char *text, int scale_num, int scale_den)
+{
+    int text_h;
+
+    if (!font || !text) {
+        return 0;
+    }
+    text_h = nSDL_GetStringHeight(font, text);
+    return subtitle_scaled_extent(text_h + subtitle_text_padding_px(scale_num, scale_den), scale_num, scale_den);
+}
+
+static int subtitle_wrap_limit_width(int wrap_width, int scale_num, int scale_den)
+{
+    int padding = subtitle_text_padding_px(scale_num, scale_den);
+    int limit;
+
+    if (wrap_width <= padding) {
+        return 1;
+    }
+    if (scale_num == scale_den) {
+        limit = wrap_width - padding;
+    } else {
+        limit = (wrap_width * scale_den) / scale_num - padding;
+    }
+    return limit > 0 ? limit : 1;
+}
+
+static int subtitle_prepare_lines(
+    nSDL_Font *font,
+    const char *text,
+    int wrap_width,
+    int scale_num,
+    int scale_den,
+    char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN],
+    int *out_line_height,
+    int *out_max_line_width
+)
+{
+    int line_count;
+    int line_height;
+    int max_line_width = 0;
+    int line_index;
+
+    if (!font || !text || !out_line_height || !out_max_line_width) {
+        return 0;
+    }
+
+    line_count = wrap_subtitle(font, text, subtitle_wrap_limit_width(wrap_width, scale_num, scale_den), lines);
+    if (line_count <= 0) {
+        return 0;
+    }
+
+    line_height = subtitle_rendered_text_height(font, "Ag", scale_num, scale_den);
+    if (line_height < 10) {
+        line_height = 10;
+    }
+    for (line_index = 0; line_index < line_count; ++line_index) {
+        int width = subtitle_rendered_text_width(font, lines[line_index], scale_num, scale_den);
+        int height = subtitle_rendered_text_height(font, lines[line_index], scale_num, scale_den);
+        if (width > max_line_width) {
+            max_line_width = width;
+        }
+        if (height > line_height) {
+            line_height = height;
+        }
+    }
+    if (max_line_width <= 0 || line_height <= 0) {
+        return 0;
+    }
+
+    *out_line_height = line_height;
+    *out_max_line_width = max_line_width;
+    return line_count;
 }
 
 int wrap_subtitle(nSDL_Font *font, const char *text, int max_width, char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN])
@@ -504,8 +621,8 @@ void draw_scaled_outlined_text(
     }
     text_surface = SDL_CreateRGBSurface(
         SDL_SWSURFACE,
-        text_w + 4,
-        text_h + 4,
+        text_w + (SUBTITLE_SCALE_PAD_PX * 2),
+        text_h + (SUBTITLE_SCALE_PAD_PX * 2),
         screen->format->BitsPerPixel,
         screen->format->Rmask,
         screen->format->Gmask,
@@ -518,7 +635,7 @@ void draw_scaled_outlined_text(
     }
     key = SDL_MapRGB(text_surface->format, 255, 0, 255);
     SDL_FillRect(text_surface, NULL, key);
-    draw_outlined_text(text_surface, white_font, outline_font, 2, 2, text);
+    draw_outlined_text(text_surface, white_font, outline_font, SUBTITLE_SCALE_PAD_PX, SUBTITLE_SCALE_PAD_PX, text);
     dst_w = (text_surface->w * scale_num) / scale_den;
     dst_h = (text_surface->h * scale_num) / scale_den;
     if (dst_w <= 0 || dst_h <= 0 || screen->format->BitsPerPixel != 16 || text_surface->format->BitsPerPixel != 16) {
@@ -595,6 +712,7 @@ bool ensure_subtitle_surface_cache(
     int total_height;
     int line_index;
     int max_line_width = 0;
+    int draw_inset;
     Uint32 key;
 
     (void) screen;
@@ -617,30 +735,25 @@ bool ensure_subtitle_surface_cache(
     subtitle_fonts_for_style(fonts, subtitle_font_index, &white_font, &outline_font);
     scale_num = subtitle_scale_num(subtitle_size);
     scale_den = subtitle_scale_den(subtitle_size);
+    draw_inset = subtitle_text_draw_inset_px(scale_num, scale_den);
 
-    line_count = wrap_subtitle(white_font, text, (wrap_width * scale_den) / scale_num, lines);
+    line_count = subtitle_prepare_lines(
+        white_font,
+        text,
+        wrap_width,
+        scale_num,
+        scale_den,
+        lines,
+        &line_height,
+        &max_line_width
+    );
     if (line_count <= 0) {
         return false;
     }
 
-    line_height = nSDL_GetStringHeight(white_font, "Ag");
-    if (line_height < 10) {
-        line_height = 10;
-    }
-    line_height = (line_height * scale_num) / scale_den;
-    if (line_height < 10) {
-        line_height = 10;
-    }
     total_height = line_count * line_height;
     if (line_count > 1) {
-        total_height += (line_count - 1) * 2;
-    }
-
-    for (line_index = 0; line_index < line_count; ++line_index) {
-        int width = (nSDL_GetStringWidth(white_font, lines[line_index]) * scale_num) / scale_den;
-        if (width > max_line_width) {
-            max_line_width = width;
-        }
+        total_height += (line_count - 1) * SUBTITLE_LINE_GAP_PX;
     }
     if (max_line_width <= 0 || total_height <= 0) {
         return false;
@@ -654,14 +767,14 @@ bool ensure_subtitle_surface_cache(
     SDL_FillRect(cache->surface, NULL, key);
     SDL_SetColorKey(cache->surface, SDL_SRCCOLORKEY, key);
     for (line_index = 0; line_index < line_count; ++line_index) {
-        int width = (nSDL_GetStringWidth(white_font, lines[line_index]) * scale_num) / scale_den;
+        int width = subtitle_rendered_text_width(white_font, lines[line_index], scale_num, scale_den);
         int x = (max_line_width - width) / 2;
         draw_scaled_outlined_text(
             cache->surface,
             white_font,
             outline_font,
-            x,
-            line_index * (line_height + 2),
+            x + draw_inset,
+            line_index * (line_height + SUBTITLE_LINE_GAP_PX) + draw_inset,
             lines[line_index],
             scale_num,
             scale_den
@@ -726,6 +839,7 @@ void draw_subtitle(
     int total_height;
     int base_y = 0;
     int line_max_width = 0;
+    int draw_inset;
     SDL_Rect dst;
     if (!text || !*text) {
         return;
@@ -737,27 +851,23 @@ void draw_subtitle(
     subtitle_fonts_for_style(fonts, subtitle_font_index, &white_font, &outline_font);
     scale_num = subtitle_scale_num(subtitle_size);
     scale_den = subtitle_scale_den(subtitle_size);
-    line_height = nSDL_GetStringHeight(white_font, "Ag");
-    if (line_height < 10) {
-        line_height = 10;
-    }
-    line_height = (line_height * scale_num) / scale_den;
-    if (line_height < 10) {
-        line_height = 10;
-    }
-    line_count = wrap_subtitle(white_font, text, (layout->wrap_width * scale_den) / scale_num, lines);
+    draw_inset = subtitle_text_draw_inset_px(scale_num, scale_den);
+    line_count = subtitle_prepare_lines(
+        white_font,
+        text,
+        layout->wrap_width,
+        scale_num,
+        scale_den,
+        lines,
+        &line_height,
+        &line_max_width
+    );
     if (line_count <= 0) {
         return;
     }
     total_height = line_count * line_height;
     if (line_count > 1) {
-        total_height += (line_count - 1) * 2;
-    }
-    for (line_index = 0; line_index < line_count; ++line_index) {
-        int width = (nSDL_GetStringWidth(white_font, lines[line_index]) * scale_num) / scale_den;
-        if (width > line_max_width) {
-            line_max_width = width;
-        }
+        total_height += (line_count - 1) * SUBTITLE_LINE_GAP_PX;
     }
     if (line_max_width <= 0) {
         return;
@@ -765,14 +875,14 @@ void draw_subtitle(
     subtitle_layout_dst_rect(layout, line_max_width, total_height, &dst);
     base_y = dst.y;
     for (line_index = 0; line_index < line_count; ++line_index) {
-        int width = (nSDL_GetStringWidth(white_font, lines[line_index]) * scale_num) / scale_den;
+        int width = subtitle_rendered_text_width(white_font, lines[line_index], scale_num, scale_den);
         int x = dst.x + (line_max_width - width) / 2;
         draw_scaled_outlined_text(
             screen,
             white_font,
             outline_font,
-            x,
-            base_y + (line_index * (line_height + 2)),
+            x + draw_inset,
+            base_y + (line_index * (line_height + SUBTITLE_LINE_GAP_PX)) + draw_inset,
             lines[line_index],
             scale_num,
             scale_den
