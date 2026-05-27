@@ -100,7 +100,7 @@ static inline void player_prefetch_data(const void *ptr)
 #define UI_PAUSE_QUIET_MS (UI_PRESS_ANIM_MS + UI_PRESS_RELEASE_ANIM_MS + 24U)
 #define PLAYBACK_INPUT_PREFETCH_GRACE_MS 80U
 #define MAX_PATH_LEN 512
-#define MAX_SUBTITLE_LINES 3
+#define MAX_SUBTITLE_LINES 32
 #define MAX_SUBTITLE_LINE_LEN 96
 #define APP_RAM_TARGET_BYTES (32U * 1024U * 1024U)
 #define TIMER_TICKS_PER_SEC 32768U
@@ -472,6 +472,10 @@ typedef struct {
     size_t subtitle_font_index;
     int subtitle_size;
     int wrap_width;
+    int wrapped_line_count;
+    int line_height;
+    int page_start_line;
+    int page_line_count;
 } SubtitleSurfaceCache;
 
 typedef struct {
@@ -1210,8 +1214,8 @@ int subtitle_visible_max_y(const SubtitleLayoutSpec *layout, int surface_h);
 void subtitle_layout_dst_rect( const SubtitleLayoutSpec *layout, int surface_w, int surface_h, SDL_Rect *dst );
 void subtitle_fonts_for_style(const Fonts *fonts, size_t subtitle_font_index, nSDL_Font **white_font, nSDL_Font **outline_font);
 void draw_scaled_outlined_text( SDL_Surface *screen, nSDL_Font *white_font, nSDL_Font *outline_font, int x, int y, const char *text, int scale_num, int scale_den );
-bool ensure_subtitle_surface_cache( SubtitleSurfaceCache *cache, SDL_Surface *screen, const Fonts *fonts, const char *text, size_t subtitle_font_index, int subtitle_size, int wrap_width );
-void draw_subtitle_cached( SDL_Surface *screen, const Fonts *fonts, SubtitleSurfaceCache *cache, const char *text, size_t subtitle_font_index, int subtitle_size, const SubtitleLayoutSpec *layout );
+bool ensure_subtitle_surface_cache( SubtitleSurfaceCache *cache, SDL_Surface *screen, const Fonts *fonts, const SubtitleCue *cue, uint32_t current_ms, size_t subtitle_font_index, int subtitle_size, const SubtitleLayoutSpec *layout );
+void draw_subtitle_cached( SDL_Surface *screen, const Fonts *fonts, SubtitleSurfaceCache *cache, const SubtitleCue *cue, uint32_t current_ms, size_t subtitle_font_index, int subtitle_size, const SubtitleLayoutSpec *layout );
 void draw_subtitle( SDL_Surface *screen, const Fonts *fonts, const char *text, size_t subtitle_font_index, int subtitle_size, const SubtitleLayoutSpec *layout );
 
 #define UI_COLOR_ACCENT (ui_theme()->accent_mid)

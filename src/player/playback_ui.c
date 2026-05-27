@@ -2554,7 +2554,8 @@ void render_movie(
                 screen,
                 fonts,
                 subtitle_cache,
-                subtitle,
+                subtitle_cue,
+                current_ms,
                 subtitle_font_index,
                 subtitle_size,
                 &subtitle_layout

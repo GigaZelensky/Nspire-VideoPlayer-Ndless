@@ -137,6 +137,136 @@ static int subtitle_prepare_lines(
     return line_count;
 }
 
+static int subtitle_lines_height(int line_count, int line_height)
+{
+    if (line_count <= 0 || line_height <= 0) {
+        return 0;
+    }
+    return (line_count * line_height) + ((line_count - 1) * SUBTITLE_LINE_GAP_PX);
+}
+
+static int subtitle_page_line_capacity(int max_height, int line_height)
+{
+    int capacity;
+
+    if (line_height <= 0) {
+        return 1;
+    }
+    if (max_height < line_height) {
+        return 1;
+    }
+    capacity = (max_height + SUBTITLE_LINE_GAP_PX) / (line_height + SUBTITLE_LINE_GAP_PX);
+    return capacity > 0 ? capacity : 1;
+}
+
+static int subtitle_layout_max_surface_height(const SubtitleLayoutSpec *layout)
+{
+    int top = 2;
+    int bottom;
+    const SDL_Rect *video_rect;
+
+    if (!layout) {
+        return SCREEN_H;
+    }
+
+    video_rect = &layout->video_rect;
+    bottom = subtitle_visible_bottom_limit(layout, 0);
+
+    if (layout->mode == SUBTITLE_CUE_POSITION_ABSOLUTE && layout->align >= 1 && layout->align <= 9) {
+        int row = subtitle_align_row(layout->align);
+        if (row == 0) {
+            top = video_rect->y;
+            bottom = layout->absolute_y;
+        } else if (row == 2) {
+            top = layout->absolute_y;
+        } else {
+            top = video_rect->y;
+        }
+    } else if (layout->mode == SUBTITLE_CUE_POSITION_MARGIN && layout->align >= 1 && layout->align <= 9) {
+        int row = subtitle_align_row(layout->align);
+        if (row == 0) {
+            top = video_rect->y;
+            bottom = subtitle_visible_bottom_limit(layout, layout->margin_v);
+        } else if (row == 2) {
+            top = video_rect->y + layout->margin_v;
+        } else {
+            top = video_rect->y;
+        }
+    } else {
+        switch (layout->manual_placement) {
+            case SUBTITLE_POS_BAR_BOTTOM:
+                top = 2;
+                bottom = SCREEN_H - 2 - ui_bar_visible_height_for_mix(layout->overlay_mix);
+                break;
+            case SUBTITLE_POS_VIDEO_TOP:
+                top = video_rect->y + 4;
+                bottom = subtitle_visible_bottom_limit(layout, 0);
+                break;
+            case SUBTITLE_POS_BAR_TOP:
+                top = 4;
+                bottom = subtitle_visible_bottom_limit(layout, 0);
+                break;
+            case SUBTITLE_POS_VIDEO_BOTTOM:
+            default:
+                top = video_rect->y + 4;
+                bottom = subtitle_visible_bottom_limit(layout, 8);
+                break;
+        }
+    }
+
+    top = clamp_int(top, 0, SCREEN_H - 1);
+    bottom = clamp_int(bottom, top + 1, SCREEN_H);
+    return bottom - top;
+}
+
+static void subtitle_select_line_window(
+    int line_count,
+    int line_capacity,
+    const SubtitleCue *cue,
+    uint32_t current_ms,
+    int *out_start_line,
+    int *out_line_count
+)
+{
+    int start_line = 0;
+    int visible_lines;
+
+    if (!out_start_line || !out_line_count) {
+        return;
+    }
+    if (line_count <= 0) {
+        *out_start_line = 0;
+        *out_line_count = 0;
+        return;
+    }
+
+    line_capacity = clamp_int(line_capacity, 1, line_count);
+    if (line_capacity < line_count && cue && cue->end_ms > cue->start_ms) {
+        uint32_t duration = cue->end_ms - cue->start_ms;
+        uint32_t elapsed = current_ms > cue->start_ms ? current_ms - cue->start_ms : 0;
+        uint32_t target_line;
+
+        if (elapsed >= duration) {
+            elapsed = duration - 1;
+        }
+        target_line = (uint32_t) (((uint64_t) elapsed * (uint64_t) line_count) / duration);
+        if (target_line >= (uint32_t) line_count) {
+            target_line = (uint32_t) (line_count - 1);
+        }
+        start_line = ((int) target_line / line_capacity) * line_capacity;
+        if (start_line >= line_count) {
+            start_line = line_count - line_capacity;
+        }
+    }
+
+    visible_lines = line_count - start_line;
+    if (visible_lines > line_capacity) {
+        visible_lines = line_capacity;
+    }
+    *out_start_line = start_line;
+    *out_line_count = visible_lines;
+}
+
 int wrap_subtitle(nSDL_Font *font, const char *text, int max_width, char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN])
 {
     char current[MAX_SUBTITLE_LINE_LEN];
@@ -696,10 +826,11 @@ bool ensure_subtitle_surface_cache(
     SubtitleSurfaceCache *cache,
     SDL_Surface *screen,
     const Fonts *fonts,
-    const char *text,
+    const SubtitleCue *cue,
+    uint32_t current_ms,
     size_t subtitle_font_index,
     int subtitle_size,
-    int wrap_width
+    const SubtitleLayoutSpec *layout
 )
 {
     char lines[MAX_SUBTITLE_LINES][MAX_SUBTITLE_LINE_LEN];
@@ -709,26 +840,45 @@ bool ensure_subtitle_surface_cache(
     int scale_num;
     int scale_den;
     int line_height;
-    int total_height;
+    int max_height;
+    int line_capacity;
+    int page_start_line;
+    int page_line_count;
+    int page_height;
     int line_index;
     int max_line_width = 0;
     int draw_inset;
+    const char *text = cue ? cue->text : NULL;
     Uint32 key;
 
     (void) screen;
 
-    if (!cache || !screen || !fonts || !text || !*text || subtitle_size < 0 || wrap_width <= 0) {
+    if (!cache || !screen || !fonts || !layout || !text || !*text || subtitle_size < 0 || layout->wrap_width <= 0) {
         invalidate_subtitle_surface_cache(cache);
         return false;
     }
 
     subtitle_size = clamp_int(subtitle_size, 0, 3);
+    max_height = subtitle_layout_max_surface_height(layout);
     if (cache->surface &&
         cache->text == text &&
         cache->subtitle_font_index == subtitle_font_index &&
         cache->subtitle_size == subtitle_size &&
-        cache->wrap_width == wrap_width) {
-        return true;
+        cache->wrap_width == layout->wrap_width &&
+        cache->wrapped_line_count > 0 &&
+        cache->line_height > 0) {
+        line_capacity = subtitle_page_line_capacity(max_height, cache->line_height);
+        subtitle_select_line_window(
+            cache->wrapped_line_count,
+            line_capacity,
+            cue,
+            current_ms,
+            &page_start_line,
+            &page_line_count
+        );
+        if (cache->page_start_line == page_start_line && cache->page_line_count == page_line_count) {
+            return true;
+        }
     }
 
     invalidate_subtitle_surface_cache(cache);
@@ -740,7 +890,7 @@ bool ensure_subtitle_surface_cache(
     line_count = subtitle_prepare_lines(
         white_font,
         text,
-        wrap_width,
+        layout->wrap_width,
         scale_num,
         scale_den,
         lines,
@@ -751,23 +901,30 @@ bool ensure_subtitle_surface_cache(
         return false;
     }
 
-    total_height = line_count * line_height;
-    if (line_count > 1) {
-        total_height += (line_count - 1) * SUBTITLE_LINE_GAP_PX;
-    }
-    if (max_line_width <= 0 || total_height <= 0) {
+    line_capacity = subtitle_page_line_capacity(max_height, line_height);
+    subtitle_select_line_window(
+        line_count,
+        line_capacity,
+        cue,
+        current_ms,
+        &page_start_line,
+        &page_line_count
+    );
+    page_height = subtitle_lines_height(page_line_count, line_height);
+    if (max_line_width <= 0 || page_height <= 0) {
         return false;
     }
 
-    cache->surface = create_rgb565_surface(max_line_width, total_height);
+    cache->surface = create_rgb565_surface(max_line_width, page_height);
     if (!cache->surface) {
         return false;
     }
     key = SDL_MapRGB(cache->surface->format, 255, 0, 255);
     SDL_FillRect(cache->surface, NULL, key);
     SDL_SetColorKey(cache->surface, SDL_SRCCOLORKEY, key);
-    for (line_index = 0; line_index < line_count; ++line_index) {
-        int width = subtitle_rendered_text_width(white_font, lines[line_index], scale_num, scale_den);
+    for (line_index = 0; line_index < page_line_count; ++line_index) {
+        int source_line = page_start_line + line_index;
+        int width = subtitle_rendered_text_width(white_font, lines[source_line], scale_num, scale_den);
         int x = (max_line_width - width) / 2;
         draw_scaled_outlined_text(
             cache->surface,
@@ -775,7 +932,7 @@ bool ensure_subtitle_surface_cache(
             outline_font,
             x + draw_inset,
             line_index * (line_height + SUBTITLE_LINE_GAP_PX) + draw_inset,
-            lines[line_index],
+            lines[source_line],
             scale_num,
             scale_den
         );
@@ -784,7 +941,11 @@ bool ensure_subtitle_surface_cache(
     cache->text = text;
     cache->subtitle_font_index = subtitle_font_index;
     cache->subtitle_size = subtitle_size;
-    cache->wrap_width = wrap_width;
+    cache->wrap_width = layout->wrap_width;
+    cache->wrapped_line_count = line_count;
+    cache->line_height = line_height;
+    cache->page_start_line = page_start_line;
+    cache->page_line_count = page_line_count;
     return true;
 }
 
@@ -792,13 +953,15 @@ void draw_subtitle_cached(
     SDL_Surface *screen,
     const Fonts *fonts,
     SubtitleSurfaceCache *cache,
-    const char *text,
+    const SubtitleCue *cue,
+    uint32_t current_ms,
     size_t subtitle_font_index,
     int subtitle_size,
     const SubtitleLayoutSpec *layout
 )
 {
     SDL_Rect dst;
+    const char *text = cue ? cue->text : NULL;
 
     if (!screen || !cache || !layout || !text || !*text || subtitle_size < 0) {
         invalidate_subtitle_surface_cache(cache);
@@ -808,10 +971,11 @@ void draw_subtitle_cached(
             cache,
             screen,
             fonts,
-            text,
+            cue,
+            current_ms,
             subtitle_font_index,
             subtitle_size,
-            layout->wrap_width)) {
+            layout)) {
         return;
     }
 
