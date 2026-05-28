@@ -70,11 +70,6 @@ static void brightness_animation_cancel(BrightnessAnimation *animation)
     memset(animation, 0, sizeof(*animation));
 }
 
-static uint32_t brightness_animation_logical_raw(const BrightnessAnimation *animation)
-{
-    return animation && animation->active ? animation->to_raw : current_lcd_brightness();
-}
-
 static void brightness_animation_tick(
     BrightnessAnimation *animation,
     SDL_Surface *screen,
@@ -469,7 +464,7 @@ int play_movie(
             (g_display_power_state.idle_dim_active ||
                 (g_display_power_state.off && g_display_power_state.off_from_idle))) {
             woke_from_idle_off = g_display_power_state.off && g_display_power_state.off_from_idle;
-            display_power_restore(&g_display_power_state, monotonic_clock_now_ms());
+            display_power_restore_animated(&g_display_power_state, monotonic_clock_now_ms());
         }
         if (scratchpad_edge) {
             display_power_off_for_exit(&g_display_power_state, screen, true);
@@ -646,7 +641,7 @@ int play_movie(
                 (g_display_power_state.off && g_display_power_state.off_from_idle)) &&
             input_activity) {
             woke_from_idle_off = g_display_power_state.off && g_display_power_state.off_from_idle;
-            display_power_restore(&g_display_power_state, now_ms);
+            display_power_restore_animated(&g_display_power_state, now_ms);
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (input_activity) {
@@ -721,7 +716,7 @@ int play_movie(
 
             if (g_display_power_state.off_from_idle && off_input_activity) {
                 woke_from_idle_off = true;
-                display_power_restore(&g_display_power_state, now_ms);
+                display_power_restore_animated(&g_display_power_state, now_ms);
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             } else if (on_edge || brightness_up_edge) {
                 bool resume_playback = g_display_power_state.resume_playback_on_wake;
@@ -1260,12 +1255,17 @@ int play_movie(
         }
         if (brightness_delta != 0) {
             uint32_t brightness_from_raw = current_lcd_brightness();
-            uint32_t brightness_logical_raw = brightness_animation_logical_raw(&brightness_animation);
+            uint32_t brightness_logical_raw = brightness_animation.active
+                ? brightness_animation.to_raw
+                : display_power_logical_brightness(&g_display_power_state);
             uint32_t brightness_target_raw;
             bool keep_brightness_badge =
                 strncmp(status_overlay_text, "BRIGHT ", 7) == 0 &&
                 (int32_t) (now_ms - (status_overlay_until + STATUS_BADGE_EXIT_ANIM_MS)) < 0;
 
+            if (display_power_is_restoring_brightness(&g_display_power_state)) {
+                display_power_cancel_brightness_restore(&g_display_power_state);
+            }
             if (brightness_delta > 0 && brightness_logical_raw >= LCD_BRIGHTNESS_LOWEST_NORMAL) {
                 bool was_paused = paused;
 

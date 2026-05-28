@@ -161,7 +161,7 @@ int pick_movie(
                 (g_display_power_state.off && g_display_power_state.off_from_idle)) &&
             input_activity) {
             woke_from_idle_off = g_display_power_state.off && g_display_power_state.off_from_idle;
-            display_power_restore(&g_display_power_state, now_ms);
+            display_power_restore_animated(&g_display_power_state, now_ms);
         }
 
         if (scratchpad_edge) {

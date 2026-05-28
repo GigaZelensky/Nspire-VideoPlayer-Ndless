@@ -239,9 +239,13 @@ typedef struct {
     bool off;
     bool off_from_idle;
     bool idle_dim_active;
+    bool idle_restore_active;
     bool resume_playback_on_wake;
     uint32_t saved_brightness;
     uint32_t idle_base_brightness;
+    uint32_t idle_restore_started_ms;
+    uint32_t idle_restore_from_brightness;
+    uint32_t idle_restore_to_brightness;
     uint32_t last_activity_ms;
 } DisplayPowerState;
 
@@ -1028,6 +1032,10 @@ void display_power_off_with_saved_brightness(DisplayPowerState *state, SDL_Surfa
 void display_power_off_for_exit(DisplayPowerState *state, SDL_Surface *screen, bool was_paused);
 void display_power_on(DisplayPowerState *state);
 void display_power_restore(DisplayPowerState *state, uint32_t now_ms);
+void display_power_restore_animated(DisplayPowerState *state, uint32_t now_ms);
+bool display_power_is_restoring_brightness(const DisplayPowerState *state);
+void display_power_cancel_brightness_restore(DisplayPowerState *state);
+uint32_t display_power_logical_brightness(const DisplayPowerState *state);
 const char *filename_from_path(const char *path);
 SDL_Surface *create_rgb565_surface(int width, int height);
 SDL_Surface *create_scaled_surface_from_surface(SDL_Surface *source, int max_width, int max_height);
