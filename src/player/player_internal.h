@@ -503,7 +503,9 @@ typedef struct {
 } ScreenshotPreviewState;
 
 typedef struct {
+    MovieCodec codec;
     storage_t *decoder;
+    void *mpeg4_decoder;
     bool decoder_initialized;
     bool active;
     bool complete;
@@ -822,6 +824,7 @@ void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerSt
 int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index);
 bool decode_h264_frame_with_progress( Movie *movie, uint32_t frame_index, bool blit_output, H264FramePublishPredicate predicate, H264DecodedFrameHook hook, void *userdata );
 bool decode_h264_frame( Movie *movie, uint32_t frame_index, bool blit_output );
+bool decode_mpeg4_frame_with_progress( Movie *movie, uint32_t frame_index, bool blit_output, H264FramePublishPredicate predicate, H264DecodedFrameHook hook, void *userdata );
 bool decode_mpeg4_frame( Movie *movie, uint32_t frame_index, bool blit_output );
 void invalidate_loaded_chunk_state(Movie *movie);
 bool recover_failed_h264_playback_state(Movie *movie);

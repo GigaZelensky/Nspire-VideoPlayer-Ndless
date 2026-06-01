@@ -238,7 +238,7 @@ static void mpeg4_codec_destroy(Movie *movie)
 static bool mpeg4_codec_supports_incremental_seek_preview(const Movie *movie)
 {
     (void) movie;
-    return false;
+    return true;
 }
 
 static const MovieCodecOps g_h264_codec_ops = {

@@ -1393,16 +1393,35 @@ bool begin_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, i
     job->target_frame = target_frame;
     job->next_frame = entry->first_frame;
     job->chunk_storage_size = entry->packed_size;
+    job->codec = movie->codec;
 
     frame_pixels = (size_t) movie->header.video_width * movie->header.video_height;
-    job->decoder = h264bsdAlloc();
-    if (job->decoder) {
-        memset(job->decoder, 0, sizeof(*job->decoder));
-    }
     job->chunk_storage = (uint8_t *) malloc(job->chunk_storage_size);
     job->pixels = (uint16_t *) malloc(frame_pixels * sizeof(uint16_t));
-    if (!job->decoder || !job->chunk_storage || !job->pixels ||
-        !reset_h264_storage_decoder(job->decoder, &job->decoder_initialized)) {
+    if (!job->chunk_storage || !job->pixels) {
+        clear_seek_bar_preview_decode_job(preview);
+        return false;
+    }
+    if (movie_uses_h264(movie)) {
+        job->decoder = h264bsdAlloc();
+        if (job->decoder) {
+            memset(job->decoder, 0, sizeof(*job->decoder));
+        }
+        if (!job->decoder ||
+            !reset_h264_storage_decoder(job->decoder, &job->decoder_initialized)) {
+            clear_seek_bar_preview_decode_job(preview);
+            return false;
+        }
+    } else if (movie->codec == MOVIE_CODEC_MPEG4) {
+        if (!init_mpeg4_decoder_global() ||
+            !mpeg4_xvid_create(
+                &job->mpeg4_decoder,
+                (int) movie->header.video_width,
+                (int) movie->header.video_height)) {
+            clear_seek_bar_preview_decode_job(preview);
+            return false;
+        }
+    } else {
         clear_seek_bar_preview_decode_job(preview);
         return false;
     }
@@ -1466,20 +1485,19 @@ bool read_seek_bar_preview_chunk_step(Movie *movie, SeekPreviewDecodeJob *job, u
     );
 }
 
-bool publish_seek_bar_preview_picture(Movie *movie, SeekBarPreviewState *preview, uint32_t frame_index, const uint8_t *picture)
+static bool publish_seek_bar_preview_pixels(Movie *movie, SeekBarPreviewState *preview, uint32_t frame_index)
 {
     SeekPreviewDecodeJob *job;
     SDL_Surface *full_surface = NULL;
     SDL_Surface *thumbnail = NULL;
     bool had_surface;
 
-    if (!movie || !preview || !picture) {
+    if (!movie || !preview) {
         return false;
     }
 
     job = &preview->decode_job;
-    if (!job->pixels ||
-        !blit_h264_picture_to_target(movie, picture, job->pixels, movie->header.video_width)) {
+    if (!job->pixels) {
         return false;
     }
 
@@ -1521,6 +1539,23 @@ bool publish_seek_bar_preview_picture(Movie *movie, SeekBarPreviewState *preview
     return true;
 }
 
+bool publish_seek_bar_preview_picture(Movie *movie, SeekBarPreviewState *preview, uint32_t frame_index, const uint8_t *picture)
+{
+    SeekPreviewDecodeJob *job;
+
+    if (!movie || !preview || !picture) {
+        return false;
+    }
+
+    job = &preview->decode_job;
+    if (!job->pixels ||
+        !blit_h264_picture_to_target(movie, picture, job->pixels, movie->header.video_width)) {
+        return false;
+    }
+
+    return publish_seek_bar_preview_pixels(movie, preview, frame_index);
+}
+
 uint32_t seek_bar_preview_macroblock_budget(
     const Movie *movie,
     const storage_t *decoder,
@@ -1532,6 +1567,79 @@ uint32_t seek_bar_preview_macroblock_budget(
         return h264_incremental_total_mbs(movie, decoder);
     }
     return h264_incremental_budget(movie, decoder, avg_mbs_per_ms_q8, spare_ms);
+}
+
+static void step_mpeg4_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, uint32_t deadline_ms)
+{
+    SeekPreviewDecodeJob *job;
+    const ChunkIndexEntry *entry;
+
+    job = &preview->decode_job;
+    if (!read_seek_bar_preview_chunk_step(movie, job, deadline_ms)) {
+        clear_seek_bar_preview_decode_job(preview);
+        return;
+    }
+    if (!job->frame_offsets) {
+        return;
+    }
+
+    entry = movie->chunk_index + job->chunk_index;
+    while (job->active && job->next_frame <= job->target_frame) {
+        uint32_t local_index;
+        size_t start;
+        size_t end;
+
+        if (deadline_ms != 0U && prefetch_deadline_reached(deadline_ms)) {
+            return;
+        }
+
+        local_index = job->next_frame - entry->first_frame;
+        if (local_index >= entry->frame_count) {
+            clear_seek_bar_preview_decode_job(preview);
+            return;
+        }
+
+        start = job->frame_offsets[local_index];
+        end = (local_index + 1U < entry->frame_count) ? job->frame_offsets[local_index + 1U] : job->chunk_size;
+        if (end <= start || end > job->chunk_size) {
+            clear_seek_bar_preview_decode_job(preview);
+            return;
+        }
+
+        if (!job->mpeg4_decoder ||
+            !mpeg4_xvid_decode_frame(
+                job->mpeg4_decoder,
+                job->chunk_bytes + start,
+                end - start,
+                job->pixels,
+                (int) movie->header.video_width,
+                (int) movie->header.video_height,
+                true,
+                false)) {
+            debug_tracef(
+                "mpeg4 seek preview decode fail frame=%lu chunk=%d local=%lu: %s",
+                (unsigned long) job->next_frame,
+                job->chunk_index,
+                (unsigned long) local_index,
+                mpeg4_xvid_last_error()
+            );
+            clear_seek_bar_preview_decode_job(preview);
+            return;
+        }
+
+        if (!publish_seek_bar_preview_pixels(movie, preview, job->next_frame)) {
+            clear_seek_bar_preview_decode_job(preview);
+            return;
+        }
+
+        job->next_frame++;
+        if (job->next_frame > job->target_frame) {
+            finish_seek_bar_preview_decode_job(preview);
+        }
+        return;
+    }
+
+    clear_seek_bar_preview_decode_job(preview);
 }
 
 void step_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, uint32_t deadline_ms)
@@ -1547,6 +1655,11 @@ void step_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, ui
     }
 
     job = &preview->decode_job;
+    if (job->codec == MOVIE_CODEC_MPEG4) {
+        step_mpeg4_seek_bar_preview_decode(movie, preview, deadline_ms);
+        return;
+    }
+
     if (!read_seek_bar_preview_chunk_step(movie, job, deadline_ms)) {
         clear_seek_bar_preview_decode_job(preview);
         return;
@@ -1668,6 +1781,9 @@ bool finish_seek_bar_preview_pending_frame(Movie *movie, SeekBarPreviewState *pr
     }
 
     job = &preview->decode_job;
+    if (job->codec != MOVIE_CODEC_H264) {
+        return true;
+    }
     if (job->consumed_bytes == 0) {
         return true;
     }
@@ -2324,10 +2440,13 @@ bool decode_h264_frame(
     return decode_h264_frame_with_progress(movie, frame_index, blit_output, NULL, NULL, NULL);
 }
 
-bool decode_mpeg4_frame(
+bool decode_mpeg4_frame_with_progress(
     Movie *movie,
     uint32_t frame_index,
-    bool blit_output
+    bool blit_output,
+    H264FramePublishPredicate predicate,
+    H264DecodedFrameHook hook,
+    void *userdata
 )
 {
     int chunk_index = movie_chunk_for_frame(movie, frame_index);
@@ -2379,7 +2498,8 @@ bool decode_mpeg4_frame(
             : movie->chunk_size;
         uint32_t decoded_frame_index = entry->first_frame + replay_index;
         bool is_target_frame = decoded_frame_index == frame_index;
-        bool should_blit = blit_output && is_target_frame;
+        bool should_publish = hook && (is_target_frame || !predicate || predicate(movie, decoded_frame_index, userdata));
+        bool should_blit = blit_output && (is_target_frame || should_publish);
         bool discontinuity = movie->mpeg4.discontinuity && replay_index == 0;
 
         if (end <= start || end > movie->chunk_size) {
@@ -2415,9 +2535,24 @@ bool decode_mpeg4_frame(
         }
         movie->mpeg4.discontinuity = false;
         movie->decoded_local_frame = (int) replay_index;
+        if (hook && should_blit && should_publish) {
+            movie->current_frame = decoded_frame_index;
+            if (!hook(movie, decoded_frame_index, userdata)) {
+                return false;
+            }
+        }
     }
 
     return true;
+}
+
+bool decode_mpeg4_frame(
+    Movie *movie,
+    uint32_t frame_index,
+    bool blit_output
+)
+{
+    return decode_mpeg4_frame_with_progress(movie, frame_index, blit_output, NULL, NULL, NULL);
 }
 
 void invalidate_loaded_chunk_state(Movie *movie)
@@ -2522,7 +2657,7 @@ bool decode_to_frame_with_progress(
     uint32_t local_index;
     bool continue_loaded_stream;
 
-    if (!hook || !movie_uses_h264(movie)) {
+    if (!hook) {
         return decode_to_frame(movie, frame_index);
     }
 
@@ -2537,43 +2672,55 @@ bool decode_to_frame_with_progress(
         return decode_to_frame(movie, frame_index);
     }
     local_index = frame_index - entry->first_frame;
-    continue_loaded_stream =
-        movie->loaded_chunk == chunk_index &&
+    continue_loaded_stream = false;
+    if (movie->loaded_chunk == chunk_index &&
         movie->frame_offsets != NULL &&
         movie->chunk_bytes != NULL &&
-        movie->h264.decoder != NULL &&
         movie->decoded_local_frame >= -1 &&
-        movie->decoded_local_frame < (int) local_index;
+        movie->decoded_local_frame < (int) local_index) {
+        if (movie_uses_h264(movie)) {
+            continue_loaded_stream = movie->h264.decoder != NULL;
+        } else if (movie->codec == MOVIE_CODEC_MPEG4) {
+            continue_loaded_stream = movie->mpeg4.decoder != NULL;
+        }
+    }
 
     if (!continue_loaded_stream) {
         if (!load_chunk(movie, chunk_index)) {
             debug_tracef("progress seek frame=%lu load chunk=%d fail", (unsigned long) frame_index, chunk_index);
             return false;
         }
-        if (!reset_h264_decoder(movie)) {
+        if (!movie->codec_ops || !movie->codec_ops->reset || !movie->codec_ops->reset(movie)) {
             return false;
         }
         movie->decoded_local_frame = -1;
-        movie->h264.chunk_dirty = false;
     }
 
     if (debug_should_collect_metrics()) {
         movie->diag_foreground_direct_decode_count++;
     }
-    if (!decode_h264_frame_with_progress(movie, frame_index, true, predicate, hook, userdata)) {
-        if (abort_requested && *abort_requested) {
+    if (movie_uses_h264(movie)) {
+        if (!decode_h264_frame_with_progress(movie, frame_index, true, predicate, hook, userdata)) {
+            if (abort_requested && *abort_requested) {
+                return false;
+            }
+            debug_tracef("progress seek frame=%lu retry after h264 recovery", (unsigned long) frame_index);
+            if (recover_failed_h264_playback_state(movie) &&
+                decode_h264_frame_with_progress(movie, frame_index, true, predicate, hook, userdata)) {
+                movie->current_frame = frame_index;
+                return true;
+            }
+            if (abort_requested && *abort_requested) {
+                return false;
+            }
             return false;
         }
-        debug_tracef("progress seek frame=%lu retry after h264 recovery", (unsigned long) frame_index);
-        if (recover_failed_h264_playback_state(movie) &&
-            decode_h264_frame_with_progress(movie, frame_index, true, predicate, hook, userdata)) {
-            movie->current_frame = frame_index;
-            return true;
-        }
-        if (abort_requested && *abort_requested) {
+    } else if (movie->codec == MOVIE_CODEC_MPEG4) {
+        if (!decode_mpeg4_frame_with_progress(movie, frame_index, true, predicate, hook, userdata)) {
             return false;
         }
-        return false;
+    } else {
+        return decode_to_frame(movie, frame_index);
     }
     movie->current_frame = frame_index;
     return true;

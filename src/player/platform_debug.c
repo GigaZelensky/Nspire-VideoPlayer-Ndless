@@ -1221,6 +1221,9 @@ void clear_seek_bar_preview_decode_job(SeekBarPreviewState *preview)
         }
         h264bsdFree(job->decoder);
     }
+    if (job->mpeg4_decoder) {
+        mpeg4_xvid_destroy(job->mpeg4_decoder);
+    }
     free(job->chunk_storage);
     free(job->frame_offsets);
     free(job->pixels);
