@@ -830,6 +830,7 @@ void draw_resume_badge(
     int press_offset_x;
     int press_offset_y;
     Uint16 base;
+    Uint16 panel_base;
 
     if (!screen || !fonts || !badge || visible_mix == 0) {
         return;
@@ -839,18 +840,24 @@ void draw_resume_badge(
     press_offset_y = pressed_control_offset_y(press_mix);
     base = animated_control_color(UI_COLOR_GUNMETAL, ui_theme()->resume_hover, hover_mix);
     base = rgb565_lerp(background_color, base, visible_mix, 255);
+    panel_base = pressed_control_base(base, press_mix);
     draw_soft_glass_panel_mix(
         screen,
         &draw_badge,
-        pressed_control_base(base, press_mix),
+        panel_base,
         hover_mix
     );
     if (hover_mix > 0 && draw_badge.w > 6) {
+        Uint16 glint_base = blend_rgb565(
+            panel_base,
+            UI_COLOR_WHITE,
+            ui_mix_int(72, 112, hover_mix)
+        );
         glint.x = (Sint16) (draw_badge.x + 2);
         glint.y = (Sint16) (draw_badge.y + 2);
         glint.w = (Uint16) (draw_badge.w - 4);
         glint.h = 1;
-        fill_rect_rgb565(screen, &glint, rgb565_lerp(base, UI_COLOR_ACCENT_HOT, hover_mix, 255));
+        fill_rect_rgb565(screen, &glint, rgb565_lerp(glint_base, UI_COLOR_ACCENT_HOT, hover_mix, 255));
     }
     draw_pressed_control_reflection(screen, &draw_badge, press_mix);
     draw_soft_glass_panel_rim(screen, &draw_badge, base, max_u8(hover_mix, press_mix));
