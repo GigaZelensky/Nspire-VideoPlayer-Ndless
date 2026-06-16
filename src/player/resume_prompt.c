@@ -74,6 +74,7 @@ int prompt_resume_position(
     int pressed_button = -1;
     int enter_button_press_stage = 0;
     bool pressed_button_fallback = false;
+    bool button_press_canceled = false;
     uint32_t button_anim_started_ms = 0;
     uint32_t prompt_open_started_ms = 0;
     uint32_t prompt_close_started_ms = 0;
@@ -189,6 +190,7 @@ int prompt_resume_position(
         bool left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || (!ctrl_down && keypad_4_edge);
         bool right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right) || (!ctrl_down && keypad_6_edge);
         bool prompt_canceling = prompt_closing && prompt_closing_result < 0;
+        bool canceled_press_with_esc = false;
         uint32_t prompt_open_elapsed_ms = now_ms - prompt_open_started_ms;
         uint8_t prompt_open_mix = !prompt_closing
             ? ui_ease_out_cubic(prompt_open_elapsed_ms, RESUME_PROMPT_OPEN_MORPH_ANIM_MS)
@@ -387,6 +389,7 @@ int prompt_resume_position(
             }
         }
         if (!prompt_closing && pointer.press_edge) {
+            button_press_canceled = false;
             if (hovered_button >= 0) {
                 pressed_button = hovered_button;
                 pressed_button_fallback = false;
@@ -397,15 +400,27 @@ int prompt_resume_position(
         }
         if (!prompt_closing && enter_edge && enter_button_press_stage == 0) {
             enter_button_press_stage = 1;
+            button_press_canceled = false;
             pressed_button = (int) selected_button;
             pressed_button_fallback = true;
             ui_transition_init(&button_press_anim, false);
         }
-        if (enter_button_press_stage == 1 && !enter_down) {
+        if (!prompt_closing &&
+            esc_edge &&
+            (pointer.down || pointer.release_edge || enter_button_press_stage == 1) &&
+            pressed_button >= 0) {
+            ui_transition_begin_press_release(&button_press_anim, now_ms);
+            button_press_canceled = true;
+            enter_button_press_stage = 0;
+            canceled_press_with_esc = true;
+            pointer_hover_guard_lock(&hover_guard, &pointer);
+        }
+        if (!button_press_canceled && enter_button_press_stage == 1 && !enter_down) {
             enter_button_press_stage = 2;
             ui_transition_begin_press_release(&button_press_anim, now_ms);
         }
         if (!prompt_closing &&
+            !button_press_canceled &&
             enter_button_press_stage == 0 &&
             pointer.release_edge &&
             pressed_button >= 0 &&
@@ -413,7 +428,7 @@ int prompt_resume_position(
             enter_button_press_stage = 2;
             ui_transition_begin_press_release(&button_press_anim, now_ms);
         }
-        button_press_hot = !prompt_closing && pressed_button >= 0 && (
+        button_press_hot = !button_press_canceled && !prompt_closing && pressed_button >= 0 && (
             enter_button_press_stage == 1 ||
             (pointer.down && (
                 hovered_button == pressed_button ||
@@ -428,6 +443,7 @@ int prompt_resume_position(
         if (enter_button_press_stage == 0 && !pointer.down && !pointer.release_edge && button_press_mix == 0) {
             pressed_button = -1;
             pressed_button_fallback = false;
+            button_press_canceled = false;
         }
 
         if (theme_edge) {
@@ -784,7 +800,7 @@ int prompt_resume_position(
                 continue;
             }
         }
-        if (esc_edge) {
+        if (esc_edge && !canceled_press_with_esc) {
             prompt_closing = true;
             prompt_closing_result = -1;
             prompt_close_started_ms = now_ms ? now_ms : 1U;

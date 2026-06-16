@@ -52,6 +52,7 @@ int pick_movie(
     int pressed_row_index = -1;
     int pressed_resume_badge_index = -1;
     bool pressed_selected_fallback = false;
+    bool picker_press_canceled = false;
     bool keyboard_resume_focused = false;
     bool deferred_movie_cleanup_done = false;
     int enter_press_stage = 0;
@@ -136,6 +137,7 @@ int pick_movie(
         uint8_t picker_press_mix;
         int activated_index = -1;
         bool activated_resume = false;
+        bool canceled_press_with_esc = false;
         bool woke_from_idle_off = false;
         bool input_activity =
             pointer_click ||
@@ -288,6 +290,7 @@ int pick_movie(
             movie_tooltip_anim_index = -1;
         }
         if (pointer.press_edge) {
+            picker_press_canceled = false;
             if (count > 0 && resume_hovered_index >= 0) {
                 pressed_resume_badge_index = resume_hovered_index;
                 pressed_row_index = -1;
@@ -312,6 +315,7 @@ int pick_movie(
         }
         if (enter_edge && count > 0 && enter_press_stage == 0) {
             enter_press_stage = 1;
+            picker_press_canceled = false;
             if (resume_hovered_index >= 0) {
                 pressed_row_index = -1;
                 pressed_resume_badge_index = resume_hovered_index;
@@ -327,7 +331,16 @@ int pick_movie(
             }
             ui_transition_init(&picker_press_anim, false);
         }
-        if (enter_press_stage == 1 && !enter_down) {
+        if (esc_edge &&
+            (pointer.down || pointer.release_edge || enter_press_stage == 1) &&
+            (pressed_row_index >= 0 || pressed_resume_badge_index >= 0)) {
+            ui_transition_begin_press_release(&picker_press_anim, now_ms);
+            picker_press_canceled = true;
+            enter_press_stage = 0;
+            canceled_press_with_esc = true;
+            pointer_hover_guard_lock(&hover_guard, &pointer);
+        }
+        if (!picker_press_canceled && enter_press_stage == 1 && !enter_down) {
             ui_transition_begin_press_release(&picker_press_anim, now_ms);
             if (pressed_row_index >= 0 || pressed_resume_badge_index >= 0) {
                 activated_resume = pressed_resume_badge_index >= 0;
@@ -337,7 +350,7 @@ int pick_movie(
             }
             enter_press_stage = 0;
         }
-        if (enter_press_stage == 0 && pointer.release_edge && count > 0) {
+        if (!picker_press_canceled && enter_press_stage == 0 && pointer.release_edge && count > 0) {
             if (pressed_resume_badge_index >= 0 && resume_hovered_index == pressed_resume_badge_index) {
                 activated_index = pressed_resume_badge_index;
                 activated_resume = true;
@@ -354,7 +367,8 @@ int pick_movie(
                 ui_transition_begin_press_release(&picker_press_anim, now_ms);
             }
         }
-        picker_press_hot = (enter_press_stage == 1 && (pressed_row_index >= 0 || pressed_resume_badge_index >= 0)) || (pointer.down && (
+        picker_press_hot = !picker_press_canceled && (
+            (enter_press_stage == 1 && (pressed_row_index >= 0 || pressed_resume_badge_index >= 0)) || (pointer.down && (
             (pressed_resume_badge_index >= 0 && (
                 (pressed_selected_fallback && pressed_resume_badge_index == (int) selected) ||
                 resume_hovered_index == pressed_resume_badge_index
@@ -363,7 +377,7 @@ int pick_movie(
                 (pressed_selected_fallback && pressed_row_index == (int) selected) ||
                 hovered_index == pressed_row_index
             ))
-        ));
+        )));
         picker_press_mix = ui_transition_update_press_ex(
             &picker_press_anim,
             picker_press_hot,
@@ -440,6 +454,7 @@ int pick_movie(
             pressed_row_index = -1;
             pressed_resume_badge_index = -1;
             pressed_selected_fallback = false;
+            picker_press_canceled = false;
         }
         if (theme_edge) {
             ui_cycle_theme();
@@ -546,7 +561,7 @@ int pick_movie(
                 pointer_hover_guard_lock(&hover_guard, &pointer);
             }
         }
-        if (esc_edge) {
+        if (esc_edge && !canceled_press_with_esc) {
             clear_screenshot_preview(&screenshot_preview);
             return -1;
         }
