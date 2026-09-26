@@ -172,9 +172,11 @@ int prompt_resume_position(
     prompt_open_started_ms = monotonic_clock_now_ms();
 
     while (1) {
+        screenshot_preview_tick(&screenshot_preview, monotonic_clock_now_ms());
         bool pointer_click = pointer_update(&pointer);
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer);
         uint32_t now_ms = monotonic_clock_now_ms();
+        bool night_input = night_mode_poll(now_ms, !g_display_power_state.off);
         bool ctrl_down = isKeyPressed(KEY_NSPIRE_CTRL) ? true : false;
         bool keypad_4_edge = key_pressed_edge(KEY_NSPIRE_4, &prev_4);
         bool keypad_5_edge = key_pressed_edge(KEY_NSPIRE_5, &prev_5);
@@ -259,6 +261,7 @@ int prompt_resume_position(
         uint8_t button_press_mix;
         bool woke_from_idle_off = false;
         bool input_activity =
+            night_input ||
             pointer_click ||
             pointer.release_edge ||
             pointer.moved ||
@@ -292,25 +295,32 @@ int prompt_resume_position(
             return RESUME_PROMPT_RESULT_SCRATCHPAD_EXIT;
         }
         if (g_display_power_state.off) {
-            if (esc_down) {
+            bool suspend_due = !on_edge && display_power_should_suspend(&g_display_power_state, now_ms);
+
+            if (!esc_down && suspend_due && player_standby(screen, movie, path, false, &screenshot_preview)) {
+                prev_on = true;
+                continue;
+            }
+
+            if (esc_down || suspend_due) {
                 free(title_main);
                 free(title_detail);
                 if (start_over_source_frame) {
                     SDL_FreeSurface(start_over_source_frame);
                 }
                 clear_screenshot_preview(&screenshot_preview);
-                return RESUME_PROMPT_RESULT_HOME_EXIT;
+                return esc_down ? RESUME_PROMPT_RESULT_HOME_EXIT : RESUME_PROMPT_RESULT_SUSPEND_EXIT;
             }
             if (on_edge) {
                 display_power_restore(&g_display_power_state, now_ms);
             }
-            msleep(16);
+            player_delay_ms(16);
             continue;
         }
         if (on_edge && !woke_from_idle_off) {
             display_power_off(&g_display_power_state, true);
             present_black_screen(screen);
-            msleep(16);
+            player_delay_ms(16);
             continue;
         }
         if (input_activity) {
@@ -736,6 +746,7 @@ int prompt_resume_position(
             }
         }
         draw_screenshot_preview_osd(screen, fonts, &screenshot_preview, now_ms);
+        night_mode_draw_status(screen, fonts, NULL, now_ms);
         if (pointer.visible) {
             draw_cursor(screen, pointer.x, pointer.y);
         }
@@ -753,22 +764,19 @@ int prompt_resume_position(
             return prompt_closing_result;
         }
         if (screenshot_edge) {
-            char saved_path[MAX_PATH_LEN];
-            if (save_screenshot_bitmap(screen, path, saved_path, sizeof(saved_path))) {
-                prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
-            }
+            request_screenshot(screen, path, &screenshot_preview);
         }
         if (loading_snapshot && *loading_snapshot && background_reveal_mix >= 255) {
             SDL_FreeSurface(*loading_snapshot);
             *loading_snapshot = NULL;
         }
         if (!prompt_closing && display_power_tick_idle(&g_display_power_state, screen, monotonic_clock_now_ms(), true, true)) {
-            msleep(16);
+            player_delay_ms(16);
             continue;
         }
 
         if (prompt_closing) {
-            msleep(16);
+            player_delay_ms(16);
             continue;
         }
         if (enter_button_press_stage != 0) {
@@ -806,7 +814,7 @@ int prompt_resume_position(
             prompt_close_started_ms = now_ms ? now_ms : 1U;
             continue;
         }
-        msleep(16);
+        player_delay_ms(16);
     }
 }
 

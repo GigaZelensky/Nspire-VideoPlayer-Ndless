@@ -1,4 +1,7 @@
 #include "player_internal.h"
+#include "movie/nvp_validation.h"
+#include "timing_math.h"
+#include "raw_player_io.h"
 
 bool load_subtitles(
     Movie *movie,
@@ -7,128 +10,168 @@ bool load_subtitles(
     SubtitleCue **out_cues,
     SubtitleTrack **out_tracks,
     uint16_t *out_track_count,
+    uint8_t **out_storage,
+    size_t *out_storage_size,
     LoadingProgress *loading_progress
 )
 {
-    SubtitleCue *cues = NULL;
-    SubtitleTrack *tracks = NULL;
-    uint32_t cue_index = 0;
-    uint32_t track_index = 0;
+    uint8_t *serialized = NULL;
+    uint8_t *storage = NULL;
+    SubtitleCue *cues;
+    SubtitleTrack *tracks;
+    uint16_t track_count;
+    uint32_t cue_index;
+    uint32_t track_index;
+    uint32_t cue_cursor = 0;
+    long file_size;
+    size_t subtitle_bytes;
+    size_t cue_meta_size;
+    size_t cursor;
+    size_t string_bytes = 0;
+    size_t cue_bytes;
+    size_t metadata_bytes;
+    size_t storage_bytes;
+    char *text;
 
+    if (!out_cues || !out_tracks || !out_track_count || !out_storage || !out_storage_size) {
+        return false;
+    }
     *out_cues = NULL;
     *out_tracks = NULL;
     *out_track_count = 0;
+    *out_storage = NULL;
+    *out_storage_size = 0;
+    if (movie) {
+        movie->subtitle_lookup_valid = false;
+    }
+    if (!header || !file) {
+        return false;
+    }
     if (!header->subtitle_count) {
         debug_tracef("open subtitles none");
         return true;
     }
     loading_progress_tick(loading_progress, false);
-
-    cues = (SubtitleCue *) calloc(header->subtitle_count, sizeof(SubtitleCue));
-    if (!cues) {
-        debug_failf("subtitle cue alloc failed count=%lu", (unsigned long) header->subtitle_count);
-        return false;
-    }
-    if (fseek(file, (long) header->subtitle_offset, SEEK_SET) != 0) {
-        debug_failf("subtitle seek failed offset=%lu", (unsigned long) header->subtitle_offset);
-        free(cues);
-        return false;
-    }
     if (movie) {
         movie->current_file_pos = -1;
     }
-
-    {
-        uint8_t track_count_bytes[2];
-        uint32_t cue_cursor = 0;
-        if (fread(track_count_bytes, 1, sizeof(track_count_bytes), file) != sizeof(track_count_bytes)) {
-            debug_failf("subtitle track count read failed");
-            free(cues);
-            return false;
-        }
-        loading_progress_tick(loading_progress, false);
-        *out_track_count = read_le16(track_count_bytes);
-        if (*out_track_count == 0) {
-            debug_tracef("open subtitles zero tracks");
-            free(cues);
-            return true;
-        }
-        tracks = (SubtitleTrack *) calloc(*out_track_count, sizeof(SubtitleTrack));
-        if (!tracks) {
-            debug_failf("subtitle track alloc failed count=%u", (unsigned) *out_track_count);
-            free(cues);
-            return false;
-        }
-        for (track_index = 0; track_index < *out_track_count; ++track_index) {
-            uint8_t meta[6];
-            uint16_t name_len;
-            if (fread(meta, 1, sizeof(meta), file) != sizeof(meta)) {
-                debug_failf("subtitle track meta read failed track=%lu", (unsigned long) track_index);
-                free(cues);
-                free(tracks);
-                return false;
-            }
-            name_len = read_le16(meta);
-            tracks[track_index].cue_start = cue_cursor;
-            tracks[track_index].cue_count = read_le32(meta + 2);
-            if (cue_cursor + tracks[track_index].cue_count > header->subtitle_count) {
-                debug_failf(
-                    "subtitle cue range overflow track=%lu start=%lu count=%lu total=%lu",
-                    (unsigned long) track_index,
-                    (unsigned long) cue_cursor,
-                    (unsigned long) tracks[track_index].cue_count,
-                    (unsigned long) header->subtitle_count
-                );
-                free(cues);
-                free(tracks);
-                return false;
-            }
-            tracks[track_index].name = (char *) malloc(name_len + 1);
-            if (!tracks[track_index].name) {
-                debug_failf("subtitle track name alloc failed track=%lu len=%u", (unsigned long) track_index, (unsigned) name_len);
-                free(cues);
-                free(tracks);
-                return false;
-            }
-            if (fread(tracks[track_index].name, 1, name_len, file) != name_len) {
-                debug_failf("subtitle track name read failed track=%lu len=%u", (unsigned long) track_index, (unsigned) name_len);
-                free(cues);
-                free(tracks[track_index].name);
-                free(tracks);
-                return false;
-            }
-            tracks[track_index].name[name_len] = '\0';
-            cue_cursor += tracks[track_index].cue_count;
-            loading_progress_tick(loading_progress, false);
-        }
-        if (cue_cursor != header->subtitle_count) {
-            debug_failf(
-                "subtitle cue count mismatch tracks=%lu cues=%lu expected=%lu",
-                (unsigned long) *out_track_count,
-                (unsigned long) cue_cursor,
-                (unsigned long) header->subtitle_count
-            );
-            free(cues);
-            for (track_index = 0; track_index < *out_track_count; ++track_index) {
-                free(tracks[track_index].name);
-            }
-            free(tracks);
-            return false;
-        }
+    if (fseek(file, 0, SEEK_END) != 0 || (file_size = ftell(file)) < 0 ||
+        (uint64_t) file_size > INT32_MAX || header->subtitle_offset > (uint32_t) file_size ||
+        header->subtitle_count > SIZE_MAX / sizeof(SubtitleCue)) {
+        debug_failf("subtitle section bounds invalid");
+        goto fail;
     }
-
-    for (cue_index = 0; cue_index < header->subtitle_count; ++cue_index) {
-        uint8_t meta[22];
-        size_t meta_size = header->version >= MOVIE_VERSION_POSITIONED_SUBS ? 22U : 10U;
-        uint16_t text_len;
-        if (fread(meta, 1, meta_size, file) != meta_size) {
-            debug_failf("subtitle cue meta read failed cue=%lu", (unsigned long) cue_index);
+    subtitle_bytes = (size_t) file_size - header->subtitle_offset;
+    cue_meta_size = header->version >= MOVIE_VERSION_POSITIONED_SUBS ? 22U : 10U;
+    if (subtitle_bytes < 8U || header->subtitle_count > (subtitle_bytes - 8U) / cue_meta_size) {
+        debug_failf("subtitle cue count exceeds section size");
+        goto fail;
+    }
+    serialized = (uint8_t *) malloc(subtitle_bytes);
+    if (!serialized || fseek(file, (long) header->subtitle_offset, SEEK_SET) != 0) {
+        debug_failf("subtitle section allocation/seek failed");
+        goto fail;
+    }
+    /* Batch file reads instead of issuing two tiny reads for every string.
+     * Bound each read so the loading animation can still advance. */
+    for (cursor = 0; cursor < subtitle_bytes;) {
+        size_t amount = subtitle_bytes - cursor;
+        if (amount > PREFETCH_FILE_BLOCK_SIZE) {
+            amount = PREFETCH_FILE_BLOCK_SIZE;
+        }
+        if (fread(serialized + cursor, 1, amount, file) != amount) {
+            debug_failf("subtitle section read failed");
             goto fail;
         }
+        cursor += amount;
+        loading_progress_tick(loading_progress, false);
+    }
+
+    track_count = read_le16(serialized);
+    if (track_count == 0 || track_count > (subtitle_bytes - 2U) / 6U) {
+        debug_failf("subtitle track count invalid");
+        goto fail;
+    }
+    /* Validate all ranges and calculate the exact resident storage before
+     * allocating it. Track/event order is preserved, including unsorted ASS. */
+    cursor = 2U;
+    for (track_index = 0; track_index < track_count; ++track_index) {
+        uint16_t name_len;
+        uint32_t count;
+        if (subtitle_bytes - cursor < 6U) {
+            goto malformed;
+        }
+        name_len = read_le16(serialized + cursor);
+        count = read_le32(serialized + cursor + 2U);
+        cursor += 6U;
+        if (name_len > subtitle_bytes - cursor || count > header->subtitle_count - cue_cursor) {
+            goto malformed;
+        }
+        cue_cursor += count;
+        cursor += name_len;
+        string_bytes += (size_t) name_len + 1U;
+    }
+    if (cue_cursor != header->subtitle_count) {
+        goto malformed;
+    }
+    for (cue_index = 0; cue_index < header->subtitle_count; ++cue_index) {
+        uint16_t text_len;
+        if (subtitle_bytes - cursor < cue_meta_size) {
+            goto malformed;
+        }
+        if (read_le32(serialized + cursor + 4U) < read_le32(serialized + cursor)) {
+            goto malformed;
+        }
+        text_len = read_le16(serialized + cursor + 8U);
+        cursor += cue_meta_size;
+        if (text_len > subtitle_bytes - cursor) {
+            goto malformed;
+        }
+        cursor += text_len;
+        string_bytes += (size_t) text_len + 1U;
+    }
+    /* Each removed record header exceeds its added NUL byte, so the validated
+     * string total cannot exceed subtitle_bytes. Check the metadata sum too. */
+    cue_bytes = (size_t) header->subtitle_count * sizeof(SubtitleCue);
+    if (track_count > (SIZE_MAX - cue_bytes) / sizeof(SubtitleTrack)) {
+        goto malformed;
+    }
+    metadata_bytes = cue_bytes + (size_t) track_count * sizeof(SubtitleTrack);
+    if (string_bytes > SIZE_MAX - metadata_bytes) {
+        goto malformed;
+    }
+    storage_bytes = metadata_bytes + string_bytes;
+    storage = (uint8_t *) malloc(storage_bytes);
+    if (!storage) {
+        debug_failf("subtitle arena allocation failed size=%lu", (unsigned long) storage_bytes);
+        goto fail;
+    }
+    /* Both structs have pointer alignment; an array of cues keeps tracks
+     * aligned. Only clear metadata, whose v9 optional fields default to zero. */
+    memset(storage, 0, metadata_bytes);
+    cues = (SubtitleCue *) storage;
+    tracks = (SubtitleTrack *) (storage + cue_bytes);
+    text = (char *) storage + metadata_bytes;
+    cursor = 2U;
+    cue_cursor = 0;
+    for (track_index = 0; track_index < track_count; ++track_index) {
+        uint16_t name_len = read_le16(serialized + cursor);
+        tracks[track_index].cue_start = cue_cursor;
+        tracks[track_index].cue_count = read_le32(serialized + cursor + 2U);
+        cue_cursor += tracks[track_index].cue_count;
+        cursor += 6U;
+        tracks[track_index].name = text;
+        memcpy(text, serialized + cursor, name_len);
+        text[name_len] = '\0';
+        text += (size_t) name_len + 1U;
+        cursor += name_len;
+    }
+    for (cue_index = 0; cue_index < header->subtitle_count; ++cue_index) {
+        const uint8_t *meta = serialized + cursor;
+        uint16_t text_len = read_le16(meta + 8U);
         cues[cue_index].start_ms = read_le32(meta);
-        cues[cue_index].end_ms = read_le32(meta + 4);
-        text_len = read_le16(meta + 8);
-        if (meta_size > 10U) {
+        cues[cue_index].end_ms = read_le32(meta + 4U);
+        if (cue_meta_size > 10U) {
             cues[cue_index].position_mode = meta[10];
             cues[cue_index].align = meta[11];
             cues[cue_index].pos_x = read_le16(meta + 12);
@@ -137,66 +180,53 @@ bool load_subtitles(
             cues[cue_index].margin_r = read_le16(meta + 18);
             cues[cue_index].margin_v = read_le16(meta + 20);
         }
-        cues[cue_index].text = (char *) malloc(text_len + 1);
-        if (!cues[cue_index].text) {
-            debug_failf("subtitle text alloc failed cue=%lu len=%u", (unsigned long) cue_index, (unsigned) text_len);
-            goto fail;
+        cursor += cue_meta_size;
+        cues[cue_index].text = text;
+        memcpy(text, serialized + cursor, text_len);
+        text[text_len] = '\0';
+        text += (size_t) text_len + 1U;
+        cursor += text_len;
+        if ((cue_index & 31U) == 0U) {
+            loading_progress_tick(loading_progress, false);
         }
-        if (fread(cues[cue_index].text, 1, text_len, file) != text_len) {
-            debug_failf("subtitle text read failed cue=%lu len=%u", (unsigned long) cue_index, (unsigned) text_len);
-            goto fail;
-        }
-        cues[cue_index].text[text_len] = '\0';
-        loading_progress_tick(loading_progress, false);
     }
-    for (track_index = 0; track_index < *out_track_count; ++track_index) {
-        uint32_t start_index = tracks[track_index].cue_start;
-        uint32_t end_index = start_index + tracks[track_index].cue_count;
-
-        if (end_index > header->subtitle_count) {
-            end_index = header->subtitle_count;
-        }
-        tracks[track_index].supports_positioning = 0;
-        for (cue_index = start_index; cue_index < end_index; ++cue_index) {
+    for (track_index = 0; track_index < track_count; ++track_index) {
+        uint32_t end_index = tracks[track_index].cue_start + tracks[track_index].cue_count;
+        for (cue_index = tracks[track_index].cue_start; cue_index < end_index; ++cue_index) {
             if ((cues[cue_index].position_mode == SUBTITLE_CUE_POSITION_MARGIN ||
                  cues[cue_index].position_mode == SUBTITLE_CUE_POSITION_ABSOLUTE) &&
-                cues[cue_index].align >= 1 &&
-                cues[cue_index].align <= 9) {
+                cues[cue_index].align >= 1 && cues[cue_index].align <= 9) {
                 tracks[track_index].supports_positioning = 1;
                 break;
             }
         }
     }
-
-    debug_tracef(
-        "open subtitles loaded tracks=%u cues=%lu",
-        (unsigned) *out_track_count,
-        (unsigned long) header->subtitle_count
-    );
+    free(serialized);
+    debug_tracef("open subtitles loaded tracks=%u cues=%lu arena=%lu",
+                 (unsigned) track_count, (unsigned long) header->subtitle_count, (unsigned long) storage_bytes);
     *out_cues = cues;
     *out_tracks = tracks;
+    *out_track_count = track_count;
+    *out_storage = storage;
+    *out_storage_size = storage_bytes;
     return true;
 
+malformed:
+    debug_failf("subtitle metadata/string bounds invalid");
 fail:
-    if (cues) {
-        for (cue_index = 0; cue_index < header->subtitle_count; ++cue_index) {
-            free(cues[cue_index].text);
-        }
-    }
-    if (tracks) {
-        for (track_index = 0; track_index < *out_track_count; ++track_index) {
-            free(tracks[track_index].name);
-        }
-    }
-    free(cues);
-    free(tracks);
-    *out_track_count = 0;
+    free(serialized);
+    free(storage);
     return false;
 }
 
 bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progress)
 {
     size_t framebuffer_words;
+    long file_size;
+
+    if (!movie) {
+        return false;
+    }
     memset(movie, 0, sizeof(*movie));
     movie->loaded_chunk = -1;
     movie->last_read_bytes = 2048U;
@@ -215,22 +245,28 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
     debug_tracef("open start path=%s", path ? path : "(null)");
     loading_progress_tick(loading_progress, false);
 
-    movie->file = fopen(path, "rb");
+    movie->file = path ? fopen(path, "rb") : NULL;
     if (!movie->file) {
         debug_failf("open failed: fopen");
-        return false;
+        goto fail;
     }
     movie->current_file_pos = 0;
     loading_progress_tick(loading_progress, false);
     if (fread(&movie->header, 1, sizeof(movie->header), movie->file) != sizeof(movie->header)) {
         debug_failf("open failed: header read");
-        return false;
+        goto fail;
     }
     movie->current_file_pos = (long) sizeof(movie->header);
-    if (memcmp(movie->header.magic, "NVP1", 4) != 0) {
-        debug_failf("open failed: bad magic");
-        return false;
+    if (fseek(movie->file, 0, SEEK_END) != 0 || (file_size = ftell(movie->file)) < 0 ||
+        (uint64_t) file_size > INT32_MAX ||
+        !nvp_header_is_valid(&movie->header, (uint32_t) file_size)) {
+        debug_failf("open failed: invalid header or file bounds");
+        goto fail;
     }
+    movie->current_file_pos = -1;
+    movie->timing_fps_num = movie->header.fps_num;
+    movie->timing_fps_den = movie->header.fps_den;
+    player_reduce_fps(&movie->timing_fps_num, &movie->timing_fps_den);
     movie->codec = movie_codec_from_header(&movie->header);
     movie->codec_ops = movie_codec_ops(movie->codec);
     if (!movie->codec_ops) {
@@ -239,7 +275,7 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
             (unsigned) movie->header.version,
             (unsigned) movie->header.flags
         );
-        return false;
+        goto fail;
     }
     debug_tracef(
         "open header version=%u codec=%s flags=0x%04x video=%ux%u frames=%lu chunks=%lu subtitles=%lu",
@@ -256,18 +292,22 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
     movie->chunk_index = (ChunkIndexEntry *) calloc(movie->header.chunk_count, sizeof(ChunkIndexEntry));
     if (!movie->chunk_index) {
         debug_failf("open failed: chunk index alloc count=%lu", (unsigned long) movie->header.chunk_count);
-        return false;
+        goto fail;
     }
     if (fseek(movie->file, (long) movie->header.index_offset, SEEK_SET) != 0) {
         debug_failf("open failed: index seek offset=%lu", (unsigned long) movie->header.index_offset);
-        return false;
+        goto fail;
     }
     movie->current_file_pos = (long) movie->header.index_offset;
     if (fread(movie->chunk_index, sizeof(ChunkIndexEntry), movie->header.chunk_count, movie->file) != movie->header.chunk_count) {
         debug_failf("open failed: chunk index read count=%lu", (unsigned long) movie->header.chunk_count);
-        return false;
+        goto fail;
     }
     movie->current_file_pos += (long) (sizeof(ChunkIndexEntry) * movie->header.chunk_count);
+    if (!nvp_index_is_valid(&movie->header, movie->chunk_index)) {
+        debug_failf("open failed: invalid chunk index");
+        goto fail;
+    }
     debug_tracef("open index loaded chunks=%lu", (unsigned long) movie->header.chunk_count);
     loading_progress_tick(loading_progress, false);
     framebuffer_words = (size_t) movie->header.video_width * movie->header.video_height;
@@ -279,13 +319,13 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
     );
     if (!movie->framebuffer) {
         debug_failf("open failed: framebuffer alloc words=%lu", (unsigned long) framebuffer_words);
-        return false;
+        goto fail;
     }
     if (movie->codec_ops->global_init && !movie->codec_ops->global_init()) {
-        return false;
+        goto fail;
     }
     if (!movie->codec_ops->open(movie)) {
-        return false;
+        goto fail;
     }
     loading_progress_tick(loading_progress, false);
     movie->frame_surface = SDL_CreateRGBSurfaceFrom(
@@ -298,24 +338,28 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
     );
     if (!movie->frame_surface) {
         debug_failf("open failed: SDL surface create");
-        return false;
+        goto fail;
     }
     if (!decode_to_frame(movie, 0)) {
         debug_tracef("open failed during initial frame decode");
-        return false;
+        goto fail;
     }
     debug_tracef("open first frame ok");
     loading_progress_tick(loading_progress, false);
-    if (!load_subtitles(movie, movie->file, &movie->header, &movie->subtitles, &movie->subtitle_tracks, &movie->subtitle_track_count, loading_progress)) {
+    if (!load_subtitles(movie, movie->file, &movie->header, &movie->subtitles, &movie->subtitle_tracks, &movie->subtitle_track_count, &movie->subtitle_storage, &movie->subtitle_storage_size, loading_progress)) {
         debug_tracef("open subtitles disabled after alloc/read failure");
     }
     loading_progress_tick(loading_progress, false);
     return true;
+
+fail:
+    destroy_movie(movie);
+    return false;
 }
 
 bool key_pressed_edge(t_key key, bool *previous_state)
 {
-    bool current_state = isKeyPressed(key) ? true : false;
+    bool current_state = player_key_pressed(key);
     bool pressed = current_state && !(*previous_state);
     *previous_state = current_state;
     return pressed;
@@ -422,43 +466,59 @@ bool strings_equal_ignore_case(const char *lhs, const char *rhs)
     return *lhs == '\0' && *rhs == '\0';
 }
 
-bool read_movie_file_timing(const char *path, uint32_t resume_frame, uint32_t *resume_ms, uint32_t *duration_ms)
+static RawPlayerIo *picker_timing_reader;
+static MovieFile *picker_timing_file;
+
+void movie_picker_timing_stop(void)
 {
-    FILE *file;
+    RawPlayerIo *reader = picker_timing_reader;
+    picker_timing_reader = NULL;
+    picker_timing_file = NULL;
+    raw_player_destroy(reader);
+}
+
+void movie_picker_timing_tick(MovieFile *files, size_t count, size_t preferred)
+{
     MovieHeader header;
-    uint32_t clamped_resume_frame;
 
-    if (resume_ms) {
-        *resume_ms = 0;
-    }
-    if (duration_ms) {
-        *duration_ms = 0;
-    }
-    if (!path || !resume_ms || !duration_ms) {
-        return false;
-    }
-
-    file = fopen(path, "rb");
-    if (!file) {
-        return false;
-    }
-    if (fread(&header, 1, sizeof(header), file) != sizeof(header)) {
-        fclose(file);
-        return false;
-    }
-    fclose(file);
-
-    if (memcmp(header.magic, "NVP1", 4) != 0 || header.fps_num == 0 || header.frame_count == 0) {
-        return false;
+    /* A cold header can require a filesystem-map scan. Discover lengths only
+     * after drawing the menu, with the same bounded reader used for playback.
+     * The picker owns it until completion or cancellation before leaving. */
+    if (!picker_timing_reader) {
+        if (!files || !count)
+            return;
+        if (preferred >= count || files[preferred].timing_checked) {
+            for (preferred = 0; preferred < count; ++preferred)
+                if (!files[preferred].timing_checked)
+                    break;
+            if (preferred == count)
+                return;
+        }
+        picker_timing_file = &files[preferred];
+        picker_timing_reader = raw_player_create(picker_timing_file->path);
+        if (!picker_timing_reader) {
+            picker_timing_file->timing_checked = true;
+            picker_timing_file = NULL;
+            return;
+        }
     }
 
-    clamped_resume_frame = resume_frame;
-    if (clamped_resume_frame >= header.frame_count) {
-        clamped_resume_frame = header.frame_count - 1U;
+    raw_player_service(8U);
+    int result = raw_player_read(picker_timing_reader, 0, &header, sizeof(header), false);
+    if (result == 0)
+        return;
+
+    MovieFile *file = picker_timing_file;
+    file->timing_checked = true;
+    if (result > 0 && memcmp(header.magic, "NVP1", 4) == 0 &&
+        header.fps_num && header.fps_den && header.frame_count) {
+        uint32_t frame = file->resume_frame < header.frame_count
+            ? file->resume_frame : header.frame_count - 1U;
+        file->resume_ms = movie_header_frame_time_ms(&header, frame);
+        file->duration_ms = movie_header_frame_time_ms(&header, header.frame_count);
+        file->resume_time_known = file->has_resume;
     }
-    *resume_ms = movie_header_frame_time_ms(&header, clamped_resume_frame);
-    *duration_ms = movie_header_frame_time_ms(&header, header.frame_count);
-    return true;
+    movie_picker_timing_stop();
 }
 
 MovieFile *scan_movies(const char *directory, size_t *out_count)
@@ -523,14 +583,6 @@ MovieFile *scan_movies(const char *directory, size_t *out_count)
                     break;
                 }
             }
-        }
-        if (files[count].has_resume) {
-            files[count].resume_time_known = read_movie_file_timing(
-                files[count].path,
-                files[count].resume_frame,
-                &files[count].resume_ms,
-                &files[count].duration_ms
-            );
         }
         count++;
     }
@@ -617,7 +669,7 @@ bool find_previous_movie_path(const char *current_path, char *previous_path, siz
     return find_adjacent_movie_path(current_path, previous_path, previous_path_size, -1);
 }
 
-const SubtitleCue *active_subtitle_cue(const Movie *movie, uint32_t now_ms)
+const SubtitleCue *active_subtitle_cue(Movie *movie, uint32_t now_ms)
 {
     uint32_t index;
     uint32_t start_index;
@@ -626,6 +678,15 @@ const SubtitleCue *active_subtitle_cue(const Movie *movie, uint32_t now_ms)
     if (!movie || !movie->subtitles) {
         return NULL;
     }
+    if (movie->subtitle_lookup_valid && movie->subtitle_lookup_track == movie->selected_subtitle_track &&
+        now_ms >= movie->subtitle_lookup_from_ms && now_ms <= movie->subtitle_lookup_until_ms) {
+        return movie->subtitle_lookup_cue;
+    }
+    movie->subtitle_lookup_cue = NULL;
+    movie->subtitle_lookup_from_ms = 0;
+    movie->subtitle_lookup_until_ms = UINT32_MAX;
+    movie->subtitle_lookup_track = movie->selected_subtitle_track;
+    movie->subtitle_lookup_valid = true;
     start_index = 0;
     end_index = movie->header.subtitle_count;
 
@@ -634,11 +695,30 @@ const SubtitleCue *active_subtitle_cue(const Movie *movie, uint32_t now_ms)
         end_index = start_index + movie->subtitle_tracks[movie->selected_subtitle_track].cue_count;
     }
     for (index = start_index; index < end_index; ++index) {
-        if (now_ms >= movie->subtitles[index].start_ms && now_ms <= movie->subtitles[index].end_ms) {
-            return &movie->subtitles[index];
+        const SubtitleCue *cue = &movie->subtitles[index];
+
+        /* File order is significant for overlapping/unsorted ASS cues. A cached
+         * answer remains valid until this cue ends or an earlier cue starts. */
+        if (now_ms < cue->start_ms) {
+            if (cue->start_ms - 1U < movie->subtitle_lookup_until_ms) {
+                movie->subtitle_lookup_until_ms = cue->start_ms - 1U;
+            }
+        } else if (now_ms > cue->end_ms) {
+            if (cue->end_ms + 1U > movie->subtitle_lookup_from_ms) {
+                movie->subtitle_lookup_from_ms = cue->end_ms + 1U;
+            }
+        } else {
+            if (cue->start_ms > movie->subtitle_lookup_from_ms) {
+                movie->subtitle_lookup_from_ms = cue->start_ms;
+            }
+            if (cue->end_ms < movie->subtitle_lookup_until_ms) {
+                movie->subtitle_lookup_until_ms = cue->end_ms;
+            }
+            movie->subtitle_lookup_cue = cue;
+            break;
         }
     }
-    return NULL;
+    return movie->subtitle_lookup_cue;
 }
 
 uint32_t h264_incremental_total_mbs(const Movie *movie, const storage_t *decoder)

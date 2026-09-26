@@ -98,6 +98,8 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
     u32 moreMbs;
     u32 nextMbAddr;
     u32 budget_active;
+    u32 single_slice_group;
+    u32 is_intra_slice;
     i32 qpY;
     macroblockLayer_t *mbLayer;
 
@@ -113,6 +115,8 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
 
     mbLayer = pStorage->mbLayer;
     budget_active = pStorage->macroblockBudget != 0U ? HANTRO_TRUE : HANTRO_FALSE;
+    single_slice_group = pStorage->activePps->numSliceGroups == 1U;
+    is_intra_slice = IS_I_SLICE(pSliceHeader->sliceType);
 
     if (!pStorage->slice->decodeInProgress)
     {
@@ -152,7 +156,7 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
         SetMbParams(pStorage->mb + currMbAddr, pSliceHeader,
             pStorage->slice->sliceId, pStorage->activePps->chromaQpIndexOffset);
 
-        if (!IS_I_SLICE(pSliceHeader->sliceType))
+        if (!is_intra_slice)
         {
             if (!prevSkipped)
             {
@@ -169,7 +173,11 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
                 if (skipRun)
                 {
                     prevSkipped = HANTRO_TRUE;
-                    memset(&mbLayer->mbPred, 0, sizeof(mbPred_t));
+                    /* Skip prediction consumes only reference 0 and MVD 0;
+                     * all other prediction fields are parsed before use. */
+                    mbLayer->mbPred.refIdxL0[0] = 0;
+                    mbLayer->mbPred.mvdL0[0].hor = 0;
+                    mbLayer->mbPred.mvdL0[0].ver = 0;
                     /* mark current macroblock skipped */
                     mbLayer->mbType = P_Skip;
                 }
@@ -218,12 +226,13 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
         /* keep on processing as long as there is stream data left or
          * processing of macroblocks to be skipped based on the last skipRun is
          * not finished */
-        moreMbs = (h264bsdMoreRbspData(pStrmData) || skipRun) ?
+        /* A remaining skip run already proves that another MB follows. */
+        moreMbs = (skipRun || h264bsdMoreRbspData(pStrmData)) ?
                                         HANTRO_TRUE : HANTRO_FALSE;
 
         /* lastMbAddr is only updated for intra slices (all macroblocks of
          * inter slices will be lost in case of an error) */
-        if (IS_I_SLICE(pSliceHeader->sliceType))
+        if (is_intra_slice)
             pStorage->slice->lastMbAddr = currMbAddr;
 
         if (budget_active)
@@ -234,8 +243,14 @@ u32 h264bsdDecodeSliceData(strmData_t *pStrmData, storage_t *pStorage,
         nextMbAddr = currMbAddr;
         if (moreMbs)
         {
-            nextMbAddr = h264bsdNextMbAddress(pStorage->sliceGroupMap,
-                pStorage->picSizeInMbs, currMbAddr);
+            if (single_slice_group) {
+                nextMbAddr = currMbAddr + 1U;
+                if (nextMbAddr >= pStorage->picSizeInMbs)
+                    nextMbAddr = 0;
+            } else {
+                nextMbAddr = h264bsdNextMbAddress(pStorage->sliceGroupMap,
+                    pStorage->picSizeInMbs, currMbAddr);
+            }
             /* data left in the buffer but no more macroblocks for current slice
              * group -> error */
             if (!nextMbAddr)

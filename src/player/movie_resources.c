@@ -1,8 +1,57 @@
 #include "player_internal.h"
+#include "crash_recorder.h"
 
 static bool player_is_power_of_two(size_t value)
 {
     return value != 0 && (value & (value - 1U)) == 0;
+}
+
+size_t movie_lookahead_storage_bound(const Movie *movie)
+{
+    uint32_t largest_chunk=0,largest_frames=0;
+    uint64_t rounded,prefetch,total;
+    if(!movie || !movie->chunk_index || !movie->header.chunk_count)return SIZE_MAX;
+    for(uint32_t i=0;i<movie->header.chunk_count;++i){
+        const ChunkIndexEntry *entry=&movie->chunk_index[i];
+        if(!entry->packed_size || !entry->unpacked_size || !entry->frame_count)return SIZE_MAX;
+        if(entry->packed_size>largest_chunk)largest_chunk=entry->packed_size;
+        if(entry->unpacked_size>largest_chunk)largest_chunk=entry->unpacked_size;
+        if(entry->frame_count>largest_frames)largest_frames=entry->frame_count;
+    }
+    /* Retained prefetch bins can outlive their chunk IDs. Bound all slots by
+     * the largest indexed bin, not only a contiguous window of current IDs.
+     * Three additional bins cover main/replacement/seek-preview storage; two
+     * offset arrays cover owned unaligned tables and their replacement. */
+    rounded=((uint64_t)largest_chunk+4095U)&~(uint64_t)4095U;
+    prefetch=rounded*PREFETCH_CHUNK_COUNT;
+    if(prefetch>PREFETCH_MAX_TOTAL_BYTES)prefetch=PREFETCH_MAX_TOTAL_BYTES;
+    total=prefetch+3U*rounded+2U*(uint64_t)largest_frames*sizeof(uint32_t);
+    return total>SIZE_MAX?SIZE_MAX:(size_t)total;
+}
+
+static bool movie_storage_add(size_t *total,size_t bytes)
+{
+    if(bytes>SIZE_MAX-*total)return false;
+    *total+=bytes;return true;
+}
+
+size_t movie_lookahead_storage_bytes(const Movie *movie)
+{
+    size_t total=0;
+    if(!movie)return 0;
+    for(unsigned i=0;i<PREFETCH_CHUNK_COUNT;++i)
+        if(movie->prefetched[i].chunk_storage &&
+           !movie_storage_add(&total,movie->prefetched[i].chunk_capacity))return 0;
+    if(movie->chunk_storage && !movie->chunk_storage_in_sram &&
+       !movie_storage_add(&total,movie->chunk_storage_capacity))return 0;
+    if(movie->frame_offsets_allocation){
+        if(movie->frame_offsets_capacity>SIZE_MAX/sizeof(uint32_t) ||
+           !movie_storage_add(&total,movie->frame_offsets_capacity*sizeof(uint32_t)))return 0;
+    }
+    /* An inconsistent/overflowed total grants no credit against future growth.
+     * Existing pixels, decoder/debug/UI allocations are already reflected in
+     * the native free-pool reading and must not be credited a second time. */
+    return total;
 }
 
 void *player_malloc_aligned(size_t size, size_t alignment, uint8_t **allocation)
@@ -77,7 +126,9 @@ void player_copy_maybe_fast(void *dest, const void *src, size_t size)
     size_t chunk_bytes;
 
     if (dest && src && size >= PLAYER_CACHE_LINE_SIZE &&
-            ((((uintptr_t) dest) | ((uintptr_t) src)) & (PLAYER_CACHE_LINE_SIZE - 1U)) == 0) {
+            ((((uintptr_t) dest) | ((uintptr_t) src)) & 3U) == 0) {
+        /* LDM/STM require word alignment, not cache-line alignment. SDL's
+         * surfaces need not be 32-byte aligned; they can still use this loop. */
         chunk_count = size / PLAYER_CACHE_LINE_SIZE;
         if (chunk_count <= UINT32_MAX) {
             chunk_bytes = chunk_count * PLAYER_CACHE_LINE_SIZE;
@@ -109,7 +160,13 @@ void release_movie_chunk_storage(Movie *movie)
     movie->chunk_storage = NULL;
     movie->chunk_storage_allocation = NULL;
     movie->chunk_storage_size = 0;
+    movie->chunk_storage_capacity = 0;
     movie->chunk_storage_in_sram = false;
+    movie->frame_offsets = NULL;
+    movie->chunk_bytes = NULL;
+    movie->chunk_size = 0;
+    movie->loaded_chunk = -1;
+    movie->decoded_local_frame = -1;
 }
 
 bool allocate_movie_chunk_storage(Movie *movie, size_t size)
@@ -117,9 +174,20 @@ bool allocate_movie_chunk_storage(Movie *movie, size_t size)
     if (!movie || size == 0) {
         return false;
     }
+    if (movie->chunk_storage && movie->chunk_storage_capacity >= size &&
+        (!sram_movie_chunk_buffer_can_hold(size) || movie->chunk_storage_in_sram)) {
+        movie->chunk_storage_size = 0;
+        movie->frame_offsets = NULL;
+        movie->chunk_bytes = NULL;
+        movie->chunk_size = 0;
+        movie->loaded_chunk = -1;
+        movie->decoded_local_frame = -1;
+        return true;
+    }
     release_movie_chunk_storage(movie);
     if (sram_movie_chunk_buffer_can_hold(size)) {
         movie->chunk_storage = g_sram_movie_chunk_buffer;
+        movie->chunk_storage_capacity = g_sram_movie_chunk_buffer_size;
         movie->chunk_storage_in_sram = true;
         return true;
     }
@@ -130,6 +198,7 @@ bool allocate_movie_chunk_storage(Movie *movie, size_t size)
         &movie->chunk_storage_allocation
     );
     movie->chunk_storage_in_sram = false;
+    movie->chunk_storage_capacity = movie->chunk_storage ? size : 0;
     return movie->chunk_storage != NULL;
 }
 
@@ -151,9 +220,11 @@ bool adopt_movie_chunk_storage_owned(Movie *movie, uint8_t **storage, uint8_t **
         player_copy_maybe_fast(g_sram_movie_chunk_buffer, owned_storage, size);
         player_free_aligned(owned_storage, owned_allocation ? owned_allocation : owned_storage);
         movie->chunk_storage = g_sram_movie_chunk_buffer;
+        movie->chunk_storage_capacity = g_sram_movie_chunk_buffer_size;
         movie->chunk_storage_in_sram = true;
     } else {
         movie->chunk_storage = owned_storage;
+        movie->chunk_storage_capacity = size;
         movie->chunk_storage_allocation = owned_allocation ? owned_allocation : owned_storage;
         movie->chunk_storage_in_sram = false;
     }
@@ -170,8 +241,59 @@ bool adopt_movie_chunk_storage(Movie *movie, uint8_t **storage, size_t size)
     return adopt_movie_chunk_storage_owned(movie, storage, NULL, size);
 }
 
+bool adopt_prefetched_movie_chunk(Movie *movie, PrefetchedChunk *chunk)
+{
+    uint8_t *previous_storage;
+    uint8_t *previous_allocation;
+    size_t previous_capacity;
+
+    if (!movie || !chunk || !chunk->chunk_storage ||
+        chunk->state != PREFETCH_READY || chunk->chunk_storage_size == 0) {
+        return false;
+    }
+    if (sram_movie_chunk_buffer_can_hold(chunk->chunk_storage_size)) {
+        /* Keep SRAM's decode locality, but retain the source allocation for
+         * the next flash read instead of freeing and reallocating each chunk. */
+        release_movie_chunk_storage(movie);
+        player_copy_maybe_fast(g_sram_movie_chunk_buffer, chunk->chunk_storage, chunk->chunk_storage_size);
+        movie->chunk_storage = g_sram_movie_chunk_buffer;
+        movie->chunk_storage_capacity = g_sram_movie_chunk_buffer_size;
+        movie->chunk_storage_in_sram = true;
+    } else {
+        /* For larger chunks transfer ownership without copying. The consumed
+         * prefetch slot takes the previous RAM buffer and can refill it. */
+        previous_storage = movie->chunk_storage_in_sram ? NULL : movie->chunk_storage;
+        previous_allocation = movie->chunk_storage_in_sram ? NULL : movie->chunk_storage_allocation;
+        previous_capacity = movie->chunk_storage_in_sram ? 0 : movie->chunk_storage_capacity;
+        movie->chunk_storage = chunk->chunk_storage;
+        movie->chunk_storage_allocation = chunk->chunk_allocation;
+        movie->chunk_storage_capacity = chunk->chunk_capacity;
+        movie->chunk_storage_in_sram = false;
+        chunk->chunk_storage = previous_storage;
+        chunk->chunk_allocation = previous_allocation;
+        chunk->chunk_capacity = previous_capacity;
+    }
+    movie->chunk_storage_size = chunk->chunk_storage_size;
+    movie->frame_offsets = NULL;
+    movie->chunk_bytes = NULL;
+    movie->chunk_size = 0;
+    movie->loaded_chunk = -1;
+    movie->decoded_local_frame = -1;
+    chunk->chunk_storage_size = 0;
+    chunk->chunk_index = -1;
+    chunk->state = PREFETCH_IDLE;
+    chunk->read_offset = 0;
+    /* Retained buffers count against the same prefetch cap in every state. */
+    if (!ensure_prefetch_budget(movie, -1, 0)) {
+        clear_prefetched_chunk(chunk);
+    }
+    return true;
+}
+
 static bool h264_codec_global_init(void)
 {
+    /* CX gives its small identity pool to the codec actually opened. */
+    if (sram_is_enabled() && !sram_uses_native_clone()) h264bsdInitSramTables();
     return init_h264_color_tables();
 }
 
@@ -183,13 +305,11 @@ static bool h264_codec_open(Movie *movie)
 
     init_sram_movie_chunk_buffer();
     movie->h264.decoder = h264bsdAlloc();
-    if (movie->h264.decoder) {
-        memset(movie->h264.decoder, 0, sizeof(*movie->h264.decoder));
-    }
     if (!movie->h264.decoder) {
         debug_failf("open failed: h264 decoder alloc");
         return false;
     }
+    /* h264bsdInit initializes the full storage; avoid clearing it twice. */
     return reset_h264_decoder(movie);
 }
 
@@ -282,28 +402,36 @@ void destroy_movie(Movie *movie)
     if (!movie) {
         return;
     }
+    /* Queue slots own the other RGB allocations after presentation swaps.
+     * Release them while the displayed framebuffer and decoder still exist. */
+    h264_lookahead_destroy(movie);
+    movie_async_stop(movie);
     if (movie->file) {
         fclose(movie->file);
     }
     if (movie->frame_surface) {
         SDL_FreeSurface(movie->frame_surface);
     }
-    if (movie->subtitles) {
-        for (index = 0; index < movie->header.subtitle_count; ++index) {
-            free(movie->subtitles[index].text);
+    if (movie->subtitle_storage) {
+        free(movie->subtitle_storage);
+    } else {
+        if (movie->subtitles) {
+            for (index = 0; index < movie->header.subtitle_count; ++index) {
+                free(movie->subtitles[index].text);
+            }
         }
-    }
-    if (movie->subtitle_tracks) {
-        for (index = 0; index < movie->subtitle_track_count; ++index) {
-            free(movie->subtitle_tracks[index].name);
+        if (movie->subtitle_tracks) {
+            for (index = 0; index < movie->subtitle_track_count; ++index) {
+                free(movie->subtitle_tracks[index].name);
+            }
         }
+        free(movie->subtitles);
+        free(movie->subtitle_tracks);
     }
-    free(movie->subtitles);
-    free(movie->subtitle_tracks);
     free(movie->chunk_index);
     player_free_aligned(movie->framebuffer, movie->framebuffer_allocation);
     release_movie_chunk_storage(movie);
-    free(movie->frame_offsets);
+    free(movie->frame_offsets_allocation);
     if (movie->codec_ops && movie->codec_ops->destroy) {
         movie->codec_ops->destroy(movie);
     }
@@ -323,6 +451,10 @@ void defer_playback_movie_cleanup(Movie *movie)
     if (!movie) {
         return;
     }
+    /* The picker transition retains only the displayed image. Partial decode
+     * work cannot outlive the chunk storage released below. */
+    h264_lookahead_destroy(movie);
+    movie_async_stop(movie);
     if (movie->file) {
         fclose(movie->file);
         movie->file = NULL;
@@ -342,34 +474,11 @@ void cleanup_deferred_playback_movie(void)
 
 bool init_fonts(Fonts *fonts)
 {
-    size_t index;
-
     memset(fonts, 0, sizeof(*fonts));
     fonts->white = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 255, 255, 255);
     fonts->outline = nSDL_LoadFont(NSDL_FONT_TINYTYPE, 0, 0, 0);
-    for (index = 0; index < SUBTITLE_FONT_CHOICE_COUNT; ++index) {
-        int font_id = g_subtitle_font_choices[index];
-        fonts->subtitle_white[font_id] = nSDL_LoadFont(font_id, 255, 255, 255);
-        fonts->subtitle_outline[font_id] = nSDL_LoadFont(font_id, 0, 0, 0);
-        if (fonts->subtitle_white[font_id]) {
-            nSDL_SetFontSpacing(fonts->subtitle_white[font_id], 0, 0);
-        }
-        if (fonts->subtitle_outline[font_id]) {
-            nSDL_SetFontSpacing(fonts->subtitle_outline[font_id], 0, 0);
-        }
-    }
-    if (!fonts->white || !fonts->outline) {
-        free_fonts(fonts);
-        return false;
-    }
-    for (index = 0; index < SUBTITLE_FONT_CHOICE_COUNT; ++index) {
-        int font_id = g_subtitle_font_choices[index];
-        if (!fonts->subtitle_white[font_id] || !fonts->subtitle_outline[font_id]) {
-            free_fonts(fonts);
-            return false;
-        }
-    }
-    if (!fonts->subtitle_white[NSDL_FONT_TINYTYPE] || !fonts->subtitle_outline[NSDL_FONT_TINYTYPE]) {
+    fonts->subtitles = calloc(1, sizeof(*fonts->subtitles));
+    if (!fonts->white || !fonts->outline || !fonts->subtitles) {
         free_fonts(fonts);
         return false;
     }
@@ -386,13 +495,12 @@ void free_fonts(Fonts *fonts)
     if (fonts->outline) {
         nSDL_FreeFont(fonts->outline);
     }
-    for (font_id = 0; font_id < NSP_NUMFONTS; ++font_id) {
-        if (fonts->subtitle_white[font_id]) {
-            nSDL_FreeFont(fonts->subtitle_white[font_id]);
+    if (fonts->subtitles) {
+        for (font_id = 0; font_id < NSP_NUMFONTS; ++font_id) {
+            if (fonts->subtitles->white[font_id]) nSDL_FreeFont(fonts->subtitles->white[font_id]);
+            if (fonts->subtitles->outline[font_id]) nSDL_FreeFont(fonts->subtitles->outline[font_id]);
         }
-        if (fonts->subtitle_outline[font_id]) {
-            nSDL_FreeFont(fonts->subtitle_outline[font_id]);
-        }
+        free(fonts->subtitles);
     }
     memset(fonts, 0, sizeof(*fonts));
 }
@@ -413,10 +521,19 @@ bool init_mpeg4_decoder_global(void)
         return true;
     }
     if (!attempted && sram_is_enabled()) {
-        sram_pool = sram_alloc(MPEG4_XVID_SRAM_POOL_BYTES, 32U);
-        if (sram_pool) {
-            sram_pool_size = MPEG4_XVID_SRAM_POOL_BYTES;
+        size_t bytes=MPEG4_XVID_SRAM_POOL_BYTES;
+        if (!sram_uses_native_clone()) {
+            /* Reserve the compact H.264/color tables before handing Xvid the
+             * remaining arena, so switching codecs is independent of order. */
+            h264bsdInitSramTables();
+            init_h264_color_tables();
+            size_t used=sram_bytes_used(), capacity=sram_bytes_capacity();
+            /* Small color/VLC tables go first in Xvid's partial arena. */
+            used=(used+31U)&~(size_t)31U;
+            bytes=used<capacity ? (capacity-used)&~(size_t)31U : 0U;
         }
+        sram_pool = sram_alloc(bytes, 32U);
+        if (sram_pool) sram_pool_size=(unsigned int)bytes;
     }
     attempted = true;
     initialized = mpeg4_xvid_global_init(sram_pool, sram_pool_size);
@@ -456,28 +573,25 @@ bool init_h264_color_tables(void)
 
     for (index = 0; index < 256; ++index) {
         int y = index - 16;
-        int chroma = index - 128;
         if (y < 0) {
             y = 0;
         }
         tables->y_base[index] = (298 * y) + 128;
-        tables->u_to_blue[index] = 516 * chroma;
+        int chroma = index - 128;
+        tables->u_to_blue[index] = 516 * chroma + H264_RGB565_RED_BLUE_BIAS;
         tables->u_to_green[index] = -100 * chroma;
-        tables->v_to_red[index] = 409 * chroma;
-        tables->v_to_green[index] = -208 * chroma;
-        tables->red565[index] = (uint16_t) ((index & 0xF8) << 8);
-        tables->green565[index] = (uint16_t) ((index & 0xFC) << 3);
-        tables->blue565[index] = (uint16_t) (index >> 3);
+        tables->v_to_red[index] = 409 * chroma + H264_RGB565_RED_BLUE_BIAS;
+        tables->v_to_green[index] = -208 * chroma + H264_RGB565_GREEN_BIAS;
     }
 
-    for (index = 0; index < H264_CLIP_TABLE_SIZE; ++index) {
-        int value = index - H264_CLIP_OFFSET;
-        if (value < 0) {
-            value = 0;
-        } else if (value > 255) {
-            value = 255;
-        }
-        tables->clip[index] = (uint8_t) value;
+    /* Across every 8-bit Y/U/V combination, biased red/blue indices lie in
+     * [31,130] and green in [217,364]. One 384-byte table serves both clamps. */
+    for (index = 0; index < H264_RGB565_CLIP_TABLE_SIZE; ++index) {
+        int limit = index < 192 ? 31 : 63;
+        int value = index - (index < 192 ? 64 : 256);
+        if(value < 0) value=0;
+        if(value > limit) value=limit;
+        tables->clip[index]=(uint8_t)value;
     }
 
     tables->initialized = true;
@@ -486,7 +600,7 @@ bool init_h264_color_tables(void)
 
 void init_sram_movie_chunk_buffer(void)
 {
-    if (g_sram_movie_chunk_buffer || !sram_is_enabled()) {
+    if (g_sram_movie_chunk_buffer || !sram_is_enabled() || !sram_uses_native_clone()) {
         return;
     }
 
@@ -553,30 +667,47 @@ void debug_trace_runtime_snapshot(
         (unsigned long) movie->diag_h264_replay_count,
         (unsigned long) total_prefetched_chunk_bytes(movie)
     );
+    debug_tracef("render shown=%lu unchanged=%lu total_ms=%lu peak_ms=%lu",
+        (unsigned long) movie->diag_render_count,
+        (unsigned long) movie->diag_render_skipped_count,
+        (unsigned long) movie->diag_render_total_ms,
+        (unsigned long) movie->diag_render_max_ms);
 }
 
-void debug_dump_session(const char *path, const Movie *movie, const char *reason)
+bool debug_dump_session(const char *path, const Movie *movie, const char *reason)
 {
     FILE *log_file;
+    char *log_buffer;
     size_t index;
     bool clip_in_sram = false;
     bool qpc_in_sram = false;
     bool deblocking_in_sram = false;
 
-    if (!path) {
-        return;
+    if (!path || (!debug_is_runtime_logging_enabled() && !playback_capture_available(movie))) {
+        return false;
     }
 
+    /* Error exits can export before the playback loop unwinds. Freeze and
+     * finalize any unfinished sample before doing filesystem work. */
+    playback_capture_stop(movie);
     log_file = fopen(path, "wb");
     if (!log_file) {
-        return;
+        return false;
     }
+    log_buffer = (char *) malloc(16384U);
+    if (log_buffer) setvbuf(log_file, log_buffer, _IOFBF, 16384U);
 
     fputs("ND Video Player diagnostic log\n", log_file);
+    movie_async_debug(log_file,movie);
+    crash_recorder_debug(log_file);
     fprintf(log_file, "reason=%s\n", reason ? reason : "unknown");
     fprintf(log_file, "last_error=%s\n", debug_last_error());
     fprintf(log_file, "verbose_logging=%u\n", debug_is_runtime_logging_enabled() ? 1U : 0U);
     fprintf(log_file, "metrics_collection=%u\n", debug_should_collect_metrics() ? 1U : 0U);
+    fprintf(log_file, "debug_text_storage bytes=%lu capacity=%u retained=%lu line_bytes=%u\n",
+        (unsigned long)(g_debug_ring ? DEBUG_RING_SIZE * sizeof(*g_debug_ring) : 0),
+        DEBUG_RING_SIZE, (unsigned long)g_debug_ring_count, DEBUG_LINE_LEN);
+    playback_capture_export(log_file, movie);
     h264bsdGetSramStatus(&clip_in_sram, &qpc_in_sram, &deblocking_in_sram);
     fprintf(
         log_file,
@@ -593,6 +724,14 @@ void debug_dump_session(const char *path, const Movie *movie, const char *reason
 
     if (movie) {
         MemoryStats stats = query_memory_stats(movie);
+        fprintf(log_file, "async_storage used=%u reads=%lu bytes=%lu foreground_waits=%lu cancels=%lu failures=%lu native_status=%ld max_read_us=%llu\n",
+            movie->diag_async_used?1U:0U, (unsigned long)movie->diag_async_reads,
+            (unsigned long)movie->diag_async_bytes, (unsigned long)movie->diag_async_waits,
+            (unsigned long)movie->diag_async_cancels, (unsigned long)movie->diag_async_failures,
+            (long)movie->diag_async_native_error,
+            (unsigned long long)capture_ticks_to_us(movie->diag_async_max_ticks, TIMER_TICKS_PER_SEC));
+        fputs("memory_accounting=tracked_movie_buffers_only; mem_free is unused accounting budget, not measured OS free RAM; decoder/fonts/debug/OS allocations are excluded\n", log_file);
+        fputs("movie_lifetime_metrics (not reset when D starts; memory is tracked player buffers, not OS heap usage):\n", log_file);
         fprintf(
             log_file,
             "frame=%lu/%lu loaded_chunk=%d decoded_local=%d mem_used=%lu mem_prefetched=%lu mem_free=%lu mem_pct=%u\n",
@@ -650,7 +789,10 @@ void debug_dump_session(const char *path, const Movie *movie, const char *reason
         fputc('\n', log_file);
     }
 
-    fclose(log_file);
+    bool saved = ferror(log_file) == 0;
+    if (fclose(log_file) != 0) saved = false;
+    free(log_buffer);
+    return saved;
 }
 
 void debug_log_sram_status(void)

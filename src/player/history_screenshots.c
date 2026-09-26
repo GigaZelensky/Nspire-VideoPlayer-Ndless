@@ -568,11 +568,12 @@ void update_movie_file_resume_from_snapshot(MovieFile *file, const DeferredHisto
     file->resume_frame = file->has_resume ? frame : 0;
     file->resume_time_known = false;
     file->resume_ms = 0;
-    file->duration_ms = 0;
+    /* Length remains available after finishing a movie clears its resume badge. */
+    file->duration_ms = movie_header_frame_time_ms(&request->header, request->header.frame_count);
+    file->timing_checked = true;
     if (file->has_resume) {
         file->resume_ms = movie_header_frame_time_ms(&request->header, frame);
-        file->duration_ms = movie_header_frame_time_ms(&request->header, request->header.frame_count);
-        file->resume_time_known = true;
+        file->resume_time_known = file->duration_ms > 0;
     }
 }
 
@@ -782,9 +783,6 @@ void prepare_screenshot_preview(ScreenshotPreviewState *preview, SDL_Surface *sc
     }
 
     thumbnail = create_scaled_surface_from_surface(screen, SCREENSHOT_PREVIEW_MAX_W, SCREENSHOT_PREVIEW_MAX_H);
-    if (!thumbnail) {
-        return;
-    }
 
     preview->surface = thumbnail;
     snprintf(preview->label, sizeof(preview->label), "Saved %.72s", filename_from_path(saved_path));

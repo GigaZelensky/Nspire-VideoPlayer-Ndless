@@ -47,6 +47,7 @@
 #include "h264bsd_macroblock_layer.h"
 #include "h264bsd_slice_header.h"
 #include "h264bsd_util.h"
+#include <stddef.h>
 #include "h264bsd_vlc.h"
 #include "h264bsd_cavlc.h"
 #include "h264bsd_nal_unit.h"
@@ -107,6 +108,21 @@ static u32 ProcessIntra16x16Residual(mbStorage_t *pMb, u8 *data, u32 constrained
 
 #else
 static u32 ProcessResidual(mbStorage_t *pMb, i32 residualLevel[][16], u32 *);
+
+static __inline void ClearResidualBlock(i32 *block)
+{
+#if defined(__arm__) && !defined(__thumb__)
+    /* Every residual block is 16 aligned i32 coefficients. Four block stores
+     * avoid general memset's alignment, length and byte-pattern machinery. */
+    __asm__ volatile(
+        "mov r0, #0\n\tmov r1, #0\n\tmov r2, #0\n\tmov r3, #0\n\t"
+        "stmia %0!, {r0-r3}\n\tstmia %0!, {r0-r3}\n\t"
+        "stmia %0!, {r0-r3}\n\tstmia %0!, {r0-r3}"
+        : "+&r" (block) : : "r0", "r1", "r2", "r3", "memory");
+#else
+    memset(block, 0, 16U * sizeof(*block));
+#endif
+}
 #endif
 
 /*------------------------------------------------------------------------------
@@ -149,21 +165,32 @@ u32 h264bsdDecodeMacroblockLayer(strmData_t *pStrmData,
 
 #ifdef H264DEC_NEON
     h264bsdClearMbLayer(pMbLayer, ((sizeof(macroblockLayer_t) + 63) & ~0x3F));
-#else
+#elif defined(H264DEC_OMXDL)
     memset(pMbLayer, 0, sizeof(macroblockLayer_t));
+#else
+    /* The parser overwrites every used prediction mode/MVD. Only implicit
+     * reference indices and absent QP/count/DC values need zero defaults.
+     * Clear AC arrays only for coded blocks below; ProcessResidual marks all
+     * other blocks empty without reading their AC values. */
+    pMbLayer->mbQpDelta = 0;
+    memset(pMbLayer->mbPred.refIdxL0, 0, sizeof(pMbLayer->mbPred.refIdxL0));
+    memset(pMbLayer->subMbPred.refIdxL0, 0, sizeof(pMbLayer->subMbPred.refIdxL0));
+    memset(pMbLayer->residual.totalCoeff, 0, sizeof(pMbLayer->residual.totalCoeff));
+    memset(pMbLayer->residual.level[24], 0,
+        sizeof(residual_t) - offsetof(residual_t, level) - 24 * sizeof(pMbLayer->residual.level[0]));
 #endif
 
     tmp = h264bsdDecodeExpGolombUnsigned(pStrmData, &value);
 
     if (IS_I_SLICE(sliceType))
     {
-        if ((value + 6) > 31 || tmp != HANTRO_OK)
+        if (tmp != HANTRO_OK || value > 25U)
             return(HANTRO_NOK);
         pMbLayer->mbType = (mbType_e)(value + 6);
     }
     else
     {
-        if ((value + 1) > 31 || tmp != HANTRO_OK)
+        if (tmp != HANTRO_OK || value > 30U)
             return(HANTRO_NOK);
         pMbLayer->mbType = (mbType_e)(value + 1);
     }
@@ -740,6 +767,7 @@ u32 DecodeResidual(strmData_t *pStrmData, residual_t *pResidual,
             for (j = 4; j--; blockIndex++)
             {
                 nc = (i32)DetermineNc(pMb, blockIndex, pResidual->totalCoeff);
+                ClearResidualBlock(level[blockIndex]);
                 if (is16x16)
                 {
                     tmp = h264bsdDecodeResidualBlockCavlc(pStrmData,
@@ -782,6 +810,7 @@ u32 DecodeResidual(strmData_t *pStrmData, residual_t *pResidual,
         for (i = 8; i--;blockIndex++)
         {
             nc = (i32)DetermineNc(pMb, blockIndex, pResidual->totalCoeff);
+            ClearResidualBlock(level[blockIndex]);
             tmp = h264bsdDecodeResidualBlockCavlc(pStrmData,
                 level[blockIndex] + 1, nc, 15);
             if ((tmp & 0xF) != HANTRO_OK)

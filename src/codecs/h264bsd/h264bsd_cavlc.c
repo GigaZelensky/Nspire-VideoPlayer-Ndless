@@ -472,6 +472,11 @@ u32 DecodeCoeffToken(u32 bits, u32 nc)
 
 u32 DecodeLevelPrefix(u32 bits)
 {
+#if defined(__GNUC__) || defined(__clang__)
+    /* ARMv5 has CLZ: replace the variable-length branch cascade with one
+     * instruction, while retaining the invalid all-zero prefix result. */
+    return bits ? (u32)__builtin_clz(bits) - 16U : VLC_NOT_FOUND;
+#else
 
 /* Variables */
 
@@ -515,7 +520,7 @@ u32 DecodeLevelPrefix(u32 bits)
         return(VLC_NOT_FOUND);
 
     return(numZeros);
-
+#endif
 }
 
 /*------------------------------------------------------------------------------
@@ -758,7 +763,6 @@ u32 h264bsdDecodeResidualBlockCavlc(
     u32 i, tmp, totalCoeff, trailingOnes, suffixLength, levelPrefix;
     u32 levelSuffix, zerosLeft, bit;
     i32 level[16];
-    u32 run[16];
     /* stream "cache" */
     u32 bufferValue;
     u32 bufferBits;
@@ -873,37 +877,36 @@ u32 h264bsdDecodeResidualBlockCavlc(
         else
             zerosLeft = 0;
 
+        /* The highest occupied scan position is known before reading runs.
+         * Write coefficients backwards as runs arrive instead of storing a
+         * second 16-element run array and walking it again in reverse. */
+        if (zerosLeft > maxNumCoeff - totalCoeff)
+            return(HANTRO_NOK);
+        tmp = totalCoeff + zerosLeft - 1U;
+        levelSuffix = 0;
         for (i = 0; i < totalCoeff - 1; i++)
         {
+            u32 run;
+            coeffLevel[tmp] = level[i];
+            levelSuffix |= 1U << tmp;
             if (zerosLeft > 0)
             {
                 BUFFER_SHOW(bufferValue, bufferBits, bit,11);
-                tmp = DecodeRunBefore(bit, zerosLeft);
-                if (!tmp)
+                run = DecodeRunBefore(bit, zerosLeft);
+                if (!run)
                     return(HANTRO_NOK);
-                BUFFER_FLUSH(bufferValue, bufferBits, LENGTH(tmp));
-                run[i] = INFO(tmp);
-                zerosLeft -= run[i]++;
+                BUFFER_FLUSH(bufferValue, bufferBits, LENGTH(run));
+                run = INFO(run);
+                zerosLeft -= run;
+                tmp -= run + 1U;
             }
             else
             {
-                run[i] = 1;
+                --tmp;
             }
         }
-
-        /* combining level and run, levelSuffix variable used to hold coeffMap,
-         * i.e. bit map indicating which coefficients had non-zero value. */
-
-        /*lint -esym(771,level,run) level and run are always initialized */
-        tmp = zerosLeft;
         coeffLevel[tmp] = level[totalCoeff-1];
-        levelSuffix = 1 << tmp;
-        for (i = totalCoeff-1; i--;)
-        {
-            tmp += run[i];
-            levelSuffix |= 1 << tmp;
-            coeffLevel[tmp] = level[i];
-        }
+        levelSuffix |= 1U << tmp;
 
     }
     else

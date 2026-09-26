@@ -1,3 +1,4 @@
+.DEFAULT_GOAL := all
 DEBUG = FALSE
 ifneq ($(wildcard ./external/Ndless-official/ndless-sdk/include/libndls.h),)
 SDKROOT ?= ./external/Ndless-official/ndless-sdk
@@ -19,18 +20,27 @@ AS  = nspire-as
 GXX = nspire-g++
 LD  = nspire-gcc -nodefaultlibs
 
-GCCFLAGS_BASE = -Wall -Wextra -Wno-unused-parameter -Wno-incompatible-pointer-types -std=c99 -marm -mcpu=arm926ej-s -mtune=arm926ej-s -mfloat-abi=soft -ffunction-sections -fdata-sections -Isrc -Isrc/codecs/h264bsd -Isrc/codecs -Isrc/codecs/xvid -DARCH_IS_32BIT -DARCH_IS_ARM -DXVID_DECODER_ONLY
+GCCFLAGS_BASE = -Wall -Wextra -Wno-unused-parameter -std=c99 -marm -mcpu=arm926ej-s -mtune=arm926ej-s -mfloat-abi=soft -ffunction-sections -fdata-sections -Isrc -Isrc/codecs/h264bsd -Isrc/codecs -Isrc/codecs/xvid -DARCH_IS_32BIT -DARCH_IS_ARM -DXVID_DECODER_ONLY
 LDFLAGS = -Wl,--gc-sections -lSDL -flto -O3
+LDFLAGS += -Wl,--wrap=fopen,--wrap=fread,--wrap=fwrite,--wrap=fseek,--wrap=fclose,--wrap=fflush,--wrap=_open,--wrap=_read,--wrap=_write,--wrap=_lseek,--wrap=_close,--wrap=remove,--wrap=rename,--wrap=nuc_opendir,--wrap=nuc_readdir,--wrap=nuc_closedir
 LOADER_GXXFLAGS = -g -Os -Wall -Wextra -march=armv5te -fPIE -std=c++11 -fno-rtti -fno-exceptions -Wl,-Tldscript -Wl,--gc-sections -nostdlib -nostartfiles -ffreestanding -I ../../include
 PACKFLAGS = --name "ND Video Player" --author "GigaZelensky" --version 1 --ndless-min 45 --hww-support --uses-lcd-blit
 
 ifeq ($(DEBUG),FALSE)
-	GCCFLAGS = $(GCCFLAGS_BASE) -Os
+	GCCFLAGS = $(GCCFLAGS_BASE) -Os -flto
 	FAST_GCCFLAGS = $(GCCFLAGS_BASE) -O3 -DNDEBUG -fno-strict-aliasing -fomit-frame-pointer -falign-functions=32 -falign-loops=32 -flto -funroll-loops
 else
 	GCCFLAGS = $(GCCFLAGS_BASE) -O0 -g
 	FAST_GCCFLAGS = $(GCCFLAGS_BASE) -O0 -g -falign-functions=32 -falign-loops=32
 endif
+
+# Keep aggressive unrolling/alignment on decode, pixel, and frame-timing paths.
+# Picker, resource setup, and history code benefit from a smaller instruction footprint.
+HOT_PLAYER_SRCS = src/player/h264_lookahead.c src/player/codec_streaming.c src/player/render_primitives.c \
+	src/player/playback_ui.c src/player/playback_loop.c src/player/subtitles.c \
+	src/player/input_timing_memory.c src/player/night_mode.c \
+	src/player/movie_open_scan.c src/player/platform_debug.c
+FAST_SRCS = src/codecs/h264bsd/% src/codecs/xvid/% src/codecs/mpeg4_xvid.c $(HOT_PLAYER_SRCS)
 
 XVID_DECODER_SRCS = \
 	src/codecs/xvid/xvid.c \
@@ -64,23 +74,25 @@ XVID_DECODER_SRCS = \
 	src/codecs/xvid/utils/sram_tables.c \
 	src/codecs/xvid/utils/timer.c
 
-OBJS = $(patsubst %.c, %.o, $(shell find src -name "*.c" -not -path "src/codecs/xvid/*"))
+OBJS = $(patsubst %.c, %.o, $(shell find src -type d -name '.*' -prune -o -type f -name "*.c" -not -path "src/codecs/xvid/*" -print))
 OBJS += $(patsubst %.c, %.o, $(XVID_DECODER_SRCS))
-OBJS += $(patsubst %.cpp, %.o, $(shell find src -name "*.cpp"))
-OBJS += $(patsubst %.S, %.o, $(shell find src -name "*.S"))
+OBJS += $(patsubst %.cpp, %.o, $(shell find src -type d -name '.*' -prune -o -type f -name "*.cpp" -print))
+OBJS += $(patsubst %.S, %.o, $(shell find src -type d -name '.*' -prune -o -type f -name "*.S" -print))
 EXE = ndvideo
 DISTDIR = dist
 LEGACY_OBJS = src/player.o
 vpath %.tns $(DISTDIR)
 vpath %.elf $(DISTDIR)
 
+.PHONY: all clean
+
 all: $(EXE).tns
 
 %.o: %.c
-	$(GCC) $(if $(filter src/codecs/h264bsd/% src/codecs/xvid/% src/codecs/mpeg4_xvid.c src/player/%,$<),$(FAST_GCCFLAGS),$(GCCFLAGS)) -c $< -o $@
+	$(GCC) $(if $(filter $(FAST_SRCS),$<),$(FAST_GCCFLAGS),$(GCCFLAGS)) $(if $(filter src/codecs/xvid/%,$<),-Wno-incompatible-pointer-types,-Werror=incompatible-pointer-types) -MMD -MP -c $< -o $@
 
 %.o: %.cpp
-	$(GXX) $(GCCFLAGS) -c $< -o $@
+	$(GXX) $(GCCFLAGS) -MMD -MP -c $< -o $@
 
 %.o: %.S
 	$(AS) -c $< -o $@
@@ -98,3 +110,6 @@ $(EXE).tns: $(EXE).elf $(LOADER)
 
 clean:
 	rm -f $(OBJS) $(LEGACY_OBJS) $(DISTDIR)/$(EXE).tns $(DISTDIR)/$(EXE).elf $(DISTDIR)/$(EXE).zehn
+	rm -f $(OBJS:.o=.d)
+
+-include $(OBJS:.o=.d)

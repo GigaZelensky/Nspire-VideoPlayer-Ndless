@@ -709,12 +709,26 @@ void subtitle_layout_dst_rect(
 void subtitle_fonts_for_style(const Fonts *fonts, size_t subtitle_font_index, nSDL_Font **white_font, nSDL_Font **outline_font)
 {
     int font_id = subtitle_font_id_for_index(subtitle_font_index);
-
-    *white_font = fonts->subtitle_white[font_id];
-    *outline_font = fonts->subtitle_outline[font_id];
+    SubtitleFonts *cache = fonts->subtitles;
+    if (cache && !cache->attempted[font_id]) {
+        cache->attempted[font_id] = true;
+        nSDL_Font *white = nSDL_LoadFont(font_id, 255, 255, 255);
+        nSDL_Font *outline = nSDL_LoadFont(font_id, 0, 0, 0);
+        if (white && outline) {
+            nSDL_SetFontSpacing(white, 0, 0);
+            nSDL_SetFontSpacing(outline, 0, 0);
+            cache->white[font_id] = white;
+            cache->outline[font_id] = outline;
+        } else {
+            if (white) nSDL_FreeFont(white);
+            if (outline) nSDL_FreeFont(outline);
+        }
+    }
+    *white_font = cache ? cache->white[font_id] : NULL;
+    *outline_font = cache ? cache->outline[font_id] : NULL;
     if (!*white_font || !*outline_font) {
-        *white_font = fonts->subtitle_white[NSDL_FONT_TINYTYPE];
-        *outline_font = fonts->subtitle_outline[NSDL_FONT_TINYTYPE];
+        *white_font = fonts->white;
+        *outline_font = fonts->outline;
     }
 }
 

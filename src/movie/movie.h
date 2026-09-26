@@ -11,9 +11,12 @@
 #include "codecs/codec.h"
 #include "codecs/h264bsd/h264bsd_decoder.h"
 #include "movie/nvp_format.h"
+#include "player/playback_cadence.h"
 
-#define PREFETCH_CHUNK_COUNT 5
-#define UI_BUFFER_CHUNK_CACHE_COUNT (PREFETCH_CHUNK_COUNT + 2)
+/* Short, high-motion chunks can exhaust five slots in well under a second.
+ * Allocations remain lazy and subject to the existing total-byte budget. */
+#define PREFETCH_CHUNK_COUNT 16
+#define UI_BUFFER_CHUNK_CACHE_COUNT 7
 
 typedef struct {
     uint32_t start_ms;
@@ -45,6 +48,7 @@ typedef struct {
     uint8_t *chunk_storage;
     uint8_t *chunk_allocation;
     size_t chunk_storage_size;
+    size_t chunk_capacity;
     int chunk_index;
     PrefetchState state;
     size_t read_offset;
@@ -60,6 +64,7 @@ typedef struct {
     uint32_t crop_height;
     bool headers_ready;
     bool decoder_initialized;
+    bool decoder_failed;
     bool chunk_dirty;
     uint16_t foreground_decode_avg_ms;
     uint16_t foreground_decode_peak_ms;
@@ -73,23 +78,43 @@ typedef struct {
 
 typedef struct Movie {
     FILE *file;
+    struct MovieAsyncIo *async_io;
+    struct H264Lookahead *h264_lookahead;
+    bool lookahead_enabled;
+    bool diag_async_used;
+    uint32_t diag_async_reads, diag_async_bytes, diag_async_waits;
+    uint32_t diag_async_cancels, diag_async_failures, diag_async_max_ticks;
+    int32_t diag_async_native_error;
     long current_file_pos;
     MovieHeader header;
+    /* Reduced once on load; keep the original serialized header for metadata. */
+    uint16_t timing_fps_num;
+    uint16_t timing_fps_den;
     MovieCodec codec;
     const MovieCodecOps *codec_ops;
     ChunkIndexEntry *chunk_index;
     SubtitleCue *subtitles;
     SubtitleTrack *subtitle_tracks;
+    uint8_t *subtitle_storage;
+    size_t subtitle_storage_size;
     uint16_t subtitle_track_count;
     uint16_t selected_subtitle_track;
+    const SubtitleCue *subtitle_lookup_cue;
+    uint32_t subtitle_lookup_from_ms;
+    uint32_t subtitle_lookup_until_ms;
+    uint16_t subtitle_lookup_track;
+    bool subtitle_lookup_valid;
     uint16_t *framebuffer;
     uint8_t *framebuffer_allocation;
     uint8_t *chunk_storage;
     uint8_t *chunk_storage_allocation;
     size_t chunk_storage_size;
+    size_t chunk_storage_capacity;
     bool chunk_storage_in_sram;
     uint8_t *chunk_bytes;
     uint32_t *frame_offsets;
+    uint32_t *frame_offsets_allocation;
+    size_t frame_offsets_capacity;
     size_t chunk_size;
     int loaded_chunk;
     PrefetchedChunk prefetched[PREFETCH_CHUNK_COUNT];
@@ -102,6 +127,7 @@ typedef struct Movie {
     Mpeg4DecoderContext mpeg4;
     uint32_t last_read_bytes;
     uint32_t last_read_time_ms;
+    uint32_t prefetch_read_bytes_per_ms;
     uint32_t diag_last_snapshot_ms;
     uint32_t diag_prefetch_tick_count;
     uint32_t diag_active_prefetch_tick_count;
@@ -112,6 +138,7 @@ typedef struct Movie {
     uint16_t diag_display_fps_x10;
     uint16_t diag_display_fps_window_frames;
     uint32_t diag_lag_event_count;
+    PlaybackCadence cadence;
     uint32_t diag_lag_frame_total;
     uint32_t diag_max_lag_frames;
     uint32_t diag_max_late_ms;
@@ -128,6 +155,10 @@ typedef struct Movie {
     int debug_idr_cache_chunk;
     uint32_t debug_idr_cache_start_local;
     uint32_t debug_idr_cache_end_local;
+    uint32_t diag_render_count;
+    uint32_t diag_render_skipped_count;
+    uint32_t diag_render_total_ms;
+    uint32_t diag_render_max_ms;
 } Movie;
 
 #endif

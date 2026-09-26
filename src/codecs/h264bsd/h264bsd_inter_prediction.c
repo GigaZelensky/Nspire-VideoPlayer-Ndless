@@ -81,7 +81,7 @@ static void GetInterNeighbour(u32 sliceId, mbStorage_t *nMb,
     interNeighbour_t *n, u32 index);
 static void GetPredictionMv(mv_t *mv, interNeighbour_t *a, u32 refIndex);
 #ifndef H264DEC_OMXDL
-static void CopyZeroMotionMacroblock(u8 *data, image_t *refPic, u32 col, u32 row);
+static void CopyZeroMotionMacroblock(image_t *image, const u8 *reference);
 static u32 HasInterResidual(const macroblockLayer_t *pMbLayer);
 static void CopyAligned16Bytes(u8 *dst, const u8 *src);
 static void CopyAligned8Bytes(u8 *dst, const u8 *src);
@@ -220,26 +220,21 @@ static void CopyAligned8Bytes(u8 *dst, const u8 *src)
     __builtin_memcpy(dst, src, 8U);
 }
 
-static void CopyZeroMotionMacroblock(u8 *data, image_t *refPic, u32 col, u32 row)
+static void CopyZeroMotionMacroblock(image_t *image, const u8 *reference)
 {
-    const u32 luma_stride = refPic->width * 16U;
-    const u32 chroma_stride = refPic->width * 8U;
-    const u32 luma_plane_size = refPic->width * refPic->height * 256U;
-    const u32 chroma_plane_size = refPic->width * refPic->height * 64U;
-    const u8 *src_luma = refPic->data + (row * luma_stride) + col;
-    const u8 *src_cb = refPic->data + luma_plane_size + ((row >> 1) * chroma_stride) + (col >> 1);
-    const u8 *src_cr = refPic->data + luma_plane_size + chroma_plane_size + ((row >> 1) * chroma_stride) + (col >> 1);
-    u8 *dst_luma = data;
-    u8 *dst_cb = data + 256U;
-    u8 *dst_cr = dst_cb + 64U;
+    const u32 luma_stride = image->width * 16U;
+    const u32 chroma_stride = image->width * 8U;
+    const u8 *src_luma = reference + (image->luma - image->data);
+    const u8 *src_cb = reference + (image->cb - image->data);
+    const u8 *src_cr = reference + (image->cr - image->data);
     u32 i;
 
     for (i = 0; i < 16U; ++i) {
-        CopyAligned16Bytes(dst_luma + (i * 16U), src_luma + (i * luma_stride));
+        CopyAligned16Bytes(image->luma + (i * luma_stride), src_luma + (i * luma_stride));
     }
     for (i = 0; i < 8U; ++i) {
-        CopyAligned8Bytes(dst_cb + (i * 8U), src_cb + (i * chroma_stride));
-        CopyAligned8Bytes(dst_cr + (i * 8U), src_cr + (i * chroma_stride));
+        CopyAligned8Bytes(image->cb + (i * chroma_stride), src_cb + (i * chroma_stride));
+        CopyAligned8Bytes(image->cr + (i * chroma_stride), src_cr + (i * chroma_stride));
     }
 }
 #endif
@@ -455,6 +450,21 @@ u32 h264bsdInterPrediction(mbStorage_t *pMb, macroblockLayer_t *pMbLayer,
     ASSERT(h264bsdMbPartPredMode(pMb->mbType) == PRED_MODE_INTER);
     ASSERT(pMbLayer);
 
+    /* A stationary, residual-free 16x16 block already exists in the reference
+     * picture. Copy straight to the output, avoiding the 384-byte temporary,
+     * second copy, and macroblock-coordinate division. Keep MV/ref metadata
+     * prediction and redundant-slice handling identical to the general path. */
+    if (pMb->mbType == P_Skip || pMb->mbType == P_L0_16x16) {
+        if (MvPrediction16x16(pMb, &pMbLayer->mbPred, dpb) != HANTRO_OK)
+            return(HANTRO_NOK);
+        if (pMb->mv[0].hor == 0 && pMb->mv[0].ver == 0 &&
+            (pMb->mbType == P_Skip || pMbLayer->codedBlockPattern == 0)) {
+            if (pMb->decoded <= 1)
+                CopyZeroMotionMacroblock(currImage, pMb->refAddr[0]);
+            return HANTRO_OK;
+        }
+    }
+
     row = mbNum / currImage->width;
     col = mbNum - row * currImage->width;
     row *= 16;
@@ -467,17 +477,9 @@ u32 h264bsdInterPrediction(mbStorage_t *pMb, macroblockLayer_t *pMbLayer,
     {
         case P_Skip:
         case P_L0_16x16:
-            if (MvPrediction16x16(pMb, &pMbLayer->mbPred, dpb) != HANTRO_OK)
-                return(HANTRO_NOK);
             refImage.data = pMb->refAddr[0];
-            if (pMb->mbType == P_Skip &&
-                pMb->mv[0].hor == 0 &&
-                pMb->mv[0].ver == 0) {
-                CopyZeroMotionMacroblock(data, &refImage, col, row);
-            } else {
-                h264bsdPredictSamples(data, pMb->mv, &refImage, col, row, 0, 0,
-                    16, 16);
-            }
+            h264bsdPredictSamples(data, pMb->mv, &refImage, col, row, 0, 0,
+                16, 16);
             break;
 
         case P_L0_L0_16x8:

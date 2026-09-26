@@ -3,6 +3,7 @@ dist/
 external/
 movies/
 *.o
+*.d
 *.elf
 *.tns
 *.zehn

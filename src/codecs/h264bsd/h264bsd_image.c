@@ -176,11 +176,10 @@ void h264bsdWriteOutputBlocks(image_t *image, u32 mbNum, u8 *data,
 /* Variables */
 
     u32 i;
-    u32 picWidth, picSize;
+    u32 picWidth;
     u8 *lum, *cb, *cr;
     u8 *imageBlock;
     u8 *tmp;
-    u32 row, col;
     u32 block;
     u32 x, y;
     i32 *pRes;
@@ -194,18 +193,13 @@ void h264bsdWriteOutputBlocks(image_t *image, u32 mbNum, u8 *data,
     ASSERT(mbNum < image->width * image->height);
     ASSERT(!((u32)data&0x3));
 
-    /* Image size in macroblocks */
-    picWidth = image->width;
-    picSize = picWidth * image->height;
-    row = mbNum / picWidth;
-    col = mbNum % picWidth;
-
-    /* Output macroblock position in output picture */
-    lum = (image->data + row * picWidth * 256 + col * 16);
-    cb = (image->data + picSize * 256 + row * picWidth * 64 + col * 8);
-    cr = (cb + picSize * 64);
-
-    picWidth *= 16;
+    /* DecodeMacroblock already called h264bsdSetCurrImageMbPointers for mbNum.
+     * Reuse those pointers as WriteMacroblock does, avoiding a second ARM
+     * software division and repeated YUV plane/row address calculations. */
+    lum = image->luma;
+    cb = image->cb;
+    cr = image->cr;
+    picWidth = image->width * 16;
 
     for (block = 0; block < 16; block++)
     {

@@ -64,14 +64,14 @@ uint8_t ui_ease_in_cubic(uint32_t elapsed_ms, uint32_t duration_ms)
 uint8_t ui_ease_smoothstep(uint32_t elapsed_ms, uint32_t duration_ms)
 {
     uint32_t t;
-    uint32_t t_squared;
 
     if (duration_ms == 0 || elapsed_ms >= duration_ms) {
         return 255;
     }
     t = (elapsed_ms * 255U) / duration_ms;
-    t_squared = (t * t + 127U) / 255U;
-    return (uint8_t) ((t_squared * ((3U * 255U) - (2U * t)) + 127U) / 255U);
+    /* Keep the polynomial exact until its final rounding; rounding t squared
+     * first creates one-step reversals in otherwise smooth fades. */
+    return (uint8_t) ((t * t * ((3U * 255U) - (2U * t)) + 32512U) / 65025U);
 }
 
 bool rects_equal(const SDL_Rect *a, const SDL_Rect *b)
@@ -379,6 +379,7 @@ bool playback_ui_mixes_animating(const PlaybackUiMixes *mixes)
 {
     return mixes && (
         ui_mix_animating(mixes->chrome) ||
+        ui_mix_animating(mixes->pause_indicator) ||
         ui_mix_animating(mixes->playback_badge) ||
         ui_mix_animating(mixes->playback_press) ||
         ui_mix_animating(mixes->scale_badge) ||
@@ -418,7 +419,7 @@ bool ui_time_before(uint32_t now_ms, uint32_t until_ms)
     return until_ms != 0U && (int32_t) (now_ms - until_ms) < 0;
 }
 
-void status_overlay_show(uint32_t now_ms, bool restart_animation, uint32_t *started_ms, uint32_t *until_ms)
+void status_overlay_update_timing(uint32_t now_ms, bool restart_animation, uint32_t *started_ms, uint32_t *until_ms)
 {
     if (now_ms == 0U) {
         now_ms = 1U;
@@ -429,6 +430,13 @@ void status_overlay_show(uint32_t now_ms, bool restart_animation, uint32_t *star
     if (until_ms) {
         *until_ms = now_ms + STATUS_OVERLAY_MS;
     }
+}
+
+void status_overlay_show(uint32_t now_ms, bool restart_animation, uint32_t *started_ms, uint32_t *until_ms)
+{
+    /* Status messages share a single slot; a later action replaces night feedback. */
+    night_mode_hide_status();
+    status_overlay_update_timing(now_ms, restart_animation, started_ms, until_ms);
 }
 
 bool seek_preview_surface_animating(const SeekBarPreviewState *preview, uint32_t now_ms)
@@ -675,16 +683,17 @@ int draw_left_text_badge_animated(
     return badge.x + badge.w + 6;
 }
 
-static bool parse_brightness_status_label(const char *label, unsigned *out_percent)
+static bool parse_percentage_status_label(const char *label, const char *prefix, unsigned *out_percent)
 {
     const char *cursor;
     unsigned percent = 0;
     bool saw_digit = false;
 
-    if (!label || strncmp(label, "BRIGHT ", 7) != 0) {
+    size_t prefix_length = strlen(prefix);
+    if (!label || strncmp(label, prefix, prefix_length) != 0) {
         return false;
     }
-    cursor = label + 7;
+    cursor = label + prefix_length;
     while (*cursor == ' ') {
         ++cursor;
     }
@@ -702,18 +711,17 @@ static bool parse_brightness_status_label(const char *label, unsigned *out_perce
     return true;
 }
 
-static int draw_left_brightness_badge_animated(
+static int draw_left_value_badge_animated(
     SDL_Surface *screen,
     const Fonts *fonts,
     int left_x,
     int y,
-    unsigned percent,
+    const char *label_text,
+    const char *percent_text,
     uint8_t mix,
     int offset_x
 )
 {
-    const char *label_text = "BRIGHT";
-    char percent_text[8];
     int label_w;
     int digit_w;
     int gap_w;
@@ -724,7 +732,6 @@ static int draw_left_brightness_badge_animated(
         return left_x;
     }
 
-    snprintf(percent_text, sizeof(percent_text), "%u%%", percent);
     label_w = nSDL_GetStringWidth(fonts->white, label_text);
     digit_w = nSDL_GetStringWidth(fonts->white, "100%");
     gap_w = nSDL_GetStringWidth(fonts->white, "  ");
@@ -811,7 +818,8 @@ void draw_status_overlay_badge(
     uint8_t mix;
     int offset_x;
     int offset_y;
-    unsigned brightness_percent;
+    unsigned percent;
+    char value[8];
 
     if (!label || label[0] == '\0' || started_ms == 0U || until_ms == 0U || chrome_mix == 0) {
         return;
@@ -829,8 +837,14 @@ void draw_status_overlay_badge(
     }
     mix = mix_product_u8(mix, chrome_mix);
     offset_y = -(((255 - chrome_mix) * 4 + 127) / 255);
-    if (parse_brightness_status_label(label, &brightness_percent)) {
-        draw_left_brightness_badge_animated(screen, fonts, left_x, y + offset_y, brightness_percent, mix, offset_x);
+    if (parse_percentage_status_label(label, "BRIGHT ", &percent)) {
+        snprintf(value, sizeof(value), "%u%%", percent);
+        draw_left_value_badge_animated(screen, fonts, left_x, y + offset_y, "BRIGHT", value, mix, offset_x);
+    } else if (parse_percentage_status_label(label, "NIGHT ", &percent)) {
+        snprintf(value, sizeof(value), "%u%%", percent);
+        draw_left_value_badge_animated(screen, fonts, left_x, y + offset_y, "NIGHT", value, mix, offset_x);
+    } else if (strcmp(label, "NIGHT OFF") == 0) {
+        draw_left_value_badge_animated(screen, fonts, left_x, y + offset_y, "NIGHT", "OFF", mix, offset_x);
     } else {
         draw_left_text_badge_animated(screen, fonts, left_x, y + offset_y, label, mix, offset_x);
     }
@@ -1134,14 +1148,16 @@ void draw_screenshot_preview_osd(
     int panel_x;
     int panel_y;
 
-    if (!screen || !fonts || !preview || !preview->surface || now_ms > preview->until_ms) {
+    if (!screen || !fonts || !preview || !preview->label[0] ||
+        (!preview->request_id && (int32_t)(now_ms - preview->until_ms) > 0)) {
         return;
     }
 
     panel_x = 8;
     panel_y = 30;
-    draw_surface_panel(screen, preview->surface, panel_x, panel_y);
-    draw_left_text_badge(screen, fonts, panel_x, panel_y + preview->surface->h + 8, preview->label);
+    if (preview->surface) draw_surface_panel(screen, preview->surface, panel_x, panel_y);
+    draw_left_text_badge(screen, fonts, panel_x,
+        panel_y + (preview->surface ? preview->surface->h + 8 : 0), preview->label);
 }
 
 void format_seek_delta(int32_t delta_ms, char *buffer, size_t buffer_size)
@@ -1240,10 +1256,10 @@ void update_playback_ui_mixes(
     SDL_Rect scale_badge;
     SDL_Rect speed_badge;
     bool controls_live;
-    bool playback_hovered;
-    bool scale_hovered;
-    bool speed_hovered;
-    bool seek_hovered;
+    bool playback_hovered = false;
+    bool scale_hovered = false;
+    bool speed_hovered = false;
+    bool seek_hovered = false;
 
     if (!mixes) {
         return;
@@ -1253,10 +1269,6 @@ void update_playback_ui_mixes(
         return;
     }
 
-    scale_morph_current_rects(movie, scale_morph, scale_mode, video_align_x, video_align_y, now_ms, &src, &dst);
-    playback_badge = playback_badge_rect(&dst);
-    status_badge_rects(fonts, &dst, scale_mode, playback_rate, &scale_badge, &speed_badge);
-
     mixes->chrome = ui_transition_update_ex(
         &transitions->chrome,
         show_ui,
@@ -1264,11 +1276,22 @@ void update_playback_ui_mixes(
         UI_CHROME_ANIM_MS,
         UI_WAKE_MIN_MIX
     );
+    mixes->pause_indicator = ui_transition_update(
+        &transitions->pause_indicator,
+        transitions->pause_indicator.target_active,
+        now_ms,
+        UI_CHROME_ANIM_MS
+    );
     controls_live = show_ui && !help_menu_open && pointer && pointer->visible;
-    playback_hovered = controls_live && pointer_over_rect(pointer, &playback_badge);
-    scale_hovered = controls_live && pointer_over_rect(pointer, &scale_badge);
-    speed_hovered = controls_live && pointer_over_rect(pointer, &speed_badge);
-    seek_hovered = controls_live && pointer->y >= SCREEN_H - UI_BAR_H && pointer->y < SCREEN_H;
+    if (controls_live) {
+        scale_morph_current_rects(movie, scale_morph, scale_mode, video_align_x, video_align_y, now_ms, &src, &dst);
+        playback_badge = playback_badge_rect(&dst);
+        status_badge_rects(fonts, &dst, scale_mode, playback_rate, &scale_badge, &speed_badge);
+        playback_hovered = pointer_over_rect(pointer, &playback_badge);
+        scale_hovered = pointer_over_rect(pointer, &scale_badge);
+        speed_hovered = pointer_over_rect(pointer, &speed_badge);
+        seek_hovered = pointer->y >= SCREEN_H - UI_BAR_H && pointer->y < SCREEN_H;
+    }
     mixes->playback_badge = ui_transition_update(
         &transitions->playback_badge,
         playback_hovered,
@@ -1332,6 +1355,16 @@ SDL_Rect playback_badge_rect(const SDL_Rect *video_rect)
     SDL_Rect outer = {chrome_left_x_for_margin(8), (Sint16) y, 22, 22};
 
     return outer;
+}
+
+SDL_Rect playback_status_badge_anchor(const SDL_Rect *video_rect, bool playback_badge_visible)
+{
+    SDL_Rect playback = playback_badge_rect(video_rect);
+    SDL_Rect anchor = {
+        playback_badge_visible ? (Sint16)(playback.x + playback.w + 6) : chrome_left_x_for_margin(8),
+        (Sint16)top_overlay_y_for_rect(video_rect, 16), 0, 16
+    };
+    return anchor;
 }
 
 void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect, bool paused, uint8_t hover_mix, uint8_t press_mix, uint8_t chrome_mix)
@@ -1412,9 +1445,13 @@ static bool h264_frame_payload_contains_idr(const uint8_t *data, size_t size)
             }
 
             if (header_index < size) {
-                if ((data[header_index] & 0x1FU) == 5U) {
+                unsigned type = data[header_index] & 0x1FU;
+                if (type == 5U) {
                     return true;
                 }
+                /* All slices of one access unit belong to the same picture.
+                 * Stop at its first VCL header, before scanning encoded data. */
+                if (type >= 1U && type <= 4U) return false;
                 index = header_index + 1U;
                 continue;
             }
@@ -1465,6 +1502,23 @@ static bool movie_h264_local_frame_is_idr(const Movie *movie, const ChunkIndexEn
     return h264_frame_payload_contains_idr(movie->chunk_bytes + start, end - start);
 }
 
+bool movie_h264_idr_bounds(const Movie *movie, uint32_t frame, uint32_t *first, uint32_t *end)
+{
+    if (!movie || !first || !end || movie->loaded_chunk < 0 || !movie->chunk_index ||
+        (uint32_t)movie->loaded_chunk >= movie->header.chunk_count ||
+        !movie->frame_offsets || !movie->chunk_bytes) return false;
+    const ChunkIndexEntry *entry = &movie->chunk_index[movie->loaded_chunk];
+    if (frame < entry->first_frame || frame - entry->first_frame >= entry->frame_count) return false;
+    uint32_t local = frame - entry->first_frame;
+    *first = 0;
+    *end = entry->frame_count;
+    for (uint32_t i = 0; i <= local; ++i)
+        if (movie_h264_local_frame_is_idr(movie, entry, i)) *first = i;
+    for (uint32_t i = local + 1U; i < entry->frame_count; ++i)
+        if (movie_h264_local_frame_is_idr(movie, entry, i)) { *end = i; break; }
+    return true;
+}
+
 static void movie_debug_frame_progress(
     Movie *movie,
     uint32_t *chunk_frame,
@@ -1509,9 +1563,6 @@ static void movie_debug_frame_progress(
     segment_end = entry->frame_count;
 
     if (movie_uses_h264(movie) &&
-            movie->loaded_chunk == chunk_index &&
-            movie->frame_offsets &&
-            movie->chunk_bytes &&
             movie->debug_idr_cache_valid &&
             movie->debug_idr_cache_chunk == chunk_index &&
             movie->debug_idr_cache_start_local <= local_index &&
@@ -1542,6 +1593,10 @@ static void movie_debug_frame_progress(
         movie->debug_idr_cache_chunk = chunk_index;
         movie->debug_idr_cache_start_local = segment_start;
         movie->debug_idr_cache_end_local = segment_end;
+    } else if (movie_uses_h264(movie)) {
+        /* The decoder may be in a later chunk. Keep the exact visible chunk
+         * progress above, but do not invent its unavailable IDR boundaries. */
+        return;
     }
 
     *idr_frame = local_index - segment_start + 1U;
@@ -1561,14 +1616,13 @@ void draw_memory_badge(
     MemoryStats stats = query_memory_stats(movie);
     char app_text[16];
     char prefetched_text[16];
-    char total_text[16];
-    char free_text[16];
     char label_full[80];
     char label_medium[64];
     char label_short[48];
     char perf_full[104];
     char perf_medium[80];
     char perf_short[48];
+    char idr_text[24];
     const char *label = NULL;
     const char *perf_label = NULL;
     uint32_t fps_x10 = movie ? movie->diag_display_fps_x10 : 0U;
@@ -1586,20 +1640,23 @@ void draw_memory_badge(
 
     format_memory_compact(stats.used_bytes, app_text, sizeof(app_text));
     format_memory_compact(stats.prefetched_bytes, prefetched_text, sizeof(prefetched_text));
-    format_memory_compact(stats.total_bytes, total_text, sizeof(total_text));
-    format_memory_compact(stats.free_bytes, free_text, sizeof(free_text));
-    snprintf(label_full, sizeof(label_full), "RAM %s/%s C%s %u%% F%s", app_text, total_text, prefetched_text, stats.percent_used, free_text);
-    snprintf(label_medium, sizeof(label_medium), "RAM %s/%s C%s", app_text, total_text, prefetched_text);
-    snprintf(label_short, sizeof(label_short), "RAM %s/%s", app_text, total_text);
+    /* This accounting covers owned movie buffers, not OS heap availability. */
+    snprintf(label_full, sizeof(label_full), "BUF %s CACHE %s", app_text, prefetched_text);
+    snprintf(label_medium, sizeof(label_medium), "BUF %s C%s", app_text, prefetched_text);
+    snprintf(label_short, sizeof(label_short), "BUF %s", app_text);
     movie_debug_frame_progress(movie, &chunk_frame, &chunk_total, &idr_frame, &idr_total);
+    if (idr_total) {
+        snprintf(idr_text, sizeof(idr_text), "%lu/%lu", (unsigned long)idr_frame, (unsigned long)idr_total);
+    } else {
+        snprintf(idr_text, sizeof(idr_text), "?");
+    }
     snprintf(
         perf_full,
         sizeof(perf_full),
-        "C%lu/%lu IDR%lu/%lu L%lu %lu.%luFPS%s",
+        "C%lu/%lu IDR%s L%lu %lu.%luFPS%s",
         (unsigned long) chunk_frame,
         (unsigned long) chunk_total,
-        (unsigned long) idr_frame,
-        (unsigned long) idr_total,
+        idr_text,
         movie ? (unsigned long) movie->diag_lag_event_count : 0UL,
         (unsigned long) (fps_x10 / 10U),
         (unsigned long) (fps_x10 % 10U),
@@ -1608,22 +1665,20 @@ void draw_memory_badge(
     snprintf(
         perf_medium,
         sizeof(perf_medium),
-        "C%lu/%lu I%lu/%lu L%lu%s",
+        "C%lu/%lu I%s L%lu%s",
         (unsigned long) chunk_frame,
         (unsigned long) chunk_total,
-        (unsigned long) idr_frame,
-        (unsigned long) idr_total,
+        idr_text,
         movie ? (unsigned long) movie->diag_lag_event_count : 0UL,
         debug_is_runtime_logging_enabled() ? " DBG ON" : ""
     );
     snprintf(
         perf_short,
         sizeof(perf_short),
-        "C%lu/%lu I%lu/%lu",
+        "C%lu/%lu I%s",
         (unsigned long) chunk_frame,
         (unsigned long) chunk_total,
-        (unsigned long) idr_frame,
-        (unsigned long) idr_total
+        idr_text
     );
 
     if (playback_badge_visible) {
@@ -1698,14 +1753,14 @@ static void draw_help_menu_contents(SDL_Surface *screen, const Fonts *fonts, con
         {"/", "Scale mode"},
         {"CTRL+NUM", "Align video / center"},
         {"U/D 8/2", "Screen brightness"},
+        {"N", "Toggle night mode"},
+        {"CTRL+U/D", "Night intensity"},
         {"{ / }", "Playback speed"},
         {"^", "Subtitle position"},
         {"+ / -", "Subtitle size"},
-        {"F", "Cycle subtitle font"},
-        {"T", "Switch subtitle track"},
+        {"F / T", "Subtitle font / track"},
         {"M", "Memory overlay"},
-        {"C", "Theme color"},
-        {"D", "Toggle debug logging"},
+        {"C / D", "Theme / debug logging"},
         {"S", "Save BMP screenshot"},
         {"TOUCHPAD", "Move cursor / show UI"},
         {"SCRATCH", "Open OS Scratchpad"},
@@ -2001,6 +2056,17 @@ void movie_update_ui_buffer_chunks(Movie *movie, int *chunks_to_draw, size_t *nu
         current_chunk = movie_chunk_for_frame(movie, movie->current_frame);
     }
     chunk_list_add_unique(fresh_chunks, &fresh_count, UI_BUFFER_CHUNK_CACHE_COUNT, current_chunk);
+    if (current_chunk >= 0 && movie->current_frame < movie->header.frame_count) {
+        unsigned queued = h264_lookahead_queued(movie);
+        uint32_t remaining = movie->header.frame_count - movie->current_frame - 1U;
+        if (queued > remaining) queued = remaining;
+        int last_queued_chunk = movie_chunk_for_frame(movie, movie->current_frame + queued);
+        /* RGB frames remain buffered after their compressed chunks are reused.
+         * Include those intervening chunks, nearest to playback first. */
+        for (int chunk = current_chunk + 1; chunk <= last_queued_chunk; ++chunk) {
+            chunk_list_add_unique(fresh_chunks, &fresh_count, UI_BUFFER_CHUNK_CACHE_COUNT, chunk);
+        }
+    }
     if (movie->loaded_chunk >= 0) {
         chunk_list_add_unique(fresh_chunks, &fresh_count, UI_BUFFER_CHUNK_CACHE_COUNT, movie->loaded_chunk);
         ++real_chunk_count;
@@ -2524,17 +2590,19 @@ void render_movie(
     uint8_t chrome_mix = ui_mixes ? ui_mixes->chrome : (show_ui ? 255 : 0);
     uint8_t help_menu_mix = ui_mixes ? ui_mixes->help_menu : (help_menu_open ? 255 : 0);
     uint8_t top_chrome_mix = help_menu_mix > 0 ? mix_product_u8(chrome_mix, (uint8_t) (255U - help_menu_mix)) : chrome_mix;
+    uint8_t pause_indicator_mix = ui_mixes ? ui_mixes->pause_indicator : 0;
+    uint8_t playback_badge_mix = max_u8(top_chrome_mix, pause_indicator_mix);
     bool help_menu_visible = help_menu_mix > 0 || help_menu_open;
     bool chrome_visible = chrome_mix > 0 || show_ui;
     bool top_chrome_visible = top_chrome_mix > 0 && chrome_visible;
     uint8_t memory_badge_mix = (memory_overlay_mode == MEMORY_OVERLAY_ALWAYS) ? 255U : 0U;
-    const SubtitleCue *subtitle_cue = active_subtitle_cue(movie, current_ms);
+    const SubtitleCue *subtitle_cue = subtitle_size >= 0 ? active_subtitle_cue(movie, current_ms) : NULL;
     const char *subtitle = subtitle_cue ? subtitle_cue->text : NULL;
     SubtitlePlacement effective_subtitle_placement = subtitle_normalize_placement(
         subtitle_placement,
         selected_subtitle_track_supports_auto_positioning(movie)
     );
-    bool playback_badge_visible = top_chrome_visible;
+    bool playback_badge_visible = playback_badge_mix > 0 && !help_menu_visible;
     bool memory_badge_visible = memory_badge_mix > 0;
     bool cursor_visible = chrome_visible && !help_menu_visible && pointer && pointer->visible;
 
@@ -2586,34 +2654,6 @@ void render_movie(
     if (chrome_visible) {
         if (top_chrome_visible) {
             memory_right_limit = draw_status_badges(screen, fonts, &dst, scale_mode, playback_rate, ui_mixes, top_chrome_mix);
-            if (playback_badge_visible) {
-                draw_playback_badge(
-                    screen,
-                    &dst,
-                    paused,
-                    ui_mixes ? ui_mixes->playback_badge : 0,
-                    ui_mixes ? ui_mixes->playback_press : 0,
-                    top_chrome_mix
-                );
-            }
-            {
-                SDL_Rect playback_badge = playback_badge_rect(&dst);
-                int status_left_x = playback_badge_visible
-                    ? playback_badge.x + playback_badge.w + 6
-                    : chrome_left_x_for_margin(8);
-
-                draw_status_overlay_badge(
-                    screen,
-                    fonts,
-                    status_left_x,
-                    top_overlay_y_for_rect(&dst, 16),
-                    status_overlay_text,
-                    status_overlay_started_ms,
-                    status_overlay_until_ms,
-                    now_ms,
-                    top_chrome_mix
-                );
-            }
         }
         draw_progress(
             screen,
@@ -2633,6 +2673,16 @@ void render_movie(
             chrome_mix
         );
     }
+    if (playback_badge_visible) {
+        draw_playback_badge(
+            screen,
+            &dst,
+            paused || pause_indicator_mix > top_chrome_mix,
+            ui_mixes ? ui_mixes->playback_badge : 0,
+            ui_mixes ? ui_mixes->playback_press : 0,
+            playback_badge_mix
+        );
+    }
     if (memory_badge_visible) {
         draw_memory_badge(screen, fonts, movie, &dst, memory_right_limit, playback_badge_visible, memory_badge_mix);
     }
@@ -2647,6 +2697,16 @@ void render_movie(
             movie_detail_text,
             mix_product_u8(ui_mixes->title_strip, top_chrome_mix)
         );
+    }
+    if (!help_menu_visible) {
+        if (night_mode_status_visible(now_ms)) {
+            night_mode_draw_status(screen, fonts, &dst, now_ms);
+        } else if (top_chrome_visible) {
+            SDL_Rect status_anchor = playback_status_badge_anchor(&dst, playback_badge_visible);
+            draw_status_overlay_badge(screen, fonts, status_anchor.x, status_anchor.y,
+                status_overlay_text, status_overlay_started_ms, status_overlay_until_ms,
+                now_ms, top_chrome_mix);
+        }
     }
     if (cursor_visible) {
         draw_cursor(screen, pointer->x, pointer->y);
@@ -2802,6 +2862,9 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
         decoded_frame > target_frame) {
         return false;
     }
+    /* Adoption replaces the decoder and compressed storage. Cancel before
+     * copying the preview's picture parameters: cancellation may reset them. */
+    h264_lookahead_cancel(movie);
     if (is_h264 && !sync_h264_picture_params(movie, job->decoder, true)) {
         return false;
     }
@@ -2817,11 +2880,14 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
         mpeg4_xvid_destroy(movie->mpeg4.decoder);
     }
     release_movie_chunk_storage(movie);
-    free(movie->frame_offsets);
+    free(movie->frame_offsets_allocation);
+    movie->frame_offsets_allocation = NULL;
+    movie->frame_offsets_capacity = 0;
 
     if (is_h264) {
         movie->h264.decoder = job->decoder;
         movie->h264.decoder_initialized = job->decoder_initialized;
+        movie->h264.decoder_failed = false;
     } else {
         movie->mpeg4.decoder = job->mpeg4_decoder;
     }
@@ -2829,6 +2895,8 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
         return false;
     }
     movie->frame_offsets = job->frame_offsets;
+    movie->frame_offsets_allocation = job->frame_offsets;
+    movie->frame_offsets_capacity = entry->frame_count;
     movie->chunk_bytes = movie->chunk_storage + chunk_bytes_offset;
     movie->chunk_size = job->chunk_size;
     movie->loaded_chunk = job->chunk_index;
@@ -2851,6 +2919,7 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
     job->chunk_bytes = NULL;
     job->chunk_size = 0;
     clear_seek_bar_preview_decode_job(preview);
+    if (movie->lookahead_enabled && !h264_lookahead_begin(movie)) movie->lookahead_enabled=false;
     return true;
 }
 

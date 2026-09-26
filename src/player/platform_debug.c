@@ -1,4 +1,5 @@
 #include "player_internal.h"
+#include "native_screen_power.h"
 
 bool ensure_debug_ring_storage(void)
 {
@@ -69,7 +70,7 @@ void present_screen(SDL_Surface *screen)
 {
     bool locked = false;
 
-    if (!screen) {
+    if (!screen || native_screen_power_is_off()) {
         return;
     }
     patch_cx2_lcd_edge_timing();
@@ -79,7 +80,25 @@ void present_screen(SDL_Surface *screen)
         }
         locked = true;
     }
-    lcd_blit(screen->pixels, screen_buffer_type());
+    bool capture_present = playback_capture_active(NULL);
+    uint64_t capture_started = capture_present ? monotonic_clock_now_ticks() : 0;
+    void *pixels = night_mode_present_pixels(screen);
+    if (capture_present) {
+        playback_capture_stage(NULL, CAPTURE_NIGHT, capture_started, monotonic_clock_now_ticks());
+        capture_started = monotonic_clock_now_ticks();
+    }
+    /* Ndless uses a plain framebuffer copy when both layouts are landscape
+     * RGB565. Use our burst copy there too; portrait panels still need its
+     * rotation path. Read the current framebuffer each time because standby
+     * can restore/reassign it. Night mode has already produced the final pixels. */
+    if (has_colors && screen->pitch == SCREEN_W * sizeof(uint16_t) &&
+        lcd_type() == SCR_320x240_565) {
+        player_copy_maybe_fast(REAL_SCREEN_BASE_ADDRESS, pixels,
+                               SCREEN_W * SCREEN_H * sizeof(uint16_t));
+    } else {
+        lcd_blit(pixels, screen_buffer_type());
+    }
+    if (capture_present) playback_capture_stage(NULL, CAPTURE_LCD, capture_started, monotonic_clock_now_ticks());
     if (locked) {
         SDL_UnlockSurface(screen);
     }
@@ -112,21 +131,26 @@ void debug_set_runtime_logging(bool enabled)
             g_debug_logging_enabled = false;
         }
     } else {
+        playback_capture_stop(NULL);
         g_debug_logging_enabled = false;
-        release_debug_ring_storage();
-        debug_clear_last_error();
+        /* Freeze both rings until export on movie exit; enabling D again
+         * explicitly starts a new recording. */
     }
 }
 
-void debug_tracevf(bool force, const char *fmt, va_list args)
+static void debug_tracevf(const char *fmt, va_list args)
 {
     char line[DEBUG_LINE_LEN];
     size_t slot_index;
-    uint32_t now_ms = g_clock.initialized ? monotonic_clock_now_ms() : 0;
+    uint32_t now_ms;
+    uint64_t capture_started = 0;
+    bool capture_format = playback_capture_active(NULL);
 
-    if (!force && !g_debug_logging_enabled) {
+    if (!g_debug_logging_enabled) {
         return;
     }
+    now_ms = g_clock.initialized ? monotonic_clock_now_ms() : 0;
+    if (capture_format) capture_started = monotonic_clock_now_ticks();
 
     vsnprintf(line, sizeof(line), fmt, args);
     if (!ensure_debug_ring_storage()) {
@@ -146,6 +170,7 @@ void debug_tracevf(bool force, const char *fmt, va_list args)
     if (g_debug_ring_count < DEBUG_RING_SIZE) {
         g_debug_ring_count++;
     }
+    if (capture_format) playback_capture_stage(NULL, CAPTURE_TEXT_FORMAT, capture_started, monotonic_clock_now_ticks());
 }
 
 void debug_tracef(const char *fmt, ...)
@@ -157,18 +182,10 @@ void debug_tracef(const char *fmt, ...)
     }
 
     va_start(args, fmt);
-    debug_tracevf(false, fmt, args);
+    debug_tracevf(fmt, args);
     va_end(args);
 }
 
-void debug_tracef_force(const char *fmt, ...)
-{
-    va_list args;
-
-    va_start(args, fmt);
-    debug_tracevf(true, fmt, args);
-    va_end(args);
-}
 
 void debug_clear_last_error(void)
 {
@@ -187,7 +204,7 @@ void debug_failf(const char *fmt, ...)
     va_start(args, fmt);
     vsnprintf(g_last_error_message, sizeof(g_last_error_message), fmt, args);
     va_end(args);
-    debug_tracef_force("%s", g_last_error_message);
+    debug_tracef("%s", g_last_error_message);
 }
 
 size_t total_prefetched_chunk_bytes(const Movie *movie)
@@ -199,8 +216,8 @@ size_t total_prefetched_chunk_bytes(const Movie *movie)
         return 0;
     }
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
-        if (movie->prefetched[index].chunk_index >= 0 && movie->prefetched[index].chunk_storage) {
-            total += movie->prefetched[index].chunk_storage_size;
+        if (movie->prefetched[index].chunk_storage) {
+            total += movie->prefetched[index].chunk_capacity;
         }
     }
     return total;
@@ -213,6 +230,7 @@ void clear_all_prefetched_chunks(Movie *movie)
     if (!movie) {
         return;
     }
+    movie_async_cancel(movie);
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
         clear_prefetched_chunk(&movie->prefetched[index]);
     }
@@ -228,8 +246,11 @@ PrefetchedChunk *find_farthest_prefetched_chunk(Movie *movie)
     }
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
         PrefetchedChunk *candidate = &movie->prefetched[index];
-        if (candidate->chunk_index < 0) {
+        if (!candidate->chunk_storage) {
             continue;
+        }
+        if (candidate->chunk_index < 0) {
+            return candidate;
         }
         if (!victim || candidate->chunk_index > victim->chunk_index) {
             victim = candidate;
@@ -242,13 +263,13 @@ bool ensure_prefetch_budget(Movie *movie, int requested_chunk, size_t required_b
 {
     size_t total_bytes;
 
-    if (!movie) {
+    if (!movie || required_bytes > PREFETCH_MAX_TOTAL_BYTES) {
         return false;
     }
     total_bytes = total_prefetched_chunk_bytes(movie);
-    while (total_bytes + required_bytes > PREFETCH_MAX_TOTAL_BYTES) {
+    while (total_bytes > PREFETCH_MAX_TOTAL_BYTES - required_bytes) {
         PrefetchedChunk *victim = find_farthest_prefetched_chunk(movie);
-        if (!victim || victim->chunk_index <= requested_chunk) {
+        if (!victim || (victim->chunk_index >= 0 && victim->chunk_index <= requested_chunk)) {
             debug_tracef(
                 "prefetch budget skip chunk=%d need=%lu total=%lu cap=%lu",
                 requested_chunk,
@@ -297,13 +318,16 @@ void debug_log_path_for_movie(const char *movie_path, char *log_path, size_t log
     }
 }
 
-void report_movie_decode_failure(const Movie *movie, const char *movie_path, const char *reason)
+void report_movie_decode_failure(Movie *movie, const char *movie_path, const char *reason)
 {
+    player_crash_trace_end(movie, PLAYER_CRASH_ERROR);
+    movie_async_stop(movie);
+    screenshot_writer_shutdown();
     char log_path[MAX_PATH_LEN];
     char message[192];
 
     if (movie) {
-        debug_tracef_force(
+        debug_tracef(
             "decode failed reason=%s frame=%lu loaded_chunk=%d decoded_local=%d prefetched=%lu",
             reason ? reason : "unknown",
             (unsigned long) movie->current_frame,
@@ -312,32 +336,34 @@ void report_movie_decode_failure(const Movie *movie, const char *movie_path, con
             (unsigned long) total_prefetched_chunk_bytes(movie)
         );
     } else {
-        debug_tracef_force("decode failed reason=%s", reason ? reason : "unknown");
+        debug_tracef("decode failed reason=%s", reason ? reason : "unknown");
     }
     debug_log_path_for_movie(movie_path, log_path, sizeof(log_path));
-    debug_dump_session(log_path, movie, "decode-failure");
+    bool saved = debug_dump_session(log_path, movie, "decode-failure");
     snprintf(
         message,
         sizeof(message),
-        "Movie decode failed.\n%s\nSee ndvideo-debug.log.",
-        debug_last_error()
+        "Movie decode failed.\n%s%s",
+        debug_last_error(), saved ? "\nSee ndvideo-debug.log." : ""
     );
     show_msgbox("ND Video Player", message);
 }
 
 void report_movie_open_failure(const char *movie_path)
 {
+    player_crash_trace_end(NULL, PLAYER_CRASH_ERROR);
+    screenshot_writer_shutdown();
     char log_path[MAX_PATH_LEN];
     char message[192];
 
-    debug_tracef_force("open failed: %s", debug_last_error());
+    debug_tracef("open failed: %s", debug_last_error());
     debug_log_path_for_movie(movie_path, log_path, sizeof(log_path));
-    debug_dump_session(log_path, NULL, "open-failure");
+    bool saved = debug_dump_session(log_path, NULL, "open-failure");
     snprintf(
         message,
         sizeof(message),
-        "Failed to open movie file.\n%s\nSee ndvideo-debug.log.",
-        debug_last_error()
+        "Failed to open movie file.\n%s%s",
+        debug_last_error(), saved ? "\nSee ndvideo-debug.log." : ""
     );
     show_msgbox("ND Video Player", message);
 }
@@ -809,6 +835,33 @@ static uint32_t display_power_clamp_brightness(uint32_t raw_value)
     return (uint32_t) clamp_int((int) raw_value, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
 }
 
+static void display_power_blank_hardware(void)
+{
+    player_crash_trace_power_event(PLAYER_CRASH_OFF_BEGIN);
+    set_lcd_dark_for_power_off();
+    /* Unsupported devices keep the existing fallback. Partial native changes
+     * retain restoration ownership in the screen-power module. */
+    (void)native_screen_power_off();
+    player_crash_trace_power_event(PLAYER_CRASH_OFF_END);
+}
+
+static bool display_power_wake_hardware(uint32_t brightness)
+{
+    if (native_screen_power_is_off()) {
+        player_crash_trace_power_event(PLAYER_CRASH_WAKE_BEGIN);
+        int result = native_screen_power_on(brightness);
+        player_crash_trace_power_event(PLAYER_CRASH_WAKE_END);
+        if (result != 0) return false;
+        patch_cx2_lcd_edge_timing();
+        /* Refresh the retained app surface while still dark, before the
+         * brightness fade. Backlight wake preserves panel configuration. */
+        present_screen(SDL_GetVideoSurface());
+        return true;
+    }
+    set_lcd_brightness((int)brightness);
+    return true;
+}
+
 void display_power_init(DisplayPowerState *state, uint32_t now_ms)
 {
     uint32_t brightness;
@@ -867,7 +920,7 @@ static void display_power_begin_brightness_restore(
     }
 
     state->idle_restore_active = true;
-    state->idle_restore_started_ms = now_ms ? now_ms : 1U;
+    state->idle_restore_started_ms = now_ms;
     state->idle_restore_from_brightness = from_brightness;
     state->idle_restore_to_brightness = to_brightness;
 }
@@ -928,10 +981,9 @@ void display_power_note_activity(DisplayPowerState *state, uint32_t now_ms)
 bool display_power_tick_idle(DisplayPowerState *state, SDL_Surface *screen, uint32_t now_ms, bool allow_idle_dim, bool was_paused)
 {
     uint32_t elapsed_ms;
-    uint32_t dim_elapsed_ms;
-    uint32_t dim_duration_ms;
     uint32_t base;
     uint32_t target;
+    uint8_t mix;
 
     if (!state) {
         return false;
@@ -964,22 +1016,40 @@ bool display_power_tick_idle(DisplayPowerState *state, SDL_Surface *screen, uint
         state->idle_dim_active = false;
         display_power_cancel_restore_fields(state);
         state->off_from_idle = true;
-        set_lcd_dark_for_power_off();
+        display_power_blank_hardware();
         state->off = true;
-        present_black_screen(screen);
+        state->off_started_ms = now_ms;
+        if (!native_screen_power_is_off()) present_black_screen(screen);
         return true;
     }
 
     base = (uint32_t) clamp_int((int) state->idle_base_brightness, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
-    dim_elapsed_ms = elapsed_ms - DISPLAY_IDLE_DIM_START_MS;
-    dim_duration_ms = DISPLAY_IDLE_DIM_OFF_MS - DISPLAY_IDLE_DIM_START_MS;
-    target = base + (uint32_t) ((((uint64_t) ((uint32_t) LCD_BRIGHTNESS_MAX - base) * dim_elapsed_ms) +
-        (dim_duration_ms / 2U)) / dim_duration_ms);
-    if (target >= (uint32_t) LCD_BRIGHTNESS_MAX) {
+    /* Dim to a stable level, then hold until the final short fade ending at
+     * the screen-off time. */
+    target = base + (((uint32_t) LCD_BRIGHTNESS_MAX - base) *
+        (100U - DISPLAY_IDLE_DIM_LEVEL_PERCENT) + 50U) / 100U;
+    if (target >= (uint32_t) LCD_BRIGHTNESS_MAX && base < (uint32_t) LCD_BRIGHTNESS_MAX) {
         target = (uint32_t) LCD_BRIGHTNESS_MAX - 1U;
+    }
+    if (elapsed_ms - DISPLAY_IDLE_DIM_START_MS < DISPLAY_IDLE_DIM_FADE_MS) {
+        mix = ui_ease_smoothstep(elapsed_ms - DISPLAY_IDLE_DIM_START_MS, DISPLAY_IDLE_DIM_FADE_MS);
+        target = display_power_mix_brightness(base, target, mix);
+    } else if (elapsed_ms >= DISPLAY_IDLE_DIM_OFF_MS - DISPLAY_IDLE_OFF_FADE_MS) {
+        mix = ui_ease_smoothstep(elapsed_ms - (DISPLAY_IDLE_DIM_OFF_MS - DISPLAY_IDLE_OFF_FADE_MS), DISPLAY_IDLE_OFF_FADE_MS);
+        target = display_power_mix_brightness(target, LCD_BRIGHTNESS_MAX, mix);
     }
     set_lcd_brightness((int) target);
     return false;
+}
+
+bool display_power_should_suspend(const DisplayPowerState *state, uint32_t now_ms)
+{
+    if (!state || !state->off) return false;
+    uint32_t elapsed = now_ms - state->off_started_ms;
+    /* Hardware OFF can finish after the caller's sampled time. Reject that
+     * future start instead of treating subtraction underflow as a long sleep.
+     * Real timer wrap remains valid for this one-minute timeout. */
+    return elapsed < 0x80000000U && elapsed >= DISPLAY_OFF_SUSPEND_MS;
 }
 
 void display_power_off(DisplayPowerState *state, bool was_paused)
@@ -989,14 +1059,46 @@ void display_power_off(DisplayPowerState *state, bool was_paused)
     }
 
     state->resume_playback_on_wake = !was_paused;
-    state->saved_brightness = state->idle_dim_active
-        ? state->idle_base_brightness
-        : current_lcd_brightness();
+    state->saved_brightness = display_power_logical_brightness(state);
+    state->off_fade_active = false;
     state->idle_dim_active = false;
     display_power_cancel_restore_fields(state);
     state->off_from_idle = false;
-    set_lcd_dark_for_power_off();
+    display_power_blank_hardware();
     state->off = true;
+    state->off_started_ms = monotonic_clock_now_ms();
+}
+
+void display_power_request_off(DisplayPowerState *state, bool was_paused, uint32_t now_ms)
+{
+    if (!state || state->off || state->off_fade_active) return;
+    state->saved_brightness = display_power_logical_brightness(state);
+    state->resume_playback_on_wake = !was_paused;
+    state->off_fade_from_brightness = current_lcd_brightness();
+    state->off_fade_started_ms = now_ms;
+    state->off_fade_active = true;
+    state->idle_dim_active = false;
+    display_power_cancel_restore_fields(state);
+}
+
+void display_power_tick_transition(DisplayPowerState *state, uint32_t now_ms)
+{
+    if (!state) return;
+    if (!state->off_fade_active) {
+        display_power_tick_brightness_restore(state, now_ms);
+        return;
+    }
+    uint32_t elapsed = now_ms - state->off_fade_started_ms;
+    if (elapsed < LCD_BRIGHTNESS_FADE_MS) {
+        set_lcd_brightness((int)display_power_mix_brightness(state->off_fade_from_brightness,
+            LCD_BRIGHTNESS_MAX, ui_ease_smoothstep(elapsed, LCD_BRIGHTNESS_FADE_MS)));
+        return;
+    }
+    state->off_fade_active = false;
+    state->off_from_idle = false;
+    display_power_blank_hardware();
+    state->off = true;
+    state->off_started_ms = monotonic_clock_now_ms();
 }
 
 void display_power_off_with_saved_brightness(DisplayPowerState *state, SDL_Surface *screen, uint32_t saved_brightness, bool was_paused)
@@ -1007,12 +1109,14 @@ void display_power_off_with_saved_brightness(DisplayPowerState *state, SDL_Surfa
 
     state->resume_playback_on_wake = !was_paused;
     state->saved_brightness = (uint32_t) clamp_int((int) saved_brightness, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
+    state->off_fade_active = false;
     state->idle_dim_active = false;
     display_power_cancel_restore_fields(state);
     state->off_from_idle = false;
-    set_lcd_dark_for_power_off();
+    display_power_blank_hardware();
     state->off = true;
-    present_black_screen(screen);
+    state->off_started_ms = monotonic_clock_now_ms();
+    if (!native_screen_power_is_off()) present_black_screen(screen);
 }
 
 void display_power_off_for_exit(DisplayPowerState *state, SDL_Surface *screen, bool was_paused)
@@ -1027,9 +1131,10 @@ void display_power_on(DisplayPowerState *state)
         return;
     }
 
-    set_lcd_brightness((int) state->saved_brightness);
+    if (!display_power_wake_hardware(state->saved_brightness)) return;
     state->off = false;
     state->off_from_idle = false;
+    state->off_started_ms = 0;
     state->idle_dim_active = false;
     display_power_cancel_restore_fields(state);
     state->idle_base_brightness = state->saved_brightness;
@@ -1039,6 +1144,15 @@ void display_power_restore(DisplayPowerState *state, uint32_t now_ms)
 {
     if (!state) {
         return;
+    }
+    if (state->off_fade_active) {
+        state->off_fade_active = false;
+        set_lcd_brightness((int)state->saved_brightness);
+    }
+    if (state->idle_restore_active) {
+        set_lcd_brightness((int)state->idle_restore_to_brightness);
+        display_power_cancel_restore_fields(state);
+        state->idle_dim_active = false;
     }
     if (state->off) {
         display_power_on(state);
@@ -1053,12 +1167,20 @@ void display_power_restore_animated(DisplayPowerState *state, uint32_t now_ms)
     if (!state) {
         return;
     }
-    if (state->off) {
-        if (state->off_from_idle) {
+    if (state->off || state->off_fade_active) {
+        {
             uint32_t saved_brightness = display_power_clamp_brightness(state->saved_brightness);
+            if (native_screen_power_is_off()) {
+                /* Native panel startup precedes the fade and may take longer
+                 * than it. Start the brightness animation only after wake. */
+                if (!display_power_wake_hardware(LCD_BRIGHTNESS_MAX)) return;
+                now_ms = monotonic_clock_now_ms();
+            }
 
             state->off = false;
+            state->off_fade_active = false;
             state->off_from_idle = false;
+            state->off_started_ms = 0;
             state->idle_dim_active = true;
             state->idle_base_brightness = saved_brightness;
             display_power_begin_brightness_restore(
@@ -1067,8 +1189,6 @@ void display_power_restore_animated(DisplayPowerState *state, uint32_t now_ms)
                 current_lcd_brightness(),
                 saved_brightness
             );
-        } else {
-            display_power_on(state);
         }
     } else {
         display_power_restore_idle_dim_animated(state, now_ms);
@@ -1102,7 +1222,7 @@ uint32_t display_power_logical_brightness(const DisplayPowerState *state)
     if (state->idle_dim_active) {
         return state->idle_base_brightness;
     }
-    if (state->off) {
+    if (state->off || state->off_fade_active) {
         return state->saved_brightness;
     }
     return current_lcd_brightness();
@@ -1203,7 +1323,9 @@ void clear_screenshot_preview(ScreenshotPreviewState *preview)
     if (preview->surface) {
         SDL_FreeSurface(preview->surface);
     }
+    uint32_t revision = preview->revision + 1U;
     memset(preview, 0, sizeof(*preview));
+    preview->revision = revision;
 }
 
 void clear_seek_bar_preview_decode_job(SeekBarPreviewState *preview)
@@ -1357,6 +1479,9 @@ uint64_t monotonic_clock_now_ticks(void)
 
 uint32_t monotonic_clock_ticks_to_ms(uint64_t ticks)
 {
+    if (monotonic_clock_ticks_per_second() == 32768U) {
+        return (uint32_t) ((ticks * 1000ULL) >> 15);
+    }
     return (uint32_t) ((ticks * 1000ULL) / monotonic_clock_ticks_per_second());
 }
 

@@ -19,6 +19,10 @@
 #include "codecs/mpeg4_xvid.h"
 #include "movie/movie.h"
 #include "sram.h"
+#include "playback_capture_core.h"
+#include "movie_async_io.h"
+#include "screenshot_writer.h"
+#include "h264_lookahead.h"
 
 #define SCREEN_W 320
 #define SCREEN_H 240
@@ -145,7 +149,11 @@ static inline void player_prefetch_data(const void *ptr)
 #define LCD_BRIGHTNESS_STEP 25
 #define LCD_BRIGHTNESS_FADE_MS 160U
 #define DISPLAY_IDLE_DIM_START_MS 60000U
-#define DISPLAY_IDLE_DIM_OFF_MS 300000U
+#define DISPLAY_IDLE_DIM_FADE_MS 800U
+#define DISPLAY_IDLE_DIM_LEVEL_PERCENT 30U
+#define DISPLAY_IDLE_DIM_OFF_MS 120000U
+#define DISPLAY_IDLE_OFF_FADE_MS 800U
+#define DISPLAY_OFF_SUSPEND_MS 60000U
 #define DEBUG_RING_SIZE 8192
 #define DEBUG_LINE_LEN 192
 #define DEBUG_SNAPSHOT_INTERVAL_MS 1000U
@@ -177,8 +185,9 @@ static inline void player_prefetch_data(const void *ptr)
 #define SEEK_BAR_PREVIEW_MAX_W 80
 #define SEEK_BAR_PREVIEW_MAX_H 60
 #define SUBTITLE_COORD_SCALE 10000U
-#define H264_CLIP_OFFSET 384
-#define H264_CLIP_TABLE_SIZE 1024
+#define H264_RGB565_CLIP_TABLE_SIZE 384
+#define H264_RGB565_RED_BLUE_BIAS 131072
+#define H264_RGB565_GREEN_BIAS 262144
 #define SRAM_MOVIE_CHUNK_BUFFER_BYTES (112U * 1024U)
 #define MPEG4_XVID_SRAM_POOL_BYTES (48U * 1024U)
 
@@ -191,6 +200,7 @@ typedef struct {
     uint32_t duration_ms;
     bool has_resume;
     bool resume_time_known;
+    bool timing_checked;
 } MovieFile;
 
 typedef struct {
@@ -247,14 +257,33 @@ typedef struct {
     uint32_t idle_restore_from_brightness;
     uint32_t idle_restore_to_brightness;
     uint32_t last_activity_ms;
+    uint32_t off_started_ms;
+    bool off_fade_active;
+    uint32_t off_fade_started_ms, off_fade_from_brightness;
 } DisplayPowerState;
+
+typedef struct {
+    nSDL_Font *white[NSP_NUMFONTS], *outline[NSP_NUMFONTS];
+    bool attempted[NSP_NUMFONTS];
+} SubtitleFonts;
 
 typedef struct {
     nSDL_Font *white;
     nSDL_Font *outline;
-    nSDL_Font *subtitle_white[NSP_NUMFONTS];
-    nSDL_Font *subtitle_outline[NSP_NUMFONTS];
+    SubtitleFonts *subtitles;
 } Fonts;
+
+void night_mode_init(const Fonts *fonts);
+bool night_mode_poll(uint32_t now_ms, bool allow_changes);
+bool night_mode_is_enabled(void);
+unsigned night_mode_percent(void);
+void night_mode_hide_status(void);
+void night_mode_draw_status(SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *video_rect, uint32_t now_ms);
+bool night_mode_status_animating(uint32_t now_ms);
+bool night_mode_status_visible(uint32_t now_ms);
+uint32_t night_mode_revision(void);
+void *night_mode_present_pixels(SDL_Surface *screen);
+void night_mode_shutdown(void);
 
 typedef struct {
     SDL_Surface *screen;
@@ -337,11 +366,13 @@ typedef enum {
     PLAY_MOVIE_RESULT_HOME_EXIT = 3,
     PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT = 4,
     PLAY_MOVIE_RESULT_SWITCH_MOVIE = 5,
+    PLAY_MOVIE_RESULT_SUSPEND_EXIT = 6,
 } PlayMovieResult;
 
 enum {
     RESUME_PROMPT_RESULT_HOME_EXIT = -2,
     RESUME_PROMPT_RESULT_SCRATCHPAD_EXIT = -3,
+    RESUME_PROMPT_RESULT_SUSPEND_EXIT = -4,
 };
 
 typedef struct {
@@ -408,6 +439,8 @@ typedef struct {
     bool c;
     bool p;
     bool r;
+    bool n;
+    bool ctrl;
     bool on;
 } PlaybackKeySnapshot;
 
@@ -446,6 +479,7 @@ typedef enum {
 
 typedef struct {
     UiTransition chrome;
+    UiTransition pause_indicator;
     UiTransition playback_badge;
     UiTransition playback_press;
     UiTransition scale_badge;
@@ -459,6 +493,7 @@ typedef struct {
 
 typedef struct {
     uint8_t chrome;
+    uint8_t pause_indicator;
     uint8_t playback_badge;
     uint8_t playback_press;
     uint8_t scale_badge;
@@ -500,6 +535,8 @@ typedef struct {
     SDL_Surface *surface;
     char label[96];
     uint32_t until_ms;
+    uint32_t request_id;
+    uint32_t revision;
 } ScreenshotPreviewState;
 
 typedef struct {
@@ -603,10 +640,9 @@ typedef struct {
     int32_t u_to_green[256];
     int32_t v_to_red[256];
     int32_t v_to_green[256];
-    uint8_t clip[H264_CLIP_TABLE_SIZE];
-    uint16_t red565[256];
-    uint16_t green565[256];
-    uint16_t blue565[256];
+    /* Disjoint biased indices let one byte table clamp already-quantized
+     * 5-bit red/blue and 6-bit green without per-pixel mask operations. */
+    uint8_t clip[H264_RGB565_CLIP_TABLE_SIZE];
 } H264ColorTables;
 
 typedef struct {
@@ -716,56 +752,27 @@ extern const int g_subtitle_font_choices[SUBTITLE_FONT_CHOICE_COUNT];
 extern const char *g_subtitle_font_names[SUBTITLE_FONT_CHOICE_COUNT];
 extern UiThemeId g_ui_theme_id;
 
-static inline uint8_t h264_clip_byte(int32_t value)
-{
-    /* The YUV->RGB fixed-point path keeps this in [-258, 534]. */
-    return g_h264_color_tables->clip[value + H264_CLIP_OFFSET];
-}
-
-#if defined(__arm__) && !defined(__thumb__)
-static inline int32_t armv5te_smulbb(int32_t lhs, int32_t rhs)
-{
-    int32_t result;
-    __asm__ volatile ("smulbb %0, %1, %2" : "=r" (result) : "r" (lhs), "r" (rhs));
-    return result;
-}
-
-static inline int32_t armv5te_smlabb(int32_t acc, int32_t lhs, int32_t rhs)
-{
-    int32_t result;
-    __asm__ volatile ("smlabb %0, %1, %2, %3" : "=r" (result) : "r" (lhs), "r" (rhs), "r" (acc));
-    return result;
-}
-
-static inline void h264_compute_chroma_terms(uint8_t u_sample, uint8_t v_sample, int32_t *red, int32_t *green, int32_t *blue)
-{
-    const int32_t u = (int32_t) u_sample - 128;
-    const int32_t v = (int32_t) v_sample - 128;
-
-    *red = armv5te_smulbb(v, 409);
-    *green = armv5te_smlabb(armv5te_smulbb(u, -100), v, -208);
-    *blue = armv5te_smulbb(u, 516);
-}
-#else
 static inline void h264_compute_chroma_terms(uint8_t u_sample, uint8_t v_sample, int32_t *red, int32_t *green, int32_t *blue)
 {
     *red = g_h264_color_tables->v_to_red[v_sample];
     *green = g_h264_color_tables->u_to_green[u_sample] + g_h264_color_tables->v_to_green[v_sample];
     *blue = g_h264_color_tables->u_to_blue[u_sample];
 }
-#endif
 
 /* Cross-module declarations for the player translation units. */
 /* movie_open_scan.c */
 void return_to_os_home_menu(void);
 void yes_teacher_im_mathing(void);
+void queue_os_suspend_shortcut(void);
 bool key_pressed_edge(t_key key, bool *previous_state);
+int player_touchpad_scan(touchpad_report_t *report);
+bool player_key_pressed(t_key key);
 bool on_key_pressed_edge(bool *previous_state);
 bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progress);
 void ensure_movie_picker_cache(MoviePickerCache *cache, const char *directory);
 bool find_next_movie_path(const char *current_path, char *next_path, size_t next_path_size);
 bool find_previous_movie_path(const char *current_path, char *previous_path, size_t previous_path_size);
-const SubtitleCue *active_subtitle_cue(const Movie *movie, uint32_t now_ms);
+const SubtitleCue *active_subtitle_cue(Movie *movie, uint32_t now_ms);
 
 /* codec_streaming.c */
 const PrefetchedChunk *find_prefetched_chunk_const(const Movie *movie, int chunk_index);
@@ -782,6 +789,7 @@ bool reset_mpeg4_decoder(Movie *movie);
 bool blit_h264_planes_to_rgb565_target_with_crop( const Movie *movie, const uint8_t *restrict y_plane, const uint8_t *restrict u_plane, const uint8_t *restrict v_plane, size_t luma_stride, size_t chroma_stride, uint16_t *restrict dst_pixels, size_t dst_pitch_pixels, size_t crop_width, size_t crop_height );
 bool blit_h264_planes_to_rgb565_target( const Movie *movie, const uint8_t *restrict y_plane, const uint8_t *restrict u_plane, const uint8_t *restrict v_plane, size_t luma_stride, size_t chroma_stride, uint16_t *restrict dst_pixels, size_t dst_pitch_pixels );
 bool blit_h264_picture_to_target( Movie *movie, const uint8_t *picture, uint16_t *dst_pixels, size_t dst_pitch_pixels );
+bool blit_h264_picture_rows_to_target( Movie *movie, const uint8_t *picture, uint16_t *dst_pixels, size_t dst_pitch_pixels, size_t first_row, size_t row_count, bool *flat_mode );
 uint8_t *take_h264_output_picture(storage_t *decoder, const char *context);
 bool pump_h264_access_unit( Movie *movie, storage_t *decoder, uint8_t *frame_data, size_t frame_size, size_t *inout_consumed, unsigned *inout_zero_advance_retries, uint32_t macroblock_budget, bool force_commit_picture_params, const char *context, bool *out_picture_ready, bool *out_pending, uint8_t **out_picture );
 bool decode_h264_access_unit_to_target( Movie *movie, uint8_t *frame_data, size_t frame_size, uint16_t *dst_pixels, size_t dst_pitch_pixels );
@@ -859,6 +867,9 @@ void flush_queued_history_save(DeferredHistorySave *request, const char *reason)
 bool save_screenshot_bitmap_in_directory(SDL_Surface *screen, const char *directory, char *saved_path, size_t saved_path_size);
 bool save_screenshot_bitmap(SDL_Surface *screen, const char *movie_path, char *saved_path, size_t saved_path_size);
 void prepare_screenshot_preview(ScreenshotPreviewState *preview, SDL_Surface *screen, const char *saved_path);
+void request_screenshot(SDL_Surface *screen, const char *movie_path, ScreenshotPreviewState *preview);
+void request_screenshot_in_directory(SDL_Surface *screen, const char *directory, ScreenshotPreviewState *preview);
+bool screenshot_preview_tick(ScreenshotPreviewState *preview, uint32_t now_ms);
 bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, const PointerState *pointer, bool show_ui, uint32_t now_ms);
 
 /* input_timing_memory.c */
@@ -885,7 +896,7 @@ uint64_t movie_frame_time_scaled_ticks(const Movie *movie, uint32_t frame_index,
 uint32_t movie_frames_from_ms(const Movie *movie, uint32_t total_ms);
 uint32_t movie_frames_from_scaled_ticks(const Movie *movie, uint64_t total_ticks, const PlaybackRate *rate);
 uint32_t movie_duration_ms(const Movie *movie);
-void reset_playback_timeline(const Movie *movie, const PlaybackRate *playback_rate, uint64_t *anchor_ticks, uint32_t *anchor_frame, uint64_t *next_frame_due_ticks);
+void reset_playback_timeline(Movie *movie, const PlaybackRate *playback_rate, uint64_t *anchor_ticks, uint32_t *anchor_frame, uint64_t *next_frame_due_ticks);
 bool step_movie_forward_one_frame(Movie *movie, bool *hover_preview_needs_rebuffer);
 uint16_t rolling_u16_average(uint16_t current, uint32_t sample_ms);
 void record_h264_foreground_decode_time(Movie *movie, uint32_t elapsed_ms);
@@ -897,13 +908,22 @@ bool playback_wait_touchpad_pending(const PointerState *pointer);
 bool playback_wait_touchpad_click_pending(const PointerState *pointer);
 bool playback_wait_input_pending(const PointerState *pointer);
 bool prefetch_abort_requested(const PointerState *pointer);
-void wait_until_ticks_playback(uint64_t target_ticks, const PointerState *pointer);
+void wait_until_ticks_playback(Movie *movie, uint64_t target_ticks, const PointerState *pointer);
+bool playback_prepare_ahead(Movie *movie, uint64_t target_ticks, const PointerState *pointer);
+int load_ready_chunk(Movie *movie, int chunk_index);
 void free_movie_files(MovieFile *files, size_t count);
 void clear_movie_picker_cache(MoviePickerCache *cache);
+void movie_picker_timing_stop(void);
+void movie_picker_timing_tick(MovieFile *files, size_t count, size_t preferred);
 void free_history_store(HistoryStore *history);
 
 /* movie_resources.c */
 bool sram_movie_chunk_buffer_can_hold(size_t size);
+/* Conservative future compressed-storage bound (SIZE_MAX if unavailable),
+ * and currently resident owned bytes eligible as credit against that bound.
+ * Bound scans the index once; current bytes is bounded by prefetch slot count. */
+size_t movie_lookahead_storage_bound(const Movie *movie);
+size_t movie_lookahead_storage_bytes(const Movie *movie);
 void *player_malloc_aligned(size_t size, size_t alignment, uint8_t **allocation);
 void *player_calloc_aligned(size_t count, size_t element_size, size_t alignment, uint8_t **allocation);
 void player_free_aligned(void *ptr, uint8_t *allocation);
@@ -912,6 +932,7 @@ void release_movie_chunk_storage(Movie *movie);
 bool allocate_movie_chunk_storage(Movie *movie, size_t size);
 bool adopt_movie_chunk_storage(Movie *movie, uint8_t **storage, size_t size);
 bool adopt_movie_chunk_storage_owned(Movie *movie, uint8_t **storage, uint8_t **allocation, size_t size);
+bool adopt_prefetched_movie_chunk(Movie *movie, PrefetchedChunk *chunk);
 void destroy_movie(Movie *movie);
 void defer_playback_movie_cleanup(Movie *movie);
 void cleanup_deferred_playback_movie(void);
@@ -923,7 +944,7 @@ bool init_h264_color_tables(void);
 void init_sram_movie_chunk_buffer(void);
 uint32_t h264_prefetch_io_min_spare_ms(const Movie *movie);
 void debug_trace_runtime_snapshot( Movie *movie, bool paused, uint32_t spare_ms, const PlaybackRate *playback_rate, const char *tag );
-void debug_dump_session(const char *path, const Movie *movie, const char *reason);
+bool debug_dump_session(const char *path, const Movie *movie, const char *reason);
 void debug_log_sram_status(void);
 
 /* picker_loop.c */
@@ -980,6 +1001,51 @@ bool ensure_debug_ring_storage(void);
 void release_debug_ring_storage(void);
 bool debug_is_runtime_logging_enabled(void);
 bool debug_should_collect_metrics(void);
+bool playback_capture_active(const Movie *movie);
+enum {
+    PLAYER_CRASH_START = 1, PLAYER_CRASH_INPUT, PLAYER_CRASH_DECODE,
+    PLAYER_CRASH_RENDER, PLAYER_CRASH_PREFETCH, PLAYER_CRASH_WAIT,
+    PLAYER_CRASH_DISPLAY_OFF, PLAYER_CRASH_SEEK, PLAYER_CRASH_EXIT,
+    PLAYER_CRASH_ERROR,
+    PLAYER_CRASH_OFF_BEGIN, PLAYER_CRASH_OFF_END,
+    PLAYER_CRASH_WAKE_BEGIN, PLAYER_CRASH_WAKE_END, PLAYER_CRASH_STANDBY
+};
+void player_crash_trace_begin(const Movie *movie, const char *path, bool paused, const PlaybackRate *rate);
+void player_crash_trace_tick(const Movie *movie, unsigned phase, bool paused, const PlaybackRate *rate);
+void player_crash_trace_presented(const Movie *movie);
+void player_crash_trace_power_event(unsigned phase);
+void player_crash_trace_end(const Movie *movie, unsigned phase);
+void player_service_writes(const Movie *movie);
+bool player_standby(SDL_Surface *screen, Movie *movie, const char *path, bool is_directory,
+    ScreenshotPreviewState *preview);
+void player_standby_shutdown(void);
+enum {
+    CAPTURE_RENDER_SCHEDULED_FRAME = 1U << 0,
+    CAPTURE_RENDER_FRAME_CHANGED = 1U << 1,
+    CAPTURE_RENDER_INPUT = 1U << 2,
+    CAPTURE_RENDER_EFFECTS_TRANSITION = 1U << 3,
+    CAPTURE_RENDER_EFFECTS_TICK = 1U << 4,
+    CAPTURE_RENDER_INITIAL = 1U << 5,
+    CAPTURE_RENDER_POINTER = 1U << 6,
+    CAPTURE_RENDER_MEMORY_REFRESH = 1U << 7,
+    CAPTURE_RENDER_NIGHT_REVISION = 1U << 8,
+    CAPTURE_RENDER_SCREENSHOT_REVISION = 1U << 9
+};
+/* Nonexclusive gate reasons, sampled before the render gate mutates its state. */
+void playback_capture_render_reason(const Movie *movie, uint32_t reasons);
+bool playback_capture_available(const Movie *movie);
+bool playback_capture_start(const Movie *movie, const char *movie_path);
+void playback_capture_stop(const Movie *movie);
+void playback_capture_release(void);
+void playback_capture_tick(const Movie *movie, uint64_t now, bool paused);
+void playback_capture_reset_timeline(const Movie *movie);
+void playback_capture_state(const Movie *movie, const CaptureSettings *settings, uint64_t now);
+void playback_capture_stage(const Movie *movie, unsigned stage, uint64_t started, uint64_t ended);
+void playback_capture_ahead_scope(const Movie *movie, bool active);
+void playback_capture_frame_begin(const Movie *movie, uint32_t target_frame, uint64_t due_ticks, uint64_t interval_ticks);
+void playback_capture_presented(const Movie *movie, uint64_t now);
+void playback_capture_io(Movie *movie, int kind, int chunk, uint32_t bytes, uint64_t started, uint64_t ended);
+void playback_capture_export(FILE *file, const Movie *movie);
 scr_type_t screen_buffer_type(void);
 scr_type_t screen_lcd_type(void);
 void patch_cx2_lcd_edge_timing(void);
@@ -987,9 +1053,7 @@ void present_screen(SDL_Surface *screen);
 void present_black_screen(SDL_Surface *screen);
 void debug_set_metrics_collection(bool enabled);
 void debug_set_runtime_logging(bool enabled);
-void debug_tracevf(bool force, const char *fmt, va_list args);
 void debug_tracef(const char *fmt, ...);
-void debug_tracef_force(const char *fmt, ...);
 void debug_clear_last_error(void);
 const char *debug_last_error(void);
 void debug_failf(const char *fmt, ...);
@@ -998,7 +1062,7 @@ void clear_all_prefetched_chunks(Movie *movie);
 PrefetchedChunk *find_farthest_prefetched_chunk(Movie *movie);
 bool ensure_prefetch_budget(Movie *movie, int requested_chunk, size_t required_bytes);
 void debug_log_path_for_movie(const char *movie_path, char *log_path, size_t log_path_size);
-void report_movie_decode_failure(const Movie *movie, const char *movie_path, const char *reason);
+void report_movie_decode_failure(Movie *movie, const char *movie_path, const char *reason);
 void report_movie_open_failure(const char *movie_path);
 uint16_t read_le16(const uint8_t *src);
 uint32_t read_le32(const uint8_t *src);
@@ -1030,7 +1094,10 @@ unsigned lcd_brightness_percent(uint32_t raw_value);
 void display_power_init(DisplayPowerState *state, uint32_t now_ms);
 void display_power_note_activity(DisplayPowerState *state, uint32_t now_ms);
 bool display_power_tick_idle(DisplayPowerState *state, SDL_Surface *screen, uint32_t now_ms, bool allow_idle_dim, bool was_paused);
+bool display_power_should_suspend(const DisplayPowerState *state, uint32_t now_ms);
 void display_power_off(DisplayPowerState *state, bool was_paused);
+void display_power_request_off(DisplayPowerState *state, bool was_paused, uint32_t now_ms);
+void display_power_tick_transition(DisplayPowerState *state, uint32_t now_ms);
 void display_power_off_with_saved_brightness(DisplayPowerState *state, SDL_Surface *screen, uint32_t saved_brightness, bool was_paused);
 void display_power_off_for_exit(DisplayPowerState *state, SDL_Surface *screen, bool was_paused);
 void display_power_on(DisplayPowerState *state);
@@ -1091,6 +1158,8 @@ void trigger_playback_badge_press( PlaybackUiTransitions *transitions, uint32_t 
 void trigger_badge_press(UiTransition *transition, uint32_t *press_until_ms, uint32_t now_ms);
 bool ui_time_before(uint32_t now_ms, uint32_t until_ms);
 void status_overlay_show(uint32_t now_ms, bool restart_animation, uint32_t *started_ms, uint32_t *until_ms);
+void status_overlay_update_timing(uint32_t now_ms, bool restart_animation, uint32_t *started_ms, uint32_t *until_ms);
+SDL_Rect playback_status_badge_anchor(const SDL_Rect *video_rect, bool playback_badge_visible);
 bool seek_preview_surface_animating(const SeekBarPreviewState *preview, uint32_t now_ms);
 void note_pause_transition( bool was_paused, bool now_paused, uint32_t now_ms, uint32_t *quiet_until_ms );
 Uint16 animated_control_color(Uint16 idle_color, Uint16 active_color, uint8_t active_mix);
@@ -1120,6 +1189,7 @@ void update_playback_ui_mixes( PlaybackUiTransitions *transitions, PlaybackUiMix
 SDL_Rect playback_badge_rect(const SDL_Rect *video_rect);
 void draw_playback_badge(SDL_Surface *screen, const SDL_Rect *video_rect, bool paused, uint8_t hover_mix, uint8_t press_mix, uint8_t chrome_mix);
 void draw_memory_badge( SDL_Surface *screen, const Fonts *fonts, Movie *movie, const SDL_Rect *video_rect, int right_limit, bool playback_badge_visible, uint8_t chrome_mix );
+bool movie_h264_idr_bounds(const Movie *, uint32_t frame, uint32_t *first, uint32_t *end);
 void draw_help_row( SDL_Surface *screen, const Fonts *fonts, int shortcut_x, int shortcut_w, int description_x, int y, const char *shortcut, const char *description );
 void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu_mix);
 bool chunk_list_contains(const int *chunks, size_t count, int chunk_index);

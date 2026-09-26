@@ -584,7 +584,7 @@ void animate_loading_transition_ex(
         if (eased >= 255) {
             break;
         }
-        msleep(16);
+        player_delay_ms(16);
     }
 }
 
@@ -681,7 +681,7 @@ void animate_movie_collapse_to_black(
         if (collapse_mix >= 255) {
             break;
         }
-        msleep(16);
+        player_delay_ms(16);
     }
     present_black_screen(screen);
     if (overlay_surface && *overlay_surface) {
@@ -750,29 +750,42 @@ void draw_movie_hover_tooltip(
     };
     char title[128];
     char detail[128];
+    char duration_text[24] = {0};
     int text_max_width = TOOLTIP_MAX_W - (TOOLTIP_PAD_X * 2);
     int title_width;
     int detail_width;
+    int duration_width;
     int width;
-    int height = (TOOLTIP_PAD_Y * 2) + TOOLTIP_LINE_GAP + 8;
+    int height = (TOOLTIP_PAD_Y * 2) + 8;
     int x;
     int y;
     SDL_Rect panel;
     SDL_Rect accent;
     int offset_y;
 
-    if (!screen || !fonts || !file || !pointer || !pointer->visible ||
-        !file->detail || file->detail[0] == '\0' || tooltip_mix == 0) {
+    if (!screen || !fonts || !file || !pointer || !pointer->visible || tooltip_mix == 0) {
         return;
     }
 
     copy_fitted_text(fonts->outline, file->name, title, sizeof(title), text_max_width);
     copy_fitted_text(fonts->outline, file->detail, detail, sizeof(detail), text_max_width);
+    if (file->duration_ms > 0) {
+        format_clock(file->duration_ms, duration_text, sizeof(duration_text));
+        height += TOOLTIP_LINE_GAP;
+    }
     title_width = nSDL_GetStringWidth(fonts->outline, title);
     detail_width = nSDL_GetStringWidth(fonts->outline, detail);
-    width = (title_width > detail_width ? title_width : detail_width) + (TOOLTIP_PAD_X * 2);
+    duration_width = nSDL_GetStringWidth(fonts->outline, duration_text);
+    width = title_width > detail_width ? title_width : detail_width;
+    if (duration_width > width) {
+        width = duration_width;
+    }
+    width += TOOLTIP_PAD_X * 2;
     if (width < 72) {
         width = 72;
+    }
+    if (detail[0] != '\0') {
+        height += TOOLTIP_LINE_GAP;
     }
 
     x = pointer->x + 12;
@@ -811,7 +824,13 @@ void draw_movie_hover_tooltip(
     );
     if (tooltip_mix > 40) {
         nSDL_DrawString(screen, fonts->white, x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y, "%s", title);
-        nSDL_DrawString(screen, fonts->white, x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y + TOOLTIP_LINE_GAP, "%s", detail);
+        if (detail[0] != '\0') {
+            nSDL_DrawString(screen, fonts->white, x + TOOLTIP_PAD_X, y + TOOLTIP_PAD_Y + TOOLTIP_LINE_GAP, "%s", detail);
+        }
+        if (duration_text[0] != '\0') {
+            nSDL_DrawString(screen, fonts->white, x + TOOLTIP_PAD_X,
+                y + TOOLTIP_PAD_Y + TOOLTIP_LINE_GAP * (detail[0] != '\0' ? 2 : 1), "%s", duration_text);
+        }
     }
 }
 
@@ -1243,6 +1262,7 @@ void render_picker(
             draw_ui_label(screen, fonts, 12, SCREEN_H - 17 + footer_offset_y, credit);
         }
         draw_screenshot_preview_osd(screen, fonts, screenshot_preview, now_ms);
+        night_mode_draw_status(screen, fonts, NULL, now_ms);
         if (pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
@@ -1457,6 +1477,7 @@ void render_picker(
         draw_movie_hover_tooltip(screen, fonts, &files[movie_tooltip_index], pointer, movie_tooltip_mix);
     }
     draw_screenshot_preview_osd(screen, fonts, screenshot_preview, now_ms);
+    night_mode_draw_status(screen, fonts, NULL, now_ms);
     if (pointer && pointer->visible) {
         draw_cursor(screen, pointer->x, pointer->y);
     }

@@ -83,6 +83,12 @@ extern const u8 *h264bsdClip;
 
 #ifndef H264DEC_OMXDL
 
+/* For byte inputs the raw six-tap first pass is in [-2550, 10710], so its
+ * scratch storage fits i16 without clipping or rounding. Second-pass math
+ * stays i32 (the conservative range is [-214200, 475320]).
+ * Two-pass six-tap intermediates can be negative. Their pair sums have
+ * magnitude below 2^16, so multiplication by 4/16 below is defined and fits
+ * i32; unlike left-shifting a negative signed value it is valid ISO C. */
 static __inline i32 H264SixTapRaw(i32 p0, i32 p1, i32 p2, i32 p3, i32 p4, i32 p5)
 {
     i32 acc = p0 + p5;
@@ -108,6 +114,21 @@ static __inline i32 H264SixTapHalf(i32 p0, i32 p1, i32 p2, i32 p3, i32 p4, i32 p
     return 16 + H264SixTapRaw(p0, p1, p2, p3, p4, p5);
 }
 
+/* Keep edge replication out of each LTO-specialized interpolation kernel.
+ * Integer-sample copies retain their normal path; only interpolation's
+ * out-of-bounds case uses this shared helper. Pixel arithmetic is unchanged. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((noinline,noclone))
+#elif defined(__clang__)
+__attribute__((noinline))
+#endif
+static void H264FillBorderBlock(
+    u8 *ref,u8 *fill,i32 x0,i32 y0,u32 width,u32 height,
+    u32 blockWidth,u32 blockHeight,u32 fillScanLength)
+{
+    h264bsdFillBlock(ref,fill,x0,y0,width,height,blockWidth,blockHeight,fillScanLength);
+}
+
 static __inline u32 H264PackFourBytes(u8 p0, u8 p1, u8 p2, u8 p3)
 {
     return (u32) p0 | ((u32) p1 << 8) | ((u32) p2 << 16) | ((u32) p3 << 24);
@@ -115,7 +136,7 @@ static __inline u32 H264PackFourBytes(u8 p0, u8 p1, u8 p2, u8 p3)
 
 static __inline void H264StoreFourBytes(u8 *dst, u8 p0, u8 p1, u8 p2, u8 p3)
 {
-    if (((u32) dst & 0x3U) == 0U)
+    if (((uintptr_t) dst & 0x3U) == 0U)
     {
         *((u32 *) dst) = H264PackFourBytes(p0, p1, p2, p3);
     }
@@ -181,10 +202,10 @@ void h264bsdInterpolateChromaHor(
     if ((x0 < 0) || ((u32)x0+chromaPartWidth+1 > width) ||
         (y0 < 0) || ((u32)y0+chromaPartHeight > height))
     {
-        h264bsdFillBlock(pRef, block, x0, y0, width, height,
+        H264FillBorderBlock(pRef, block, x0, y0, width, height,
             chromaPartWidth + 1, chromaPartHeight, chromaPartWidth + 1);
         pRef += width * height;
-        h264bsdFillBlock(pRef, block + (chromaPartWidth+1)*chromaPartHeight,
+        H264FillBorderBlock(pRef, block + (chromaPartWidth+1)*chromaPartHeight,
             x0, y0, width, height, chromaPartWidth + 1,
             chromaPartHeight, chromaPartWidth + 1);
 
@@ -277,10 +298,10 @@ void h264bsdInterpolateChromaVer(
     if ((x0 < 0) || ((u32)x0+chromaPartWidth > width) ||
         (y0 < 0) || ((u32)y0+chromaPartHeight+1 > height))
     {
-        h264bsdFillBlock(pRef, block, x0, y0, width, height, chromaPartWidth,
+        H264FillBorderBlock(pRef, block, x0, y0, width, height, chromaPartWidth,
             chromaPartHeight + 1, chromaPartWidth);
         pRef += width * height;
-        h264bsdFillBlock(pRef, block + chromaPartWidth*(chromaPartHeight+1),
+        H264FillBorderBlock(pRef, block + chromaPartWidth*(chromaPartHeight+1),
             x0, y0, width, height, chromaPartWidth,
             chromaPartHeight + 1, chromaPartWidth);
 
@@ -372,10 +393,10 @@ void h264bsdInterpolateChromaHorVer(
     if ((x0 < 0) || ((u32)x0+chromaPartWidth+1 > width) ||
         (y0 < 0) || ((u32)y0+chromaPartHeight+1 > height))
     {
-        h264bsdFillBlock(ref, block, x0, y0, width, height,
+        H264FillBorderBlock(ref, block, x0, y0, width, height,
             chromaPartWidth + 1, chromaPartHeight + 1, chromaPartWidth + 1);
         ref += width * height;
-        h264bsdFillBlock(ref, block + (chromaPartWidth+1)*(chromaPartHeight+1),
+        H264FillBorderBlock(ref, block + (chromaPartWidth+1)*(chromaPartHeight+1),
             x0, y0, width, height, chromaPartWidth + 1,
             chromaPartHeight + 1, chromaPartWidth + 1);
 
@@ -555,7 +576,7 @@ void h264bsdInterpolateVerHalf(
     if ((x0 < 0) || ((u32)x0+partWidth > width) ||
         (y0 < 0) || ((u32)y0+partHeight+5 > height))
     {
-        h264bsdFillBlock(ref, (u8*)p1, x0, y0, width, height,
+        H264FillBorderBlock(ref, (u8*)p1, x0, y0, width, height,
                 partWidth, partHeight+5, partWidth);
 
         x0 = 0;
@@ -625,7 +646,7 @@ void h264bsdInterpolateVerQuarter(
     if ((x0 < 0) || ((u32)x0+partWidth > width) ||
         (y0 < 0) || ((u32)y0+partHeight+5 > height))
     {
-        h264bsdFillBlock(ref, (u8*)p1, x0, y0, width, height,
+        H264FillBorderBlock(ref, (u8*)p1, x0, y0, width, height,
                 partWidth, partHeight+5, partWidth);
 
         x0 = 0;
@@ -657,13 +678,13 @@ void h264bsdInterpolateVerQuarter(
             tmp6 = *ptrV++;
 
             tmp7 = tmp4 + tmp1;
-            tmp2 -= (tmp7 << 2);
+            tmp2 -= (tmp7 * 4);
             tmp2 -= tmp7;
             tmp2 += 16;
             tmp7 = tmp5 + tmp6;
             tmp3 = ptrC[width*2];
-            tmp2 += (tmp7 << 4);
-            tmp2 += (tmp7 << 2);
+            tmp2 += (tmp7 * 16);
+            tmp2 += (tmp7 * 4);
             tmp2 += tmp3;
             tmp2 = clp[tmp2>>5];
             tmp7 = ptrInt[width*2];
@@ -672,12 +693,12 @@ void h264bsdInterpolateVerQuarter(
             mb[48] = (u8)((tmp2 + tmp7) >> 1);
 
             tmp7 = tmp3 + tmp6;
-            tmp1 -= (tmp7 << 2);
+            tmp1 -= (tmp7 * 4);
             tmp1 -= tmp7;
             tmp7 = tmp4 + tmp5;
             tmp2 = ptrC[width];
-            tmp1 += (tmp7 << 4);
-            tmp1 += (tmp7 << 2);
+            tmp1 += (tmp7 * 16);
+            tmp1 += (tmp7 * 4);
             tmp1 += tmp2;
             tmp1 = clp[tmp1>>5];
             tmp7 = ptrInt[width];
@@ -686,12 +707,12 @@ void h264bsdInterpolateVerQuarter(
             mb[32] = (u8)((tmp1 + tmp7) >> 1);
 
             tmp7 = tmp2 + tmp5;
-            tmp6 -= (tmp7 << 2);
+            tmp6 -= (tmp7 * 4);
             tmp6 -= tmp7;
             tmp7 = tmp4 + tmp3;
             tmp1 = *ptrC;
-            tmp6 += (tmp7 << 4);
-            tmp6 += (tmp7 << 2);
+            tmp6 += (tmp7 * 16);
+            tmp6 += (tmp7 * 4);
             tmp6 += tmp1;
             tmp6 = clp[tmp6>>5];
             tmp7 = *ptrInt;
@@ -700,12 +721,12 @@ void h264bsdInterpolateVerQuarter(
             mb[16] = (u8)((tmp6 + tmp7) >> 1);
 
             tmp1 += tmp4;
-            tmp5 -= (tmp1 << 2);
+            tmp5 -= (tmp1 * 4);
             tmp5 -= tmp1;
             tmp3 += tmp2;
             tmp6 = ptrC[-(i32)width];
-            tmp5 += (tmp3 << 4);
-            tmp5 += (tmp3 << 2);
+            tmp5 += (tmp3 * 16);
+            tmp5 += (tmp3 * 4);
             tmp5 += tmp6;
             tmp5 = clp[tmp5>>5];
             tmp7 = ptrInt[-(i32)width];
@@ -758,7 +779,7 @@ void h264bsdInterpolateHorHalf(
     if ((x0 < 0) || ((u32)x0+partWidth+5 > width) ||
         (y0 < 0) || ((u32)y0+partHeight > height))
     {
-        h264bsdFillBlock(ref, (u8*)p1, x0, y0, width, height,
+        H264FillBorderBlock(ref, (u8*)p1, x0, y0, width, height,
                 partWidth+5, partHeight, partWidth+5);
 
         x0 = 0;
@@ -823,7 +844,7 @@ void h264bsdInterpolateHorQuarter(
     if ((x0 < 0) || ((u32)x0+partWidth+5 > width) ||
         (y0 < 0) || ((u32)y0+partHeight > height))
     {
-        h264bsdFillBlock(ref, (u8*)p1, x0, y0, width, height,
+        H264FillBorderBlock(ref, (u8*)p1, x0, y0, width, height,
                 partWidth+5, partHeight, partWidth+5);
 
         x0 = 0;
@@ -847,70 +868,20 @@ void h264bsdInterpolateHorQuarter(
         /* calculate 4 pels per iteration */
         for (x = (partWidth >> 2); x; x--)
         {
-            /* First pixel */
-            tmp6 += 16;
-            tmp7 = tmp3 + tmp4;
-            tmp6 += (tmp7 << 4);
-            tmp6 += (tmp7 << 2);
-            tmp7 = tmp2 + tmp5;
+            /* Preserve the five-sample window: one new reference byte per
+             * output, with the unchanged clipped six-tap and integer average. */
             tmp1 = *ptrJ++;
-            tmp6 -= (tmp7 << 2);
-            tmp6 -= tmp7;
-            tmp6 += tmp1;
-            tmp6 = clp[tmp6>>5];
-            tmp5 += 16;
-            if (!horOffset)
-                tmp6 += tmp4;
-            else
-                tmp6 += tmp3;
-            *mb++ = (u8)((tmp6 + 1) >> 1);
-            /* Second pixel */
-            tmp7 = tmp2 + tmp3;
-            tmp5 += (tmp7 << 4);
-            tmp5 += (tmp7 << 2);
-            tmp7 = tmp1 + tmp4;
+            u32 value = clp[H264SixTapHalf(tmp6,tmp5,tmp4,tmp3,tmp2,tmp1)>>5];
+            *mb++ = (u8)((value+(horOffset?tmp3:tmp4)+1U)>>1);
             tmp6 = *ptrJ++;
-            tmp5 -= (tmp7 << 2);
-            tmp5 -= tmp7;
-            tmp5 += tmp6;
-            tmp5 = clp[tmp5>>5];
-            tmp4 += 16;
-            if (!horOffset)
-                tmp5 += tmp3;
-            else
-                tmp5 += tmp2;
-            *mb++ = (u8)((tmp5 + 1) >> 1);
-            /* Third pixel */
-            tmp7 = tmp1 + tmp2;
-            tmp4 += (tmp7 << 4);
-            tmp4 += (tmp7 << 2);
-            tmp7 = tmp6 + tmp3;
+            value = clp[H264SixTapHalf(tmp5,tmp4,tmp3,tmp2,tmp1,tmp6)>>5];
+            *mb++ = (u8)((value+(horOffset?tmp2:tmp3)+1U)>>1);
             tmp5 = *ptrJ++;
-            tmp4 -= (tmp7 << 2);
-            tmp4 -= tmp7;
-            tmp4 += tmp5;
-            tmp4 = clp[tmp4>>5];
-            tmp3 += 16;
-            if (!horOffset)
-                tmp4 += tmp2;
-            else
-                tmp4 += tmp1;
-            *mb++ = (u8)((tmp4 + 1) >> 1);
-            /* Fourth pixel */
-            tmp7 = tmp6 + tmp1;
-            tmp3 += (tmp7 << 4);
-            tmp3 += (tmp7 << 2);
-            tmp7 = tmp5 + tmp2;
+            value = clp[H264SixTapHalf(tmp4,tmp3,tmp2,tmp1,tmp6,tmp5)>>5];
+            *mb++ = (u8)((value+(horOffset?tmp1:tmp2)+1U)>>1);
             tmp4 = *ptrJ++;
-            tmp3 -= (tmp7 << 2);
-            tmp3 -= tmp7;
-            tmp3 += tmp4;
-            tmp3 = clp[tmp3>>5];
-            if (!horOffset)
-                tmp3 += tmp1;
-            else
-                tmp3 += tmp6;
-            *mb++ = (u8)((tmp3 + 1) >> 1);
+            value = clp[H264SixTapHalf(tmp3,tmp2,tmp1,tmp6,tmp5,tmp4)>>5];
+            *mb++ = (u8)((value+(horOffset?tmp6:tmp1)+1U)>>1);
             tmp3 = tmp5;
             tmp5 = tmp1;
             tmp7 = tmp4;
@@ -937,16 +908,9 @@ void h264bsdInterpolateHorQuarter(
 ------------------------------------------------------------------------------*/
 
 void h264bsdInterpolateHorVerQuarter(
-  u8 *ref,
-  u8 *mb,
-  i32 x0,
-  i32 y0,
-  u32 width,
-  u32 height,
-  u32 partWidth,
-  u32 partHeight,
-  u32 horVerOffset) /* 0 for pixel e, 1 for pixel g,
-                       2 for pixel p, 3 for pixel r */
+  u8 *ref, u8 *mb, i32 x0, i32 y0, u32 width, u32 height,
+  u32 partWidth, u32 partHeight,
+  u32 horVerOffset) /* 0=e, 1=g, 2=p, 3=r */
 {
     u32 p1[21*21/4+1];
     u8 *ptrC, *ptrJ, *ptrV;
@@ -954,180 +918,70 @@ void h264bsdInterpolateHorVerQuarter(
     i32 tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7;
     const u8 *clp = h264bsdClip + 512;
 
-    /* Code */
-
     ASSERT(ref);
     ASSERT(mb);
-
     if ((x0 < 0) || ((u32)x0+partWidth+5 > width) ||
         (y0 < 0) || ((u32)y0+partHeight+5 > height))
     {
-        h264bsdFillBlock(ref, (u8*)p1, x0, y0, width, height,
-                partWidth+5, partHeight+5, partWidth+5);
-
-        x0 = 0;
-        y0 = 0;
+        H264FillBorderBlock(ref, (u8*)p1, x0, y0, width, height,
+            partWidth+5, partHeight+5, partWidth+5);
+        x0 = y0 = 0;
         ref = (u8*)p1;
         width = partWidth+5;
     }
-
-    /* Ref points to G + (-2, -2) */
     ref += (u32)y0 * width + (u32)x0;
-
-    /* ptrJ points to either J or Q, depending on vertical offset */
-    ptrJ = ref + (((horVerOffset & 0x2) >> 1) + 2) * width + 5;
-
-    /* ptrC points to either C or D, depending on horizontal offset */
-    ptrC = ref + width + 2 + (horVerOffset & 0x1);
-
-    for (y = partHeight; y; y--)
+    ptrJ = ref + (((horVerOffset & 2U) >> 1) + 2U) * width + 5U;
+    ptrC = ref + width + 2U + (horVerOffset & 1U);
+    for (y = partHeight; y; --y)
     {
-        tmp6 = *(ptrJ - 5);
-        tmp5 = *(ptrJ - 4);
-        tmp4 = *(ptrJ - 3);
-        tmp3 = *(ptrJ - 2);
-        tmp2 = *(ptrJ - 1);
-
-        /* Horizontal interpolation, calculate 4 pels per iteration */
-        for (x = (partWidth >> 2); x; x--)
+        tmp6 = ptrJ[-5]; tmp5 = ptrJ[-4]; tmp4 = ptrJ[-3];
+        tmp3 = ptrJ[-2]; tmp2 = ptrJ[-1];
+        /* Keep the five-sample sliding window: one new reference load per
+         * output pixel, with ARM926 DSP arithmetic in the shared six-tap. */
+        for (x = partWidth >> 2; x; --x)
         {
-            /* First pixel */
-            tmp6 += 16;
-            tmp7 = tmp3 + tmp4;
-            tmp6 += (tmp7 << 4);
-            tmp6 += (tmp7 << 2);
-            tmp7 = tmp2 + tmp5;
             tmp1 = *ptrJ++;
-            tmp6 -= (tmp7 << 2);
-            tmp6 -= tmp7;
-            tmp6 += tmp1;
-            tmp6 = clp[tmp6>>5];
-            /* Second pixel */
-            tmp5 += 16;
-            tmp7 = tmp2 + tmp3;
-            *mb++ = (u8)tmp6;
-            tmp5 += (tmp7 << 4);
-            tmp5 += (tmp7 << 2);
-            tmp7 = tmp1 + tmp4;
+            *mb++ = clp[H264SixTapHalf(tmp6,tmp5,tmp4,tmp3,tmp2,tmp1) >> 5];
             tmp6 = *ptrJ++;
-            tmp5 -= (tmp7 << 2);
-            tmp5 -= tmp7;
-            tmp5 += tmp6;
-            tmp5 = clp[tmp5>>5];
-            /* Third pixel */
-            tmp4 += 16;
-            tmp7 = tmp1 + tmp2;
-            *mb++ = (u8)tmp5;
-            tmp4 += (tmp7 << 4);
-            tmp4 += (tmp7 << 2);
-            tmp7 = tmp6 + tmp3;
+            *mb++ = clp[H264SixTapHalf(tmp5,tmp4,tmp3,tmp2,tmp1,tmp6) >> 5];
             tmp5 = *ptrJ++;
-            tmp4 -= (tmp7 << 2);
-            tmp4 -= tmp7;
-            tmp4 += tmp5;
-            tmp4 = clp[tmp4>>5];
-            /* Fourth pixel */
-            tmp3 += 16;
-            tmp7 = tmp6 + tmp1;
-            *mb++ = (u8)tmp4;
-            tmp3 += (tmp7 << 4);
-            tmp3 += (tmp7 << 2);
-            tmp7 = tmp5 + tmp2;
+            *mb++ = clp[H264SixTapHalf(tmp4,tmp3,tmp2,tmp1,tmp6,tmp5) >> 5];
             tmp4 = *ptrJ++;
-            tmp3 -= (tmp7 << 2);
-            tmp3 -= tmp7;
-            tmp3 += tmp4;
-            tmp3 = clp[tmp3>>5];
-            tmp7 = tmp4;
-            tmp4 = tmp6;
-            tmp6 = tmp2;
-            tmp2 = tmp7;
-            *mb++ = (u8)tmp3;
-            tmp3 = tmp5;
-            tmp5 = tmp1;
+            *mb++ = clp[H264SixTapHalf(tmp3,tmp2,tmp1,tmp6,tmp5,tmp4) >> 5];
+            tmp7 = tmp4; tmp4 = tmp6; tmp6 = tmp2;
+            tmp2 = tmp7; tmp3 = tmp5; tmp5 = tmp1;
         }
         ptrJ += width - partWidth;
-        mb += 16 - partWidth;
+        mb += 16U - partWidth;
     }
-
-    mb -= 16*partHeight;
-    ptrV = ptrC + 5*width;
-
-    for (y = (partHeight >> 2); y; y--)
+    mb -= 16U * partHeight;
+    ptrV = ptrC + 5U * width;
+    for (y = partHeight >> 2; y; --y)
     {
-        /* Vertical interpolation and averaging, 4 pels per iteration */
-        for (x = partWidth; x; x--)
+        for (x = partWidth; x; --x)
         {
-            tmp4 = ptrV[-(i32)width*2];
-            tmp5 = ptrV[-(i32)width];
-            tmp1 = ptrV[width];
-            tmp2 = ptrV[width*2];
-            tmp6 = *ptrV++;
-
-            tmp7 = tmp4 + tmp1;
-            tmp2 -= (tmp7 << 2);
-            tmp2 -= tmp7;
-            tmp2 += 16;
-            tmp7 = tmp5 + tmp6;
+            tmp4 = ptrV[-(i32)width*2]; tmp5 = ptrV[-(i32)width];
+            tmp1 = ptrV[width]; tmp2 = ptrV[width*2]; tmp6 = *ptrV++;
             tmp3 = ptrC[width*2];
-            tmp2 += (tmp7 << 4);
-            tmp2 += (tmp7 << 2);
-            tmp2 += tmp3;
-            tmp7 = clp[tmp2>>5];
-            tmp2 = mb[48];
-            tmp1 += 16;
-            tmp7++;
-            mb[48] = (u8)((tmp2 + tmp7) >> 1);
-
-            tmp7 = tmp3 + tmp6;
-            tmp1 -= (tmp7 << 2);
-            tmp1 -= tmp7;
-            tmp7 = tmp4 + tmp5;
+            tmp7 = clp[H264SixTapHalf(tmp3,tmp4,tmp5,tmp6,tmp1,tmp2) >> 5];
+            mb[48] = (u8)((mb[48] + tmp7 + 1) >> 1);
             tmp2 = ptrC[width];
-            tmp1 += (tmp7 << 4);
-            tmp1 += (tmp7 << 2);
-            tmp1 += tmp2;
-            tmp7 = clp[tmp1>>5];
-            tmp1 = mb[32];
-            tmp6 += 16;
-            tmp7++;
-            mb[32] = (u8)((tmp1 + tmp7) >> 1);
-
+            tmp7 = clp[H264SixTapHalf(tmp2,tmp3,tmp4,tmp5,tmp6,tmp1) >> 5];
+            mb[32] = (u8)((mb[32] + tmp7 + 1) >> 1);
             tmp1 = *ptrC;
-            tmp7 = tmp2 + tmp5;
-            tmp6 -= (tmp7 << 2);
-            tmp6 -= tmp7;
-            tmp7 = tmp4 + tmp3;
-            tmp6 += (tmp7 << 4);
-            tmp6 += (tmp7 << 2);
-            tmp6 += tmp1;
-            tmp7 = clp[tmp6>>5];
-            tmp6 = mb[16];
-            tmp5 += 16;
-            tmp7++;
-            mb[16] = (u8)((tmp6 + tmp7) >> 1);
-
+            tmp7 = clp[H264SixTapHalf(tmp1,tmp2,tmp3,tmp4,tmp5,tmp6) >> 5];
+            mb[16] = (u8)((mb[16] + tmp7 + 1) >> 1);
             tmp6 = ptrC[-(i32)width];
-            tmp1 += tmp4;
-            tmp5 -= (tmp1 << 2);
-            tmp5 -= tmp1;
-            tmp3 += tmp2;
-            tmp5 += (tmp3 << 4);
-            tmp5 += (tmp3 << 2);
-            tmp5 += tmp6;
-            tmp7 = clp[tmp5>>5];
-            tmp5 = *mb;
-            tmp7++;
-            *mb++ = (u8)((tmp5 + tmp7) >> 1);
-            ptrC++;
-
+            tmp7 = clp[H264SixTapHalf(tmp6,tmp1,tmp2,tmp3,tmp4,tmp5) >> 5];
+            *mb = (u8)((*mb + tmp7 + 1) >> 1);
+            ++mb; ++ptrC;
         }
-        ptrC += 4*width - partWidth;
-        ptrV += 4*width - partWidth;
-        mb += 4*16 - partWidth;
+        ptrC += 4U*width - partWidth;
+        ptrV += 4U*width - partWidth;
+        mb += 4U*16U - partWidth;
     }
-
 }
+
 #endif
 
 /*------------------------------------------------------------------------------
@@ -1154,8 +1008,8 @@ void h264bsdInterpolateMidHalf(
 {
     u32 p1[21*21/4+1];
     u32 x, y;
-    i32 *table_ptr;
-    i32 table[21 * 16];
+    i16 *table_ptr;
+    i16 table[21 * 16];
     const u8 *clp = h264bsdClip + 512;
 
     /* Code */
@@ -1166,7 +1020,7 @@ void h264bsdInterpolateMidHalf(
     if ((x0 < 0) || ((u32)x0+partWidth+5 > width) ||
         (y0 < 0) || ((u32)y0+partHeight+5 > height))
     {
-        h264bsdFillBlock(ref, (u8*)p1, x0, y0, width, height,
+        H264FillBorderBlock(ref, (u8*)p1, x0, y0, width, height,
                 partWidth+5, partHeight+5, partWidth+5);
 
         x0 = 0;
@@ -1191,12 +1045,12 @@ void h264bsdInterpolateMidHalf(
 
     for (y = 0; y < partHeight; ++y)
     {
-        const i32 *row0 = table + (y * partWidth);
-        const i32 *row1 = row0 + partWidth;
-        const i32 *row2 = row1 + partWidth;
-        const i32 *row3 = row2 + partWidth;
-        const i32 *row4 = row3 + partWidth;
-        const i32 *row5 = row4 + partWidth;
+        const i16 *row0 = table + (y * partWidth);
+        const i16 *row1 = row0 + partWidth;
+        const i16 *row2 = row1 + partWidth;
+        const i16 *row3 = row2 + partWidth;
+        const i16 *row4 = row3 + partWidth;
+        const i16 *row5 = row4 + partWidth;
         u8 *dst = mb + (y * 16U);
 
         for (x = 0; x < partWidth; x += 4U)
@@ -1237,9 +1091,9 @@ void h264bsdInterpolateMidVerQuarter(
     u32 p1[21*21/4+1];
     u32 x, y;
     i32 tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7;
-    i32 *ptrC, *ptrV, *ptrInt, *b1;
+    i16 *ptrC, *ptrV, *ptrInt, *b1;
     u8  *ptrJ;
-    i32 table[21*16];
+    i16 table[21*16];
     const u8 *clp = h264bsdClip + 512;
 
     /* Code */
@@ -1250,7 +1104,7 @@ void h264bsdInterpolateMidVerQuarter(
     if ((x0 < 0) || ((u32)x0+partWidth+5 > width) ||
         (y0 < 0) || ((u32)y0+partHeight+5 > height))
     {
-        h264bsdFillBlock(ref, (u8*)p1, x0, y0, width, height,
+        H264FillBorderBlock(ref, (u8*)p1, x0, y0, width, height,
                 partWidth+5, partHeight+5, partWidth+5);
 
         x0 = 0;
@@ -1277,41 +1131,41 @@ void h264bsdInterpolateMidVerQuarter(
         {
             /* First pixel */
             tmp7 = tmp3 + tmp4;
-            tmp6 += (tmp7 << 4);
-            tmp6 += (tmp7 << 2);
+            tmp6 += (tmp7 * 16);
+            tmp6 += (tmp7 * 4);
             tmp7 = tmp2 + tmp5;
             tmp1 = *ptrJ++;
-            tmp6 -= (tmp7 << 2);
+            tmp6 -= (tmp7 * 4);
             tmp6 -= tmp7;
             tmp6 += tmp1;
             *b1++ = tmp6;
             /* Second pixel */
             tmp7 = tmp2 + tmp3;
-            tmp5 += (tmp7 << 4);
-            tmp5 += (tmp7 << 2);
+            tmp5 += (tmp7 * 16);
+            tmp5 += (tmp7 * 4);
             tmp7 = tmp1 + tmp4;
             tmp6 = *ptrJ++;
-            tmp5 -= (tmp7 << 2);
+            tmp5 -= (tmp7 * 4);
             tmp5 -= tmp7;
             tmp5 += tmp6;
             *b1++ = tmp5;
             /* Third pixel */
             tmp7 = tmp1 + tmp2;
-            tmp4 += (tmp7 << 4);
-            tmp4 += (tmp7 << 2);
+            tmp4 += (tmp7 * 16);
+            tmp4 += (tmp7 * 4);
             tmp7 = tmp6 + tmp3;
             tmp5 = *ptrJ++;
-            tmp4 -= (tmp7 << 2);
+            tmp4 -= (tmp7 * 4);
             tmp4 -= tmp7;
             tmp4 += tmp5;
             *b1++ = tmp4;
             /* Fourth pixel */
             tmp7 = tmp6 + tmp1;
-            tmp3 += (tmp7 << 4);
-            tmp3 += (tmp7 << 2);
+            tmp3 += (tmp7 * 16);
+            tmp3 += (tmp7 * 4);
             tmp7 = tmp5 + tmp2;
             tmp4 = *ptrJ++;
-            tmp3 -= (tmp7 << 2);
+            tmp3 -= (tmp7 * 4);
             tmp3 -= tmp7;
             tmp3 += tmp4;
             *b1++ = tmp3;
@@ -1341,13 +1195,13 @@ void h264bsdInterpolateMidVerQuarter(
             tmp6 = *ptrV++;
 
             tmp7 = tmp4 + tmp1;
-            tmp2 -= (tmp7 << 2);
+            tmp2 -= (tmp7 * 4);
             tmp2 -= tmp7;
             tmp2 += 512;
             tmp7 = tmp5 + tmp6;
             tmp3 = ptrC[partWidth*2];
-            tmp2 += (tmp7 << 4);
-            tmp2 += (tmp7 << 2);
+            tmp2 += (tmp7 * 16);
+            tmp2 += (tmp7 * 4);
             tmp7 = ptrInt[partWidth*2];
             tmp2 += tmp3;
             tmp2 = clp[tmp2>>10];
@@ -1358,12 +1212,12 @@ void h264bsdInterpolateMidVerQuarter(
             mb[48] = (u8)((tmp7 + tmp2) >> 1);
 
             tmp7 = tmp3 + tmp6;
-            tmp1 -= (tmp7 << 2);
+            tmp1 -= (tmp7 * 4);
             tmp1 -= tmp7;
             tmp7 = tmp4 + tmp5;
             tmp2 = ptrC[partWidth];
-            tmp1 += (tmp7 << 4);
-            tmp1 += (tmp7 << 2);
+            tmp1 += (tmp7 * 16);
+            tmp1 += (tmp7 * 4);
             tmp7 = ptrInt[partWidth];
             tmp1 += tmp2;
             tmp1 = clp[tmp1>>10];
@@ -1375,11 +1229,11 @@ void h264bsdInterpolateMidVerQuarter(
 
             tmp1 = *ptrC;
             tmp7 = tmp2 + tmp5;
-            tmp6 -= (tmp7 << 2);
+            tmp6 -= (tmp7 * 4);
             tmp6 -= tmp7;
             tmp7 = tmp4 + tmp3;
-            tmp6 += (tmp7 << 4);
-            tmp6 += (tmp7 << 2);
+            tmp6 += (tmp7 * 16);
+            tmp6 += (tmp7 * 4);
             tmp7 = *ptrInt;
             tmp6 += tmp1;
             tmp6 = clp[tmp6>>10];
@@ -1391,11 +1245,11 @@ void h264bsdInterpolateMidVerQuarter(
 
             tmp6 = ptrC[-(i32)partWidth];
             tmp1 += tmp4;
-            tmp5 -= (tmp1 << 2);
+            tmp5 -= (tmp1 * 4);
             tmp5 -= tmp1;
             tmp3 += tmp2;
-            tmp5 += (tmp3 << 4);
-            tmp5 += (tmp3 << 2);
+            tmp5 += (tmp3 * 16);
+            tmp5 += (tmp3 * 4);
             tmp7 = ptrInt[-(i32)partWidth];
             tmp5 += tmp6;
             tmp5 = clp[tmp5>>10];
@@ -1455,7 +1309,7 @@ void h264bsdInterpolateMidHorQuarter(
     if ((x0 < 0) || ((u32)x0+partWidth+5 > width) ||
         (y0 < 0) || ((u32)y0+partHeight+5 > height))
     {
-        h264bsdFillBlock(ref, (u8*)p1, x0, y0, width, height,
+        H264FillBorderBlock(ref, (u8*)p1, x0, y0, width, height,
                 partWidth+5, partHeight+5, partWidth+5);
 
         x0 = 0;
@@ -1483,42 +1337,42 @@ void h264bsdInterpolateMidHorQuarter(
             tmp6 = *ptrV++;
 
             tmp7 = tmp4 + tmp1;
-            tmp2 -= (tmp7 << 2);
+            tmp2 -= (tmp7 * 4);
             tmp2 -= tmp7;
             tmp7 = tmp5 + tmp6;
             tmp3 = ptrC[width*2];
-            tmp2 += (tmp7 << 4);
-            tmp2 += (tmp7 << 2);
+            tmp2 += (tmp7 * 16);
+            tmp2 += (tmp7 * 4);
             tmp2 += tmp3;
             h1[tableWidth*2] = tmp2;
 
             tmp7 = tmp3 + tmp6;
-            tmp1 -= (tmp7 << 2);
+            tmp1 -= (tmp7 * 4);
             tmp1 -= tmp7;
             tmp7 = tmp4 + tmp5;
             tmp2 = ptrC[width];
-            tmp1 += (tmp7 << 4);
-            tmp1 += (tmp7 << 2);
+            tmp1 += (tmp7 * 16);
+            tmp1 += (tmp7 * 4);
             tmp1 += tmp2;
             h1[tableWidth] = tmp1;
 
             tmp1 = *ptrC;
             tmp7 = tmp2 + tmp5;
-            tmp6 -= (tmp7 << 2);
+            tmp6 -= (tmp7 * 4);
             tmp6 -= tmp7;
             tmp7 = tmp4 + tmp3;
-            tmp6 += (tmp7 << 4);
-            tmp6 += (tmp7 << 2);
+            tmp6 += (tmp7 * 16);
+            tmp6 += (tmp7 * 4);
             tmp6 += tmp1;
             *h1 = tmp6;
 
             tmp6 = ptrC[-(i32)width];
             tmp1 += tmp4;
-            tmp5 -= (tmp1 << 2);
+            tmp5 -= (tmp1 * 4);
             tmp5 -= tmp1;
             tmp3 += tmp2;
-            tmp5 += (tmp3 << 4);
-            tmp5 += (tmp3 << 2);
+            tmp5 += (tmp3 * 16);
+            tmp5 += (tmp3 * 4);
             tmp5 += tmp6;
             h1[-tableWidth] = tmp5;
             h1++;
@@ -1545,11 +1399,11 @@ void h264bsdInterpolateMidHorQuarter(
             /* First pixel */
             tmp6 += 512;
             tmp7 = tmp3 + tmp4;
-            tmp6 += (tmp7 << 4);
-            tmp6 += (tmp7 << 2);
+            tmp6 += (tmp7 * 16);
+            tmp6 += (tmp7 * 4);
             tmp7 = tmp2 + tmp5;
             tmp1 = *ptrJ++;
-            tmp6 -= (tmp7 << 2);
+            tmp6 -= (tmp7 * 4);
             tmp6 -= tmp7;
             tmp7 = *ptrInt++;
             tmp6 += tmp1;
@@ -1561,11 +1415,11 @@ void h264bsdInterpolateMidHorQuarter(
             *mb++ = (u8)((tmp6 + tmp7) >> 1);
             /* Second pixel */
             tmp7 = tmp2 + tmp3;
-            tmp5 += (tmp7 << 4);
-            tmp5 += (tmp7 << 2);
+            tmp5 += (tmp7 * 16);
+            tmp5 += (tmp7 * 4);
             tmp7 = tmp1 + tmp4;
             tmp6 = *ptrJ++;
-            tmp5 -= (tmp7 << 2);
+            tmp5 -= (tmp7 * 4);
             tmp5 -= tmp7;
             tmp7 = *ptrInt++;
             tmp5 += tmp6;
@@ -1577,11 +1431,11 @@ void h264bsdInterpolateMidHorQuarter(
             *mb++ = (u8)((tmp5 + tmp7) >> 1);
             /* Third pixel */
             tmp7 = tmp1 + tmp2;
-            tmp4 += (tmp7 << 4);
-            tmp4 += (tmp7 << 2);
+            tmp4 += (tmp7 * 16);
+            tmp4 += (tmp7 * 4);
             tmp7 = tmp6 + tmp3;
             tmp5 = *ptrJ++;
-            tmp4 -= (tmp7 << 2);
+            tmp4 -= (tmp7 * 4);
             tmp4 -= tmp7;
             tmp7 = *ptrInt++;
             tmp4 += tmp5;
@@ -1593,11 +1447,11 @@ void h264bsdInterpolateMidHorQuarter(
             *mb++ = (u8)((tmp4 + tmp7) >> 1);
             /* Fourth pixel */
             tmp7 = tmp6 + tmp1;
-            tmp3 += (tmp7 << 4);
-            tmp3 += (tmp7 << 2);
+            tmp3 += (tmp7 * 16);
+            tmp3 += (tmp7 * 4);
             tmp7 = tmp5 + tmp2;
             tmp4 = *ptrJ++;
-            tmp3 -= (tmp7 << 2);
+            tmp3 -= (tmp7 * 4);
             tmp3 -= tmp7;
             tmp7 = *ptrInt++;
             tmp3 += tmp4;

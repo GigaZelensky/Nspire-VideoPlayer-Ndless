@@ -1,4 +1,6 @@
 #include "player_internal.h"
+#include "storage_descriptors.h"
+#include "storage_read_stream.h"
 
 int main(int argc, char **argv)
 {
@@ -13,6 +15,7 @@ int main(int argc, char **argv)
     bool picker_opened_loading = false;
     bool return_home_after_exit = false;
     bool open_scratchpad_after_exit = false;
+    bool suspend_after_exit = false;
 
     if (argc < 1) {
         show_msgbox("ND Video Player", "Ndless did not provide argv[0].");
@@ -48,9 +51,7 @@ int main(int argc, char **argv)
         monotonic_clock_shutdown();
         return 1;
     }
-    if (has_colors && sram_init()) {
-        h264bsdInitSramTables();
-    }
+    night_mode_init(&fonts);
 
     strncpy(directory, argv[0], sizeof(directory) - 1);
     directory[sizeof(directory) - 1] = '\0';
@@ -77,10 +78,12 @@ int main(int argc, char **argv)
                     &resume_without_prompt);
 
             if (picker_result == PLAY_MOVIE_RESULT_HOME_EXIT ||
-                picker_result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) {
+                picker_result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT ||
+                picker_result == PLAY_MOVIE_RESULT_SUSPEND_EXIT) {
                 result = picker_result;
                 return_home_after_exit = true;
                 open_scratchpad_after_exit = picker_result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT;
+                suspend_after_exit = picker_result == PLAY_MOVIE_RESULT_SUSPEND_EXIT;
                 break;
             }
             if (picker_result != 0) {
@@ -104,9 +107,11 @@ int main(int argc, char **argv)
             continue;
         }
         if (result == PLAY_MOVIE_RESULT_HOME_EXIT ||
-            result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) {
+            result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT ||
+            result == PLAY_MOVIE_RESULT_SUSPEND_EXIT) {
             return_home_after_exit = true;
             open_scratchpad_after_exit = result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT;
+            suspend_after_exit = result == PLAY_MOVIE_RESULT_SUSPEND_EXIT;
             break;
         }
         if (result == PLAY_MOVIE_RESULT_APP_EXIT) {
@@ -117,10 +122,18 @@ int main(int argc, char **argv)
         }
     }
 
+    player_crash_trace_end(NULL, PLAYER_CRASH_EXIT);
+    screenshot_writer_shutdown();
     flush_queued_history_save(&g_pending_history_save, "shutdown");
     flush_queued_theme_save("shutdown");
+    if (g_display_power_state.off || g_display_power_state.off_fade_active) {
+        /* Retain video for normal wake, but do not flash it while exiting to
+         * the OS from an off screen. The SDL surface is still owned here. */
+        SDL_FillRect(screen, NULL, SDL_MapRGB(screen->format, 0, 0, 0));
+    }
     display_power_restore(&g_display_power_state, monotonic_clock_now_ms());
-    if (return_home_after_exit) {
+    player_standby_shutdown();
+    if (return_home_after_exit && !suspend_after_exit) {
         if (open_scratchpad_after_exit) {
             yes_teacher_im_mathing();
         } else {
@@ -129,15 +142,27 @@ int main(int argc, char **argv)
     }
     cleanup_deferred_playback_movie();
     clear_movie_picker_cache(&g_picker_cache);
+    night_mode_shutdown();
+    playback_capture_release();
+    release_debug_ring_storage();
     free_fonts(&fonts);
+    storage_descriptors_shutdown();
+    storage_read_stream_shutdown();
     lcd_init(SCR_TYPE_INVALID);
     SDL_Quit();
     sram_shutdown();
     monotonic_clock_shutdown();
+    if (suspend_after_exit) {
+        /* Hand the request to the OS only after its LCD/timer state and all
+         * movie/history resources have been restored and released. */
+        return_to_os_home_menu();
+        queue_os_suspend_shortcut();
+    }
     return (result == PLAY_MOVIE_RESULT_EXIT ||
         result == PLAY_MOVIE_RESULT_AUTO_NEXT ||
         result == PLAY_MOVIE_RESULT_SWITCH_MOVIE ||
         result == PLAY_MOVIE_RESULT_APP_EXIT ||
         result == PLAY_MOVIE_RESULT_HOME_EXIT ||
-        result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) ? 0 : 1;
+        result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT ||
+        result == PLAY_MOVIE_RESULT_SUSPEND_EXIT) ? 0 : 1;
 }

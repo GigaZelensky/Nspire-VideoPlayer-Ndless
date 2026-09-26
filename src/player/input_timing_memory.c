@@ -1,4 +1,32 @@
 #include "player_internal.h"
+#include "timing_math.h"
+#include "app_task_io.h"
+#include "player_idle.h"
+
+static touchpad_report_t g_input_touchpad_report;
+static bool g_input_touchpad_sampled;
+static bool g_input_touchpad_ok;
+
+int player_touchpad_scan(touchpad_report_t *report)
+{
+    int result;
+    memset(&g_input_touchpad_report, 0, sizeof(g_input_touchpad_report));
+    result = touchpad_scan(&g_input_touchpad_report);
+    g_input_touchpad_sampled = true;
+    g_input_touchpad_ok = result == 0;
+    if (report) *report = g_input_touchpad_report;
+    return result;
+}
+
+bool player_key_pressed(t_key key)
+{
+    if (key.tpad_arrow != TPAD_ARROW_NONE && is_touchpad) {
+        if (!g_input_touchpad_sampled) player_touchpad_scan(NULL);
+        return g_input_touchpad_ok && g_input_touchpad_report.pressed &&
+            g_input_touchpad_report.arrow == key.tpad_arrow;
+    }
+    return isKeyPressed(key) ? true : false;
+}
 
 void pointer_init(PointerState *pointer)
 {
@@ -28,7 +56,9 @@ bool pointer_update(PointerState *pointer)
     bool current_down = false;
     bool previous_down;
     bool has_touch_position;
-    if (!pointer->info || touchpad_scan(&report) != 0) {
+    pointer->moved = false;
+    if (!pointer->info && is_touchpad) player_touchpad_scan(NULL);
+    if (!pointer->info || player_touchpad_scan(&report) != 0) {
         pointer->press_edge = false;
         pointer->release_edge = false;
         return false;
@@ -284,7 +314,9 @@ MemoryStats query_memory_stats(const Movie *movie)
     if (movie->chunk_index) {
         stats.used_bytes += (size_t) movie->header.chunk_count * sizeof(ChunkIndexEntry);
     }
-    if (movie->subtitles) {
+    if (movie->subtitle_storage) {
+        stats.used_bytes += movie->subtitle_storage_size;
+    } else if (movie->subtitles) {
         stats.used_bytes += (size_t) movie->header.subtitle_count * sizeof(SubtitleCue);
     }
 
@@ -292,21 +324,25 @@ MemoryStats query_memory_stats(const Movie *movie)
     if (movie->framebuffer) {
         stats.used_bytes += framebuffer_words * sizeof(uint16_t);
     }
-    if (movie->frame_offsets && movie->loaded_chunk >= 0 && (uint32_t) movie->loaded_chunk < movie->header.chunk_count) {
-        stats.used_bytes += (size_t) movie->chunk_index[movie->loaded_chunk].frame_count * sizeof(uint32_t);
+    if (movie->frame_offsets_allocation) {
+        stats.used_bytes += movie->frame_offsets_capacity * sizeof(uint32_t);
     }
     if (movie->chunk_storage && !movie->chunk_storage_in_sram) {
-        stats.used_bytes += movie->chunk_storage_size;
+        stats.used_bytes += movie->chunk_storage_capacity;
     }
 
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
-        if (movie->prefetched[index].chunk_index >= 0 && movie->prefetched[index].chunk_storage) {
-            chunk_prefetch_bytes += movie->prefetched[index].chunk_storage_size;
+        if (movie->prefetched[index].chunk_storage) {
+            chunk_prefetch_bytes += movie->prefetched[index].chunk_capacity;
         }
     }
 
+    chunk_prefetch_bytes += movie_async_buffer_bytes(movie);
     stats.prefetched_bytes = chunk_prefetch_bytes;
     stats.used_bytes += chunk_prefetch_bytes;
+    stats.used_bytes += screenshot_writer_pending_bytes();
+    stats.used_bytes += app_task_io_memory_bytes();
+    stats.used_bytes += h264_lookahead_memory_bytes(movie);
     stats.total_bytes = APP_RAM_TARGET_BYTES;
     stats.free_bytes = stats.total_bytes > stats.used_bytes
         ? (stats.total_bytes - stats.used_bytes)
@@ -339,7 +375,9 @@ uint64_t movie_frame_interval_ticks(const Movie *movie)
     if (!movie->header.fps_num) {
         return 0;
     }
-    return (((uint64_t) monotonic_clock_ticks_per_second()) * movie->header.fps_den) / movie->header.fps_num;
+    uint32_t numerator = movie->timing_fps_num ? movie->timing_fps_num : movie->header.fps_num;
+    uint32_t denominator = movie->timing_fps_den ? movie->timing_fps_den : movie->header.fps_den;
+    return player_div_u64(((uint64_t) monotonic_clock_ticks_per_second()) * denominator, numerator);
 }
 
 uint32_t tab_hold_frame_repeat_interval_ms(const Movie *movie)
@@ -373,11 +411,14 @@ uint32_t movie_header_frame_time_ms(const MovieHeader *header, uint32_t frame_in
     if (!header || !header->fps_num) {
         return 0;
     }
-    return (uint32_t) (((uint64_t) frame_index * 1000ULL * header->fps_den) / header->fps_num);
+    return (uint32_t) player_div_u64((uint64_t) frame_index * 1000ULL * header->fps_den, header->fps_num);
 }
 
 uint32_t movie_frame_time_ms(const Movie *movie, uint32_t frame_index)
 {
+    if (movie && movie->timing_fps_num && movie->timing_fps_den) {
+        return (uint32_t) player_div_u64((uint64_t) frame_index * 1000U * movie->timing_fps_den, movie->timing_fps_num);
+    }
     return movie_header_frame_time_ms(movie ? &movie->header : NULL, frame_index);
 }
 
@@ -386,8 +427,10 @@ uint64_t movie_frame_time_scaled_ticks(const Movie *movie, uint32_t frame_index,
     if (!movie->header.fps_num || !rate || !rate->numerator) {
         return 0;
     }
-    return (((uint64_t) frame_index) * monotonic_clock_ticks_per_second() * movie->header.fps_den * rate->denominator)
-        / (((uint64_t) movie->header.fps_num) * rate->numerator);
+    uint32_t numerator = movie->timing_fps_num ? movie->timing_fps_num : movie->header.fps_num;
+    uint32_t denominator = movie->timing_fps_den ? movie->timing_fps_den : movie->header.fps_den;
+    return player_div_u64(((uint64_t) frame_index) * monotonic_clock_ticks_per_second() * denominator * rate->denominator,
+        ((uint64_t) numerator) * rate->numerator);
 }
 
 uint32_t movie_frames_from_ms(const Movie *movie, uint32_t total_ms)
@@ -395,7 +438,9 @@ uint32_t movie_frames_from_ms(const Movie *movie, uint32_t total_ms)
     if (!movie->header.fps_num || !movie->header.fps_den) {
         return 0;
     }
-    return (uint32_t) (((uint64_t) total_ms * movie->header.fps_num) / (1000ULL * movie->header.fps_den));
+    uint32_t numerator = movie->timing_fps_num ? movie->timing_fps_num : movie->header.fps_num;
+    uint32_t denominator = movie->timing_fps_den ? movie->timing_fps_den : movie->header.fps_den;
+    return (uint32_t) player_div_u64((uint64_t) total_ms * numerator, 1000ULL * denominator);
 }
 
 uint32_t movie_frames_from_scaled_ticks(const Movie *movie, uint64_t total_ticks, const PlaybackRate *rate)
@@ -403,8 +448,10 @@ uint32_t movie_frames_from_scaled_ticks(const Movie *movie, uint64_t total_ticks
     if (!movie->header.fps_num || !movie->header.fps_den || !rate || !rate->denominator) {
         return 0;
     }
-    return (uint32_t) ((total_ticks * movie->header.fps_num * rate->numerator)
-        / (((uint64_t) monotonic_clock_ticks_per_second()) * movie->header.fps_den * rate->denominator));
+    uint32_t numerator = movie->timing_fps_num ? movie->timing_fps_num : movie->header.fps_num;
+    uint32_t denominator = movie->timing_fps_den ? movie->timing_fps_den : movie->header.fps_den;
+    return (uint32_t) player_div_u64(total_ticks * numerator * rate->numerator,
+        ((uint64_t) monotonic_clock_ticks_per_second()) * denominator * rate->denominator);
 }
 
 uint32_t movie_duration_ms(const Movie *movie)
@@ -412,9 +459,11 @@ uint32_t movie_duration_ms(const Movie *movie)
     return movie_frame_time_ms(movie, movie->header.frame_count);
 }
 
-void reset_playback_timeline(const Movie *movie, const PlaybackRate *playback_rate, uint64_t *anchor_ticks, uint32_t *anchor_frame, uint64_t *next_frame_due_ticks)
+void reset_playback_timeline(Movie *movie, const PlaybackRate *playback_rate, uint64_t *anchor_ticks, uint32_t *anchor_frame, uint64_t *next_frame_due_ticks)
 {
     uint64_t now_ticks = monotonic_clock_now_ticks();
+    movie->cadence.valid = false;
+    playback_capture_reset_timeline(movie);
     *anchor_ticks = now_ticks;
     *anchor_frame = movie->current_frame;
     *next_frame_due_ticks = now_ticks + movie_frame_time_scaled_ticks(movie, 1, playback_rate);
@@ -517,6 +566,8 @@ void record_debug_displayed_frame(Movie *movie, uint32_t now_ms)
 
 bool playback_wait_key_pending(void)
 {
+    /* One I2C report for all four arrows and the subsequent pointer check. */
+    if (is_touchpad) player_touchpad_scan(NULL);
     return
         isKeyPressed(KEY_NSPIRE_ESC) ||
         isKeyPressed(KEY_NSPIRE_ENTER) ||
@@ -533,10 +584,10 @@ bool playback_wait_key_pending(void)
         isKeyPressed(KEY_NSPIRE_7) ||
         isKeyPressed(KEY_NSPIRE_8) ||
         isKeyPressed(KEY_NSPIRE_9) ||
-        isKeyPressed(KEY_NSPIRE_LEFT) ||
-        isKeyPressed(KEY_NSPIRE_RIGHT) ||
-        isKeyPressed(KEY_NSPIRE_UP) ||
-        isKeyPressed(KEY_NSPIRE_DOWN) ||
+        player_key_pressed(KEY_NSPIRE_LEFT) ||
+        player_key_pressed(KEY_NSPIRE_RIGHT) ||
+        player_key_pressed(KEY_NSPIRE_UP) ||
+        player_key_pressed(KEY_NSPIRE_DOWN) ||
         isKeyPressed(KEY_NSPIRE_DIVIDE) ||
         isKeyPressed(KEY_NSPIRE_EXP) ||
         isKeyPressed(KEY_NSPIRE_TENX) ||
@@ -554,12 +605,13 @@ bool playback_wait_key_pending(void)
         isKeyPressed(KEY_NSPIRE_C) ||
         isKeyPressed(KEY_NSPIRE_P) ||
         isKeyPressed(KEY_NSPIRE_R) ||
+        isKeyPressed(KEY_NSPIRE_N) ||
         on_key_pressed();
 }
 
 static bool key_snapshot_new_press(t_key key, bool *previous)
 {
-    bool down = isKeyPressed(key) ? true : false;
+    bool down = player_key_pressed(key);
     bool pressed = down && !*previous;
 
     *previous = down;
@@ -575,11 +627,12 @@ static bool on_key_snapshot_new_press(bool *previous)
     return pressed;
 }
 
-void playback_key_snapshot_init(PlaybackKeySnapshot *snapshot)
+static void playback_key_snapshot_sample(PlaybackKeySnapshot *snapshot, bool refresh_touchpad)
 {
     if (!snapshot) {
         return;
     }
+    if (is_touchpad && (refresh_touchpad || !g_input_touchpad_sampled)) player_touchpad_scan(NULL);
 
     snapshot->esc = isKeyPressed(KEY_NSPIRE_ESC);
     snapshot->enter = isKeyPressed(KEY_NSPIRE_ENTER);
@@ -596,10 +649,10 @@ void playback_key_snapshot_init(PlaybackKeySnapshot *snapshot)
     snapshot->keypad_7 = isKeyPressed(KEY_NSPIRE_7);
     snapshot->keypad_8 = isKeyPressed(KEY_NSPIRE_8);
     snapshot->keypad_9 = isKeyPressed(KEY_NSPIRE_9);
-    snapshot->left = isKeyPressed(KEY_NSPIRE_LEFT);
-    snapshot->right = isKeyPressed(KEY_NSPIRE_RIGHT);
-    snapshot->up = isKeyPressed(KEY_NSPIRE_UP);
-    snapshot->down = isKeyPressed(KEY_NSPIRE_DOWN);
+    snapshot->left = player_key_pressed(KEY_NSPIRE_LEFT);
+    snapshot->right = player_key_pressed(KEY_NSPIRE_RIGHT);
+    snapshot->up = player_key_pressed(KEY_NSPIRE_UP);
+    snapshot->down = player_key_pressed(KEY_NSPIRE_DOWN);
     snapshot->divide = isKeyPressed(KEY_NSPIRE_DIVIDE);
     snapshot->exp = isKeyPressed(KEY_NSPIRE_EXP);
     snapshot->tenx = isKeyPressed(KEY_NSPIRE_TENX);
@@ -617,7 +670,14 @@ void playback_key_snapshot_init(PlaybackKeySnapshot *snapshot)
     snapshot->c = isKeyPressed(KEY_NSPIRE_C);
     snapshot->p = isKeyPressed(KEY_NSPIRE_P);
     snapshot->r = isKeyPressed(KEY_NSPIRE_R);
+    snapshot->n = isKeyPressed(KEY_NSPIRE_N);
+    snapshot->ctrl = isKeyPressed(KEY_NSPIRE_CTRL);
     snapshot->on = on_key_pressed() ? true : false;
+}
+
+void playback_key_snapshot_init(PlaybackKeySnapshot *snapshot)
+{
+    playback_key_snapshot_sample(snapshot,true);
 }
 
 bool playback_key_snapshot_new_press(PlaybackKeySnapshot *snapshot)
@@ -627,6 +687,7 @@ bool playback_key_snapshot_new_press(PlaybackKeySnapshot *snapshot)
     if (!snapshot) {
         return playback_wait_key_pending();
     }
+    if (is_touchpad) player_touchpad_scan(NULL);
 
     pending = key_snapshot_new_press(KEY_NSPIRE_ESC, &snapshot->esc) || pending;
     pending = key_snapshot_new_press(KEY_NSPIRE_ENTER, &snapshot->enter) || pending;
@@ -664,11 +725,13 @@ bool playback_key_snapshot_new_press(PlaybackKeySnapshot *snapshot)
     pending = key_snapshot_new_press(KEY_NSPIRE_C, &snapshot->c) || pending;
     pending = key_snapshot_new_press(KEY_NSPIRE_P, &snapshot->p) || pending;
     pending = key_snapshot_new_press(KEY_NSPIRE_R, &snapshot->r) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_N, &snapshot->n) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_CTRL, &snapshot->ctrl) || pending;
     pending = on_key_snapshot_new_press(&snapshot->on) || pending;
     return pending;
 }
 
-bool playback_wait_touchpad_pending(const PointerState *pointer)
+static bool playback_wait_touchpad_report_pending(const PointerState *pointer)
 {
     touchpad_report_t report;
     bool current_down;
@@ -676,9 +739,10 @@ bool playback_wait_touchpad_pending(const PointerState *pointer)
     int dx;
     int dy;
 
-    if (!pointer || !pointer->info || touchpad_scan(&report) != 0) {
+    if (!pointer || !pointer->info || !g_input_touchpad_ok) {
         return false;
     }
+    report = g_input_touchpad_report;
     current_down = (report.pressed && report.arrow == TPAD_ARROW_CLICK) ? true : false;
     if (current_down != pointer->down) {
         return true;
@@ -704,6 +768,12 @@ bool playback_wait_touchpad_pending(const PointerState *pointer)
     return dx > POINTER_JITTER_THRESHOLD || dy > POINTER_JITTER_THRESHOLD;
 }
 
+bool playback_wait_touchpad_pending(const PointerState *pointer)
+{
+    player_touchpad_scan(NULL);
+    return playback_wait_touchpad_report_pending(pointer);
+}
+
 bool playback_wait_touchpad_click_pending(const PointerState *pointer)
 {
     touchpad_report_t report;
@@ -718,7 +788,7 @@ bool playback_wait_touchpad_click_pending(const PointerState *pointer)
 
 bool playback_wait_input_pending(const PointerState *pointer)
 {
-    return playback_wait_key_pending() || playback_wait_touchpad_pending(pointer);
+    return playback_wait_key_pending() || playback_wait_touchpad_report_pending(pointer);
 }
 
 bool prefetch_abort_requested(const PointerState *pointer)
@@ -726,21 +796,96 @@ bool prefetch_abort_requested(const PointerState *pointer)
     return pointer && playback_wait_input_pending(pointer);
 }
 
-void wait_until_ticks_playback(uint64_t target_ticks, const PointerState *pointer)
+void player_service_writes(const Movie *movie)
 {
+    bool capture = playback_capture_active(movie);
+    uint64_t started = capture ? monotonic_clock_now_ticks() : 0U;
+    app_task_io_service(8U);
+    if (capture) playback_capture_stage(movie,CAPTURE_WRITER_SERVICE,started,monotonic_clock_now_ticks());
+}
+
+static void playback_wait_snapshot(Movie *movie,PlaybackKeySnapshot *snapshot,bool refresh_touchpad)
+{
+    bool capture = playback_capture_active(movie);
+    uint64_t started = capture ? monotonic_clock_now_ticks() : 0U;
+    if (is_touchpad && refresh_touchpad) {
+        player_touchpad_scan(NULL);
+        if (capture) playback_capture_stage(movie,CAPTURE_WAIT_TOUCHPAD,started,monotonic_clock_now_ticks());
+    }
+    playback_key_snapshot_sample(snapshot,false);
+    if (capture) playback_capture_stage(movie,CAPTURE_WAIT_INPUT,started,monotonic_clock_now_ticks());
+}
+
+void wait_until_ticks_playback(Movie *movie, uint64_t target_ticks, const PointerState *pointer)
+{
+    PlaybackKeySnapshot previous_keys;
+    PlaybackKeySnapshot current_keys;
     uint64_t poll_interval_ticks = ((uint64_t) monotonic_clock_ticks_per_second()) / 1000U;
+    uint64_t touch_interval_ticks = ((uint64_t) monotonic_clock_ticks_per_second() * 4U + 999U) / 1000U;
+    uint64_t sleep_guard_ticks = (uint64_t) monotonic_clock_ticks_per_second() * (FRAME_PACING_SPIN_MS + 1U) / 1000U;
+    uint64_t writer_guard_ticks = ((uint64_t)monotonic_clock_ticks_per_second() * 8U + 999U) / 1000U;
     uint64_t next_poll_ticks = monotonic_clock_now_ticks();
+    uint64_t next_touch_ticks;
     uint64_t now_ticks = next_poll_ticks;
+    bool writer_turn = true;
+
+    /* Prefetch/writer service may have consumed the remaining slack. Do not
+     * delay an already-due presentation with a fresh bus transaction. */
+    if ((int64_t)(target_ticks - now_ticks) <= 0) return;
+
+    /* Keyboard matrix/ON reads are cheap. A touchpad report is a complete
+     * native I2C transaction; keep its own 4 ms cadence during this wait.
+     * Main-loop/seek snapshots still request a fresh report immediately. */
+    playback_wait_snapshot(movie,&previous_keys,true);
 
     if (poll_interval_ticks == 0) {
         poll_interval_ticks = 1;
     }
+    now_ticks = monotonic_clock_now_ticks();
+    next_poll_ticks = now_ticks + poll_interval_ticks;
+    next_touch_ticks = now_ticks + touch_interval_ticks;
     while ((int64_t) (target_ticks - now_ticks) > 0) {
-        if ((int64_t) (now_ticks - next_poll_ticks) >= 0) {
-            if (playback_wait_input_pending(pointer)) {
+        bool refresh_touchpad = is_touchpad && (int64_t) (now_ticks - next_touch_ticks) >= 0;
+        if ((int64_t) (now_ticks - next_poll_ticks) >= 0 || refresh_touchpad) {
+            playback_wait_snapshot(movie,&current_keys,refresh_touchpad);
+            if (memcmp(&current_keys, &previous_keys, sizeof(current_keys)) != 0 ||
+                playback_wait_touchpad_report_pending(pointer)) {
                 break;
             }
+            now_ticks = monotonic_clock_now_ticks();
             next_poll_ticks = now_ticks + poll_interval_ticks;
+            if (refresh_touchpad) next_touch_ticks = now_ticks + touch_interval_ticks;
+        }
+        /* Alternate a bounded storage turn with productive decode work.
+         * Otherwise an always-progressing lookahead consumes every roomy wait
+         * and a long native close receives only one tiny slice per frame. */
+        if(writer_turn && target_ticks>now_ticks &&
+           target_ticks-now_ticks>=writer_guard_ticks && app_task_io_pending()) {
+            bool capture=playback_capture_active(movie);
+            uint64_t started=capture?monotonic_clock_now_ticks():0U;
+            writer_turn=false;
+            app_task_io_service(8U);
+            now_ticks=monotonic_clock_now_ticks();
+            if(capture)playback_capture_stage(movie,CAPTURE_WAIT_IO,started,now_ticks);
+            /* Native work can exceed its cooperative budget. Return through
+             * the poll/deadline check before offering any further decode. */
+            if(now_ticks>=target_ticks || now_ticks>=next_poll_ticks ||
+               (is_touchpad && now_ticks>=next_touch_ticks))continue;
+        }
+        /* Service app-owned storage jobs and use a protected hardware sleep
+         * when idle. Spin only near the frame deadline. */
+        if(target_ticks>now_ticks && target_ticks-now_ticks>sleep_guard_ticks) {
+            bool progressed=playback_prepare_ahead(movie,target_ticks,pointer);
+            now_ticks=monotonic_clock_now_ticks();
+            if(progressed){writer_turn=true;continue;}
+        }
+        if (target_ticks > now_ticks && target_ticks - now_ticks > sleep_guard_ticks) {
+            /* A native transaction can exceed its cooperative slice (6.2 ms
+             * observed). Near due, retain CPU sleep but don't start a writer;
+             * after-present service guarantees progress even under overload. */
+            if (target_ticks-now_ticks < writer_guard_ticks && app_task_io_pending())
+                player_idle_sleep(1);
+            else player_delay_ms(1);
         }
         now_ticks = monotonic_clock_now_ticks();
     }
@@ -765,6 +910,7 @@ void clear_movie_picker_cache(MoviePickerCache *cache)
     if (!cache) {
         return;
     }
+    movie_picker_timing_stop();
     free_movie_files(cache->files, cache->count);
     memset(cache, 0, sizeof(*cache));
 }

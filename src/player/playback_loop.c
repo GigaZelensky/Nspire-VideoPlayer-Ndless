@@ -1,4 +1,65 @@
 #include "player_internal.h"
+#include "playback_render_gate.h"
+#include "playback_pacing.h"
+
+/* Cooperative file writes progress independently of diagnostic recording.
+ * Keep native file work away from a running frame's commit deadline. */
+static void playback_phase(const Movie *movie,unsigned phase,bool paused,const PlaybackRate *rate)
+{
+    if (paused || g_display_power_state.off || phase == PLAYER_CRASH_SEEK)
+        player_service_writes(movie);
+    player_crash_trace_tick(movie,phase,paused,rate);
+}
+
+/* 1: committed for scheduled rendering, 2: prepared but an input-interrupted
+ * wait returned early, 0: use ordinary decoding/recovery. Keep
+ * current_frame and the framebuffer on the visible image until the deadline;
+ * the caller can still render pointer/chrome changes after an early return. */
+static int prepare_h264_presentation(Movie *movie, uint32_t target_frame,
+    uint64_t due_ticks, uint64_t interval_ticks, const PointerState *pointer,
+    bool paused, const PlaybackRate *playback_rate, uint32_t *decode_elapsed_ms)
+{
+    bool capture = playback_capture_active(movie);
+    uint64_t started = monotonic_clock_now_ticks();
+    uint64_t prepared;
+    int ready;
+    *decode_elapsed_ms = 0;
+    playback_phase(movie, PLAYER_CRASH_DECODE, paused, playback_rate);
+    ready = h264_lookahead_prepare_target(movie, target_frame);
+    prepared = monotonic_clock_now_ticks();
+    if (capture) playback_capture_stage(movie, CAPTURE_DECODE, started, prepared);
+    *decode_elapsed_ms = monotonic_clock_ticks_to_ms(prepared - started);
+    if (ready <= 0) return 0;
+
+    if (prepared < due_ticks) {
+        uint32_t spare = monotonic_clock_ticks_to_ms(due_ticks - prepared);
+        if (spare > 1U) prefetch_tick(movie, false, spare - 1U, pointer);
+        uint64_t wait_started = monotonic_clock_now_ticks();
+        if (capture) playback_capture_stage(movie, CAPTURE_PREFETCH, prepared, wait_started);
+        playback_phase(movie, PLAYER_CRASH_WAIT, paused, playback_rate);
+        wait_until_ticks_playback(movie, due_ticks, pointer);
+        if (capture) playback_capture_stage(movie, CAPTURE_WAIT, wait_started, monotonic_clock_now_ticks());
+    }
+    /* Background work can fail/cancel a later image during the wait. Preserve
+     * the ordinary decoder's existing reload/recovery path in that case. */
+    if (!h264_lookahead_active(movie) || !h264_lookahead_queued(movie)) return 0;
+    started = monotonic_clock_now_ticks();
+    if (started < due_ticks) return 2;
+
+    /* A UI-only redraw during an interrupted wait must not finish a pending
+     * capture for this future image. Begin capture only at the actual commit. */
+    if (capture) {
+        uint64_t setup_started = started;
+        playback_capture_frame_begin(movie, target_frame, due_ticks, interval_ticks);
+        started = monotonic_clock_now_ticks();
+        playback_capture_stage(movie, CAPTURE_BOOKKEEPING, setup_started, started);
+    }
+    if (!h264_lookahead_take(movie, target_frame)) return 0;
+    prepared = monotonic_clock_now_ticks();
+    if (capture) playback_capture_stage(movie, CAPTURE_DECODE, started, prepared);
+    *decode_elapsed_ms += monotonic_clock_ticks_to_ms(prepared - started);
+    return 1;
+}
 
 typedef struct {
     bool active;
@@ -161,6 +222,7 @@ int play_movie(
     bool prev_minus = false;
     bool prev_on = false;
     bool paused = false;
+    bool pause_icon_only = false;
     bool esc_exit_suppressed_until_release = false;
     uint64_t frame_interval_ticks;
     uint64_t next_frame_due_ticks;
@@ -200,6 +262,13 @@ int play_movie(
     PlaybackUiMixes ui_mixes;
     ScaleMorphState scale_morph;
     BrightnessAnimation brightness_animation;
+    PlaybackRenderGate render_gate = {0};
+    uint32_t last_screenshot_revision = 0;
+    uint32_t last_render_night_revision = 0;
+    uint32_t last_render_visibility = 0;
+    int last_render_pointer_x = -1, last_render_pointer_y = -1;
+    bool last_render_pointer_visible = false;
+    int last_render_buffer_chunks[PREFETCH_CHUNK_COUNT + 1] = {0};
     PlaybackPressTarget playback_press_target = PLAYBACK_PRESS_NONE;
     PointerState pointer;
     bool help_menu_open = false;
@@ -256,6 +325,7 @@ int play_movie(
         snprintf(playback_title, sizeof(playback_title), "%s", movie_filename ? movie_filename : "");
     }
 
+    playback_capture_release();
     if (debug_is_runtime_logging_enabled()) {
         g_debug_ring_count = 0;
         g_debug_ring_next = 0;
@@ -274,6 +344,13 @@ int play_movie(
     }
     loading_progress_init(&loading_progress, screen, loading_snapshot, fonts, "Loading", true);
     loading_progress_tick(&loading_progress, true);
+    /* Decoder-only resources are deferred until a movie is actually opened,
+     * after the loading UI is visible. Keep SRAM and its tables for reuse. */
+    static bool decoder_platform_attempted;
+    if (!decoder_platform_attempted) {
+        decoder_platform_attempted = true;
+        if (has_colors && sram_init() && sram_uses_native_clone()) h264bsdInitSramTables();
+    }
     cleanup_deferred_playback_movie();
     loading_progress_tick(&loading_progress, false);
     flush_queued_history_save(&g_pending_history_save, "loading");
@@ -336,6 +413,10 @@ int play_movie(
         subtitle_placement,
         selected_subtitle_track_supports_auto_positioning(&movie)
     );
+    if (movie.header.subtitle_count) {
+        nSDL_Font *subtitle_white, *subtitle_outline;
+        subtitle_fonts_for_style(fonts, subtitle_font_index, &subtitle_white, &subtitle_outline);
+    }
     if (startup_has_resume && resume_frame < movie.header.frame_count) {
         int resume_choice = 1;
 
@@ -352,12 +433,16 @@ int play_movie(
                 &loading_snapshot
             );
             if (resume_choice == RESUME_PROMPT_RESULT_HOME_EXIT ||
-                resume_choice == RESUME_PROMPT_RESULT_SCRATCHPAD_EXIT) {
+                resume_choice == RESUME_PROMPT_RESULT_SCRATCHPAD_EXIT ||
+                resume_choice == RESUME_PROMPT_RESULT_SUSPEND_EXIT) {
                 if (loading_snapshot) {
                     SDL_FreeSurface(loading_snapshot);
                     loading_snapshot = NULL;
                 }
                 defer_playback_movie_cleanup(&movie);
+                if (resume_choice == RESUME_PROMPT_RESULT_SUSPEND_EXIT) {
+                    return PLAY_MOVIE_RESULT_SUSPEND_EXIT;
+                }
                 return resume_choice == RESUME_PROMPT_RESULT_SCRATCHPAD_EXIT
                     ? PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT
                     : PLAY_MOVIE_RESULT_HOME_EXIT;
@@ -420,8 +505,18 @@ int play_movie(
     prev_scratchpad = isKeyPressed(KEY_NSPIRE_SCRATCHPAD);
     prev_on = on_key_pressed() ? true : false;
     debug_set_metrics_collection(debug_is_runtime_logging_enabled());
+    if (debug_is_runtime_logging_enabled() && !playback_capture_start(&movie, path)) {
+        debug_set_runtime_logging(false);
+        release_debug_ring_storage();
+        debug_set_metrics_collection(false);
+    }
     frame_interval_ticks = movie_frame_interval_ticks(&movie);
     tab_hold_repeat_interval_ms = tab_hold_frame_repeat_interval_ms(&movie);
+    /* Start cooperative reads before filling the decoded-frame reserve. */
+    movie_async_start(&movie, path);
+    movie.lookahead_enabled=!realtime_frame_skip && movie_uses_h264(&movie);
+    if(movie.lookahead_enabled && !h264_lookahead_begin(&movie))movie.lookahead_enabled=false;
+    player_crash_trace_begin(&movie, path, paused, playback_rate_for_index(playback_rate_index));
     if (!resume_prompt_returned) {
         prefetch_tick(&movie, true, 1000, NULL);
     }
@@ -450,6 +545,7 @@ int play_movie(
     }
 
     while (1) {
+        screenshot_preview_tick(&screenshot_preview, monotonic_clock_now_ms());
         bool woke_from_idle_off = false;
         bool esc_down = isKeyPressed(KEY_NSPIRE_ESC) ? true : false;
         bool scratchpad_down = isKeyPressed(KEY_NSPIRE_SCRATCHPAD) ? true : false;
@@ -467,15 +563,17 @@ int play_movie(
             display_power_restore_animated(&g_display_power_state, monotonic_clock_now_ms());
         }
         if (scratchpad_edge) {
+            playback_capture_stop(&movie);
             display_power_off_for_exit(&g_display_power_state, screen, true);
             result = PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT;
             break;
         }
-        if (g_display_power_state.off && !g_display_power_state.off_from_idle && esc_down) {
+        if ((g_display_power_state.off || g_display_power_state.off_fade_active) && !g_display_power_state.off_from_idle && esc_down) {
             result = PLAY_MOVIE_RESULT_HOME_EXIT;
             break;
         }
-        if (!g_display_power_state.off && !help_menu_open && esc_down && !esc_exit_suppressed_until_release) {
+        if (!g_display_power_state.off && !g_display_power_state.off_fade_active && !help_menu_open && esc_down && !esc_exit_suppressed_until_release) {
+            playback_capture_stop(&movie);
             SDL_Surface *collapse_overlay = capture_screen_surface(screen);
 
             animate_movie_collapse_to_black(
@@ -489,13 +587,19 @@ int play_movie(
             break;
         }
 
+        bool capture_input = playback_capture_active(&movie);
+        uint64_t capture_input_started = capture_input ? monotonic_clock_now_ticks() : 0;
+        if (capture_input) playback_capture_tick(&movie, capture_input_started, paused || help_menu_open || g_display_power_state.off);
+        bool scheduled_frame_advanced = false;
         bool touchpad_click = pointer_update(&pointer);
         bool pointer_click = touchpad_click;
         bool pending_seek_consumed_click = false;
         uint64_t now_ticks = monotonic_clock_now_ticks();
         uint32_t now_ms = monotonic_clock_ticks_to_ms(now_ticks);
+        bool night_input = night_mode_poll(now_ms, !g_display_power_state.off);
         const PlaybackRate *playback_rate = playback_rate_for_index(playback_rate_index);
-        bool show_ui = help_menu_open || paused || (now_ms <= ui_visible_until);
+        playback_phase(&movie, PLAYER_CRASH_INPUT, paused, playback_rate);
+        bool show_ui = help_menu_open || (paused && !pause_icon_only) || ui_time_before(now_ms, ui_visible_until);
         bool ctrl_down = isKeyPressed(KEY_NSPIRE_CTRL) ? true : false;
         bool enter_key_was_down = prev_enter;
         bool keypad_5_was_down = prev_5;
@@ -537,10 +641,12 @@ int play_movie(
         bool seek_right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right) || (!ctrl_down && keypad_6_edge);
         bool seek_left_down = prev_left || (!ctrl_down && prev_4);
         bool seek_right_down = prev_right || (!ctrl_down && prev_6);
-        bool brightness_up_edge = key_pressed_edge(KEY_NSPIRE_UP, &prev_up) || (!ctrl_down && keypad_8_edge);
-        bool brightness_down_edge = key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) || (!ctrl_down && keypad_2_edge);
-        bool brightness_up_down = prev_up || (!ctrl_down && prev_8);
-        bool brightness_down_down = prev_down || (!ctrl_down && prev_2);
+        bool touchpad_up_edge = key_pressed_edge(KEY_NSPIRE_UP, &prev_up);
+        bool touchpad_down_edge = key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down);
+        bool brightness_up_edge = !ctrl_down && (touchpad_up_edge || keypad_8_edge);
+        bool brightness_down_edge = !ctrl_down && (touchpad_down_edge || keypad_2_edge);
+        bool brightness_up_down = !ctrl_down && (prev_up || prev_8);
+        bool brightness_down_down = !ctrl_down && (prev_down || prev_2);
         bool video_down_left_edge = ctrl_down && keypad_1_edge;
         bool video_down_edge = ctrl_down && keypad_2_edge;
         bool video_down_right_edge = ctrl_down && keypad_3_edge;
@@ -571,7 +677,9 @@ int play_movie(
         bool pointer_release_edge;
         bool show_ui_before_pointer_activation;
         bool input_activity;
+        bool chrome_input_activity;
 
+        if (capture_input) playback_capture_stage(&movie, CAPTURE_INPUT, capture_input_started, monotonic_clock_now_ticks());
         esc_exit_request = esc_edge || (!help_menu_open && esc_down && !esc_exit_suppressed_until_release);
 
         if (resume_input_guard_until_ms != 0U) {
@@ -589,7 +697,7 @@ int play_movie(
             pointer_click = true;
         }
         pointer_release_edge = pointer.release_edge || (enter_release_edge && pointer.visible);
-        input_activity =
+        chrome_input_activity =
             pointer_click ||
             pointer_release_edge ||
             pointer.moved ||
@@ -597,8 +705,6 @@ int play_movie(
             enter_edge ||
             enter_release_edge ||
             enter_down ||
-            space_edge ||
-            space_down ||
             tab_edge ||
             tab_down ||
             cat_edge ||
@@ -637,11 +743,22 @@ int play_movie(
             frame_skip_mode_edge ||
             theme_edge ||
             on_edge;
+        input_activity = chrome_input_activity || space_edge || space_down || night_input;
+        if (chrome_input_activity && pause_icon_only) {
+            pause_icon_only = false;
+            ui_transition_init(&ui_transitions.pause_indicator, false);
+            show_ui = help_menu_open || paused || ui_time_before(now_ms, ui_visible_until);
+        }
         if ((g_display_power_state.idle_dim_active ||
                 (g_display_power_state.off && g_display_power_state.off_from_idle)) &&
-            input_activity) {
+            input_activity && !woke_from_idle_off) {
             woke_from_idle_off = g_display_power_state.off && g_display_power_state.off_from_idle;
             display_power_restore_animated(&g_display_power_state, now_ms);
+            if (woke_from_idle_off && !g_display_power_state.off) {
+                render_gate.valid = false;
+                now_ticks = monotonic_clock_now_ticks();
+                now_ms = monotonic_clock_ticks_to_ms(now_ticks);
+            }
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (input_activity) {
@@ -666,7 +783,8 @@ int play_movie(
             screenshot_edge ||
             playback_mode_edge ||
             frame_skip_mode_edge ||
-            theme_edge) {
+            theme_edge ||
+            night_input) {
             playback_input_prefetch_quiet_until_ms = now_ms + PLAYBACK_INPUT_PREFETCH_GRACE_MS;
         }
         if (!space_down) {
@@ -688,7 +806,16 @@ int play_movie(
             show_ui = true;
         }
 
-        if (g_display_power_state.off) {
+        if (g_display_power_state.off_fade_active || g_display_power_state.idle_restore_active) {
+            /* An earlier idle-wake handler may already have spent time in
+             * native panel startup. Sample again before advancing its fade. */
+            now_ticks = monotonic_clock_now_ticks();
+            now_ms = monotonic_clock_ticks_to_ms(now_ticks);
+            display_power_tick_transition(&g_display_power_state, now_ms);
+            now_ticks = monotonic_clock_now_ticks();
+            now_ms = monotonic_clock_ticks_to_ms(now_ticks);
+        }
+        if (g_display_power_state.off || g_display_power_state.off_fade_active) {
             bool off_input_activity =
                 pointer_click ||
                 pointer_release_edge ||
@@ -714,11 +841,18 @@ int play_movie(
                 esc_edge ||
                 on_edge;
 
-            if (g_display_power_state.off_from_idle && off_input_activity) {
+            /* The earlier activity handler may already have attempted this
+             * idle wake. A failed native ON must not be repeated in one poll. */
+            if (!woke_from_idle_off && g_display_power_state.off_from_idle && off_input_activity) {
                 woke_from_idle_off = true;
                 display_power_restore_animated(&g_display_power_state, now_ms);
+                if (!g_display_power_state.off) {
+                    render_gate.valid = false;
+                    now_ticks = monotonic_clock_now_ticks();
+                    now_ms = monotonic_clock_ticks_to_ms(now_ticks);
+                }
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
-            } else if (on_edge || brightness_up_edge) {
+            } else if (!woke_from_idle_off && (on_edge || brightness_up_edge)) {
                 bool resume_playback = g_display_power_state.resume_playback_on_wake;
                 bool keep_brightness_badge =
                     brightness_up_edge &&
@@ -726,7 +860,14 @@ int play_movie(
                     (int32_t) (now_ms - (status_overlay_until + STATUS_BADGE_EXIT_ANIM_MS)) < 0;
 
                 brightness_animation_cancel(&brightness_animation);
-                display_power_on(&g_display_power_state);
+                display_power_restore_animated(&g_display_power_state, now_ms);
+                if (g_display_power_state.off) {
+                    player_delay_ms(16);
+                    continue;
+                }
+                now_ticks = monotonic_clock_now_ticks();
+                now_ms = monotonic_clock_ticks_to_ms(now_ticks);
+                render_gate.valid = false;
                 paused = !resume_playback;
                 if (!paused) {
                     paused_ui_quiet_until_ms = 0;
@@ -735,6 +876,7 @@ int play_movie(
                     hover_preview_needs_rebuffer = false;
                 }
                 if (brightness_up_edge) {
+                    display_power_cancel_brightness_restore(&g_display_power_state);
                     set_lcd_brightness(LCD_BRIGHTNESS_MAX);
                     brightness_animation_begin(
                         &brightness_animation,
@@ -776,11 +918,29 @@ int play_movie(
                     &playback_anchor_frame,
                     &next_frame_due_ticks
                 );
-                msleep(16);
                 continue;
             }
-            if (g_display_power_state.off) {
-                msleep(16);
+            if (g_display_power_state.off || g_display_power_state.off_fade_active) {
+                playback_phase(&movie, PLAYER_CRASH_DISPLAY_OFF, true, playback_rate);
+                if (display_power_should_suspend(&g_display_power_state, now_ms)) {
+                    queue_history_save_from_movie(&g_pending_history_save, &g_picker_cache,
+                        path, &movie, scale_mode, playback_rate_index, playback_mode,
+                        realtime_frame_skip, subtitle_font_index, subtitle_size,
+                        subtitle_placement, video_align_x, video_align_y);
+                    bool resume_playback = g_display_power_state.resume_playback_on_wake;
+                    if (player_standby(screen, &movie, path, false, &screenshot_preview)) {
+                        prev_on = true;
+                        if (!g_display_power_state.off) paused = !resume_playback;
+                        render_gate.valid = false;
+                        reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks,
+                            &playback_anchor_frame, &next_frame_due_ticks);
+                        player_crash_trace_begin(&movie, path, paused, playback_rate);
+                        continue;
+                    }
+                    result = PLAY_MOVIE_RESULT_SUSPEND_EXIT;
+                    break;
+                }
+                player_delay_ms(16);
                 continue;
             }
         }
@@ -801,8 +961,7 @@ int play_movie(
                 &playback_anchor_frame,
                 &next_frame_due_ticks
             );
-            display_power_off(&g_display_power_state, was_paused);
-            present_black_screen(screen);
+            display_power_request_off(&g_display_power_state, was_paused, now_ms);
             continue;
         }
 
@@ -814,7 +973,7 @@ int play_movie(
             sizeof(status_overlay_text)
         );
         if (g_display_power_state.off) {
-            msleep(16);
+            player_delay_ms(16);
             continue;
         }
 
@@ -980,6 +1139,7 @@ int play_movie(
             seek_context.abort_on_input = true;
             playback_key_snapshot_init(&seek_context.abort_key_snapshot);
             seek_context.target_frame = target_frame;
+            playback_phase(&movie, PLAYER_CRASH_SEEK, paused, playback_rate);
             if (!decode_to_frame_with_progress(
                     &movie,
                     target_frame,
@@ -1061,6 +1221,7 @@ int play_movie(
                 show_ui = true;
                 esc_exit_suppressed_until_release = true;
             } else {
+                playback_capture_stop(&movie);
                 SDL_Surface *collapse_overlay = capture_screen_surface(screen);
 
                 animate_movie_collapse_to_black(
@@ -1095,6 +1256,7 @@ int play_movie(
                 &pointer,
                 now_ms
             );
+            render_gate.valid = false;
             render_movie(
                 screen,
                 fonts,
@@ -1129,13 +1291,10 @@ int play_movie(
                 &ui_mixes
             );
             if (take_screenshot) {
-                char saved_path[MAX_PATH_LEN];
-                if (save_screenshot_bitmap(screen, path, saved_path, sizeof(saved_path))) {
-                    prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
-                }
+                request_screenshot(screen, path, &screenshot_preview);
             }
             if (display_power_tick_idle(&g_display_power_state, screen, monotonic_clock_now_ms(), true, true)) {
-                msleep(16);
+                player_delay_ms(16);
                 continue;
             }
             if (!playback_ui_mixes_animating(&ui_mixes) &&
@@ -1143,7 +1302,7 @@ int play_movie(
                 !ui_time_before(monotonic_clock_now_ms(), playback_input_prefetch_quiet_until_ms)) {
                 prefetch_tick(&movie, true, 1000, &pointer);
             }
-            msleep(16);
+            player_delay_ms(16);
             continue;
         }
         if (previous_video_edge || next_video_edge) {
@@ -1167,6 +1326,9 @@ int play_movie(
         }
         if (frame_skip_mode_edge) {
             realtime_frame_skip = !realtime_frame_skip;
+            movie.lookahead_enabled=!realtime_frame_skip && movie_uses_h264(&movie);
+            if(realtime_frame_skip){h264_lookahead_cancel(&movie);h264_lookahead_destroy(&movie);}
+            else if(movie.lookahead_enabled)h264_lookahead_begin(&movie);
             snprintf(
                 status_overlay_text,
                 sizeof(status_overlay_text),
@@ -1361,7 +1523,18 @@ int play_movie(
                 restart_after_pause = true;
             }
             reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
-            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
+            /* Keyboard pause owns only its badge, independently of the controls. */
+            pause_icon_only = true;
+            ui_visible_until = 0;
+            show_ui = false;
+            ui_transition_init(&ui_transitions.chrome, false);
+            ui_transition_init(&ui_transitions.title_strip, false);
+            ui_transition_init(&ui_transitions.seek_preview, false);
+            ui_transition_init(&ui_transitions.help_menu, false);
+            ui_transition_init(&ui_transitions.pause_indicator, true);
+            if (!paused) {
+                ui_transition_update(&ui_transitions.pause_indicator, false, now_ms, UI_CHROME_ANIM_MS);
+            }
         }
         if (divide_edge) {
             cycle_scale_mode_with_morph(&movie, &scale_morph, &scale_mode, video_align_x, video_align_y, now_ms);
@@ -1469,6 +1642,10 @@ int play_movie(
                 snprintf(status_overlay_text, sizeof(status_overlay_text), "DEBUG LOG OFF");
             } else {
                 debug_set_runtime_logging(true);
+                if (debug_is_runtime_logging_enabled() && !playback_capture_start(&movie, path)) {
+                    debug_set_runtime_logging(false);
+                    release_debug_ring_storage();
+                }
                 snprintf(
                     status_overlay_text,
                     sizeof(status_overlay_text),
@@ -1476,6 +1653,7 @@ int play_movie(
                     debug_is_runtime_logging_enabled() ? "DEBUG LOG ON" : "DEBUG LOG NO RAM"
                 );
                 if (debug_is_runtime_logging_enabled()) {
+                    player_crash_trace_begin(&movie,path,paused,playback_rate);
                     debug_tracef(
                         "debug logging enabled frame=%lu chunk=%d",
                         (unsigned long) movie.current_frame,
@@ -1656,6 +1834,7 @@ int play_movie(
                     seek_context.abort_on_input = true;
                     playback_key_snapshot_init(&seek_context.abort_key_snapshot);
                     seek_context.target_frame = target_frame;
+                    playback_phase(&movie, PLAYER_CRASH_SEEK, paused, playback_rate);
                     used_preview_frame = commit_seek_bar_preview_to_movie(&movie, &seek_preview, target_frame);
                     clear_seek_bar_preview(&seek_preview);
                     suppress_seek_bar_preview_rebuild(&seek_preview, seek_marker_x, target_frame);
@@ -1726,14 +1905,42 @@ int play_movie(
                 trigger_playback_badge_press(&ui_transitions, &playback_badge_press_until_ms, now_ms);
             }
         }
+        if (playback_capture_active(&movie)) {
+            CaptureSettings capture_settings = {0};
+            capture_settings.rate_num = playback_rate->numerator;
+            capture_settings.rate_den = playback_rate->denominator;
+            capture_settings.paused = paused || help_menu_open || g_display_power_state.off;
+            capture_settings.frame_skip = realtime_frame_skip;
+            capture_settings.scale_mode = (uint8_t) scale_mode;
+            capture_settings.subtitle_track = movie.selected_subtitle_track;
+            capture_settings.subtitle_font = (uint8_t) subtitle_font_index;
+            capture_settings.subtitle_size = (int8_t) subtitle_size;
+            capture_settings.subtitle_placement = (uint8_t) subtitle_placement;
+            capture_settings.memory_overlay = (uint8_t) memory_overlay_mode;
+            capture_settings.night_enabled = night_mode_is_enabled();
+            capture_settings.night_percent = (uint8_t) night_mode_percent();
+            playback_capture_state(&movie, &capture_settings, monotonic_clock_now_ticks());
+        }
         if (!paused && frame_interval_ticks > 0) {
-            if (now_ticks >= next_frame_due_ticks) {
+            now_ticks = monotonic_clock_now_ticks();
+            uint64_t scaled_interval = movie_frame_time_scaled_ticks(&movie, 1, playback_rate);
+            /* Keep the final frame for its full interval before repeat,
+             * auto-next or the end-of-video pause. There is nothing to decode
+             * ahead at that boundary. */
+            uint64_t decode_due = (realtime_frame_skip || movie.current_frame + 1U >= movie.header.frame_count) ? next_frame_due_ticks :
+                playback_decode_due(next_frame_due_ticks, scaled_interval, monotonic_clock_ticks_per_second());
+            if (now_ticks >= decode_due) {
                 uint64_t elapsed_ticks = now_ticks - playback_anchor_ticks;
                 uint32_t frames_to_advance = movie_frames_from_scaled_ticks(&movie, elapsed_ticks, playback_rate);
                 uint32_t target_frame = playback_anchor_frame + frames_to_advance;
                 bool lagged = false;
                 uint32_t lag_frames = 0;
                 uint32_t late_ms = 0;
+
+                /* The decoder may run ahead of the display clock. Smooth
+                 * playback always prepares exactly the next frame. */
+                if (!realtime_frame_skip && target_frame <= movie.current_frame)
+                    target_frame = movie.current_frame + 1U;
 
                 if (target_frame > movie.current_frame + 1U) {
                     lag_frames = target_frame - (movie.current_frame + 1U);
@@ -1744,15 +1951,7 @@ int play_movie(
                 }
                 if (lagged) {
                     late_ms = monotonic_clock_ticks_to_ms(now_ticks - next_frame_due_ticks);
-                    movie.diag_lag_event_count++;
-                    movie.diag_lag_frame_total += lag_frames;
-                    if (lag_frames > movie.diag_max_lag_frames) {
-                        movie.diag_max_lag_frames = lag_frames;
-                    }
-                    if (late_ms > movie.diag_max_late_ms) {
-                        movie.diag_max_late_ms = late_ms;
-                    }
-                    debug_tracef(
+                    if (!playback_capture_active(&movie)) debug_tracef(
                         "lag frame=%lu target=%lu late_ms=%lu lag_frames=%lu spare_prev=%lu",
                         (unsigned long) movie.current_frame,
                         (unsigned long) target_frame,
@@ -1797,24 +1996,53 @@ int play_movie(
                         ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
                     }
                 } else {
+                    bool waiting_for_presentation = false;
                     if (target_frame > movie.current_frame) {
                         uint32_t decode_start_ms = monotonic_clock_now_ms();
-                        uint32_t decode_end_ms;
-                        uint32_t decode_elapsed_ms;
+                        uint32_t decode_elapsed_ms = 0;
+                        bool capture_decode = playback_capture_active(&movie);
+                        uint64_t capture_decode_started = 0;
+                        uint64_t capture_due = next_frame_due_ticks;
+                        uint64_t capture_next_due = capture_due + scaled_interval;
+                        if (capture_decode) {
+                            capture_due = playback_anchor_ticks + movie_frame_time_scaled_ticks(
+                                &movie, target_frame - playback_anchor_frame, playback_rate);
+                            capture_next_due = playback_anchor_ticks + movie_frame_time_scaled_ticks(
+                                &movie, target_frame - playback_anchor_frame + 1U, playback_rate);
+                        }
+                        int prepared = 0;
+                        if (!realtime_frame_skip && h264_lookahead_active(&movie)) {
+                            prepared = prepare_h264_presentation(&movie, target_frame,
+                                capture_due, capture_next_due - capture_due, &pointer,
+                                paused, playback_rate, &decode_elapsed_ms);
+                            waiting_for_presentation = prepared == 2;
+                        }
 
-                        if (!decode_to_frame(&movie, target_frame)) {
-                            report_movie_decode_failure(&movie, path, "playback advance");
-                            result = -1;
-                            break;
+                        if (!prepared) {
+                            if (capture_decode) {
+                                uint64_t capture_setup_started = monotonic_clock_now_ticks();
+                                playback_capture_frame_begin(&movie, target_frame, capture_due, capture_next_due - capture_due);
+                                capture_decode_started = monotonic_clock_now_ticks();
+                                playback_capture_stage(&movie, CAPTURE_BOOKKEEPING, capture_setup_started, capture_decode_started);
+                            }
+                            playback_phase(&movie, PLAYER_CRASH_DECODE, paused, playback_rate);
+                            if (!decode_to_frame(&movie, target_frame)) {
+                                if (capture_decode) playback_capture_stage(&movie, CAPTURE_DECODE, capture_decode_started, monotonic_clock_now_ticks());
+                                report_movie_decode_failure(&movie, path, "playback advance");
+                                result = -1;
+                                break;
+                            }
+                            if (capture_decode) playback_capture_stage(&movie, CAPTURE_DECODE, capture_decode_started, monotonic_clock_now_ticks());
+                            decode_elapsed_ms = monotonic_clock_now_ms() - decode_start_ms;
                         }
-                        decode_end_ms = monotonic_clock_now_ms();
-                        decode_elapsed_ms = decode_end_ms - decode_start_ms;
-                        record_debug_displayed_frame(&movie, decode_end_ms);
-                        if (debug_should_collect_metrics()) {
-                            movie.diag_foreground_decode_count++;
+                        scheduled_frame_advanced = !waiting_for_presentation;
+                        if (scheduled_frame_advanced || decode_elapsed_ms) {
+                            if (debug_should_collect_metrics()) {
+                                movie.diag_foreground_decode_count++;
+                            }
+                            record_h264_foreground_decode_time(&movie, decode_elapsed_ms);
                         }
-                        record_h264_foreground_decode_time(&movie, decode_elapsed_ms);
-                        if (debug_is_runtime_logging_enabled() &&
+                        if (debug_is_runtime_logging_enabled() && !playback_capture_active(&movie) &&
                             (decode_elapsed_ms >= DEBUG_TRACE_FOREGROUND_MS || lagged)) {
                             debug_tracef(
                                 "fg frame=%lu ms=%lu lagged=%u chunk=%d direct=%lu",
@@ -1826,9 +2054,28 @@ int play_movie(
                             );
                         }
                     }
-                    if (lagged && !realtime_frame_skip) {
-                        reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
-                    } else {
+                    if (!realtime_frame_skip && scheduled_frame_advanced) {
+                        /* Decode first, then spend remaining presentation
+                         * slack on read-ahead and an input-interruptible wait.
+                         * No second image copy or decoder rollback is needed. */
+                        uint64_t ready_ticks = monotonic_clock_now_ticks();
+                        if (ready_ticks < next_frame_due_ticks) {
+                            uint32_t spare = monotonic_clock_ticks_to_ms(next_frame_due_ticks - ready_ticks);
+                            uint64_t work_started = ready_ticks;
+                            if (spare > 1U) prefetch_tick(&movie, false, spare - 1U, &pointer);
+                            if (playback_capture_active(&movie))
+                                playback_capture_stage(&movie, CAPTURE_PREFETCH, work_started, monotonic_clock_now_ticks());
+                            uint64_t wait_started = monotonic_clock_now_ticks();
+                            playback_phase(&movie, PLAYER_CRASH_WAIT, paused, playback_rate);
+                            wait_until_ticks_playback(&movie, next_frame_due_ticks, &pointer);
+                            if (playback_capture_active(&movie))
+                                playback_capture_stage(&movie, CAPTURE_WAIT, wait_started, monotonic_clock_now_ticks());
+                        }
+                        playback_anchor_ticks = playback_present_anchor(next_frame_due_ticks,
+                            monotonic_clock_now_ticks(), monotonic_clock_ticks_per_second());
+                        playback_anchor_frame = movie.current_frame;
+                        next_frame_due_ticks = playback_anchor_ticks + scaled_interval;
+                    } else if (!waiting_for_presentation) {
                         next_frame_due_ticks = playback_anchor_ticks + movie_frame_time_scaled_ticks(&movie, (target_frame - playback_anchor_frame) + 1, playback_rate);
                     }
                 }
@@ -1857,7 +2104,7 @@ int play_movie(
                     seek_badge_hide_elapsed_ms += seek_badge_frame_ms;
                 }
             }
-            show_ui = paused || (render_now_ms <= ui_visible_until);
+            show_ui = (paused && !pause_icon_only) || ui_time_before(render_now_ms, ui_visible_until);
             update_playback_ui_mixes(
                 &ui_transitions,
                 &ui_mixes,
@@ -1885,44 +2132,150 @@ int play_movie(
                 &pointer,
                 render_now_ms
             );
-            render_movie(
-                screen,
-                fonts,
-                &movie,
-                paused,
-                show_ui,
-                false,
-                scale_mode,
-                &scale_morph,
-                video_align_x,
-                video_align_y,
-                playback_rate,
-                memory_overlay_mode,
-                &subtitle_cache,
-                subtitle_font_index,
-                subtitle_font_overlay_visible,
-                subtitle_size,
-                subtitle_placement,
-                playback_title,
-                playback_detail,
-                status_overlay_text,
-                status_overlay_started_ms,
-                status_overlay_until,
-                &screenshot_preview,
-                &seek_preview,
-                render_now_ms,
-                &pointer,
-                pending_seek_ms,
-                seek_badge_ms,
-                seek_badge_started_ms,
-                seek_badge_hide_elapsed_ms,
-                &ui_mixes
-            );
-            if (take_screenshot) {
-                char saved_path[MAX_PATH_LEN];
-                if (save_screenshot_bitmap(screen, path, saved_path, sizeof(saved_path))) {
-                    prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
+            bool render_status_visible = ui_mixes.chrome && status_overlay_text[0] &&
+                playback_timed_badge_visible(render_now_ms, status_overlay_started_ms,
+                    status_overlay_until, STATUS_BADGE_EXIT_ANIM_MS);
+            uint32_t render_visibility = (show_ui ? 1U : 0U) |
+                (ui_mixes.chrome ? 2U : 0U) | (ui_mixes.help_menu ? 4U : 0U) |
+                (subtitle_font_overlay_visible ? 8U : 0U) | (render_status_visible ? 16U : 0U) |
+                (night_mode_status_visible(render_now_ms) ? 32U : 0U);
+            bool render_effects = playback_ui_mixes_animating(&ui_mixes) ||
+                brightness_animation.active ||
+                scale_morph_animating(&scale_morph, render_now_ms) ||
+                ui_theme_transition_active() ||
+                night_mode_status_animating(render_now_ms) ||
+                (render_status_visible && playback_timed_badge_animating(render_now_ms,
+                    status_overlay_started_ms, status_overlay_until, STATUS_BADGE_ANIM_MS, STATUS_BADGE_EXIT_ANIM_MS)) ||
+                seek_preview_surface_animating(&seek_preview, render_now_ms) ||
+                pending_seek_ms || seek_badge_ms || seek_bar_preview_decode_active(&seek_preview);
+            bool collect_render_metrics = debug_should_collect_metrics();
+            uint32_t render_night_revision = night_mode_revision();
+            bool render_pointer_changed = pointer_click || pointer_release_edge ||
+                playback_pointer_pixels_changed(last_render_pointer_visible, last_render_pointer_x,
+                    last_render_pointer_y, pointer.visible, pointer.x, pointer.y);
+            bool render_memory_refresh = playback_memory_refresh_due(&render_gate, render_now_ms,
+                memory_overlay_mode != MEMORY_OVERLAY_OFF);
+            int render_buffer_chunks[PREFETCH_CHUNK_COUNT + 1];
+            render_buffer_chunks[0] = movie.loaded_chunk;
+            for (int i = 0; i < PREFETCH_CHUNK_COUNT; ++i)
+                render_buffer_chunks[i + 1] = movie.prefetched[i].chunk_index;
+            bool render_buffers_changed = ui_mixes.chrome &&
+                memcmp(render_buffer_chunks, last_render_buffer_chunks, sizeof(render_buffer_chunks)) != 0;
+            bool render_input_changed = render_pointer_changed ||
+                enter_edge || enter_release_edge || space_edge || tab_edge || cat_edge || esc_edge ||
+                divide_edge || exp_edge || tenx_edge || speed_down_edge || speed_up_edge ||
+                seek_left_edge || seek_right_edge || previous_video_edge || next_video_edge ||
+                brightness_up_edge || brightness_down_edge ||
+                video_down_left_edge || video_down_edge || video_down_right_edge ||
+                video_left_edge || video_center_edge || video_right_edge ||
+                video_up_left_edge || video_up_edge || video_up_right_edge ||
+                subtitle_font_edge || subtitle_track_edge || subtitle_size_up_edge || subtitle_size_down_edge ||
+                memory_overlay_edge || debug_logging_edge || screenshot_edge ||
+                playback_mode_edge || frame_skip_mode_edge || theme_edge || on_edge || woke_from_idle_off ||
+                tab_repeat_step || seek_delta_ms || brightness_delta || speed_delta ||
+                render_memory_refresh || render_buffers_changed || render_visibility != last_render_visibility ||
+                screenshot_preview.revision != last_screenshot_revision ||
+                render_night_revision != last_render_night_revision;
+            uint32_t capture_render_reasons = 0;
+            if (playback_capture_active(&movie)) {
+                if (scheduled_frame_advanced) capture_render_reasons |= CAPTURE_RENDER_SCHEDULED_FRAME;
+                if (!render_gate.valid) capture_render_reasons |= CAPTURE_RENDER_INITIAL;
+                if (movie.current_frame != render_gate.frame) capture_render_reasons |= CAPTURE_RENDER_FRAME_CHANGED;
+                if (render_input_changed || take_screenshot) capture_render_reasons |= CAPTURE_RENDER_INPUT;
+                if (render_effects != render_gate.effects_active) capture_render_reasons |= CAPTURE_RENDER_EFFECTS_TRANSITION;
+                if (render_effects && (uint32_t)(render_now_ms - render_gate.presented_ms) >= 16U)
+                    capture_render_reasons |= CAPTURE_RENDER_EFFECTS_TICK;
+                if (render_pointer_changed) capture_render_reasons |= CAPTURE_RENDER_POINTER;
+                if (render_memory_refresh) capture_render_reasons |= CAPTURE_RENDER_MEMORY_REFRESH;
+                if (render_night_revision != last_render_night_revision) capture_render_reasons |= CAPTURE_RENDER_NIGHT_REVISION;
+                if (screenshot_preview.revision != last_screenshot_revision) capture_render_reasons |= CAPTURE_RENDER_SCREENSHOT_REVISION;
+            }
+            bool defer_ui_render = playback_defer_ui_render(&render_gate, movie.current_frame,
+                monotonic_clock_now_ticks(), next_frame_due_ticks, monotonic_clock_ticks_per_second(),
+                !paused && !help_menu_open && !realtime_frame_skip && frame_interval_ticks > 0,
+                scheduled_frame_advanced || take_screenshot || seek_delta_ms || pending_seek_ms ||
+                    on_edge || woke_from_idle_off ||
+                    g_display_power_state.off || g_display_power_state.off_fade_active);
+            if (!defer_ui_render && playback_render_needed(&render_gate, movie.current_frame, render_now_ms,
+                    render_input_changed || take_screenshot, render_effects)) {
+                playback_phase(&movie, PLAYER_CRASH_RENDER, paused, playback_rate);
+                if (playback_capture_active(&movie)) playback_capture_render_reason(&movie, capture_render_reasons);
+                last_render_night_revision = render_night_revision;
+                last_screenshot_revision = screenshot_preview.revision;
+                last_render_visibility = render_visibility;
+                last_render_pointer_visible = pointer.visible;
+                last_render_pointer_x = pointer.x;
+                last_render_pointer_y = pointer.y;
+                memcpy(last_render_buffer_chunks, render_buffer_chunks, sizeof(render_buffer_chunks));
+                uint32_t render_started_ms = collect_render_metrics ? monotonic_clock_now_ms() : 0;
+                bool capture_render = playback_capture_active(&movie);
+                uint64_t capture_render_started = monotonic_clock_now_ticks();
+                render_movie(
+                    screen,
+                    fonts,
+                    &movie,
+                    paused,
+                    show_ui,
+                    false,
+                    scale_mode,
+                    &scale_morph,
+                    video_align_x,
+                    video_align_y,
+                    playback_rate,
+                    memory_overlay_mode,
+                    &subtitle_cache,
+                    subtitle_font_index,
+                    subtitle_font_overlay_visible,
+                    subtitle_size,
+                    subtitle_placement,
+                    playback_title,
+                    playback_detail,
+                    status_overlay_text,
+                    status_overlay_started_ms,
+                    status_overlay_until,
+                    &screenshot_preview,
+                    &seek_preview,
+                    render_now_ms,
+                    &pointer,
+                    pending_seek_ms,
+                    seek_badge_ms,
+                    seek_badge_started_ms,
+                    seek_badge_hide_elapsed_ms,
+                    &ui_mixes
+                );
+                uint64_t presented_ticks=monotonic_clock_now_ticks();
+                playback_render_observed(&render_gate, presented_ticks - capture_render_started);
+                if (capture_render) {
+                    uint64_t capture_render_ended = presented_ticks;
+                    playback_capture_stage(&movie, CAPTURE_RENDER, capture_render_started, capture_render_ended);
+                    playback_capture_presented(&movie, capture_render_ended);
                 }
+                if (scheduled_frame_advanced) {
+                    /* Always account actual on-screen intervals, including
+                     * decode/render/I/O overruns hidden by smooth rebasing. */
+                    playback_cadence_present(&movie.cadence,presented_ticks,movie.current_frame,
+                        movie_frame_time_scaled_ticks(&movie,1,playback_rate));
+                    movie.diag_lag_event_count=movie.cadence.events;
+                    movie.diag_lag_frame_total=movie.cadence.missed_intervals;
+                    movie.diag_max_lag_frames=movie.cadence.max_missed_intervals;
+                    movie.diag_max_late_ms=monotonic_clock_ticks_to_ms(movie.cadence.max_lag);
+                    if(collect_render_metrics)record_debug_displayed_frame(&movie,monotonic_clock_ticks_to_ms(presented_ticks));
+                }
+                if (scheduled_frame_advanced) {
+                    player_crash_trace_presented(&movie);
+                    player_service_writes(&movie);
+                }
+                if (collect_render_metrics) {
+                    uint32_t render_elapsed_ms = monotonic_clock_now_ms() - render_started_ms;
+                    ++movie.diag_render_count;
+                    movie.diag_render_total_ms += render_elapsed_ms;
+                    if (render_elapsed_ms > movie.diag_render_max_ms) movie.diag_render_max_ms = render_elapsed_ms;
+                }
+            } else if (collect_render_metrics) {
+                ++movie.diag_render_skipped_count;
+            }
+            if (take_screenshot) {
+                request_screenshot(screen, path, &screenshot_preview);
             }
             if (display_power_tick_idle(
                     &g_display_power_state,
@@ -1932,7 +2285,7 @@ int play_movie(
                     true)) {
                 paused = true;
                 reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
-                msleep(16);
+                player_delay_ms(16);
                 continue;
             }
             if (seek_badge_hide_elapsed_ms >= SEEK_BADGE_EXIT_ANIM_MS) {
@@ -1957,6 +2310,7 @@ int play_movie(
             }
             bool paused_ui_busy = paused && (
                 playback_ui_mixes_animating(&ui_mixes) ||
+                night_mode_status_animating(idle_now_ms) ||
                 scale_morph_animating(&scale_morph, idle_now_ms) ||
                 seek_bar_preview_decode_active(&seek_preview) ||
                 seek_preview_surface_animating(&seek_preview, idle_now_ms) ||
@@ -1965,7 +2319,10 @@ int play_movie(
             );
 
             if (!paused_ui_busy) {
+                playback_phase(&movie, PLAYER_CRASH_PREFETCH, paused, playback_rate);
+                uint64_t capture_prefetch_started = playback_capture_active(&movie) ? monotonic_clock_now_ticks() : 0;
                 prefetch_tick(&movie, true, 1000, &pointer);
+                if (playback_capture_active(&movie)) playback_capture_stage(&movie, CAPTURE_PREFETCH, capture_prefetch_started, monotonic_clock_now_ticks());
             }
             if (!paused_ui_busy &&
                 debug_is_runtime_logging_enabled() &&
@@ -1973,12 +2330,20 @@ int play_movie(
                 movie.diag_last_snapshot_ms = now_ms;
                 debug_trace_runtime_snapshot(&movie, true, 1000U, playback_rate, "paused");
             }
-            msleep((paused_input_grace || playback_input_grace) ? 2 : 16);
+            {
+                uint64_t capture_wait_started = playback_capture_active(&movie) ? monotonic_clock_now_ticks() : 0;
+                playback_phase(&movie, PLAYER_CRASH_WAIT, paused, playback_rate);
+                player_delay_ms((paused_input_grace || playback_input_grace) ? 2 : 16);
+                if (playback_capture_active(&movie)) playback_capture_stage(&movie, CAPTURE_WAIT, capture_wait_started, monotonic_clock_now_ticks());
+            }
         } else {
             uint64_t after_render_ticks = monotonic_clock_now_ticks();
-            uint64_t spare_ticks = next_frame_due_ticks > after_render_ticks ? (next_frame_due_ticks - after_render_ticks) : 0;
+            uint64_t work_due_ticks = (realtime_frame_skip || movie.current_frame + 1U >= movie.header.frame_count) ? next_frame_due_ticks :
+                playback_decode_due(next_frame_due_ticks,
+                    movie_frame_time_scaled_ticks(&movie, 1, playback_rate), monotonic_clock_ticks_per_second());
+            uint64_t spare_ticks = work_due_ticks > after_render_ticks ? (work_due_ticks - after_render_ticks) : 0;
             uint32_t spare_ms = monotonic_clock_ticks_to_ms(spare_ticks);
-            uint64_t wait_target_ticks = next_frame_due_ticks;
+            uint64_t wait_target_ticks = work_due_ticks;
             bool playback_input_grace = ui_time_before(monotonic_clock_ticks_to_ms(after_render_ticks), playback_input_prefetch_quiet_until_ms);
             if (debug_should_collect_metrics()) {
                 if (spare_ms > movie.diag_max_spare_ms) {
@@ -1986,8 +2351,13 @@ int play_movie(
                 }
                 movie.diag_last_spare_ms = spare_ms;
             }
-            if (!playback_input_grace && !playback_wait_input_pending(&pointer)) {
+            /* Prefetch owns cancellation checks immediately before real I/O;
+             * don't scan the touchpad a second time for an idle cache tick. */
+            if (!playback_input_grace) {
+                playback_phase(&movie, PLAYER_CRASH_PREFETCH, paused, playback_rate);
+                uint64_t capture_prefetch_started = playback_capture_active(&movie) ? monotonic_clock_now_ticks() : 0;
                 prefetch_tick(&movie, false, spare_ms, &pointer);
+                if (playback_capture_active(&movie)) playback_capture_stage(&movie, CAPTURE_PREFETCH, capture_prefetch_started, monotonic_clock_now_ticks());
             }
             if (debug_is_runtime_logging_enabled() &&
                 now_ms - movie.diag_last_snapshot_ms >= DEBUG_SNAPSHOT_INTERVAL_MS) {
@@ -1995,19 +2365,26 @@ int play_movie(
                 debug_trace_runtime_snapshot(&movie, false, spare_ms, playback_rate, "play");
             }
             after_render_ticks = monotonic_clock_now_ticks();
-            spare_ticks = next_frame_due_ticks > after_render_ticks ? (next_frame_due_ticks - after_render_ticks) : 0;
+            spare_ticks = work_due_ticks > after_render_ticks ? (work_due_ticks - after_render_ticks) : 0;
             if (spare_ticks > 0) {
                 uint64_t max_wait_ticks = (((uint64_t) monotonic_clock_ticks_per_second()) * 8U) / 1000U;
                 if (spare_ticks > max_wait_ticks) {
                     wait_target_ticks = after_render_ticks + max_wait_ticks;
                 }
-                wait_until_ticks_playback(wait_target_ticks, &pointer);
+                uint64_t capture_wait_started = playback_capture_active(&movie) ? monotonic_clock_now_ticks() : 0;
+                playback_phase(&movie, PLAYER_CRASH_WAIT, paused, playback_rate);
+                wait_until_ticks_playback(&movie, wait_target_ticks, &pointer);
+                if (playback_capture_active(&movie)) playback_capture_stage(&movie, CAPTURE_WAIT, capture_wait_started, monotonic_clock_now_ticks());
             }
         }
     }
 
+    playback_capture_stop(&movie);
+    movie_async_stop(&movie);
+    player_crash_trace_end(&movie, result == PLAY_MOVIE_RESULT_ERROR ? PLAYER_CRASH_ERROR : PLAYER_CRASH_EXIT);
     if (result != PLAY_MOVIE_RESULT_HOME_EXIT &&
-        result != PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) {
+        result != PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT &&
+        result != PLAY_MOVIE_RESULT_SUSPEND_EXIT) {
         display_power_restore(&g_display_power_state, monotonic_clock_now_ms());
     }
     if (result == PLAY_MOVIE_RESULT_EXIT ||
@@ -2015,7 +2392,8 @@ int play_movie(
         result == PLAY_MOVIE_RESULT_SWITCH_MOVIE ||
         result == PLAY_MOVIE_RESULT_APP_EXIT ||
         result == PLAY_MOVIE_RESULT_HOME_EXIT ||
-        result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) {
+        result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT ||
+        result == PLAY_MOVIE_RESULT_SUSPEND_EXIT) {
         queue_history_save_from_movie(
             &g_pending_history_save,
             &g_picker_cache,
@@ -2032,13 +2410,7 @@ int play_movie(
             video_align_y
         );
     }
-    if (debug_is_runtime_logging_enabled() ||
-        (result != PLAY_MOVIE_RESULT_EXIT &&
-            result != PLAY_MOVIE_RESULT_AUTO_NEXT &&
-            result != PLAY_MOVIE_RESULT_SWITCH_MOVIE &&
-            result != PLAY_MOVIE_RESULT_APP_EXIT &&
-            result != PLAY_MOVIE_RESULT_HOME_EXIT &&
-            result != PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT)) {
+    if (debug_is_runtime_logging_enabled() || playback_capture_available(&movie)) {
         char log_path[MAX_PATH_LEN];
         const char *exit_reason = "normal-exit";
 
@@ -2052,6 +2424,8 @@ int play_movie(
             exit_reason = "home-exit";
         } else if (result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT) {
             exit_reason = "scratchpad-exit";
+        } else if (result == PLAY_MOVIE_RESULT_SUSPEND_EXIT) {
+            exit_reason = "idle-suspend";
         } else if (result != PLAY_MOVIE_RESULT_EXIT) {
             exit_reason = "aborted";
         }

@@ -1,3 +1,4 @@
+#include "utils/sram_tables.h"
 /*****************************************************************************
  *
  *  XVID MPEG-4 VIDEO CODEC
@@ -117,6 +118,14 @@ int xvid_gbl_init(xvid_gbl_init_t * init)
 		xvid_init_sram(init->sram_base, init->sram_size);
 	}
 
+    /* On the original CX, prioritize per-pixel color and compact VLC tables
+     * before large coefficient tables or macroblock storage. CX II keeps its
+     * established allocation order and 48 KiB arena. */
+    int small_sram = init->sram_base && init->sram_size <= 16U * 1024U;
+    if (small_sram) {
+        colorspace_init();
+        init_sram_tables();
+    }
 	/* Initialize the function pointers */
 	init_vlc_tables();
 
@@ -193,7 +202,7 @@ int xvid_gbl_init(xvid_gbl_init_t * init)
 	image_brightness = image_brightness_c;
 
 	/* Initialize internal colorspace transformation tables */
-	colorspace_init();
+	if (!small_sram) colorspace_init();
 
 	/* All colorspace transformation functions User Format->YV12 */
 	yv12_to_yv12    = yv12_to_yv12_c;

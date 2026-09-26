@@ -98,9 +98,15 @@ int pick_movie(
     picker_tooltip_hover_reset(&tooltip_hover);
     intro_started_ms = monotonic_clock_now_ms();
     while (1) {
+        screenshot_preview_tick(&screenshot_preview, monotonic_clock_now_ms());
         bool pointer_click = pointer_update(&pointer);
         uint32_t now_ms = monotonic_clock_now_ms();
+        if (g_display_power_state.off_fade_active || g_display_power_state.idle_restore_active) {
+            display_power_tick_transition(&g_display_power_state, now_ms);
+            now_ms = monotonic_clock_now_ms();
+        }
         bool ctrl_down = isKeyPressed(KEY_NSPIRE_CTRL) ? true : false;
+        bool night_input = night_mode_poll(now_ms, !g_display_power_state.off);
         bool keypad_2_edge = key_pressed_edge(KEY_NSPIRE_2, &prev_2);
         bool keypad_4_edge = key_pressed_edge(KEY_NSPIRE_4, &prev_4);
         bool keypad_5_edge = key_pressed_edge(KEY_NSPIRE_5, &prev_5);
@@ -114,10 +120,10 @@ int pick_movie(
         bool on_edge = on_key_pressed_edge(&prev_on);
         bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) || (!ctrl_down && keypad_5_edge);
         bool enter_down = prev_enter || (!ctrl_down && prev_5);
-        bool up_edge = key_pressed_edge(KEY_NSPIRE_UP, &prev_up) || (!ctrl_down && keypad_8_edge);
-        bool down_edge = key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) || (!ctrl_down && keypad_2_edge);
-        bool up_down = prev_up || (!ctrl_down && prev_8);
-        bool down_down = prev_down || (!ctrl_down && prev_2);
+        bool up_edge = (key_pressed_edge(KEY_NSPIRE_UP, &prev_up) || keypad_8_edge) && !ctrl_down;
+        bool down_edge = (key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) || keypad_2_edge) && !ctrl_down;
+        bool up_down = !ctrl_down && (prev_up || prev_8);
+        bool down_down = !ctrl_down && (prev_down || prev_2);
         bool left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || (!ctrl_down && keypad_4_edge);
         bool right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right) || (!ctrl_down && keypad_6_edge);
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer);
@@ -148,6 +154,7 @@ int pick_movie(
             esc_edge ||
             esc_down ||
             theme_edge ||
+            night_input ||
             screenshot_edge ||
             on_edge ||
             enter_edge ||
@@ -164,28 +171,40 @@ int pick_movie(
             input_activity) {
             woke_from_idle_off = g_display_power_state.off && g_display_power_state.off_from_idle;
             display_power_restore_animated(&g_display_power_state, now_ms);
+            if (woke_from_idle_off && !g_display_power_state.off)
+                now_ms = monotonic_clock_now_ms();
         }
 
         if (scratchpad_edge) {
+            movie_picker_timing_stop();
             display_power_off_for_exit(&g_display_power_state, screen, true);
             clear_screenshot_preview(&screenshot_preview);
             return PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT;
         }
-        if (g_display_power_state.off) {
+        if (g_display_power_state.off || g_display_power_state.off_fade_active) {
+            movie_picker_timing_stop();
             if (esc_down) {
                 clear_screenshot_preview(&screenshot_preview);
                 return PLAY_MOVIE_RESULT_HOME_EXIT;
             }
-            if (on_edge) {
-                display_power_restore(&g_display_power_state, now_ms);
+            if (on_edge && !woke_from_idle_off) {
+                display_power_restore_animated(&g_display_power_state, now_ms);
+            } else if (display_power_should_suspend(&g_display_power_state, now_ms)) {
+                if (player_standby(screen, NULL, directory, true, &screenshot_preview)) {
+                    prev_on = true;
+                    continue;
+                }
+                clear_screenshot_preview(&screenshot_preview);
+                return PLAY_MOVIE_RESULT_SUSPEND_EXIT;
             }
-            msleep(16);
+            if (g_display_power_state.off || g_display_power_state.off_fade_active)
+                player_delay_ms(16);
             continue;
         }
         if (on_edge && !woke_from_idle_off) {
-            display_power_off(&g_display_power_state, true);
-            present_black_screen(screen);
-            msleep(16);
+            movie_picker_timing_stop();
+            display_power_request_off(&g_display_power_state, true, now_ms);
+            player_delay_ms(16);
             continue;
         }
         if (input_activity) {
@@ -386,6 +405,7 @@ int pick_movie(
             PICKER_PRESS_RELEASE_ANIM_MS
         );
         if (activated_index >= 0) {
+            movie_picker_timing_stop();
             uint32_t exit_started_ms = monotonic_clock_now_ms();
             PointerState hidden_pointer = pointer;
 
@@ -440,7 +460,7 @@ int pick_movie(
                 if (exit_elapsed_ms >= PICKER_EXIT_TO_LOADING_ANIM_MS && loading_mix >= 255) {
                     break;
                 }
-                msleep(16);
+                player_delay_ms(16);
             }
             strncpy(selected_path, files[activated_index].path, selected_size - 1);
             selected_path[selected_size - 1] = '\0';
@@ -491,13 +511,11 @@ int pick_movie(
             0
         );
         if (screenshot_edge) {
-            char saved_path[MAX_PATH_LEN];
-            if (save_screenshot_bitmap_in_directory(screen, directory, saved_path, sizeof(saved_path))) {
-                prepare_screenshot_preview(&screenshot_preview, screen, saved_path);
-            }
+            request_screenshot_in_directory(screen, directory, &screenshot_preview);
         }
         if (display_power_tick_idle(&g_display_power_state, screen, monotonic_clock_now_ms(), true, true)) {
-            msleep(16);
+            movie_picker_timing_stop();
+            player_delay_ms(16);
             continue;
         }
         if (!deferred_movie_cleanup_done &&
@@ -562,10 +580,14 @@ int pick_movie(
             }
         }
         if (esc_edge && !canceled_press_with_esc) {
+            movie_picker_timing_stop();
             clear_screenshot_preview(&screenshot_preview);
             return -1;
         }
-        msleep(16);
+        /* Let the opening animation finish before opening metadata handles. */
+        if (!g_deferred_playback_movie && (uint32_t) (now_ms - intro_started_ms) >= PICKER_INTRO_ANIM_MS)
+            movie_picker_timing_tick(files, count, selected);
+        player_delay_ms(16);
     }
 }
 

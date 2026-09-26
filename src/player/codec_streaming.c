@@ -1,4 +1,5 @@
 #include "player_internal.h"
+#include "prefetch_io_policy.h"
 
 const PrefetchedChunk *find_prefetched_chunk_const(const Movie *movie, int chunk_index)
 {
@@ -16,6 +17,41 @@ const PrefetchedChunk *find_prefetched_chunk_const(const Movie *movie, int chunk
     return NULL;
 }
 
+static bool chunk_storage_layout(
+    const ChunkIndexEntry *entry,
+    const uint8_t *chunk_storage,
+    size_t chunk_storage_size,
+    size_t *out_header_size,
+    uint32_t *out_payload_size
+)
+{
+    size_t local_offset;
+    size_t remaining;
+    size_t header_size;
+    uint32_t payload_size;
+
+    if (!entry || !chunk_storage || entry->frame_count == 0) {
+        return false;
+    }
+    local_offset = (size_t) entry->frame_table_offset;
+    if (local_offset > chunk_storage_size) {
+        return false;
+    }
+    remaining = chunk_storage_size - local_offset;
+    /* Bound the multiplication by the remaining buffer before computing it. */
+    if (remaining < 4U || entry->frame_count > (remaining - 4U) / sizeof(uint32_t)) {
+        return false;
+    }
+    header_size = 4U + (size_t) entry->frame_count * sizeof(uint32_t);
+    payload_size = read_le32(chunk_storage + local_offset);
+    if (payload_size == 0 || payload_size > remaining - header_size) {
+        return false;
+    }
+    *out_header_size = header_size;
+    *out_payload_size = payload_size;
+    return true;
+}
+
 uint32_t h264_frame_size_from_offsets(const uint32_t *frame_offsets, uint32_t frame_count, size_t chunk_size, uint32_t local_index)
 {
     size_t start;
@@ -27,7 +63,7 @@ uint32_t h264_frame_size_from_offsets(const uint32_t *frame_offsets, uint32_t fr
 
     start = frame_offsets[local_index];
     end = (local_index + 1U < frame_count) ? frame_offsets[local_index + 1U] : chunk_size;
-    if (end < start || end > chunk_size) {
+    if (end <= start || end > chunk_size) {
         return 0;
     }
     return (uint32_t) (end - start);
@@ -36,7 +72,6 @@ uint32_t h264_frame_size_from_offsets(const uint32_t *frame_offsets, uint32_t fr
 uint32_t h264_frame_size_from_chunk_storage(const Movie *movie, const ChunkIndexEntry *entry, const uint8_t *chunk_storage, size_t chunk_storage_size, uint32_t local_index)
 {
     size_t local_offset;
-    size_t table_size;
     size_t header_size;
     uint32_t payload_size;
     uint32_t start;
@@ -47,14 +82,8 @@ uint32_t h264_frame_size_from_chunk_storage(const Movie *movie, const ChunkIndex
     }
 
     local_offset = (size_t) entry->frame_table_offset;
-    table_size = (size_t) entry->frame_count * sizeof(uint32_t);
-    header_size = 4U + table_size;
-    if (local_offset + header_size > chunk_storage_size) {
-        return 0;
-    }
-
-    payload_size = read_le32(chunk_storage + local_offset);
-    if (local_offset + header_size + payload_size > chunk_storage_size) {
+    if (!chunk_storage_layout(entry, chunk_storage, chunk_storage_size,
+                              &header_size, &payload_size)) {
         return 0;
     }
 
@@ -62,7 +91,7 @@ uint32_t h264_frame_size_from_chunk_storage(const Movie *movie, const ChunkIndex
     end = (local_index + 1U < entry->frame_count)
         ? read_le32(chunk_storage + local_offset + 4U + ((size_t) (local_index + 1U) * sizeof(uint32_t)))
         : payload_size;
-    if (end < start || end > payload_size) {
+    if (end <= start || end > payload_size) {
         return 0;
     }
     return end - start;
@@ -77,20 +106,20 @@ uint32_t estimate_h264_chunk_average_frame_bytes(const Movie *movie, const Chunk
     }
 
     payload_bytes = entry->unpacked_size;
-    {
-        size_t header_bytes = 4U + ((size_t) entry->frame_count * sizeof(uint32_t));
-        if (payload_bytes > header_bytes) {
-            payload_bytes -= header_bytes;
-        } else {
-            payload_bytes = 0;
-        }
+    if (entry->frame_table_offset > payload_bytes) {
+        return 0;
     }
+    payload_bytes -= entry->frame_table_offset;
+    if (payload_bytes < 4U || entry->frame_count > (payload_bytes - 4U) / sizeof(uint32_t)) {
+        return 0;
+    }
+    payload_bytes -= 4U + (size_t) entry->frame_count * sizeof(uint32_t);
 
     if (payload_bytes == 0) {
         return 0;
     }
 
-    return (uint32_t) ((payload_bytes + entry->frame_count - 1U) / entry->frame_count);
+    return (uint32_t) (1U + (payload_bytes - 1U) / entry->frame_count);
 }
 
 uint32_t estimate_h264_frame_bytes(const Movie *movie, uint32_t frame_index)
@@ -251,14 +280,25 @@ bool sync_h264_picture_params(Movie *movie, storage_t *decoder, bool force_commi
 
 bool reset_h264_decoder(Movie *movie)
 {
+    bool capture_reset;
+    bool reset_ok;
+    uint64_t reset_started_ticks;
+
     if (!movie || !movie->h264.decoder) {
         debug_failf("h264 decoder reset failed: decoder missing");
         return false;
     }
-    if (!reset_h264_storage_decoder(movie->h264.decoder, &movie->h264.decoder_initialized)) {
+    capture_reset = debug_is_runtime_logging_enabled();
+    reset_started_ticks = capture_reset ? monotonic_clock_now_ticks() : 0;
+    reset_ok = reset_h264_storage_decoder(movie->h264.decoder, &movie->h264.decoder_initialized);
+    if (capture_reset) {
+        playback_capture_io(movie, 4, movie->loaded_chunk, 0, reset_started_ticks, monotonic_clock_now_ticks());
+    }
+    if (!reset_ok) {
         return false;
     }
     movie->h264.headers_ready = false;
+    movie->h264.decoder_failed = false;
     movie->h264.full_width = 0;
     movie->h264.full_height = 0;
     movie->h264.crop_left = 0;
@@ -271,6 +311,10 @@ bool reset_h264_decoder(Movie *movie)
 
 bool reset_mpeg4_decoder(Movie *movie)
 {
+    bool capture_reset;
+    bool reset_ok;
+    uint64_t reset_started_ticks;
+
     if (!movie) {
         debug_failf("mpeg4 decoder reset failed: movie missing");
         return false;
@@ -278,10 +322,16 @@ bool reset_mpeg4_decoder(Movie *movie)
     if (!init_mpeg4_decoder_global()) {
         return false;
     }
-    if (!mpeg4_xvid_reset(
+    capture_reset = debug_is_runtime_logging_enabled();
+    reset_started_ticks = capture_reset ? monotonic_clock_now_ticks() : 0;
+    reset_ok = mpeg4_xvid_reset(
             &movie->mpeg4.decoder,
             (int) movie->header.video_width,
-            (int) movie->header.video_height)) {
+            (int) movie->header.video_height);
+    if (capture_reset) {
+        playback_capture_io(movie, 4, movie->loaded_chunk, 0, reset_started_ticks, monotonic_clock_now_ticks());
+    }
+    if (!reset_ok) {
         debug_failf("mpeg4 decoder reset failed: %s", mpeg4_xvid_last_error());
         return false;
     }
@@ -322,35 +372,142 @@ static bool prepare_movie_codec_for_loaded_chunk(Movie *movie, int previous_chun
         chunk_index == previous_chunk + 1) {
         clear_movie_codec_chunk_progress(movie);
         movie->mpeg4.discontinuity = true;
+        if (debug_is_runtime_logging_enabled()) {
+            playback_capture_io(movie, 5, chunk_index, 0, 0, 0);
+        }
+        return true;
+    }
+    if (movie->codec == MOVIE_CODEC_H264 && movie->h264.decoder &&
+        movie->h264.decoder_initialized && !movie->h264.decoder_failed &&
+        previous_chunk >= 0 && chunk_index == previous_chunk + 1) {
+        /* Each NVP chunk starts an independent IDR sequence. The decoder
+         * already handles its SPS/PPS and DPB reset, so keep its allocations
+         * across normal sequential playback. Rewinds/errors still reset. */
+        clear_movie_codec_chunk_progress(movie);
+        if (debug_is_runtime_logging_enabled()) {
+            playback_capture_io(movie, 5, chunk_index, 0, 0, 0);
+        }
         return true;
     }
     return reset_movie_codec_for_chunk(movie);
 }
 
-static inline uint32_t h264_pack_rgb565_pair(uint16_t left_pixel, uint16_t right_pixel)
+static inline bool h264_flat_luma_blocks(const uint8_t *plane, size_t stride, size_t width, size_t height)
 {
-    return ((uint32_t) right_pixel << 16) | left_pixel;
+    /* Only take the per-block flat-color branch when 3/8 of 128 spaced probes
+     * are constant. Dense scenes use the branch-free loop; cartoon backgrounds
+     * can reuse one exact RGB value for all four pixels sharing their chroma. */
+    unsigned flat=0;
+    if(width<64 || height<64) return false;
+    for(unsigned row=0;row<16;++row) {
+        size_t y=(((height-2U)*row)>>4)&~(size_t)1;
+        for(unsigned col=0;col<8;++col) {
+            size_t x=(((width-2U)*col)>>3)&~(size_t)1;
+            const uint8_t *p=plane+y*stride+x;
+            flat += p[0]==p[1] && p[0]==p[stride] && p[0]==p[stride+1];
+        }
+    }
+    return flat>=48;
 }
 
-static inline void h264_prefetch_yuv420_rows(
-    const uint8_t *restrict y_row0,
-    const uint8_t *restrict y_row1,
-    const uint8_t *restrict u_row,
-    const uint8_t *restrict v_row,
-    size_t x,
-    size_t crop_width
+static inline uint32_t h264_rgb565_pair(const uint8_t *row, const int32_t *y_base, const uint8_t *clip,
+    int32_t red, int32_t green, int32_t blue)
+{
+    /* floor(clamp8(fixed>>8)/8) == clamp5(fixed>>11), likewise green's
+     * 6-bit clamp at >>10. Biased chroma selects disjoint byte-table ranges.
+     * The ARM sequence packs both pixels without extra masks or compiler
+     * spills for intermediate channel values; the C fallback is identical. */
+#if defined(__arm__) && !defined(__thumb__)
+    uint32_t result, luma, value;
+    __asm__ volatile(
+        "ldrb %[value], [%[row]]\n\t"
+        "ldr %[luma], [%[ytab], %[value], lsl #2]\n\t"
+        "add %[value], %[luma], %[blue]\n\t"
+        "ldrb %[result], [%[clip], %[value], asr #11]\n\t"
+        "add %[value], %[luma], %[green]\n\t"
+        "ldrb %[value], [%[clip], %[value], asr #10]\n\t"
+        "orr %[result], %[result], %[value], lsl #5\n\t"
+        "add %[value], %[luma], %[red]\n\t"
+        "ldrb %[value], [%[clip], %[value], asr #11]\n\t"
+        "orr %[result], %[result], %[value], lsl #11\n\t"
+        "ldrb %[value], [%[row], #1]\n\t"
+        "ldr %[luma], [%[ytab], %[value], lsl #2]\n\t"
+        "add %[value], %[luma], %[blue]\n\t"
+        "ldrb %[value], [%[clip], %[value], asr #11]\n\t"
+        "orr %[result], %[result], %[value], lsl #16\n\t"
+        "add %[value], %[luma], %[green]\n\t"
+        "ldrb %[value], [%[clip], %[value], asr #10]\n\t"
+        "orr %[result], %[result], %[value], lsl #21\n\t"
+        "add %[value], %[luma], %[red]\n\t"
+        "ldrb %[value], [%[clip], %[value], asr #11]\n\t"
+        "orr %[result], %[result], %[value], lsl #27\n\t"
+        : [result] "=&r"(result), [luma] "=&r"(luma), [value] "=&r"(value)
+        : [row] "r"(row), [ytab] "r"(y_base), [clip] "r"(clip), [red] "r"(red), [green] "r"(green), [blue] "r"(blue)
+        : "memory");
+    return result;
+#else
+    int32_t l0=y_base[row[0]], l1=y_base[row[1]];
+    uint32_t p0=((uint32_t)clip[(l0+red)>>11]<<11)|((uint32_t)clip[(l0+green)>>10]<<5)|clip[(l0+blue)>>11];
+    uint32_t p1=((uint32_t)clip[(l1+red)>>11]<<11)|((uint32_t)clip[(l1+green)>>10]<<5)|clip[(l1+blue)>>11];
+    return p0|(p1<<16);
+#endif
+}
+
+static inline bool blit_h264_planes_to_rgb565_rows(
+    const Movie *movie,
+    const uint8_t *restrict y_plane,
+    const uint8_t *restrict u_plane,
+    const uint8_t *restrict v_plane,
+    size_t luma_stride,
+    size_t chroma_stride,
+    uint16_t *restrict dst_pixels,
+    size_t dst_pitch_pixels,
+    size_t crop_width,
+    size_t crop_height,
+    bool try_flat
 )
 {
-    const size_t prefetch_x = x + 64U;
+    const int32_t *restrict y_base = g_h264_color_tables->y_base;
+    const uint8_t *restrict clip = g_h264_color_tables->clip;
 
-    if (prefetch_x >= crop_width) {
-        return;
+    size_t y;
+    if (!movie || !y_plane || !u_plane || !v_plane || !dst_pixels || !crop_width || !crop_height || ((crop_width | crop_height) & 1U)) return false;
+    for (y=0;y<crop_height;y+=2U) {
+        const uint8_t *y0=y_plane+y*luma_stride, *y1=y0+luma_stride;
+        const uint8_t *u=u_plane+(y/2U)*chroma_stride, *v=v_plane+(y/2U)*chroma_stride;
+        uint16_t *d0=dst_pixels+y*dst_pitch_pixels, *d1=d0+dst_pitch_pixels;
+        const bool packed=(((uintptr_t)d0|(uintptr_t)d1)&3U)==0;
+        size_t x;
+        if(packed) {
+            uint32_t *w0=(uint32_t *)(void *)d0,*w1=(uint32_t *)(void *)d1;
+#pragma GCC unroll 1
+            for(x=0;x<crop_width;x+=2U) {
+                int32_t r,g,b;
+                h264_compute_chroma_terms(u[x/2U],v[x/2U],&r,&g,&b);
+                uint8_t sample=y0[x];
+                if(try_flat && sample==y0[x+1] && sample==y1[x] && sample==y1[x+1]) {
+                    int32_t luma=y_base[sample];
+                    uint32_t pixel=((uint32_t)clip[(luma+r)>>11]<<11)|((uint32_t)clip[(luma+g)>>10]<<5)|clip[(luma+b)>>11];
+                    pixel|=pixel<<16;
+                    w0[x/2U]=pixel;w1[x/2U]=pixel;
+                    continue;
+                }
+                w0[x/2U]=h264_rgb565_pair(y0+x,y_base,clip,r,g,b);
+                w1[x/2U]=h264_rgb565_pair(y1+x,y_base,clip,r,g,b);
+            }
+        } else {
+#pragma GCC unroll 1
+            for(x=0;x<crop_width;x+=2U) {
+                int32_t r,g,b,l0,l1;
+                h264_compute_chroma_terms(u[x/2U],v[x/2U],&r,&g,&b);
+                l0=y_base[y0[x]];l1=y_base[y0[x+1]];
+                d0[x]=(uint16_t)(((uint32_t)clip[(l0+r)>>11] << 11) | ((uint32_t)clip[(l0+g)>>10] << 5) | clip[(l0+b)>>11]);d0[x+1]=(uint16_t)(((uint32_t)clip[(l1+r)>>11] << 11) | ((uint32_t)clip[(l1+g)>>10] << 5) | clip[(l1+b)>>11]);
+                l0=y_base[y1[x]];l1=y_base[y1[x+1]];
+                d1[x]=(uint16_t)(((uint32_t)clip[(l0+r)>>11] << 11) | ((uint32_t)clip[(l0+g)>>10] << 5) | clip[(l0+b)>>11]);d1[x+1]=(uint16_t)(((uint32_t)clip[(l1+r)>>11] << 11) | ((uint32_t)clip[(l1+g)>>10] << 5) | clip[(l1+b)>>11]);
+            }
+        }
     }
-
-    player_prefetch_data(y_row0 + prefetch_x);
-    player_prefetch_data(y_row1 + prefetch_x);
-    player_prefetch_data(u_row + (prefetch_x / 2U));
-    player_prefetch_data(v_row + (prefetch_x / 2U));
+    return true;
 }
 
 bool blit_h264_planes_to_rgb565_target_with_crop(
@@ -366,314 +523,11 @@ bool blit_h264_planes_to_rgb565_target_with_crop(
     size_t crop_height
 )
 {
-    const int32_t *restrict y_base = g_h264_color_tables->y_base;
-    const uint16_t *restrict red565 = g_h264_color_tables->red565;
-    const uint16_t *restrict green565 = g_h264_color_tables->green565;
-    const uint16_t *restrict blue565 = g_h264_color_tables->blue565;
-    size_t y;
-
-    if (!movie || !y_plane || !u_plane || !v_plane || !dst_pixels || crop_width == 0 || crop_height == 0) {
-        return false;
-    }
-
-    for (y = 0; y < crop_height; y += 2U) {
-        const uint8_t *restrict y_row0 = y_plane + ((size_t) y * luma_stride);
-        const uint8_t *restrict y_row1 = y_row0 + luma_stride;
-        const uint8_t *restrict u_row = u_plane + ((size_t) (y / 2U) * chroma_stride);
-        const uint8_t *restrict v_row = v_plane + ((size_t) (y / 2U) * chroma_stride);
-        uint16_t *restrict dst_row0_16 = dst_pixels + ((size_t) y * dst_pitch_pixels);
-        uint16_t *restrict dst_row1_16 = dst_row0_16 + dst_pitch_pixels;
-        const bool packed_writes = ((((uintptr_t) dst_row0_16) | ((uintptr_t) dst_row1_16)) & (sizeof(uint32_t) - 1U)) == 0U;
-        const size_t main_width = crop_width & ~(size_t) 3U;
-        size_t x;
-
-        if (packed_writes) {
-            uint32_t *restrict dst_row0 = (uint32_t *) (void *) dst_row0_16;
-            uint32_t *restrict dst_row1 = (uint32_t *) (void *) dst_row1_16;
-
-            for (x = 0; x < main_width; x += 4U) {
-                const size_t chroma_index = x / 2U;
-                const size_t dst_index = x / 2U;
-                int32_t r0;
-                int32_t g0;
-                int32_t b0;
-                int32_t r1;
-                int32_t g1;
-                int32_t b1;
-                uint16_t p0;
-                uint16_t p1;
-                uint16_t p2;
-                uint16_t p3;
-                int32_t luma0;
-                int32_t luma1;
-
-                if ((x & 31U) == 0U) {
-                    h264_prefetch_yuv420_rows(y_row0, y_row1, u_row, v_row, x, crop_width);
-                }
-
-                h264_compute_chroma_terms(
-                    u_row[chroma_index],
-                    v_row[chroma_index],
-                    &r0,
-                    &g0,
-                    &b0
-                );
-                h264_compute_chroma_terms(
-                    u_row[chroma_index + 1U],
-                    v_row[chroma_index + 1U],
-                    &r1,
-                    &g1,
-                    &b1
-                );
-
-                luma0 = y_base[y_row0[x]];
-                luma1 = y_base[y_row0[x + 1U]];
-                p0 = (uint16_t) (
-                    red565[h264_clip_byte((luma0 + r0) >> 8)] |
-                    green565[h264_clip_byte((luma0 + g0) >> 8)] |
-                    blue565[h264_clip_byte((luma0 + b0) >> 8)]
-                );
-                p1 = (uint16_t) (
-                    red565[h264_clip_byte((luma1 + r0) >> 8)] |
-                    green565[h264_clip_byte((luma1 + g0) >> 8)] |
-                    blue565[h264_clip_byte((luma1 + b0) >> 8)]
-                );
-                luma0 = y_base[y_row0[x + 2U]];
-                luma1 = y_base[y_row0[x + 3U]];
-                p2 = (uint16_t) (
-                    red565[h264_clip_byte((luma0 + r1) >> 8)] |
-                    green565[h264_clip_byte((luma0 + g1) >> 8)] |
-                    blue565[h264_clip_byte((luma0 + b1) >> 8)]
-                );
-                p3 = (uint16_t) (
-                    red565[h264_clip_byte((luma1 + r1) >> 8)] |
-                    green565[h264_clip_byte((luma1 + g1) >> 8)] |
-                    blue565[h264_clip_byte((luma1 + b1) >> 8)]
-                );
-                dst_row0[dst_index] = h264_pack_rgb565_pair(p0, p1);
-                dst_row0[dst_index + 1U] = h264_pack_rgb565_pair(p2, p3);
-
-                luma0 = y_base[y_row1[x]];
-                luma1 = y_base[y_row1[x + 1U]];
-                p0 = (uint16_t) (
-                    red565[h264_clip_byte((luma0 + r0) >> 8)] |
-                    green565[h264_clip_byte((luma0 + g0) >> 8)] |
-                    blue565[h264_clip_byte((luma0 + b0) >> 8)]
-                );
-                p1 = (uint16_t) (
-                    red565[h264_clip_byte((luma1 + r0) >> 8)] |
-                    green565[h264_clip_byte((luma1 + g0) >> 8)] |
-                    blue565[h264_clip_byte((luma1 + b0) >> 8)]
-                );
-                luma0 = y_base[y_row1[x + 2U]];
-                luma1 = y_base[y_row1[x + 3U]];
-                p2 = (uint16_t) (
-                    red565[h264_clip_byte((luma0 + r1) >> 8)] |
-                    green565[h264_clip_byte((luma0 + g1) >> 8)] |
-                    blue565[h264_clip_byte((luma0 + b1) >> 8)]
-                );
-                p3 = (uint16_t) (
-                    red565[h264_clip_byte((luma1 + r1) >> 8)] |
-                    green565[h264_clip_byte((luma1 + g1) >> 8)] |
-                    blue565[h264_clip_byte((luma1 + b1) >> 8)]
-                );
-                dst_row1[dst_index] = h264_pack_rgb565_pair(p0, p1);
-                dst_row1[dst_index + 1U] = h264_pack_rgb565_pair(p2, p3);
-            }
-
-            for (; x < crop_width; x += 2U) {
-                const size_t chroma_index = x / 2U;
-                const size_t dst_index = x / 2U;
-                int32_t chroma_red;
-                int32_t chroma_green;
-                int32_t chroma_blue;
-                uint16_t p0;
-                uint16_t p1;
-                int32_t luma0;
-                int32_t luma1;
-
-                h264_compute_chroma_terms(
-                    u_row[chroma_index],
-                    v_row[chroma_index],
-                    &chroma_red,
-                    &chroma_green,
-                    &chroma_blue
-                );
-
-                luma0 = y_base[y_row0[x]];
-                luma1 = y_base[y_row0[x + 1U]];
-                p0 = (uint16_t) (
-                    red565[h264_clip_byte((luma0 + chroma_red) >> 8)] |
-                    green565[h264_clip_byte((luma0 + chroma_green) >> 8)] |
-                    blue565[h264_clip_byte((luma0 + chroma_blue) >> 8)]
-                );
-                p1 = (uint16_t) (
-                    red565[h264_clip_byte((luma1 + chroma_red) >> 8)] |
-                    green565[h264_clip_byte((luma1 + chroma_green) >> 8)] |
-                    blue565[h264_clip_byte((luma1 + chroma_blue) >> 8)]
-                );
-                dst_row0[dst_index] = h264_pack_rgb565_pair(p0, p1);
-
-                luma0 = y_base[y_row1[x]];
-                luma1 = y_base[y_row1[x + 1U]];
-                p0 = (uint16_t) (
-                    red565[h264_clip_byte((luma0 + chroma_red) >> 8)] |
-                    green565[h264_clip_byte((luma0 + chroma_green) >> 8)] |
-                    blue565[h264_clip_byte((luma0 + chroma_blue) >> 8)]
-                );
-                p1 = (uint16_t) (
-                    red565[h264_clip_byte((luma1 + chroma_red) >> 8)] |
-                    green565[h264_clip_byte((luma1 + chroma_green) >> 8)] |
-                    blue565[h264_clip_byte((luma1 + chroma_blue) >> 8)]
-                );
-                dst_row1[dst_index] = h264_pack_rgb565_pair(p0, p1);
-            }
-        } else {
-            for (x = 0; x < main_width; x += 4U) {
-                const size_t chroma_index = x / 2U;
-                int32_t r0;
-                int32_t g0;
-                int32_t b0;
-                int32_t r1;
-                int32_t g1;
-                int32_t b1;
-                uint16_t p0;
-                uint16_t p1;
-                uint16_t p2;
-                uint16_t p3;
-                int32_t luma0;
-                int32_t luma1;
-
-                if ((x & 31U) == 0U) {
-                    h264_prefetch_yuv420_rows(y_row0, y_row1, u_row, v_row, x, crop_width);
-                }
-
-                h264_compute_chroma_terms(
-                    u_row[chroma_index],
-                    v_row[chroma_index],
-                    &r0,
-                    &g0,
-                    &b0
-                );
-                h264_compute_chroma_terms(
-                    u_row[chroma_index + 1U],
-                    v_row[chroma_index + 1U],
-                    &r1,
-                    &g1,
-                    &b1
-                );
-
-                luma0 = y_base[y_row0[x]];
-                luma1 = y_base[y_row0[x + 1U]];
-                p0 = (uint16_t) (
-                    red565[h264_clip_byte((luma0 + r0) >> 8)] |
-                    green565[h264_clip_byte((luma0 + g0) >> 8)] |
-                    blue565[h264_clip_byte((luma0 + b0) >> 8)]
-                );
-                p1 = (uint16_t) (
-                    red565[h264_clip_byte((luma1 + r0) >> 8)] |
-                    green565[h264_clip_byte((luma1 + g0) >> 8)] |
-                    blue565[h264_clip_byte((luma1 + b0) >> 8)]
-                );
-                luma0 = y_base[y_row0[x + 2U]];
-                luma1 = y_base[y_row0[x + 3U]];
-                p2 = (uint16_t) (
-                    red565[h264_clip_byte((luma0 + r1) >> 8)] |
-                    green565[h264_clip_byte((luma0 + g1) >> 8)] |
-                    blue565[h264_clip_byte((luma0 + b1) >> 8)]
-                );
-                p3 = (uint16_t) (
-                    red565[h264_clip_byte((luma1 + r1) >> 8)] |
-                    green565[h264_clip_byte((luma1 + g1) >> 8)] |
-                    blue565[h264_clip_byte((luma1 + b1) >> 8)]
-                );
-                dst_row0_16[x] = p0;
-                dst_row0_16[x + 1U] = p1;
-                dst_row0_16[x + 2U] = p2;
-                dst_row0_16[x + 3U] = p3;
-
-                luma0 = y_base[y_row1[x]];
-                luma1 = y_base[y_row1[x + 1U]];
-                p0 = (uint16_t) (
-                    red565[h264_clip_byte((luma0 + r0) >> 8)] |
-                    green565[h264_clip_byte((luma0 + g0) >> 8)] |
-                    blue565[h264_clip_byte((luma0 + b0) >> 8)]
-                );
-                p1 = (uint16_t) (
-                    red565[h264_clip_byte((luma1 + r0) >> 8)] |
-                    green565[h264_clip_byte((luma1 + g0) >> 8)] |
-                    blue565[h264_clip_byte((luma1 + b0) >> 8)]
-                );
-                luma0 = y_base[y_row1[x + 2U]];
-                luma1 = y_base[y_row1[x + 3U]];
-                p2 = (uint16_t) (
-                    red565[h264_clip_byte((luma0 + r1) >> 8)] |
-                    green565[h264_clip_byte((luma0 + g1) >> 8)] |
-                    blue565[h264_clip_byte((luma0 + b1) >> 8)]
-                );
-                p3 = (uint16_t) (
-                    red565[h264_clip_byte((luma1 + r1) >> 8)] |
-                    green565[h264_clip_byte((luma1 + g1) >> 8)] |
-                    blue565[h264_clip_byte((luma1 + b1) >> 8)]
-                );
-                dst_row1_16[x] = p0;
-                dst_row1_16[x + 1U] = p1;
-                dst_row1_16[x + 2U] = p2;
-                dst_row1_16[x + 3U] = p3;
-            }
-
-            for (; x < crop_width; x += 2U) {
-                const size_t chroma_index = x / 2U;
-                int32_t chroma_red;
-                int32_t chroma_green;
-                int32_t chroma_blue;
-                uint16_t p0;
-                uint16_t p1;
-                int32_t luma0;
-                int32_t luma1;
-
-                h264_compute_chroma_terms(
-                    u_row[chroma_index],
-                    v_row[chroma_index],
-                    &chroma_red,
-                    &chroma_green,
-                    &chroma_blue
-                );
-
-                luma0 = y_base[y_row0[x]];
-                luma1 = y_base[y_row0[x + 1U]];
-                p0 = (uint16_t) (
-                    red565[h264_clip_byte((luma0 + chroma_red) >> 8)] |
-                    green565[h264_clip_byte((luma0 + chroma_green) >> 8)] |
-                    blue565[h264_clip_byte((luma0 + chroma_blue) >> 8)]
-                );
-                p1 = (uint16_t) (
-                    red565[h264_clip_byte((luma1 + chroma_red) >> 8)] |
-                    green565[h264_clip_byte((luma1 + chroma_green) >> 8)] |
-                    blue565[h264_clip_byte((luma1 + chroma_blue) >> 8)]
-                );
-                dst_row0_16[x] = p0;
-                dst_row0_16[x + 1U] = p1;
-
-                luma0 = y_base[y_row1[x]];
-                luma1 = y_base[y_row1[x + 1U]];
-                p0 = (uint16_t) (
-                    red565[h264_clip_byte((luma0 + chroma_red) >> 8)] |
-                    green565[h264_clip_byte((luma0 + chroma_green) >> 8)] |
-                    blue565[h264_clip_byte((luma0 + chroma_blue) >> 8)]
-                );
-                p1 = (uint16_t) (
-                    red565[h264_clip_byte((luma1 + chroma_red) >> 8)] |
-                    green565[h264_clip_byte((luma1 + chroma_green) >> 8)] |
-                    blue565[h264_clip_byte((luma1 + chroma_blue) >> 8)]
-                );
-                dst_row1_16[x] = p0;
-                dst_row1_16[x + 1U] = p1;
-            }
-        }
-    }
-
-    return true;
+    if (!movie || !y_plane || !u_plane || !v_plane || !dst_pixels ||
+        !crop_width || !crop_height || ((crop_width | crop_height) & 1U)) return false;
+    return blit_h264_planes_to_rgb565_rows(movie,y_plane,u_plane,v_plane,
+        luma_stride,chroma_stride,dst_pixels,dst_pitch_pixels,crop_width,crop_height,
+        h264_flat_luma_blocks(y_plane,luma_stride,crop_width,crop_height));
 }
 
 bool blit_h264_planes_to_rgb565_target(
@@ -691,7 +545,9 @@ bool blit_h264_planes_to_rgb565_target(
         return false;
     }
 
-    return blit_h264_planes_to_rgb565_target_with_crop(
+    bool capture_color = playback_capture_active(movie);
+    uint64_t capture_started = capture_color ? monotonic_clock_now_ticks() : 0;
+    bool converted = blit_h264_planes_to_rgb565_target_with_crop(
         movie,
         y_plane,
         u_plane,
@@ -703,6 +559,8 @@ bool blit_h264_planes_to_rgb565_target(
         movie->h264.crop_width,
         movie->h264.crop_height
     );
+    if (capture_color) playback_capture_stage(movie, CAPTURE_COLOR, capture_started, monotonic_clock_now_ticks());
+    return converted;
 }
 
 bool blit_h264_picture_to_target(
@@ -742,6 +600,48 @@ bool blit_h264_picture_to_target(
         dst_pixels,
         dst_pitch_pixels
     );
+}
+
+bool blit_h264_picture_rows_to_target(
+    Movie *movie,
+    const uint8_t *picture,
+    uint16_t *dst_pixels,
+    size_t dst_pitch_pixels,
+    size_t first_row,
+    size_t row_count,
+    bool *flat_mode
+)
+{
+    const uint8_t *y_plane, *u_plane, *v_plane;
+    size_t luma_stride, chroma_stride, luma_size, chroma_size;
+    bool capture_color;
+    uint64_t started;
+    bool converted;
+    if (!movie || !picture || !dst_pixels || !flat_mode || !movie->h264.headers_ready ||
+        !row_count || ((first_row | row_count) & 1U) ||
+        first_row > movie->h264.crop_height || row_count > movie->h264.crop_height - first_row ||
+        dst_pitch_pixels < movie->h264.crop_width) return false;
+    luma_stride = movie->h264.full_width;
+    chroma_stride = luma_stride / 2U;
+    luma_size = luma_stride * movie->h264.full_height;
+    chroma_size = chroma_stride * (movie->h264.full_height / 2U);
+    y_plane = picture + (size_t) movie->h264.crop_top * luma_stride + movie->h264.crop_left;
+    u_plane = picture + luma_size + (size_t) (movie->h264.crop_top / 2U) * chroma_stride + movie->h264.crop_left / 2U;
+    v_plane = picture + luma_size + chroma_size + (size_t) (movie->h264.crop_top / 2U) * chroma_stride + movie->h264.crop_left / 2U;
+    capture_color = playback_capture_active(movie);
+    started = capture_color ? monotonic_clock_now_ticks() : 0U;
+    /* The original heuristic samples the full picture exactly once. Testing
+     * each short band would disable its flat-block optimization (<64 rows). */
+    if (!first_row) *flat_mode = h264_flat_luma_blocks(y_plane,luma_stride,
+        movie->h264.crop_width,movie->h264.crop_height);
+    converted = blit_h264_planes_to_rgb565_rows(movie,
+        y_plane + first_row * luma_stride,
+        u_plane + (first_row / 2U) * chroma_stride,
+        v_plane + (first_row / 2U) * chroma_stride,
+        luma_stride,chroma_stride,dst_pixels + first_row * dst_pitch_pixels,
+        dst_pitch_pixels,movie->h264.crop_width,row_count,*flat_mode);
+    if (capture_color) playback_capture_stage(movie,CAPTURE_COLOR,started,monotonic_clock_now_ticks());
+    return converted;
 }
 
 uint8_t *take_h264_output_picture(storage_t *decoder, const char *context)
@@ -902,16 +802,20 @@ bool decode_h264_access_unit_to_target(
             &picture_ready,
             &pending,
             &picture)) {
+        movie->h264.decoder_failed = true;
         return false;
     }
     if (pending) {
+        movie->h264.decoder_failed = true;
         debug_failf("h264 decode yielded unexpectedly");
         return false;
     }
     if (!picture_ready || !picture) {
+        movie->h264.decoder_failed = true;
         return false;
     }
     if (dst_pixels && !blit_h264_picture_to_target(movie, picture, dst_pixels, dst_pitch_pixels)) {
+        movie->h264.decoder_failed = true;
         debug_failf("h264 blit failed");
         return false;
     }
@@ -952,17 +856,16 @@ bool configure_chunk_view_from_storage(
     uint8_t *chunk_bytes = NULL;
     size_t chunk_size = 0;
     uint32_t payload_size;
+    uint32_t frame;
 
-    if (!movie || !chunk_storage || !out_frame_offsets || !out_chunk_bytes || !out_chunk_size ||
+    if (!movie || !movie->chunk_index || !chunk_storage || !out_frame_offsets || !out_chunk_bytes || !out_chunk_size ||
         chunk_index < 0 || (uint32_t) chunk_index >= movie->header.chunk_count) {
         return false;
     }
     entry = movie->chunk_index + chunk_index;
     local_offset = (size_t) entry->frame_table_offset;
-    table_bytes = (size_t) entry->frame_count * sizeof(uint32_t);
-    header_size = 4U + table_bytes;
-
-    if (local_offset + header_size > chunk_storage_size) {
+    if (!chunk_storage_layout(entry, chunk_storage, chunk_storage_size,
+                              &header_size, &payload_size)) {
         debug_failf(
             "chunk view invalid table chunk=%d table=%lu storage=%lu",
             chunk_index,
@@ -971,23 +874,25 @@ bool configure_chunk_view_from_storage(
         );
         return false;
     }
-    payload_size = read_le32(chunk_storage + local_offset);
-    if (local_offset + header_size + payload_size > chunk_storage_size) {
-        debug_failf(
-            "chunk view payload overflow chunk=%d payload=%lu table=%lu storage=%lu",
-            chunk_index,
-            (unsigned long) payload_size,
-            (unsigned long) entry->frame_table_offset,
-            (unsigned long) chunk_storage_size
-        );
-        return false;
-    }
-    frame_offsets = (uint32_t *) calloc((size_t) entry->frame_count, sizeof(uint32_t));
+    table_bytes = header_size - 4U;
+    frame_offsets = (uint32_t *) malloc(table_bytes);
     if (!frame_offsets) {
         debug_failf("chunk view frame offset alloc failed chunk=%d count=%u", chunk_index, (unsigned) entry->frame_count);
         return false;
     }
-    memcpy(frame_offsets, chunk_storage + local_offset + 4U, table_bytes);
+    /* Decode and validate once at chunk load, before the codec can dereference
+     * any frame. malloc avoids clearing the whole table before overwriting it. */
+    for (frame = 0; frame < entry->frame_count; ++frame) {
+        uint32_t offset = read_le32(chunk_storage + local_offset + 4U + (size_t) frame * 4U);
+        if ((frame == 0 && offset != 0) || offset >= payload_size ||
+            (frame > 0 && offset <= frame_offsets[frame - 1U])) {
+            debug_failf("chunk view invalid frame offset chunk=%d frame=%lu offset=%lu",
+                        chunk_index, (unsigned long) frame, (unsigned long) offset);
+            free(frame_offsets);
+            return false;
+        }
+        frame_offsets[frame] = offset;
+    }
     chunk_bytes = (uint8_t *) chunk_storage + local_offset + header_size;
     chunk_size = payload_size;
     *out_frame_offsets = frame_offsets;
@@ -998,28 +903,62 @@ bool configure_chunk_view_from_storage(
 
 bool configure_chunk_view(Movie *movie, int chunk_index)
 {
-    uint32_t *frame_offsets = NULL;
-    uint8_t *chunk_bytes = NULL;
-    size_t chunk_size = 0;
+    const ChunkIndexEntry *entry;
+    const uint8_t *table;
+    size_t header_size;
+    uint32_t payload_size;
+    uint32_t previous_offset = 0;
+    uint32_t frame;
 
-    free(movie->frame_offsets);
+    if (!movie || !movie->chunk_index || chunk_index < 0 ||
+        (uint32_t) chunk_index >= movie->header.chunk_count) {
+        return false;
+    }
     movie->frame_offsets = NULL;
     movie->chunk_bytes = NULL;
     movie->chunk_size = 0;
-
-    if (!configure_chunk_view_from_storage(
-            movie,
-            chunk_index,
-            movie->chunk_storage,
-            movie->chunk_storage_size,
-            &frame_offsets,
-            &chunk_bytes,
-            &chunk_size)) {
+    entry = movie->chunk_index + chunk_index;
+    if (!chunk_storage_layout(entry, movie->chunk_storage, movie->chunk_storage_size,
+                              &header_size, &payload_size)) {
         return false;
     }
-    movie->frame_offsets = frame_offsets;
-    movie->chunk_bytes = chunk_bytes;
-    movie->chunk_size = chunk_size;
+    table = movie->chunk_storage + entry->frame_table_offset + 4U;
+    for (frame = 0; frame < entry->frame_count; ++frame) {
+        uint32_t offset = read_le32(table + (size_t) frame * sizeof(uint32_t));
+        if ((frame == 0 && offset != 0) || offset >= payload_size ||
+            (frame > 0 && offset <= previous_offset)) {
+            debug_failf("chunk view invalid frame offset chunk=%d frame=%lu offset=%lu",
+                        chunk_index, (unsigned long) frame, (unsigned long) offset);
+            return false;
+        }
+        previous_offset = offset;
+    }
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    if (((uintptr_t) table & (sizeof(uint32_t) - 1U)) == 0) {
+        /* NVP's aligned little-endian table is already the required array.
+         * It stays valid for exactly the lifetime of the active chunk. */
+        movie->frame_offsets = (uint32_t *) table;
+    } else
+#endif
+    {
+        /* Valid older/custom files may place the table at an unaligned offset.
+         * Keep an owned fallback instead of making ARM unaligned word reads. */
+        if (movie->frame_offsets_capacity < entry->frame_count) {
+            uint32_t *replacement = (uint32_t *) realloc(movie->frame_offsets_allocation,
+                (size_t) entry->frame_count * sizeof(uint32_t));
+            if (!replacement) {
+                return false;
+            }
+            movie->frame_offsets_allocation = replacement;
+            movie->frame_offsets_capacity = entry->frame_count;
+        }
+        for (frame = 0; frame < entry->frame_count; ++frame) {
+            movie->frame_offsets_allocation[frame] = read_le32(table + (size_t) frame * sizeof(uint32_t));
+        }
+        movie->frame_offsets = movie->frame_offsets_allocation;
+    }
+    movie->chunk_bytes = movie->chunk_storage + entry->frame_table_offset + header_size;
+    movie->chunk_size = payload_size;
     return true;
 }
 
@@ -1036,6 +975,7 @@ void reset_prefetched_chunk(PrefetchedChunk *chunk)
     chunk->chunk_storage = NULL;
     chunk->chunk_allocation = NULL;
     chunk->chunk_storage_size = 0;
+    chunk->chunk_capacity = 0;
     chunk->chunk_index = -1;
     chunk->state = PREFETCH_IDLE;
     chunk->read_offset = 0;
@@ -1094,7 +1034,8 @@ PrefetchedChunk *find_prefetch_work_chunk(Movie *movie, int current_chunk, int m
     return best;
 }
 
-bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respect_deadline, uint32_t deadline_ms)
+static bool prefetch_read_step_impl(Movie *movie, PrefetchedChunk *chunk, bool respect_deadline,
+    uint32_t deadline_ms, bool maintenance)
 {
     const ChunkIndexEntry *entry;
     size_t remaining;
@@ -1102,11 +1043,14 @@ bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respect_deadl
     size_t block_size;
     size_t bytes_read;
     long target_pos;
-    uint32_t bytes_per_ms;
     uint32_t read_start_ms;
     uint32_t read_elapsed_ms;
+    bool capture_read;
+    uint64_t read_started_ticks;
+    uint64_t read_finished_ticks;
 
-    if (!movie || !chunk || chunk->chunk_index < 0) {
+    if (!movie || !chunk || chunk->chunk_index < 0 ||
+        (uint32_t) chunk->chunk_index >= movie->header.chunk_count) {
         return false;
     }
     entry = movie->chunk_index + chunk->chunk_index;
@@ -1128,23 +1072,28 @@ bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respect_deadl
         return false;
     }
 
-    if (respect_deadline) {
-        int32_t time_left_ms = (int32_t) (deadline_ms - monotonic_clock_now_ms());
-        uint64_t dynamic_block_size;
-
-        if (time_left_ms <= 0) {
-            /* The cooperative slice expired. Keep the partial read alive so
-             * the next tick can continue it instead of restarting flash I/O. */
+    if (movie_async_enabled(movie)) {
+        read_size = remaining > MOVIE_ASYNC_BLOCK_BYTES ? MOVIE_ASYNC_BLOCK_BYTES : remaining;
+        int result = movie_async_read(movie, (uint64_t)entry->offset + chunk->read_offset,
+            chunk->chunk_storage + chunk->read_offset, read_size, chunk->chunk_index, !respect_deadline);
+        if (result == MOVIE_ASYNC_PENDING) return true;
+        if (result == MOVIE_ASYNC_READY) {
+            chunk->read_offset += read_size;
+            if (chunk->read_offset == entry->packed_size) chunk->state = PREFETCH_READY;
             return true;
         }
-        bytes_per_ms = movie->last_read_bytes / (movie->last_read_time_ms > 0 ? movie->last_read_time_ms : 1U);
-        dynamic_block_size = (uint64_t) (uint32_t) time_left_ms * (uint64_t) bytes_per_ms;
-        if (dynamic_block_size < 512U) {
-            dynamic_block_size = 512U;
-        } else if (dynamic_block_size > PREFETCH_FILE_BLOCK_SIZE) {
-            dynamic_block_size = PREFETCH_FILE_BLOCK_SIZE;
+        /* Native failure already joined its worker: legacy I/O is safe now. */
+    }
+    if (respect_deadline) {
+        int32_t time_left_ms = (int32_t) (deadline_ms - monotonic_clock_now_ms());
+        block_size = maintenance
+            ? prefetch_io_maintenance_read_size(movie->prefetch_read_bytes_per_ms, remaining, time_left_ms)
+            : prefetch_io_read_size(movie->prefetch_read_bytes_per_ms, remaining, time_left_ms);
+        if (block_size == 0) {
+            /* Leave partial data intact when the remaining budget cannot fit
+             * even one sector. The work loop will yield without spinning. */
+            return true;
         }
-        block_size = (size_t) dynamic_block_size;
     } else {
         block_size = PREFETCH_FILE_BLOCK_SIZE;
     }
@@ -1157,11 +1106,29 @@ bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respect_deadl
         }
         movie->current_file_pos = target_pos;
     }
+    if (respect_deadline) {
+        /* Seeking can itself consume time. Recheck before entering fread. */
+        int32_t time_left_ms = (int32_t) (deadline_ms - monotonic_clock_now_ms());
+        read_size = maintenance
+            ? prefetch_io_maintenance_read_size(movie->prefetch_read_bytes_per_ms, remaining, time_left_ms)
+            : prefetch_io_read_size(movie->prefetch_read_bytes_per_ms, remaining, time_left_ms);
+        if (read_size == 0) {
+            return true;
+        }
+    }
     read_start_ms = monotonic_clock_now_ms();
+    capture_read = debug_is_runtime_logging_enabled();
+    read_started_ticks = capture_read ? monotonic_clock_now_ticks() : 0;
     bytes_read = fread(chunk->chunk_storage + chunk->read_offset, 1, read_size, movie->file);
+    read_finished_ticks = capture_read ? monotonic_clock_now_ticks() : 0;
     read_elapsed_ms = monotonic_clock_now_ms() - read_start_ms;
+    if (capture_read) {
+        playback_capture_io(movie, 2, chunk->chunk_index, (uint32_t) bytes_read, read_started_ticks, read_finished_ticks);
+    }
     movie->last_read_time_ms = read_elapsed_ms;
     movie->last_read_bytes = (uint32_t) bytes_read;
+    movie->prefetch_read_bytes_per_ms = prefetch_io_update_rate(
+        movie->prefetch_read_bytes_per_ms, (uint32_t) bytes_read, read_elapsed_ms);
     if (bytes_read != read_size) {
         movie->current_file_pos = -1;
         return false;
@@ -1176,6 +1143,11 @@ bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respect_deadl
         chunk->state = PREFETCH_READY;
     }
     return true;
+}
+
+bool prefetch_read_step(Movie *movie, PrefetchedChunk *chunk, bool respect_deadline, uint32_t deadline_ms)
+{
+    return prefetch_read_step_impl(movie, chunk, respect_deadline, deadline_ms, false);
 }
 
 bool prefetch_process_chunk(
@@ -1196,12 +1168,13 @@ bool prefetch_process_chunk(
         if (!prefetch_read_step(movie, chunk, respect_deadline, deadline_ms)) {
             return false;
         }
-
-        if (prefetch_abort_requested(abort_pointer)) {
+        /* A cooperative step is one bounded read, including a deferred read.
+         * The caller may request more work after checking input/time again. */
+        if (respect_deadline) {
             return true;
         }
-        if (respect_deadline && prefetch_deadline_reached(deadline_ms)) {
-            break;
+        if (prefetch_abort_requested(abort_pointer)) {
+            return true;
         }
     }
     return true;
@@ -1225,10 +1198,12 @@ bool load_chunk_from_file(Movie *movie, int chunk_index, bool allow_prefetch_ret
 {
     const ChunkIndexEntry *entry = movie->chunk_index + chunk_index;
     int previous_chunk = movie->loaded_chunk;
+    size_t bytes_read;
+    bool capture_read;
+    uint64_t read_started_ticks;
+    bool async_loaded = false;
 
 retry:
-    release_movie_chunk_storage(movie);
-
     if (entry->packed_size != entry->unpacked_size) {
         debug_failf(
             "load chunk=%d unsupported packed=%lu unpacked=%lu",
@@ -1254,19 +1229,37 @@ retry:
         debug_failf("load chunk=%d packed alloc fail packed=%lu", chunk_index, (unsigned long) entry->packed_size);
         return false;
     }
-    if (fseek(movie->file, (long) entry->offset, SEEK_SET) != 0) {
+    if (movie_async_enabled(movie)) {
+        size_t offset = 0;
+        while (offset < entry->packed_size) {
+            size_t amount = entry->packed_size - offset;
+            if (amount > MOVIE_ASYNC_BLOCK_BYTES) amount = MOVIE_ASYNC_BLOCK_BYTES;
+            if (movie_async_read(movie, (uint64_t)entry->offset + offset,
+                    movie->chunk_storage + offset, amount, chunk_index, true) != MOVIE_ASYNC_READY) break;
+            offset += amount;
+        }
+        async_loaded = offset == entry->packed_size;
+    }
+    if (!async_loaded && movie->current_file_pos != (long) entry->offset &&
+        fseek(movie->file, (long) entry->offset, SEEK_SET) != 0) {
         debug_failf("load chunk=%d fseek fail offset=%lu", chunk_index, (unsigned long) entry->offset);
         movie->current_file_pos = -1;
         release_movie_chunk_storage(movie);
         return false;
     }
-    if (fread(movie->chunk_storage, 1, entry->packed_size, movie->file) != entry->packed_size) {
+    capture_read = !async_loaded && debug_is_runtime_logging_enabled();
+    read_started_ticks = capture_read ? monotonic_clock_now_ticks() : 0;
+    bytes_read = async_loaded ? entry->packed_size : fread(movie->chunk_storage, 1, entry->packed_size, movie->file);
+    if (capture_read) {
+        playback_capture_io(movie, 1, chunk_index, (uint32_t) bytes_read, read_started_ticks, monotonic_clock_now_ticks());
+    }
+    if (bytes_read != entry->packed_size) {
         debug_failf("load chunk=%d fread fail packed=%lu", chunk_index, (unsigned long) entry->packed_size);
         movie->current_file_pos = -1;
         release_movie_chunk_storage(movie);
         return false;
     }
-    movie->current_file_pos = (long) entry->offset + (long) entry->packed_size;
+    if (!async_loaded) movie->current_file_pos = (long) entry->offset + (long) entry->packed_size;
     movie->chunk_storage_size = entry->packed_size;
     if (!configure_chunk_view(movie, chunk_index)) {
         debug_tracef(
@@ -1294,6 +1287,27 @@ retry:
         (unsigned long) total_prefetched_chunk_bytes(movie)
     );
     return true;
+}
+
+int load_ready_chunk(Movie *movie, int chunk_index)
+{
+    if(!movie || !movie_uses_h264(movie) || chunk_index<0 ||
+       (uint32_t)chunk_index>=movie->header.chunk_count)return -1;
+    if(movie->loaded_chunk==chunk_index)
+        return movie->chunk_bytes && movie->frame_offsets ? 1 : -1;
+    /* Background adoption must never fall through to a blocking file read
+     * or a decoder reset. Only the healthy sequential path is eligible. */
+    int previous=movie->loaded_chunk;
+    if(previous<0 || chunk_index!=previous+1 || !movie->h264.decoder_initialized ||
+       movie->h264.decoder_failed)return 0;
+    PrefetchedChunk *slot=find_prefetched_chunk(movie,chunk_index);
+    if(!slot || slot->state!=PREFETCH_READY)return 0;
+    if(!adopt_prefetched_movie_chunk(movie,slot))return -1;
+    if(!configure_chunk_view(movie,chunk_index))return -1;
+    movie->loaded_chunk=chunk_index;
+    if(!prepare_movie_codec_for_loaded_chunk(movie,previous,chunk_index))return -1;
+    if(debug_should_collect_metrics())++movie->diag_chunk_load_prefetched_count;
+    return 1;
 }
 
 bool load_chunk(Movie *movie, int chunk_index)
@@ -1324,15 +1338,10 @@ bool load_chunk(Movie *movie, int chunk_index)
                 return load_chunk_from_file(movie, chunk_index, true);
             }
         }
-        if (!adopt_movie_chunk_storage_owned(
-                movie,
-                &prefetched->chunk_storage,
-                &prefetched->chunk_allocation,
-                prefetched->chunk_storage_size)) {
+        if (!adopt_prefetched_movie_chunk(movie, prefetched)) {
             clear_prefetched_chunk(prefetched);
             return load_chunk_from_file(movie, chunk_index, true);
         }
-        reset_prefetched_chunk(prefetched);
         if (!configure_chunk_view(movie, chunk_index)) {
             debug_tracef(
                 "prefetched configure fail chunk=%d storage=%lu frame_count=%u table=%lu",
@@ -1403,12 +1412,22 @@ bool begin_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, i
         return false;
     }
     if (movie_uses_h264(movie)) {
+        bool capture_reset;
+        bool reset_ok;
+        uint64_t reset_started_ticks;
+
         job->decoder = h264bsdAlloc();
-        if (job->decoder) {
-            memset(job->decoder, 0, sizeof(*job->decoder));
+        if (!job->decoder) {
+            clear_seek_bar_preview_decode_job(preview);
+            return false;
         }
-        if (!job->decoder ||
-            !reset_h264_storage_decoder(job->decoder, &job->decoder_initialized)) {
+        capture_reset = debug_is_runtime_logging_enabled();
+        reset_started_ticks = capture_reset ? monotonic_clock_now_ticks() : 0;
+        reset_ok = reset_h264_storage_decoder(job->decoder, &job->decoder_initialized);
+        if (capture_reset) {
+            playback_capture_io(movie, 4, job->chunk_index, 0, reset_started_ticks, monotonic_clock_now_ticks());
+        }
+        if (!reset_ok) {
             clear_seek_bar_preview_decode_job(preview);
             return false;
         }
@@ -1448,6 +1467,8 @@ bool read_seek_bar_preview_chunk_step(Movie *movie, SeekPreviewDecodeJob *job, u
         size_t read_size;
         long target_pos;
         size_t bytes_read;
+        bool capture_read;
+        uint64_t read_started_ticks;
 
         if (deadline_ms != 0U && prefetch_deadline_reached(deadline_ms)) {
             return true;
@@ -1458,6 +1479,16 @@ bool read_seek_bar_preview_chunk_step(Movie *movie, SeekPreviewDecodeJob *job, u
             ? SEEK_BAR_PREVIEW_IO_BLOCK_SIZE
             : remaining;
         target_pos = (long) (entry->offset + job->read_offset);
+        if (movie_async_enabled(movie)) {
+            if (read_size > MOVIE_ASYNC_BLOCK_BYTES) read_size = MOVIE_ASYNC_BLOCK_BYTES;
+            int result = movie_async_read(movie, (uint64_t)entry->offset + job->read_offset,
+                job->chunk_storage + job->read_offset, read_size, job->chunk_index, deadline_ms == 0U);
+            if (result == MOVIE_ASYNC_PENDING) return true;
+            if (result == MOVIE_ASYNC_READY) {
+                job->read_offset += read_size;
+                continue;
+            }
+        }
         if (movie->current_file_pos != target_pos) {
             if (fseek(movie->file, target_pos, SEEK_SET) != 0) {
                 movie->current_file_pos = -1;
@@ -1465,7 +1496,12 @@ bool read_seek_bar_preview_chunk_step(Movie *movie, SeekPreviewDecodeJob *job, u
             }
             movie->current_file_pos = target_pos;
         }
+        capture_read = debug_is_runtime_logging_enabled();
+        read_started_ticks = capture_read ? monotonic_clock_now_ticks() : 0;
         bytes_read = fread(job->chunk_storage + job->read_offset, 1, read_size, movie->file);
+        if (capture_read) {
+            playback_capture_io(movie, 3, job->chunk_index, (uint32_t) bytes_read, read_started_ticks, monotonic_clock_now_ticks());
+        }
         if (bytes_read != read_size) {
             movie->current_file_pos = -1;
             return false;
@@ -1839,18 +1875,32 @@ bool prefetch_chunk(Movie *movie, int chunk_index)
 {
     const ChunkIndexEntry *entry;
     PrefetchedChunk *slot = NULL;
+    size_t capacity;
     int index;
 
-    if (chunk_index < 0 || (uint32_t) chunk_index >= movie->header.chunk_count) {
+    if (!movie || chunk_index < 0 || (uint32_t) chunk_index >= movie->header.chunk_count) {
         return false;
     }
     if (movie->loaded_chunk == chunk_index || find_prefetched_chunk(movie, chunk_index)) {
         return true;
     }
+    entry = movie->chunk_index + chunk_index;
+    if (entry->packed_size != entry->unpacked_size || entry->unpacked_size == 0 ||
+        entry->unpacked_size > PREFETCH_MAX_TOTAL_BYTES) {
+        return false;
+    }
+    /* Prefer the smallest retained buffer that fits. Once the rotating slots
+     * have warmed up, ordinary playback does not touch the heap at all. */
     for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
-        if (movie->prefetched[index].chunk_index < 0) {
-            slot = &movie->prefetched[index];
-            break;
+        PrefetchedChunk *candidate = &movie->prefetched[index];
+        if (candidate->chunk_index >= 0) {
+            continue;
+        }
+        if (!slot ||
+            (candidate->chunk_capacity >= entry->unpacked_size &&
+                (slot->chunk_capacity < entry->unpacked_size || candidate->chunk_capacity < slot->chunk_capacity)) ||
+            (slot->chunk_capacity < entry->unpacked_size && candidate->chunk_capacity > slot->chunk_capacity)) {
+            slot = candidate;
         }
     }
     if (!slot) {
@@ -1863,39 +1913,34 @@ bool prefetch_chunk(Movie *movie, int chunk_index)
         clear_prefetched_chunk(slot);
     }
 
-    entry = movie->chunk_index + chunk_index;
-    if (!ensure_prefetch_budget(movie, chunk_index, entry->unpacked_size)) {
-        return false;
-    }
-    clear_prefetched_chunk(slot);
-    slot->chunk_storage = (uint8_t *) player_malloc_aligned(
-        entry->unpacked_size,
-        PLAYER_CACHE_LINE_SIZE,
-        &slot->chunk_allocation
-    );
-    if (!slot->chunk_storage) {
-        debug_tracef(
-            "prefetch alloc fail chunk=%d unpacked=%lu total=%lu",
-            chunk_index,
-            (unsigned long) entry->unpacked_size,
-            (unsigned long) total_prefetched_chunk_bytes(movie)
+    if (!slot->chunk_storage || slot->chunk_capacity < entry->unpacked_size) {
+        clear_prefetched_chunk(slot);
+        /* Small bins absorb typical neighbouring chunk-size variation, while
+         * the full capacity remains charged to the existing memory budget. */
+        capacity = ((size_t) entry->unpacked_size + 4095U) & ~(size_t) 4095U;
+        if (capacity > PREFETCH_MAX_TOTAL_BYTES) {
+            capacity = entry->unpacked_size;
+        }
+        if (!ensure_prefetch_budget(movie, chunk_index, capacity)) {
+            return false;
+        }
+        slot->chunk_storage = (uint8_t *) player_malloc_aligned(
+            capacity,
+            PLAYER_CACHE_LINE_SIZE,
+            &slot->chunk_allocation
         );
-        return false;
+        if (!slot->chunk_storage) {
+            debug_tracef("prefetch alloc fail chunk=%d unpacked=%lu total=%lu",
+                        chunk_index, (unsigned long) entry->unpacked_size,
+                        (unsigned long) total_prefetched_chunk_bytes(movie));
+            return false;
+        }
+        slot->chunk_capacity = capacity;
     }
     slot->chunk_storage_size = entry->unpacked_size;
     slot->chunk_index = chunk_index;
     slot->state = PREFETCH_READING;
     slot->read_offset = 0;
-    if (entry->packed_size != entry->unpacked_size) {
-        debug_tracef(
-            "prefetch unsupported chunk=%d packed=%lu unpacked=%lu",
-            chunk_index,
-            (unsigned long) entry->packed_size,
-            (unsigned long) entry->unpacked_size
-        );
-        clear_prefetched_chunk(slot);
-        return false;
-    }
     debug_tracef(
         "prefetch start chunk=%d packed=%lu unpacked=%lu total=%lu",
         chunk_index,
@@ -1922,7 +1967,11 @@ void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks, int max
         int wanted_max = current_chunk + PREFETCH_CHUNK_COUNT;
         if (movie->prefetched[index].chunk_index >= 0 &&
             (movie->prefetched[index].chunk_index < wanted_min || movie->prefetched[index].chunk_index > wanted_max)) {
-            clear_prefetched_chunk(&movie->prefetched[index]);
+            /* Drop stale contents while retaining a budgeted allocation. */
+            movie->prefetched[index].chunk_index = -1;
+            movie->prefetched[index].state = PREFETCH_IDLE;
+            movie->prefetched[index].chunk_storage_size = 0;
+            movie->prefetched[index].read_offset = 0;
         }
     }
     for (index = 1; index <= max_new_distance; ++index) {
@@ -1952,12 +2001,12 @@ void prefetch_do_work(
 {
     while (!prefetch_deadline_reached(deadline_ms)) {
         PrefetchedChunk *slot = find_prefetch_work_chunk(movie, current_chunk, max_work_distance);
+        size_t previous_read_offset;
         if (!slot) {
             break;
         }
-        if (prefetch_abort_requested(abort_pointer)) {
-            break;
-        }
+        /* prefetch_process_chunk checks input immediately before its read. */
+        previous_read_offset = slot->read_offset;
         if (!prefetch_process_chunk(movie, slot, deadline_ms, true, abort_pointer)) {
             debug_tracef(
                 "prefetch work fail chunk=%d state=%d read=%lu",
@@ -1968,10 +2017,10 @@ void prefetch_do_work(
             clear_prefetched_chunk(slot);
             break;
         }
-        if (single_step) {
+        if (slot->read_offset == previous_read_offset && slot->state != PREFETCH_READY) {
             break;
         }
-        if (prefetch_abort_requested(abort_pointer)) {
+        if (single_step) {
             break;
         }
     }
@@ -2001,6 +2050,9 @@ int prefetch_target_chunk(const Movie *movie)
     if (!movie) {
         return -1;
     }
+
+    if(h264_lookahead_active(movie) && movie->loaded_chunk>=0 &&
+       (uint32_t)movie->loaded_chunk<movie->header.chunk_count)return movie->loaded_chunk;
 
     current_chunk = movie_chunk_for_frame(movie, movie->current_frame);
     if (current_chunk >= 0) {
@@ -2221,18 +2273,79 @@ void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerSt
     bool prioritize_io = false;
     bool accelerate_next_chunk_io = false;
     bool next_chunk_ready = false;
+    bool maintenance = false;
     int max_new_prefetch_distance = PREFETCH_CHUNK_COUNT;
     int max_work_distance = PREFETCH_CHUNK_COUNT;
 
     if (!movie) {
         return;
     }
-    if (spare_ms == 0 || prefetch_abort_requested(abort_pointer)) {
+    if (movie_async_enabled(movie)) {
+        /* Fill bounded lookahead early. Unlike an OS worker, the independent
+         * reader needs explicit CPU slices even when decoding uses all slack. */
+        uint32_t service_started_ms=spare_ms?monotonic_clock_now_ms():0U;
+        current_chunk = prefetch_target_chunk(movie);
+        if (current_chunk < 0) return;
+        /* Decide before polling the reader: even a pending-read poll spends
+         * a bounded SPI slice. At high playback rates the post-render decode
+         * deadline is already due, so deep lookahead belongs in real slack. */
+        uint32_t buffered_end=movie->chunk_index[current_chunk].first_frame+
+            movie->chunk_index[current_chunk].frame_count;
+        for(int n=current_chunk+1;n<current_chunk+PREFETCH_CHUNK_COUNT+1 &&
+            (uint32_t)n<movie->header.chunk_count;++n){
+            PrefetchedChunk *ready=find_prefetched_chunk(movie,n);
+            if(!ready || ready->state!=PREFETCH_READY)break;
+            buffered_end=movie->chunk_index[n].first_frame+movie->chunk_index[n].frame_count;
+        }
+        uint32_t needed=h264_lookahead_active(movie)?h264_lookahead_next_frame(movie):movie->current_frame;
+        uint32_t runway=buffered_end>needed?buffered_end-needed:0;
+        if(!prefetch_async_should_work(paused,runway,spare_ms))return;
+        PrefetchedChunk *work = find_prefetch_work_chunk(movie, current_chunk, PREFETCH_CHUNK_COUNT);
+        bool missing = false;
+        for (int distance = 1; !work && distance <= PREFETCH_CHUNK_COUNT; ++distance) {
+            int wanted = current_chunk + distance;
+            if ((uint32_t)wanted >= movie->header.chunk_count) break;
+            if (!find_prefetched_chunk(movie, wanted)) { missing = true; break; }
+        }
+        if ((!work && !missing) || prefetch_abort_requested(abort_pointer)) return;
+        prefetch_ahead(movie, current_chunk, 1, PREFETCH_CHUNK_COUNT);
+        work = find_prefetch_work_chunk(movie, current_chunk, PREFETCH_CHUNK_COUNT);
+        size_t before_read=work?work->read_offset:0;
+        if (work && !prefetch_read_step(movie, work, true, 0)) clear_prefetched_chunk(work);
+        if(movie_async_enabled(movie) && work && work->state==PREFETCH_READING && work->read_offset==before_read){
+            unsigned service_ticks=prefetch_async_remaining_ticks(runway,spare_ms,
+                spare_ms?monotonic_clock_now_ms()-service_started_ms:0U);
+            if(!service_ticks)return;
+            movie_async_service(movie,service_ticks);
+            /* Publish a block completed in that slice instead of leaving its
+             * READY bytes parked until the next video frame. */
+            if(!prefetch_read_step(movie,work,true,0))clear_prefetched_chunk(work);
+        }
         return;
     }
-    time_slice_ms = paused && spare_ms > PREFETCH_PAUSED_SLICE_MS ? PREFETCH_PAUSED_SLICE_MS : spare_ms;
-    current_chunk = prefetch_target_chunk(movie);
-    budget = prefetch_budget_for_state(movie, paused, spare_ms);
+    if (spare_ms <= PREFETCH_IO_GUARD_MS) {
+        if (paused || spare_ms != 0) {
+            return;
+        }
+        current_chunk = prefetch_target_chunk(movie);
+        if (current_chunk < 0 || !should_prioritize_next_chunk_io(movie, current_chunk)) {
+            return;
+        }
+        /* Under sustained decode overload there is no positive spare time.
+         * Only an urgent, incomplete next chunk earns this small slice. */
+        maintenance = true;
+        prioritize_io = true;
+        time_slice_ms = PREFETCH_IO_OVERLOAD_SLICE_MS;
+        budget = 1;
+        max_new_prefetch_distance = max_work_distance = 1;
+        if (debug_should_collect_metrics()) {
+            movie->diag_io_priority_count++;
+        }
+    } else {
+        time_slice_ms = paused && spare_ms > PREFETCH_PAUSED_SLICE_MS ? PREFETCH_PAUSED_SLICE_MS : spare_ms;
+        current_chunk = prefetch_target_chunk(movie);
+        budget = prefetch_budget_for_state(movie, paused, spare_ms);
+    }
 
     if (movie_uses_h264(movie)) {
         if (debug_should_collect_metrics()) {
@@ -2245,7 +2358,7 @@ void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerSt
         }
     }
 
-    if (!paused && movie_uses_h264(movie) && current_chunk >= 0) {
+    if (!maintenance && !paused && movie_uses_h264(movie) && current_chunk >= 0) {
         bool allow_second_next_chunk = false;
 
         max_new_prefetch_distance = 1;
@@ -2290,18 +2403,40 @@ void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerSt
         }
     }
     if (current_chunk >= 0 && budget > 0 && time_slice_ms > 0) {
+        bool work_pending = find_prefetch_work_chunk(movie, current_chunk, max_work_distance) != NULL;
+        int distance;
+        /* Most playback ticks already have their next chunks ready. Avoid
+         * another expensive keypad/touchpad scan unless I/O can do work. */
+        for (distance = 1; !work_pending && distance <= max_new_prefetch_distance; ++distance) {
+            int wanted = current_chunk + distance;
+            if ((uint32_t) wanted >= movie->header.chunk_count) {
+                break;
+            }
+            work_pending = movie->loaded_chunk != wanted && !find_prefetched_chunk(movie, wanted);
+        }
+        if (!work_pending || prefetch_abort_requested(abort_pointer)) {
+            return;
+        }
         uint32_t io_start_ms = monotonic_clock_now_ms();
         uint32_t io_deadline_ms = io_start_ms + time_slice_ms;
         if (!io_deadline_ms || !prefetch_deadline_reached(io_deadline_ms)) {
             prefetch_ahead(movie, current_chunk, budget, max_new_prefetch_distance);
-            prefetch_do_work(
-                movie,
-                current_chunk,
-                max_work_distance,
-                io_deadline_ms,
-                !paused && !prioritize_io && !accelerate_next_chunk_io,
-                abort_pointer
-            );
+            if (maintenance) {
+                PrefetchedChunk *slot = find_prefetch_work_chunk(movie, current_chunk, 1);
+                if (slot && !prefetch_abort_requested(abort_pointer) &&
+                    !prefetch_read_step_impl(movie, slot, true, io_deadline_ms, true)) {
+                    clear_prefetched_chunk(slot);
+                }
+            } else {
+                prefetch_do_work(
+                    movie,
+                    current_chunk,
+                    max_work_distance,
+                    io_deadline_ms,
+                    !paused && !prioritize_io && !accelerate_next_chunk_io,
+                    abort_pointer
+                );
+            }
             if (!paused) {
                 uint32_t io_elapsed_ms = monotonic_clock_now_ms() - io_start_ms;
                 if (io_elapsed_ms >= time_slice_ms + 8U) {
@@ -2323,12 +2458,31 @@ int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index)
 {
     uint32_t left = 0;
     uint32_t right = movie->header.chunk_count;
+
+    /* Playback and prefetch queries usually stay in the loaded chunk or cross
+     * its next boundary. Avoid searching the entire index for those frames. */
+    if (movie->loaded_chunk >= 0 && (uint32_t) movie->loaded_chunk < right) {
+        uint32_t loaded = (uint32_t) movie->loaded_chunk;
+        const ChunkIndexEntry *entry = movie->chunk_index + loaded;
+        if (frame_index >= entry->first_frame &&
+            frame_index - entry->first_frame < entry->frame_count) {
+            return (int) loaded;
+        }
+        if (loaded + 1U < right) {
+            ++entry;
+            if (frame_index >= entry->first_frame &&
+                frame_index - entry->first_frame < entry->frame_count) {
+                return (int) (loaded + 1U);
+            }
+        }
+    }
+
     while (left < right) {
         uint32_t mid = left + ((right - left) / 2);
         const ChunkIndexEntry *entry = movie->chunk_index + mid;
         if (frame_index < entry->first_frame) {
             right = mid;
-        } else if (frame_index >= entry->first_frame + entry->frame_count) {
+        } else if (frame_index - entry->first_frame >= entry->frame_count) {
             left = mid + 1;
         } else {
             return (int) mid;
@@ -2560,7 +2714,6 @@ void invalidate_loaded_chunk_state(Movie *movie)
     if (!movie) {
         return;
     }
-    free(movie->frame_offsets);
     movie->frame_offsets = NULL;
     movie->chunk_bytes = NULL;
     movie->chunk_size = 0;
@@ -2604,6 +2757,12 @@ bool recover_failed_h264_playback_state(Movie *movie)
 
 bool decode_to_frame(Movie *movie, uint32_t frame_index)
 {
+    if(movie && movie->h264_lookahead){
+        if(h264_lookahead_take(movie,frame_index))return true;
+        int ahead=h264_lookahead_finish_target(movie,frame_index);
+        if(ahead>0)return true;
+        h264_lookahead_cancel(movie);
+    }
     int chunk_index = movie_chunk_for_frame(movie, frame_index);
     const ChunkIndexEntry *entry;
 
@@ -2635,11 +2794,13 @@ bool decode_to_frame(Movie *movie, uint32_t frame_index)
         if (recover_failed_h264_playback_state(movie) &&
             movie->codec_ops->decode_frame(movie, frame_index, true)) {
             movie->current_frame = frame_index;
+            if(movie->lookahead_enabled && !h264_lookahead_begin(movie))movie->lookahead_enabled=false;
             return true;
         }
         return false;
     }
     movie->current_frame = frame_index;
+    if(movie->lookahead_enabled && !h264_lookahead_begin(movie))movie->lookahead_enabled=false;
     return true;
 }
 
@@ -2660,6 +2821,8 @@ bool decode_to_frame_with_progress(
     if (!hook) {
         return decode_to_frame(movie, frame_index);
     }
+
+    h264_lookahead_cancel(movie);
 
     chunk_index = movie_chunk_for_frame(movie, frame_index);
     if (chunk_index < 0) {
@@ -2686,7 +2849,15 @@ bool decode_to_frame_with_progress(
     }
 
     if (!continue_loaded_stream) {
-        if (!load_chunk(movie, chunk_index)) {
+        /* Rewinding/equal-frame progress seeks restart at the chunk's IDR.
+         * H264 has already removed emulation-prevention bytes in place; a
+         * decoder reset clears chunk_dirty, so reload before that reset can
+         * hide the need for pristine input. Forward continuation needs none. */
+        bool reload_dirty = movie_uses_h264(movie) &&
+            movie->loaded_chunk == chunk_index && movie->h264.chunk_dirty;
+        bool loaded = reload_dirty ? load_chunk_from_file(movie, chunk_index, true)
+            : load_chunk(movie, chunk_index);
+        if (!loaded) {
             debug_tracef("progress seek frame=%lu load chunk=%d fail", (unsigned long) frame_index, chunk_index);
             return false;
         }
@@ -2708,6 +2879,7 @@ bool decode_to_frame_with_progress(
             if (recover_failed_h264_playback_state(movie) &&
                 decode_h264_frame_with_progress(movie, frame_index, true, predicate, hook, userdata)) {
                 movie->current_frame = frame_index;
+                if(movie->lookahead_enabled && !h264_lookahead_begin(movie))movie->lookahead_enabled=false;
                 return true;
             }
             if (abort_requested && *abort_requested) {
@@ -2723,5 +2895,31 @@ bool decode_to_frame_with_progress(
         return decode_to_frame(movie, frame_index);
     }
     movie->current_frame = frame_index;
+    if(movie->lookahead_enabled && !h264_lookahead_begin(movie))movie->lookahead_enabled=false;
     return true;
+}
+
+bool playback_prepare_ahead(Movie *movie,uint64_t target_ticks,const PointerState *pointer)
+{
+    if(!h264_lookahead_active(movie))return false;
+    uint64_t now=monotonic_clock_now_ticks();
+    uint32_t guard=monotonic_clock_ticks_per_second()*2U/1000U;
+    if(target_ticks<=now || target_ticks-now<=guard)return false;
+    uint64_t started=now;
+    playback_capture_ahead_scope(movie,true);
+    bool progressed=h264_lookahead_step(movie,target_ticks-guard);
+    playback_capture_ahead_scope(movie,false);
+    uint64_t ended=monotonic_clock_now_ticks();
+    playback_capture_stage(movie,CAPTURE_AHEAD,started,ended);
+    if(!progressed && movie_async_enabled(movie) &&
+       h264_lookahead_next_frame(movie)<movie->header.frame_count &&
+       target_ticks>ended && target_ticks-ended>guard){
+        uint32_t spare=monotonic_clock_ticks_to_ms(target_ticks-ended-guard);
+        if(spare>4U)spare=4U;
+        if(spare){
+            prefetch_tick(movie,false,spare,pointer);
+            playback_capture_stage(movie,CAPTURE_PREFETCH,ended,monotonic_clock_now_ticks());
+        }
+    }
+    return progressed;
 }

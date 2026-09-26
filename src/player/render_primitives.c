@@ -1560,7 +1560,7 @@ void draw_cursor(SDL_Surface *screen, int x, int y)
     }
 }
 
-void compute_video_rects(
+static void compute_video_rects_uncached(
     const Movie *movie,
     ScaleMode scale_mode,
     VideoAlign video_align_x,
@@ -1619,6 +1619,43 @@ void compute_video_rects(
     dst->y = aligned_axis_position(SCREEN_H, dst->h, video_align_y);
 }
 
+void compute_video_rects(
+    const Movie *movie,
+    ScaleMode scale_mode,
+    VideoAlign video_align_x,
+    VideoAlign video_align_y,
+    SDL_Rect *src,
+    SDL_Rect *dst
+)
+{
+    static bool valid;
+    static uint16_t width;
+    static uint16_t height;
+    static ScaleMode cached_mode;
+    static VideoAlign cached_align_x;
+    static VideoAlign cached_align_y;
+    static SDL_Rect cached_src;
+    static SDL_Rect cached_dst;
+
+    if (!movie || !src || !dst) {
+        return;
+    }
+    /* Geometry is fixed between scale/alignment changes. Avoid repeating soft-float
+     * division on ARM; key by values so reuse of a Movie allocation stays safe. */
+    if (!valid || width != movie->header.video_width || height != movie->header.video_height ||
+        cached_mode != scale_mode || cached_align_x != video_align_x || cached_align_y != video_align_y) {
+        compute_video_rects_uncached(movie, scale_mode, video_align_x, video_align_y, &cached_src, &cached_dst);
+        width = movie->header.video_width;
+        height = movie->header.video_height;
+        cached_mode = scale_mode;
+        cached_align_x = video_align_x;
+        cached_align_y = video_align_y;
+        valid = true;
+    }
+    *src = cached_src;
+    *dst = cached_dst;
+}
+
 bool clip_scaled_rects_to_screen(
     const SDL_Rect *src,
     const SDL_Rect *dst,
@@ -1647,6 +1684,14 @@ bool clip_scaled_rects_to_screen(
         return false;
     }
 
+    /* The normal FIT/STRETCH/FILL path is fully contained: no clipping divisions. */
+    if (src->x >= 0 && src->y >= 0 && src->x + src->w <= source_w && src->y + src->h <= source_h &&
+        dst->x >= 0 && dst->y >= 0 && dst->x + dst->w <= SCREEN_W && dst->y + dst->h <= SCREEN_H) {
+        *clipped_src = *src;
+        *clipped_dst = *dst;
+        return true;
+    }
+
     dst_x0 = dst->x;
     dst_y0 = dst->y;
     dst_x1 = dst_x0 + dst->w;
@@ -1659,10 +1704,12 @@ bool clip_scaled_rects_to_screen(
         return false;
     }
 
-    src_x0 = src->x + (int) (((int64_t) (clip_x0 - dst_x0) * src->w) / dst->w);
-    src_y0 = src->y + (int) (((int64_t) (clip_y0 - dst_y0) * src->h) / dst->h);
-    src_x1 = src->x + (int) (((int64_t) (clip_x1 - dst_x0) * src->w) / dst->w);
-    src_y1 = src->y + (int) (((int64_t) (clip_y1 - dst_y0) * src->h) / dst->h);
+    /* Each delta is within the Uint16 destination extent, so its product with
+     * a Uint16 source extent fits uint32_t. Avoid ARM's 64-bit divide helper. */
+    src_x0 = src->x + (int) (((uint32_t) (clip_x0 - dst_x0) * src->w) / dst->w);
+    src_y0 = src->y + (int) (((uint32_t) (clip_y0 - dst_y0) * src->h) / dst->h);
+    src_x1 = src->x + (int) (((uint32_t) (clip_x1 - dst_x0) * src->w) / dst->w);
+    src_y1 = src->y + (int) (((uint32_t) (clip_y1 - dst_y0) * src->h) / dst->h);
     src_x0 = clamp_int(src_x0, 0, source_w);
     src_y0 = clamp_int(src_y0, 0, source_h);
     src_x1 = clamp_int(src_x1, 0, source_w);

@@ -4207,7 +4207,8 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         if preview_output_path is not None:
             log(f"Wrote {preview_output_path.name} for preview.", quiet=args.quiet)
         return stats
-    except KeyboardInterrupt:
+    except BaseException:
+        # A failed pack/write must never leave a seemingly playable partial container.
         if output_started:
             cleanup_partial_file(output_path)
         if stats_started:

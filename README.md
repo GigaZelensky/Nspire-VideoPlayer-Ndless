@@ -35,13 +35,16 @@ The `.nvp` format used by the current player is:
 - H.264 decode through `h264bsd`
 - MPEG-4 Part 2 decode through vendored Xvid sources
 - RGB565 output
-- chunk-byte prefetching for smoother playback
+- direct storage reads on CX and CX II, with decoded frames prepared ahead for smoother playback
+- SRAM lookup tables on CX and CX II
 - accurate frame pacing from a hardware-backed monotonic timer
 - subtitle support for text subtitle tracks
 - built-in subtitle font cycling
 - scale modes: `FIT`, `FILL`, `STRETCH`, `1:1`
 - playback speed control from `0.25x` to `2.0x`
 - screen brightness control with `Up` / `Down` and an on-screen percentage overlay
+- adjustable warm night filter
+- idle dimming, screen-off and automatic standby
 - theme color profiles: `DORFic`, `Blue`, `Green`, and `Red`
 - picker UI for multiple `.nvp` / `.nvp.tns` files
 - picker filename metadata tooltips from bracketed tags
@@ -51,6 +54,7 @@ The `.nvp` format used by the current player is:
 ## Current Limits
 
 - no audio yet
+- automatic standby returns to the OS first on firmware without in-player standby support
 
 ## Battery Life
 
@@ -62,7 +66,7 @@ Battery Life: ~9.5 hours of continuous H.264 playback at 100% brightness on a CX
 
 - `Up` / `Down` or keypad `8` / `2`: select movie
 - touchpad: move cursor
-- touchpad hover: after a short pause, show filename metadata tooltip when available
+- touchpad hover: show the title, filename metadata and video duration
 - touchpad click: open highlighted movie
 - `Enter` or keypad `5`: open movie
 - `C`: cycle theme color
@@ -80,16 +84,18 @@ Example:
 Rick and Morty S07E03 [English SDH].nvp.tns
 ```
 
-The list row shows `Rick and Morty S07E03`. If you hover the row and keep the pointer still briefly, a small tooltip shows the clean title plus `English SDH` underneath. Multiple bracketed tags are joined with ` | ` in the tooltip.
+The list row shows `Rick and Morty S07E03`. Hover briefly to see the clean title, `English SDH` metadata and the video duration on separate lines. Multiple bracketed tags are joined with ` | ` in the tooltip.
 
 ### Playback
 
-- `Space`: play / pause, or restart when the movie has ended
+- `Space`: play / pause with a small pause indicator, or restart when the movie has ended
 - touchpad: move cursor and show the UI
 - `Enter` / keypad `5` / touchpad click: play / pause, restart at end, click hovered controls, or seek inside the bottom UI band
 - `Left` / `Right` or keypad `4` / `6`: seek `-5s` / `+5s`
 - keypad `7` / `9`: switch to the previous / next video in the current directory
 - `Up` / `Down` or keypad `8` / `2`: increase / decrease screen brightness
+- `N`: toggle night mode
+- `Ctrl` + touchpad `Up` / `Down`: enable night mode, then adjust its intensity; hold to repeat. At 0%, night mode is off.
 - `Tab`: single-frame step while paused, hold to repeat
 - `P`: cycle playback mode: `PLAY ONCE`, `REPLAY`, `AUTO NEXT`
 - `R`: toggle realtime sync, allowing displayed-frame drops instead of slowdown
@@ -102,12 +108,14 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 - `T`: cycle subtitle track
 - `M`: toggle memory / playback diagnostics overlay
 - `C`: cycle theme color
-- `D`: toggle verbose debug logging
+- `D`: toggle performance recording and diagnostic logging (off by default)
 - `S`: save a BMP screenshot
 - `Catalog`: open / close the help overlay
 - `Scratchpad`: save state and open OS Scratchpad
 - `Esc`: close help, or leave the movie if help is not open
-- `On`: turn the display black; while black, `Esc` saves history and returns to the OS home menu
+- `On`: smoothly turn the screen off or back on; while off, `Esc` saves history and returns to the OS home menu
+
+Night mode also works in the picker and resume prompt. Its intensity is remembered while the app is open.
 
 ### Resume Prompt
 
@@ -119,6 +127,10 @@ The list row shows `Rick and Morty S07E03`. If you hover the row and keep the po
 - `S`: save a BMP screenshot
 - `Scratchpad`: save state and open OS Scratchpad
 - `Esc`: cancel and return
+
+## Idle Power Management
+
+In the picker, resume prompt or paused playback, the screen dims after one minute, turns off after two, and enters standby after three. Input wakes the screen; active playback keeps it awake. On the verified CX II-T firmware, standby resumes directly in the player. Other firmware uses the normal OS suspend path.
 
 ## Subtitle Fonts
 
@@ -274,11 +286,11 @@ Run `python tools/encode_ndless_video.py --help` for the full CLI.
 
 ## Diagnostics
 
-The player can write a debug log next to the movie file as `ndvideo-debug.log`.
+Debug logging is off by default. Press `D` during playback to start or stop a performance recording, then leave the movie normally to save `ndvideo-debug.log` beside it. No diagnostic files are written unless you enable `D`.
 
 The `M` overlay shows:
 
-- total RAM usage
+- tracked movie-buffer usage (not total OS memory)
 - cache usage
 - current frame
 - contiguous decoded runway
@@ -286,8 +298,6 @@ The `M` overlay shows:
 - lag count
 - ring-hit vs direct-decode counts
 - whether verbose debug logging is currently enabled
-
-Verbose debug logging is off by default. Press `D` during playback to enable it; normal playback exits do not write `ndvideo-debug.log` unless logging was enabled or the player hits an error.
 
 The [examples](examples) folder also includes a short packaged sample movie and a matching `ndvideo.tns` for quick on-device smoke testing.
 
