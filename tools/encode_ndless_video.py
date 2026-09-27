@@ -8,6 +8,7 @@ from collections import deque
 import hashlib
 import html
 import json
+import math
 import re
 import shutil
 import struct
@@ -2552,8 +2553,8 @@ def h264_stream_profile_options(idr_frames: int, stream_profile: str, *, flexibl
         extra_params = [
             "aq-mode=1",
             "mbtree=1",
-            "rc-lookahead=20",
-            "sync-lookahead=20",
+            "rc-lookahead=60",
+            "sync-lookahead=60",
         ]
     elif stream_profile == "intra":
         tune = None
@@ -3424,6 +3425,127 @@ def bitstream_access_units(bitstream: bytes) -> list[AccessUnit]:
     return group_nals_into_access_units(parse_annex_b_nalus(bitstream))
 
 
+@dataclass(slots=True)
+class H264SizeAnalysis:
+    frame_bytes: list[int]  # Payload plus the container's four-byte frame offset.
+    idr_frames: list[int]
+    bitrate_kbps: float | None
+    crf: float
+
+
+def measure_h264_sizes(access_units: list[AccessUnit], bitrate_kbps: float | None, crf: float) -> H264SizeAnalysis:
+    return H264SizeAnalysis(
+        [4 + access_unit_payload_size(unit, keep_parameter_sets=True) for unit in access_units],
+        [i for i, unit in enumerate(access_units) if chunk_has_independent_start(unit)],
+        bitrate_kbps, crf,
+    )
+
+
+def h264_analysis_cache_path(input_path: Path, settings: dict) -> Path:
+    def identity(path: Path) -> tuple[str, int, int]:
+        stat = path.stat()
+        return str(path.resolve()), stat.st_size, stat.st_mtime_ns
+    key = {"version": 1, "input": identity(input_path), "settings": settings,
+           "ffmpeg": identity(Path(imageio_ffmpeg.get_ffmpeg_exe()))}
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    return Path(tempfile.gettempdir()) / "nvp-idr-analysis-cache" / f"{digest}.json"
+
+
+def load_h264_size_analysis(path: Path, bitrate_kbps: float | None, crf: float) -> H264SizeAnalysis | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        sizes, idrs = value["frame_bytes"], value["idr_frames"]
+        rate, saved_crf = value["bitrate_kbps"], value["crf"]
+        if not isinstance(sizes, list) or not sizes or not all(type(n) is int and 4 < n <= 0x7FFFFFFF for n in sizes):
+            return None
+        if not isinstance(idrs, list) or not idrs or idrs[0] != 0 or not all(type(n) is int and 0 <= n < len(sizes) for n in idrs):
+            return None
+        if any(a >= b for a, b in zip(idrs, idrs[1:])):
+            return None
+        if any(b - a > AUTO_IDR_MAX_FRAMES for a, b in zip(idrs, idrs[1:] + [len(sizes)])):
+            return None
+        # Nearby bitrate changes can reuse the measured complexity. Large
+        # changes get a fresh probe; all resulting chunks are verified either way.
+        if bitrate_kbps is not None:
+            if not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0 or not 0.8 <= bitrate_kbps / rate <= 1.25:
+                return None
+        elif rate is not None or saved_crf != crf:
+            return None
+        return H264SizeAnalysis(sizes, idrs, rate, saved_crf)
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        return None
+
+
+def save_h264_size_analysis(path: Path, analysis: H264SizeAnalysis, *, quiet: bool) -> None:
+    temporary: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(asdict(analysis), handle, separators=(",", ":"))
+        temporary.replace(path)
+    except OSError:
+        log("Could not cache the IDR analysis; the encode can still continue.", quiet=quiet)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def plan_bounded_idrs(analysis: H264SizeAnalysis, *, max_chunk_bytes: int,
+                      chunk_frames: int, bitrate_kbps: float | None = None) -> list[int]:
+    if not analysis.idr_frames or analysis.idr_frames[0] != 0:
+        raise RuntimeError("IDR analysis must start with an independently decodable frame.")
+    scale = bitrate_kbps / analysis.bitrate_kbps if bitrate_kbps and analysis.bitrate_kbps else 1.0
+    costs = [4 + math.ceil((size - 4) * scale) for size in analysis.frame_bytes]
+    anchors = analysis.idr_frames + [len(costs)]
+    added: list[int] = []
+    frame_cap = chunk_frames or len(costs)
+    for gop, (first, end) in enumerate(zip(anchors, anchors[1:])):
+        segment = costs[first:end]
+        if len(segment) <= frame_cap and align4(4 + sum(segment)) <= max_chunk_bytes:
+            continue
+        nearby = sorted(costs[i] for i in analysis.idr_frames[max(0, gop - 2):gop + 3])
+        idr_cost = max(segment[0], nearby[len(nearby) // 2])
+        prefix = [0]
+        for size in segment:
+            prefix.append(prefix[-1] + size)
+        # Minimize new IDRs first, then tiny tails and estimated I-frame cost.
+        # The latter favors frames already expensive to predict (often a cut).
+        # Leave room for the rate-control change caused by inserting IDRs.
+        for limit in (int(max_chunk_bytes * 0.92), max_chunk_bytes):
+            scores: list[tuple[int, int, int, int] | None] = [None] * (len(segment) + 1)
+            previous = [-1] * len(scores)
+            scores[0] = (0, 0, 0, 0)
+            for stop in range(1, len(scores)):
+                for start in range(stop - 1, -1, -1):
+                    raw_bytes = 4 + prefix[stop] - prefix[start]
+                    if stop - start > frame_cap or raw_bytes > limit:
+                        break
+                    if scores[start] is None:
+                        continue
+                    extra = max(0, idr_cost - segment[start]) if start else 0
+                    size = align4(raw_bytes + extra)
+                    if size > limit:
+                        continue
+                    parts, short, penalty, imbalance = scores[start]
+                    candidate = (parts + 1, short + (stop - start < 6), penalty + extra, imbalance + size * size)
+                    if scores[stop] is None or candidate < scores[stop]:
+                        scores[stop], previous[stop] = candidate, start
+            if scores[-1] is not None:
+                break
+        if scores[-1] is None:
+            raise RuntimeError(f"Cannot fit GOP at frame {first} into the chunk limit; raise --max-chunk-kib.")
+        stop = len(segment)
+        while previous[stop] > 0:
+            stop = previous[stop]
+            added.append(first + stop)
+    # Keep existing anchors, so adding an IDR does not shift later GOPs that fit.
+    return sorted(set(analysis.idr_frames[1:] + added)) if added else []
+
+
 def byte_budget_idr_frames_from_access_units(
     access_units: list[AccessUnit],
     *,
@@ -3431,29 +3553,8 @@ def byte_budget_idr_frames_from_access_units(
     chunk_frames: int,
     stream_profile: str,
 ) -> list[int]:
-    forced_frames: list[int] = []
-    current_payload_size = 0
-    current_frame_count = 0
-    frame_cap = chunk_frames if chunk_frames > 0 else None
-
-    for frame_index, unit in enumerate(access_units):
-        keep_parameter_sets = current_frame_count == 0 or stream_profile != "intra"
-        unit_payload_size = access_unit_payload_size(unit, keep_parameter_sets=keep_parameter_sets)
-        candidate_frame_count = current_frame_count + 1
-        candidate_payload_size = current_payload_size + unit_payload_size
-        candidate_blob_size = align4(4 + (candidate_frame_count * 4) + candidate_payload_size)
-        exceeds_byte_cap = current_frame_count > 0 and candidate_blob_size > max_chunk_bytes
-        exceeds_frame_cap = current_frame_count > 0 and frame_cap is not None and candidate_frame_count > frame_cap
-
-        if exceeds_byte_cap or exceeds_frame_cap:
-            forced_frames.append(frame_index)
-            current_frame_count = 1
-            current_payload_size = access_unit_payload_size(unit, keep_parameter_sets=True)
-        else:
-            current_frame_count = candidate_frame_count
-            current_payload_size = candidate_payload_size
-
-    return forced_frames
+    return plan_bounded_idrs(measure_h264_sizes(access_units, None, 0.0),
+                            max_chunk_bytes=max_chunk_bytes, chunk_frames=chunk_frames)
 
 
 def summarize_chunk_oversize(
@@ -3512,121 +3613,67 @@ def encode_h264_bitstream_byte_auto(
     quiet: bool,
 ) -> tuple[bytes, int, str]:
     max_keyint = min(AUTO_IDR_MAX_FRAMES, chunk_frames) if chunk_frames > 0 else AUTO_IDR_MAX_FRAMES
-    previous_forced_frames: list[int] | None = None
-    idr_reason = (
-        f"byte-auto, max keyint {max_keyint}; forced IDRs are refined from measured "
-        f"{format_binary_size(max_chunk_bytes)} chunk boundaries"
+    options = dict(
+        input_path=input_path, source_width=source_width, source_height=source_height,
+        source_fps=source_fps, width=width, height=height, fps=fps, crop_rect=crop_rect,
+        idr_frames=max_keyint, crf=crf, bitrate_kbps=bitrate_kbps, two_pass=two_pass,
+        preset=preset, level=level, stream_profile=stream_profile, start=start,
+        duration=duration, encode_duration=encode_duration, hdr_to_sdr=hdr_to_sdr,
+        burn_subtitle=burn_subtitle, burn_subtitle_size=burn_subtitle_size,
+        preview_output_path=None, quiet=quiet,
     )
+    burn_identity = asdict(burn_subtitle) if burn_subtitle else None
+    if burn_subtitle and burn_subtitle.path:
+        stat = burn_subtitle.path.stat()
+        burn_identity["file_size"] = stat.st_size
+        burn_identity["file_mtime_ns"] = stat.st_mtime_ns
+    cache_path = h264_analysis_cache_path(input_path, {
+        "source": [source_width, source_height, source_fps], "output": [width, height, fps],
+        "crop": asdict(crop_rect) if crop_rect else None, "start": start, "duration": duration,
+        "hdr_to_sdr": hdr_to_sdr, "burn": burn_identity, "burn_scale": burn_subtitle_size,
+        "preset": preset, "level": level, "two_pass": two_pass,
+        "profile": h264_stream_profile_options(max_keyint, stream_profile)[1],
+    })
+    cached = load_h264_size_analysis(cache_path, bitrate_kbps, crf)
+    if cached:
+        forced = plan_bounded_idrs(cached, max_chunk_bytes=max_chunk_bytes,
+                                  chunk_frames=chunk_frames, bitrate_kbps=bitrate_kbps)
+        added = len(set(forced).difference(cached.idr_frames))
+        log(f"Reusing cached frame-size analysis; planning {added} additional IDR(s) in oversized GOPs.", quiet=quiet)
+        bitstream = encode_h264_bitstream(**options, forced_keyframe_frames=forced or None,
+                                         label_prefix="FFmpeg byte-IDR cached plan")
+    else:
+        bitstream = encode_h264_bitstream(**options, label_prefix="FFmpeg byte-IDR probe")
+        analysis = measure_h264_sizes(bitstream_access_units(bitstream), bitrate_kbps, crf)
+        save_h264_size_analysis(cache_path, analysis, quiet=quiet)
 
-    bitstream = encode_h264_bitstream(
-        input_path=input_path,
-        source_width=source_width,
-        source_height=source_height,
-        source_fps=source_fps,
-        width=width,
-        height=height,
-        fps=fps,
-        crop_rect=crop_rect,
-        idr_frames=max_keyint,
-        crf=crf,
-        bitrate_kbps=bitrate_kbps,
-        two_pass=two_pass,
-        preset=preset,
-        level=level,
-        stream_profile=stream_profile,
-        start=start,
-        duration=duration,
-        encode_duration=encode_duration,
-        hdr_to_sdr=hdr_to_sdr,
-        burn_subtitle=burn_subtitle,
-        burn_subtitle_size=burn_subtitle_size,
-        preview_output_path=None,
-        quiet=quiet,
-        label_prefix="FFmpeg byte-IDR probe",
-    )
-
-    for pass_index in range(DEFAULT_BYTE_AUTO_IDR_PASSES):
-        access_units = bitstream_access_units(bitstream)
-        forced_frames = byte_budget_idr_frames_from_access_units(
-            access_units,
-            max_chunk_bytes=max_chunk_bytes,
-            chunk_frames=chunk_frames,
-            stream_profile=stream_profile,
-        )
-        if previous_forced_frames:
-            forced_frames = sorted(set(previous_forced_frames).union(forced_frames))
-        if previous_forced_frames == forced_frames:
-            log(
-                f"Byte-auto IDR converged with {len(forced_frames)} forced boundary frame(s).",
-                quiet=quiet,
-            )
-            break
-
-        previous_forced_frames = forced_frames
-        log(
-            f"Byte-auto IDR pass {pass_index + 1}/{DEFAULT_BYTE_AUTO_IDR_PASSES}: "
-            f"forcing {len(forced_frames)} measured chunk boundary frame(s).",
-            quiet=quiet,
-        )
-        bitstream = encode_h264_bitstream(
-            input_path=input_path,
-            source_width=source_width,
-            source_height=source_height,
-            source_fps=source_fps,
-            width=width,
-            height=height,
-            fps=fps,
-            crop_rect=crop_rect,
-            idr_frames=max_keyint,
-            forced_keyframe_frames=forced_frames,
-            crf=crf,
-            bitrate_kbps=bitrate_kbps,
-            two_pass=two_pass,
-            preset=preset,
-            level=level,
-            stream_profile=stream_profile,
-            start=start,
-            duration=duration,
-            encode_duration=encode_duration,
-            hdr_to_sdr=hdr_to_sdr,
-            burn_subtitle=burn_subtitle,
-            burn_subtitle_size=burn_subtitle_size,
-            preview_output_path=None,
-            quiet=quiet,
-            label_prefix=f"FFmpeg byte-IDR refine {pass_index + 1}/{DEFAULT_BYTE_AUTO_IDR_PASSES}",
-        )
-
+    # Verify before asking for any re-encode. A file that already fits needs
+    # no refinement, including near-misses covered by the user's tolerance.
+    for attempt in range(DEFAULT_BYTE_AUTO_IDR_PASSES + 1):
         access_units = bitstream_access_units(bitstream)
         try:
-            oversize_count, chunk_count, max_blob_size = summarize_chunk_oversize(
-                access_units,
-                chunk_frames=chunk_frames,
-                max_chunk_bytes=max_chunk_bytes,
-                hard_max_chunk_bytes=hard_max_chunk_bytes,
-                stream_profile=stream_profile,
+            oversize_count, chunk_count, largest = summarize_chunk_oversize(
+                access_units, chunk_frames=chunk_frames, max_chunk_bytes=max_chunk_bytes,
+                hard_max_chunk_bytes=hard_max_chunk_bytes, stream_profile=stream_profile,
             )
-        except ChunkTooLargeError as error:
-            log(f"Byte-auto IDR pass {pass_index + 1} still has an oversized {error.label}; refining again.", quiet=quiet)
-            continue
-
-        if oversize_count == 0:
-            log(
-                f"Byte-auto IDR pass {pass_index + 1} hit the byte target cleanly "
-                f"({chunk_count} chunks, max {format_binary_size(max_blob_size)}).",
-                quiet=quiet,
-            )
+        except ChunkTooLargeError:
+            if attempt == DEFAULT_BYTE_AUTO_IDR_PASSES:
+                raise
+            analysis = measure_h264_sizes(access_units, bitrate_kbps, crf)
+            forced = plan_bounded_idrs(analysis, max_chunk_bytes=max_chunk_bytes, chunk_frames=chunk_frames)
+            added = len(set(forced).difference(analysis.idr_frames))
+            if not added:
+                raise
+            log(f"Byte-auto repair {attempt + 1}: adding {added} IDR(s) only inside oversized GOPs.", quiet=quiet)
+            bitstream = encode_h264_bitstream(**options, forced_keyframe_frames=forced,
+                                             label_prefix=f"FFmpeg byte-IDR repair {attempt + 1}")
+        else:
+            log(f"Byte-auto verified {chunk_count} chunks, max {format_binary_size(largest)}, "
+                f"{oversize_count} within-tolerance near-miss(es); no further encoding needed.", quiet=quiet)
             break
-        log(
-            f"Byte-auto IDR pass {pass_index + 1} left {oversize_count} soft-over target chunk(s); "
-            f"max {format_binary_size(max_blob_size)}; keeping this because it is within the hard tolerance.",
-            quiet=quiet,
-        )
-        break
-
     if preview_output_path is not None:
         write_preview_mp4_from_bitstream(bitstream, preview_output_path, fps, quiet=quiet)
-
-    return bitstream, max_keyint, idr_reason
+    return bitstream, max_keyint, "byte-auto: verified bounds, selective GOP splitting and reusable size analysis"
 
 
 def build_access_unit_payload(unit: AccessUnit, *, keep_parameter_sets: bool) -> bytes:

@@ -278,7 +278,17 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --output ".\dist\vi
 ```
 
 Use CRF when you want the best quality-per-bit without caring about the exact final size. Use `--bitrate-kbps ... --two-pass` when you need a tighter size target.
-By default, chunks are packed by `--max-chunk-kib`; `64` is the recommended starting point for smooth on-device playback. `--chunk-frames` can still be set as an extra frame-count ceiling, and `--chunk-frames 0` leaves that ceiling disabled. `--idr-frames auto` is also the default; in bitrate mode it estimates a fixed keyframe cadence from the chunk byte cap. For higher-quality size-targeted encodes, `--idr-frames byte-auto` runs a probe encode, measures real frame sizes, then re-encodes with IDRs placed at measured chunk byte boundaries. This adds encode time, but avoids shrinking every GOP just because one scene is heavy. `--max-chunk-overshoot-percent` allows rare single-GOP near-misses above the target instead of throwing away an otherwise good encode.
+
+Chunks are packed by `--max-chunk-kib`; `64` is a useful starting point for smooth
+playback. `--chunk-frames` adds an optional frame-count ceiling (`0` disables it).
+`--idr-frames auto` estimates a fixed keyframe interval from the bitrate and byte cap.
+
+`--idr-frames byte-auto` measures frame sizes and splits oversized GOPs while
+leaving the others alone. Files that already fit skip refinement. Analysis is
+cached for repeat encodes and nearby bitrate changes; every final chunk is still
+checked. `--max-chunk-overshoot-percent` permits small near-misses without adding
+more keyframes just to shave off a few bytes.
+
 When `--fps` caps or changes the framerate, the encoder timeline-samples frames and then verifies the encoded frame count against the intended duration. The `.json` sidecar records source fps, target fps, expected frames, actual frames, and drift in milliseconds.
 
 ### Main Encoder Options
