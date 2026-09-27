@@ -80,14 +80,13 @@ OBJS += $(patsubst %.c, %.o, $(XVID_DECODER_SRCS))
 OBJS += $(patsubst %.cpp, %.o, $(shell find src -type d -name '.*' -prune -o -type f -name "*.cpp" -print))
 OBJS += $(patsubst %.S, %.o, $(shell find src -type d -name '.*' -prune -o -type f -name "*.S" -print))
 EXE = ndvideo
+TNS = _$(EXE).tns
 DISTDIR = dist
 LEGACY_OBJS = src/player.o
-vpath %.tns $(DISTDIR)
-vpath %.elf $(DISTDIR)
 
 .PHONY: all clean
 
-all: $(EXE).tns
+all: $(DISTDIR)/$(TNS)
 
 %.o: %.c
 	$(GCC) $(if $(filter $(FAST_SRCS),$<),$(FAST_GCCFLAGS),$(GCCFLAGS)) $(if $(filter src/codecs/xvid/%,$<),-Wno-incompatible-pointer-types,-Werror=incompatible-pointer-types) -MMD -MP -c $< -o $@
@@ -98,19 +97,19 @@ all: $(EXE).tns
 %.o: %.S
 	$(AS) -c $< -o $@
 
-$(EXE).elf: $(OBJS)
+$(DISTDIR)/$(EXE).elf: $(OBJS)
 	mkdir -p $(DISTDIR)
-	$(LD) $^ -o $(DISTDIR)/$@ $(LDFLAGS)
+	$(LD) $^ -o $@ $(LDFLAGS)
 
 $(LOADER):
 	cd $(LOADER_DIR) && $(RAW_GXX) $(LOADER_GXXFLAGS) loader.cpp -o zehn_loader.tns.elf
 	$(OBJCOPY) --set-section-flags .pad=alloc,load,contents -O binary $(LOADER_ELF) $(LOADER)
 
-$(EXE).tns: $(EXE).elf $(LOADER)
-	$(PACKZEHN) --input $(DISTDIR)/$< --output $(DISTDIR)/$@ --zehn-output $(DISTDIR)/$(EXE).zehn --loader $(LOADER) $(PACKFLAGS)
+$(DISTDIR)/$(TNS): $(DISTDIR)/$(EXE).elf $(LOADER)
+	$(PACKZEHN) --input $< --output "$@" --zehn-output $(DISTDIR)/$(EXE).zehn --loader $(LOADER) $(PACKFLAGS)
 
 clean:
-	rm -f $(OBJS) $(LEGACY_OBJS) $(DISTDIR)/$(EXE).tns $(DISTDIR)/$(EXE).elf $(DISTDIR)/$(EXE).zehn
+	rm -f $(OBJS) $(LEGACY_OBJS) "$(DISTDIR)/$(TNS)" $(DISTDIR)/$(EXE).elf $(DISTDIR)/$(EXE).zehn
 	rm -f $(OBJS:.o=.d)
 
 -include $(OBJS:.o=.d)

@@ -16,7 +16,6 @@
 /* Short, high-motion chunks can exhaust five slots in well under a second.
  * Allocations remain lazy and subject to the existing total-byte budget. */
 #define PREFETCH_CHUNK_COUNT 16
-#define UI_BUFFER_CHUNK_CACHE_COUNT 7
 
 typedef struct {
     uint32_t start_ms;
@@ -119,8 +118,6 @@ typedef struct Movie {
     size_t chunk_size;
     int loaded_chunk;
     PrefetchedChunk prefetched[PREFETCH_CHUNK_COUNT];
-    int ui_buffer_chunks[UI_BUFFER_CHUNK_CACHE_COUNT];
-    size_t ui_buffer_chunk_count;
     int decoded_local_frame;
     uint32_t current_frame;
     SDL_Surface *frame_surface;

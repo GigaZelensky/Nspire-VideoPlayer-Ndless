@@ -234,12 +234,8 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
     movie->last_read_time_ms = 1U;
     {
         int prefetch_index;
-        int ui_chunk_index;
         for (prefetch_index = 0; prefetch_index < PREFETCH_CHUNK_COUNT; ++prefetch_index) {
             movie->prefetched[prefetch_index].chunk_index = -1;
-        }
-        for (ui_chunk_index = 0; ui_chunk_index < UI_BUFFER_CHUNK_CACHE_COUNT; ++ui_chunk_index) {
-            movie->ui_buffer_chunks[ui_chunk_index] = -1;
         }
     }
     movie->decoded_local_frame = -1;

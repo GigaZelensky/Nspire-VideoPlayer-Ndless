@@ -268,7 +268,8 @@ int play_movie(
     uint32_t last_render_visibility = 0;
     int last_render_pointer_x = -1, last_render_pointer_y = -1;
     bool last_render_pointer_visible = false;
-    int last_render_buffer_chunks[PREFETCH_CHUNK_COUNT + 1] = {0};
+    int last_render_buffer_width = -1;
+    int last_render_decoded_width = -1;
     PlaybackPressTarget playback_press_target = PLAYBACK_PRESS_NONE;
     PointerState pointer;
     bool help_menu_open = false;
@@ -2151,12 +2152,13 @@ int play_movie(
                     last_render_pointer_y, pointer.visible, pointer.x, pointer.y);
             bool render_memory_refresh = playback_memory_refresh_due(&render_gate, render_now_ms,
                 memory_overlay_mode != MEMORY_OVERLAY_OFF);
-            int render_buffer_chunks[PREFETCH_CHUNK_COUNT + 1];
-            render_buffer_chunks[0] = movie.loaded_chunk;
-            for (int i = 0; i < PREFETCH_CHUNK_COUNT; ++i)
-                render_buffer_chunks[i + 1] = movie.prefetched[i].chunk_index;
+            int render_buffer_width = ui_mixes.chrome
+                ? movie_buffered_bar_width(&movie, progress_bar_rect().w) : -1;
+            int render_decoded_width = ui_mixes.chrome
+                ? movie_decoded_bar_width(&movie, progress_bar_rect().w) : -1;
             bool render_buffers_changed = ui_mixes.chrome &&
-                memcmp(render_buffer_chunks, last_render_buffer_chunks, sizeof(render_buffer_chunks)) != 0;
+                (render_buffer_width != last_render_buffer_width ||
+                 render_decoded_width != last_render_decoded_width);
             bool render_input_changed = render_pointer_changed ||
                 enter_edge || enter_release_edge || space_edge || tab_edge || cat_edge || esc_edge ||
                 divide_edge || exp_edge || tenx_edge || speed_down_edge || speed_up_edge ||
@@ -2202,7 +2204,8 @@ int play_movie(
                 last_render_pointer_visible = pointer.visible;
                 last_render_pointer_x = pointer.x;
                 last_render_pointer_y = pointer.y;
-                memcpy(last_render_buffer_chunks, render_buffer_chunks, sizeof(render_buffer_chunks));
+                last_render_buffer_width = render_buffer_width;
+                last_render_decoded_width = render_decoded_width;
                 uint32_t render_started_ms = collect_render_metrics ? monotonic_clock_now_ms() : 0;
                 bool capture_render = playback_capture_active(&movie);
                 uint64_t capture_render_started = monotonic_clock_now_ticks();

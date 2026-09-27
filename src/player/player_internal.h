@@ -1208,12 +1208,10 @@ void draw_memory_badge( SDL_Surface *screen, const Fonts *fonts, Movie *movie, c
 bool movie_h264_idr_bounds(const Movie *, uint32_t frame, uint32_t *first, uint32_t *end);
 void draw_help_row( SDL_Surface *screen, const Fonts *fonts, int shortcut_x, int shortcut_w, int description_x, int y, const char *shortcut, const char *description );
 void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu_mix);
-bool chunk_list_contains(const int *chunks, size_t count, int chunk_index);
-void chunk_list_add_unique(int *chunks, size_t *count, size_t capacity, int chunk_index);
-void movie_update_ui_buffer_chunks(Movie *movie, int *chunks_to_draw, size_t *num_chunks_to_draw);
+int movie_buffered_bar_width(const Movie *movie, int width);
+int movie_decoded_bar_width(const Movie *movie, int width);
 Uint16 progress_overlay_fill_color_at_y(const SDL_Rect *overlay, int y);
 void draw_progress_track(SDL_Surface *screen, const SDL_Rect *bar_back, const SDL_Rect *overlay);
-void draw_progress_buffer_range(SDL_Surface *screen, const SDL_Rect *rect);
 void draw_progress_overlay(SDL_Surface *screen, const SDL_Rect *overlay);
 void draw_progress( SDL_Surface *screen, const Fonts *fonts, Movie *movie, uint32_t current_ms, bool paused, const PlaybackRate *playback_rate, uint32_t now_ms, const PointerState *pointer, int32_t pending_seek_ms, int32_t seek_badge_ms, uint32_t seek_badge_started_ms, uint32_t seek_badge_hide_elapsed_ms, SeekBarPreviewState *seek_preview, uint8_t preview_mix, uint8_t chrome_mix );
 void render_movie( SDL_Surface *screen, const Fonts *fonts, Movie *movie, bool paused, bool show_ui, bool help_menu_open, ScaleMode scale_mode, ScaleMorphState *scale_morph, VideoAlign video_align_x, VideoAlign video_align_y, const PlaybackRate *playback_rate, MemoryOverlayMode memory_overlay_mode, SubtitleSurfaceCache *subtitle_cache, size_t subtitle_font_index, bool subtitle_font_overlay_visible, int subtitle_size, SubtitlePlacement subtitle_placement, const char *movie_title_text, const char *movie_detail_text, const char *status_overlay_text, uint32_t status_overlay_started_ms, uint32_t status_overlay_until_ms, const ScreenshotPreviewState *screenshot_preview, SeekBarPreviewState *seek_preview, uint32_t now_ms, const PointerState *pointer, int32_t pending_seek_ms, int32_t seek_badge_ms, uint32_t seek_badge_started_ms, uint32_t seek_badge_hide_elapsed_ms, const PlaybackUiMixes *ui_mixes );

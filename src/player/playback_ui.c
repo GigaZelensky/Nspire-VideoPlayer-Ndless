@@ -2020,98 +2020,75 @@ void draw_help_menu(SDL_Surface *screen, const Fonts *fonts, uint8_t menu_mix)
     }
 }
 
-bool chunk_list_contains(const int *chunks, size_t count, int chunk_index)
+static uint32_t movie_decoded_buffer_end(const Movie *movie)
 {
-    size_t index;
-
-    if (!chunks || chunk_index < 0) {
-        return false;
-    }
-    for (index = 0; index < count; ++index) {
-        if (chunks[index] == chunk_index) {
-            return true;
-        }
-    }
-    return false;
+    if (!movie || movie->current_frame >= movie->header.frame_count)
+        return 0;
+    uint32_t end = movie->current_frame + 1U;
+    unsigned queued = h264_lookahead_queued(movie);
+    uint32_t next = h264_lookahead_next_frame(movie);
+    if (queued && next >= queued && next - queued == end)
+        end = next > movie->header.frame_count ? movie->header.frame_count : next;
+    return end;
 }
 
-void chunk_list_add_unique(int *chunks, size_t *count, size_t capacity, int chunk_index)
+int movie_decoded_bar_width(const Movie *movie, int width)
 {
-    if (!chunks || !count || chunk_index < 0 || *count >= capacity ||
-        chunk_list_contains(chunks, *count, chunk_index)) {
-        return;
-    }
-    chunks[*count] = chunk_index;
-    ++(*count);
+    uint32_t end = movie_decoded_buffer_end(movie);
+    return end && width > 0
+        ? (int) (((uint64_t) width * end) / movie->header.frame_count) : 0;
 }
 
-void movie_update_ui_buffer_chunks(Movie *movie, int *chunks_to_draw, size_t *num_chunks_to_draw)
+/* Show only the continuous forward buffer. Decoded RGB frames can bridge
+ * chunks whose compressed storage has already been recycled. A pending read
+ * or a disconnected seek-cache entry must not promise buffered playback. */
+int movie_buffered_bar_width(const Movie *movie, int width)
 {
-    int fresh_chunks[UI_BUFFER_CHUNK_CACHE_COUNT];
-    size_t fresh_count = 0;
-    size_t real_chunk_count = 0;
-    size_t index;
-    int current_chunk = -1;
+    int chunks[PREFETCH_CHUNK_COUNT + 1];
+    unsigned count = 0;
+    uint32_t end;
+    uint32_t total;
 
-    if (!movie || !chunks_to_draw || !num_chunks_to_draw) {
-        return;
-    }
+    if (!movie || width <= 0 || !movie->chunk_index ||
+        !(total = movie->header.frame_count) || movie->current_frame >= total)
+        return 0;
 
-    for (index = 0; index < UI_BUFFER_CHUNK_CACHE_COUNT; ++index) {
-        fresh_chunks[index] = -1;
-    }
-    if (movie->header.frame_count > 0 && movie->chunk_index) {
-        current_chunk = movie_chunk_for_frame(movie, movie->current_frame);
-    }
-    chunk_list_add_unique(fresh_chunks, &fresh_count, UI_BUFFER_CHUNK_CACHE_COUNT, current_chunk);
-    if (current_chunk >= 0 && movie->current_frame < movie->header.frame_count) {
-        unsigned queued = h264_lookahead_queued(movie);
-        uint32_t remaining = movie->header.frame_count - movie->current_frame - 1U;
-        if (queued > remaining) queued = remaining;
-        int last_queued_chunk = movie_chunk_for_frame(movie, movie->current_frame + queued);
-        /* RGB frames remain buffered after their compressed chunks are reused.
-         * Include those intervening chunks, nearest to playback first. */
-        for (int chunk = current_chunk + 1; chunk <= last_queued_chunk; ++chunk) {
-            chunk_list_add_unique(fresh_chunks, &fresh_count, UI_BUFFER_CHUNK_CACHE_COUNT, chunk);
+    end = movie_decoded_buffer_end(movie);
+
+    for (unsigned i = 0; i <= PREFETCH_CHUNK_COUNT; ++i) {
+        int chunk;
+        if (!i) {
+            if (!movie->chunk_storage || !movie->chunk_bytes || !movie->frame_offsets)
+                continue;
+            chunk = movie->loaded_chunk;
+        } else {
+            const PrefetchedChunk *slot = &movie->prefetched[i - 1U];
+            if (slot->state != PREFETCH_READY || !slot->chunk_storage)
+                continue;
+            chunk = slot->chunk_index;
         }
-    }
-    if (movie->loaded_chunk >= 0) {
-        chunk_list_add_unique(fresh_chunks, &fresh_count, UI_BUFFER_CHUNK_CACHE_COUNT, movie->loaded_chunk);
-        ++real_chunk_count;
-    }
-    for (index = 0; index < PREFETCH_CHUNK_COUNT; ++index) {
-        if (movie->prefetched[index].chunk_index >= 0) {
-            chunk_list_add_unique(
-                fresh_chunks,
-                &fresh_count,
-                UI_BUFFER_CHUNK_CACHE_COUNT,
-                movie->prefetched[index].chunk_index
-            );
-            ++real_chunk_count;
+        if (chunk < 0 || (uint32_t) chunk >= movie->header.chunk_count)
+            continue;
+        unsigned at = count;
+        while (at && chunks[at - 1U] > chunk) {
+            chunks[at] = chunks[at - 1U];
+            --at;
         }
+        chunks[at] = chunk;
+        ++count;
     }
-
-    if (real_chunk_count > 0 || movie->ui_buffer_chunk_count == 0) {
-        movie->ui_buffer_chunk_count = 0;
-        for (index = 0; index < fresh_count; ++index) {
-            chunk_list_add_unique(
-                movie->ui_buffer_chunks,
-                &movie->ui_buffer_chunk_count,
-                UI_BUFFER_CHUNK_CACHE_COUNT,
-                fresh_chunks[index]
-            );
-        }
+    for (unsigned i = 0; i < count; ++i) {
+        const ChunkIndexEntry *entry = &movie->chunk_index[chunks[i]];
+        if (entry->first_frame > end)
+            break;
+        uint32_t length = entry->frame_count;
+        if (length > total - entry->first_frame)
+            length = total - entry->first_frame;
+        uint32_t chunk_end = entry->first_frame + length;
+        if (chunk_end > end)
+            end = chunk_end;
     }
-
-    *num_chunks_to_draw = 0;
-    for (index = 0; index < movie->ui_buffer_chunk_count; ++index) {
-        chunk_list_add_unique(
-            chunks_to_draw,
-            num_chunks_to_draw,
-            UI_BUFFER_CHUNK_CACHE_COUNT,
-            movie->ui_buffer_chunks[index]
-        );
-    }
+    return (int) (((uint64_t) width * end) / total);
 }
 
 Uint16 progress_overlay_fill_color_at_y(const SDL_Rect *overlay, int y)
@@ -2243,7 +2220,7 @@ void draw_progress_track(SDL_Surface *screen, const SDL_Rect *bar_back, const SD
     fill_rect_rgb565(screen, &pixel, turn_bottom);
 }
 
-void draw_progress_buffer_range(SDL_Surface *screen, const SDL_Rect *rect)
+static void draw_progress_buffer_range(SDL_Surface *screen, const SDL_Rect *rect, bool decoded)
 {
     SDL_Rect line;
     Uint16 top;
@@ -2256,9 +2233,9 @@ void draw_progress_buffer_range(SDL_Surface *screen, const SDL_Rect *rect)
     top = blend_rgb565(
         blend_rgb565(ui_theme()->progress_fill_top, ui_theme()->progress_fill_bottom, 144),
         UI_COLOR_BLACK,
-        78
+        decoded ? 36 : 78
     );
-    bottom = blend_rgb565(ui_theme()->progress_fill_bottom, UI_COLOR_BLACK, 116);
+    bottom = blend_rgb565(ui_theme()->progress_fill_bottom, UI_COLOR_BLACK, decoded ? 58 : 116);
     draw_vertical_gradient(screen, rect, top, bottom);
     if (rect->h > 2) {
         line.x = rect->x;
@@ -2383,7 +2360,6 @@ void draw_progress(
     SDL_Rect bar_back = progress_bar_rect();
     SDL_Rect bar_front = bar_back;
     int ui_offset = ui_bar_hidden_offset_for_mix(chrome_mix);
-    size_t chunk_draw_index;
     char current_text[24];
     char total_text[24];
     char left_text[56];
@@ -2407,43 +2383,11 @@ void draw_progress(
 
     draw_progress_track(screen, &bar_back, &overlay);
 
-    if (movie->header.frame_count > 0 && movie->chunk_index) {
-        int chunks_to_draw[UI_BUFFER_CHUNK_CACHE_COUNT];
-        size_t num_chunks_to_draw = 0;
-
-        movie_update_ui_buffer_chunks(movie, chunks_to_draw, &num_chunks_to_draw);
-
-        for (chunk_draw_index = 0; chunk_draw_index < num_chunks_to_draw; ++chunk_draw_index) {
-            const ChunkIndexEntry *entry = movie->chunk_index + chunks_to_draw[chunk_draw_index];
-            int bar_right = bar_back.x + bar_back.w;
-            uint32_t start_frame = entry->first_frame;
-            uint32_t end_frame = start_frame + entry->frame_count;
-
-            int x1 = bar_back.x + (int) (((uint64_t) bar_back.w * start_frame) / movie->header.frame_count);
-            int x2 = bar_back.x + (int) (((uint64_t) bar_back.w * end_frame) / movie->header.frame_count);
-
-            SDL_Rect prefetch_rect = bar_back;
-            prefetch_rect.x = x1;
-            prefetch_rect.w = x2 - x1;
-
-            if (prefetch_rect.w <= 0) {
-                prefetch_rect.w = 1;
-            }
-            if (prefetch_rect.x >= bar_right) {
-                prefetch_rect.w = 0;
-            } else if (prefetch_rect.x + prefetch_rect.w > bar_right) {
-                prefetch_rect.w = (Uint16) (bar_right - prefetch_rect.x);
-            }
-
-            if (prefetch_rect.w > 0) {
-                SDL_Rect sep = {prefetch_rect.x + prefetch_rect.w - 1, prefetch_rect.y, 1, prefetch_rect.h};
-                draw_progress_buffer_range(screen, &prefetch_rect);
-                if (prefetch_rect.w > 2) {
-                    fill_rect_rgb565_mix(screen, &sep, UI_COLOR_BLACK, 28);
-                }
-            }
-        }
-    }
+    SDL_Rect buffered = bar_back;
+    buffered.w = (Uint16) movie_buffered_bar_width(movie, bar_back.w);
+    draw_progress_buffer_range(screen, &buffered, false);
+    buffered.w = (Uint16) movie_decoded_bar_width(movie, bar_back.w);
+    draw_progress_buffer_range(screen, &buffered, true);
     bar_front.w = 0;
     if (seek_preview &&
         seek_preview->suppress_until_pointer_moves &&

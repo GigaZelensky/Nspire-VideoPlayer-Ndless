@@ -4,7 +4,7 @@ Native Ndless video player and PC-side encoder for the TI-Nspire CX and CX II li
 
 This project targets the **TI-Nspire CX**, **TI-Nspire CX II**, and **TI-Nspire CX II-T**, and plays streamed `.nvp` movies from calculator storage. The player binary and the movie data stay separate:
 
-- `ndvideo.tns`: the Ndless launcher
+- `_ndvideo.tns`: the Ndless launcher
 - `*.nvp.tns`: movie containers produced by the encoder
 
 ## Screenshots
@@ -184,7 +184,7 @@ The built-in subtitle font cycle currently includes:
 
 ## Build
 
-If you just want to run the player on a calculator, you do not have to build it yourself. The latest GitHub Actions run uploads `ndvideo.tns` as an artifact in the repository's `Actions` tab.
+If you just want to run the player on a calculator, you do not have to build it yourself. The latest GitHub Actions run uploads `_ndvideo.tns` as an artifact in the repository's `Actions` tab.
 
 ### Requirements
 
@@ -205,7 +205,7 @@ make
 
 The build writes to [dist](dist):
 
-- `ndvideo.tns`
+- `_ndvideo.tns`
 - `ndvideo.elf`
 - `ndvideo.zehn`
 
@@ -336,14 +336,14 @@ The `M` overlay shows:
 - ring-hit vs direct-decode counts
 - whether verbose debug logging is currently enabled
 
-The [examples](examples) folder also includes a short packaged sample movie and a matching `ndvideo.tns` for quick on-device smoke testing.
+The [examples](examples) folder includes a short packaged sample movie to try on your calculator.
 
 ## Install On Calculator
 
-1. Download `ndvideo.tns` from the latest GitHub Actions artifact, or build it locally.
+1. Download `_ndvideo.tns` from the latest GitHub Actions artifact, or build it locally.
 2. Encode one or more videos into `.nvp.tns`.
-3. Copy `ndvideo.tns` and the movie files to the calculator.
-4. Launch `ndvideo.tns` through Ndless.
+3. Copy `_ndvideo.tns` and the movie files to the calculator.
+4. Launch `_ndvideo.tns` through Ndless.
 5. Pick a movie and play it locally from storage.
 
 ## License

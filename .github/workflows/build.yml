@@ -104,7 +104,7 @@ jobs:
         with:
           name: ndvideo-${{ github.sha }}
           path: |
-            dist/ndvideo.tns
+            dist/_ndvideo.tns
             dist/ndvideo.zehn
             dist/ndvideo.elf
           if-no-files-found: error
@@ -151,12 +151,12 @@ jobs:
           build_sha="$(git rev-parse HEAD)"
           release_name="${RELEASE_TAG//\//-}"
           mkdir -p release
-          cp dist/ndvideo.tns "release/ndvideo-${release_name}.tns"
+          cp "dist/_ndvideo.tns" "release/_ndvideo.tns"
           cp dist/ndvideo.zehn "release/ndvideo-${release_name}.zehn"
           cp dist/ndvideo.elf "release/ndvideo-${release_name}.elf"
           (
             cd release
-            sha256sum "ndvideo-${release_name}.tns" "ndvideo-${release_name}.zehn" "ndvideo-${release_name}.elf" > SHA256SUMS.txt
+            sha256sum "_ndvideo.tns" "ndvideo-${release_name}.zehn" "ndvideo-${release_name}.elf" > SHA256SUMS.txt
           )
           {
             echo "ND Video Player ${RELEASE_TAG}"
@@ -168,7 +168,7 @@ jobs:
             fi
             echo
             echo "## Assets"
-            echo "- \`ndvideo-${release_name}.tns\` - calculator-ready app"
+            echo "- \`_ndvideo.tns\` - calculator-ready app"
             echo "- \`ndvideo-${release_name}.zehn\` - packed Zehn payload"
             echo "- \`ndvideo-${release_name}.elf\` - debug/symbol build artifact"
             echo "- \`SHA256SUMS.txt\` - SHA-256 checksums"
