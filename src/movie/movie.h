@@ -87,6 +87,7 @@ typedef struct Movie {
     int32_t diag_async_native_error;
     long current_file_pos;
     MovieHeader header;
+    bool encrypted;
     /* Reduced once on load; keep the original serialized header for metadata. */
     uint16_t timing_fps_num;
     uint16_t timing_fps_den;

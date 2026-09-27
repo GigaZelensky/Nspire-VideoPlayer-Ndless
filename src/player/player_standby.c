@@ -3,6 +3,7 @@
 #include "native_standby.h"
 #include "native_screen_power.h"
 #include "screenshot_writer.h"
+#include "performance_clock.h"
 
 /* Ownership is needed only for the explicit native standby/resume bridge.
  * Normal picker/playback does not run the OS scheduler or acquire these holds. */
@@ -36,8 +37,10 @@ static void standby_bridge(void *unused)
     (void)unused;
     /* The only interrupt-enabled OS spans execute with genuine SRAM mapped. */
     if (standby_acquire()) {
+        performance_clock_restore();
         standby_entered = true;
         native_standby_run();
+        performance_clock_start();
     }
 }
 

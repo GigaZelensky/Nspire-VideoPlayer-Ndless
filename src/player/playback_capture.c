@@ -4,6 +4,7 @@
 #include "native_screen_power.h"
 #include "native_standby.h"
 #include "private_writer.h"
+#include "performance_clock.h"
 
 #define CAPTURE_RENDER_REASON_COUNT 10U
 
@@ -362,10 +363,13 @@ void playback_capture_export(FILE *file, const Movie *movie)
         (unsigned long)ahead.allocation_failures);
     fprintf(
         file,
-        "device hwtype=%u cx2=%u color=%u touchpad=%u lcd=%d clock_hw=%u tick_hz=%lu timer_control_saved=%08x timer_speed_saved=%08x\n",
-        hwtype(), is_cx2 ? 1U : 0U, has_colors ? 1U : 0U, is_touchpad ? 1U : 0U, (int)lcd_type(),
+        "device hwtype=%u cx2=%u color=1 touchpad=%u lcd=%d clock_hw=%u tick_hz=%lu timer_control_saved=%08x timer_speed_saved=%08x\n",
+        hwtype(), is_cx2 ? 1U : 0U, is_touchpad ? 1U : 0U, (int)lcd_type(),
         g_clock.using_hw_timer ? 1U : 0U, (unsigned long)g_capture->tick_hz,
         g_clock.original_control, g_clock.original_speed);
+    performance_clock_debug(file);
+    if (movie && movie->codec == MOVIE_CODEC_H264)
+        fputs("color_conversion flat_reuse=exact_yuv cache_entries=1 cache_scope=conversion_band\n", file);
     fprintf(file,
             "platform_features screen_power_profile=%u standby_profile=%u async_writer_profile=%u detection=driver_code_and_mapping\n",
             native_screen_power_supported() ? 1U : 0U, native_standby_supported() ? 1U : 0U,

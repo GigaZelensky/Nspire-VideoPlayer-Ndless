@@ -36,7 +36,7 @@ bool debug_should_collect_metrics(void)
 
 scr_type_t screen_buffer_type(void)
 {
-    return has_colors ? SCR_320x240_565 : SCR_320x240_8;
+    return SCR_320x240_565;
 }
 
 scr_type_t screen_lcd_type(void)
@@ -51,7 +51,7 @@ void patch_cx2_lcd_edge_timing(void)
     volatile uint32_t *timing_1 = (volatile uint32_t *) 0xC0000004;
     uint32_t timing;
 
-    if (!has_colors || !is_cx2) {
+    if (!is_cx2) {
         return;
     }
 
@@ -91,7 +91,7 @@ void present_screen(SDL_Surface *screen)
      * RGB565. Use our burst copy there too; portrait panels still need its
      * rotation path. Read the current framebuffer each time because standby
      * can restore/reassign it. Night mode has already produced the final pixels. */
-    if (has_colors && screen->pitch == SCREEN_W * sizeof(uint16_t) &&
+    if (screen->pitch == SCREEN_W * sizeof(uint16_t) &&
         lcd_type() == SCR_320x240_565) {
         player_copy_maybe_fast(REAL_SCREEN_BASE_ADDRESS, pixels,
                                SCREEN_W * SCREEN_H * sizeof(uint16_t));
@@ -745,9 +745,6 @@ static size_t lcd_manual_brightness_nearest_index(uint32_t raw_value)
 
 uint32_t current_lcd_brightness(void)
 {
-    if (!has_colors) {
-        return LCD_BRIGHTNESS_MIN;
-    }
     if (is_cx2) {
         return (uint32_t) clamp_int((int) *LCD_BRIGHTNESS_CX2_ADDR,
             LCD_BRIGHTNESS_MIN,
@@ -760,9 +757,6 @@ uint32_t set_lcd_brightness(int value)
 {
     uint32_t clamped = (uint32_t) clamp_int(value, LCD_BRIGHTNESS_MIN, LCD_BRIGHTNESS_MAX);
 
-    if (!has_colors) {
-        return clamped;
-    }
     if (is_cx2) {
         *LCD_BRIGHTNESS_CX2_ADDR = clamped;
     } else {
@@ -773,9 +767,6 @@ uint32_t set_lcd_brightness(int value)
 
 void set_lcd_dark_for_power_off(void)
 {
-    if (!has_colors) {
-        return;
-    }
     if (is_cx2) {
         set_lcd_brightness(LCD_BRIGHTNESS_MAX);
     } else {
@@ -1413,10 +1404,6 @@ void suppress_seek_bar_preview_rebuild(SeekBarPreviewState *preview, int marker_
 
 bool monotonic_clock_try_init_hw_timer(void)
 {
-    if (is_classic) {
-        return false;
-    }
-
     g_clock.value_reg = (volatile unsigned *) MONOTONIC_TIMER_VALUE_ADDR;
     g_clock.control_reg = (volatile unsigned *) MONOTONIC_TIMER_CONTROL_ADDR;
     g_clock.speed_reg = (volatile unsigned *) MONOTONIC_TIMER_CLOCK_SOURCE_ADDR;

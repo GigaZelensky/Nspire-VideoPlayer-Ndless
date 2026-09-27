@@ -7,6 +7,7 @@
 #include "storage_activity.h"
 #include "storage_mutation.h"
 #include "raw_region_cache.h"
+#include "movie_crypto_session.h"
 #include "../platform/portable_reader_platform.h"
 #include "../storage/raw_file_reader.h"
 #define REG(a) (*(volatile uint32_t *)(uintptr_t)(a))
@@ -17,6 +18,8 @@ struct RawPlayerIo {
     PortableStorageSnapshot snapshot;
     RawFileOverlay overlays[32];
     uint8_t buffer[32768];
+    NveReader *crypt;
+    bool crypt_restart;
     unsigned overlay_count;
     RawFileOverlay metadata_overlays[PORTABLE_STORAGE_CLEAN_MAX];
     uint32_t metadata_total;
@@ -254,6 +257,26 @@ static void service_once(RawPlayerIo *ctx)
      * Canceling on every 1 Hz journal write can starve a cold region rebuild. */
     if (native_requested && !ctx->running)
         return;
+    if (ctx->crypt) {
+        if (ctx->crypt_restart) {
+            if (ctx->offset > UINT32_MAX ||
+                !nve_reader_begin(ctx->crypt, (uint32_t)ctx->offset, ctx->buffer, (uint32_t)ctx->bytes)) {
+                ctx->failed = true; ctx->error = -320; return;
+            }
+            ctx->crypt_restart = false;
+        }
+        if (ctx->crypt->phase != NVE_READ_FETCH) {
+            nve_reader_step(ctx->crypt);
+            if (ctx->crypt->phase == NVE_READ_DONE) {
+                ctx->ready = true;
+                ctx->ended = counter();
+                ctx->completed_bytes = (uint32_t)ctx->bytes;
+            } else if (ctx->crypt->phase == NVE_READ_ERROR) {
+                ctx->failed = true; ctx->error = -321;
+            }
+            return;
+        }
+    }
     if (!ctx->view) {
         if (native_requested || storage_native_active())
             return;
@@ -268,7 +291,10 @@ static void service_once(RawPlayerIo *ctx)
         }
     }
     if (!ctx->running) {
-        if (!raw_file_begin(&ctx->reader, ctx->offset, ctx->buffer, (uint32_t)ctx->bytes)) {
+        uint64_t offset = ctx->crypt ? nve_reader_physical_offset(ctx->crypt) : ctx->offset;
+        void *buffer = ctx->crypt ? ctx->crypt->block : ctx->buffer;
+        uint32_t bytes = ctx->crypt ? ctx->crypt->unit_bytes + NVE_TAG_BYTES : (uint32_t)ctx->bytes;
+        if (!raw_file_begin(&ctx->reader, offset, buffer, bytes)) {
             ctx->failed = true;
             ctx->error = -306;
             return;
@@ -278,10 +304,13 @@ static void service_once(RawPlayerIo *ctx)
     restore_cached_region(ctx);
     RawFileStatus status = raw_file_step(&ctx->reader, now(), 32768U);
     if (status == RAW_FILE_DONE) {
-        ctx->ready = true;
         ctx->running = false;
-        ctx->ended = counter();
-        ctx->completed_bytes = (uint32_t)ctx->bytes;
+        if (ctx->crypt) nve_reader_supplied(ctx->crypt, true);
+        else {
+            ctx->ready = true;
+            ctx->ended = counter();
+            ctx->completed_bytes = (uint32_t)ctx->bytes;
+        }
     }
     if (status == RAW_FILE_CANCELED)
         ctx->running = false;
@@ -302,8 +331,10 @@ static void service(RawPlayerIo *ctx, uint32_t budget)
     unsigned mask = native_critical_enter();
     do {
         uint32_t before = counter();
-        /* Four bounded core steps share interrupt/timer bookkeeping. */
-        for (unsigned i = 0; i < 4U; ++i) {
+        /* Keep the existing read batching for plain movies. Crypto steps do
+         * more CPU work, so check the playback deadline after each one. */
+        unsigned batch = ctx->crypt ? 1U : 4U;
+        for (unsigned i = 0; i < batch; ++i) {
             service_once(ctx);
             ++ctx->steps;
             if (ctx->failed || ctx->ready || (!ctx->requested && !ctx->park) ||
@@ -348,6 +379,14 @@ RawPlayerIo *raw_player_create(const char *path)
         create_error = ctx->error ? ctx->error : -310;
         goto fail;
     }
+    const NveKeys *keys = movie_crypto_keys(path);
+    if (keys) {
+        create_error = -320;
+        if (keys->header.physical_bytes != ctx->snapshot.file_bytes ||
+            !(ctx->crypt = calloc(1, sizeof(*ctx->crypt))))
+            goto fail;
+        nve_reader_init(ctx->crypt, keys);
+    }
     create_error = 0;
     live = ctx;
     native_critical_leave(entry_mask);
@@ -367,6 +406,7 @@ void raw_player_cancel(RawPlayerIo *ctx)
     ctx->discard_regions = true;
     ctx->requested = false;
     ctx->ready = false;
+    ctx->crypt_restart = true;
     if (ctx->running)
         raw_file_cancel(&ctx->reader);
     ctx->park = true;
@@ -421,6 +461,7 @@ static void before_foreground_io(bool native)
             raw_player_cancel(ctx);
         else {
             ctx->requested = ctx->ready = false;
+            ctx->crypt_restart = true;
             raw_file_cancel(&ctx->reader);
             ctx->park = true;
         }
@@ -454,6 +495,11 @@ void raw_player_destroy(RawPlayerIo *ctx)
         live = NULL;
     if (ctx->input)
         portable_reader_platform_close(&ctx->platform, ctx->input);
+    if (ctx->crypt) {
+        nve_wipe(ctx->crypt, sizeof(*ctx->crypt));
+        free(ctx->crypt);
+        nve_wipe(ctx->buffer, sizeof(ctx->buffer));
+    }
     free(ctx);
     native_critical_leave(entry_mask);
 }
@@ -470,6 +516,7 @@ int raw_player_read(RawPlayerIo *ctx, uint64_t offset, void *destination, size_t
         ctx->bytes = bytes;
         ctx->requested = true;
         ctx->ready = false;
+        ctx->crypt_restart = true;
         ctx->started = counter();
     }
     do {
@@ -516,7 +563,10 @@ bool raw_player_idle(unsigned milliseconds)
     } while ((uint32_t)(start - counter()) < duration);
     return true;
 }
-size_t raw_player_memory_bytes(void) { return sizeof(RawPlayerIo); }
+size_t raw_player_memory_bytes(void)
+{
+    return sizeof(RawPlayerIo) + (live && live->crypt ? sizeof(NveReader) : 0U);
+}
 bool raw_player_last_read(RawPlayerIo *ctx, uint32_t *start, uint32_t *end, uint32_t *bytes)
 {
     if (!ctx || !ctx->completed_bytes)
@@ -543,7 +593,7 @@ void raw_player_after_clock_reset(RawPlayerIo *ctx)
 int raw_player_error(const RawPlayerIo *ctx) { return ctx ? ctx->error : create_error; }
 uint32_t raw_player_file_bytes(const RawPlayerIo *ctx)
 {
-    return ctx ? ctx->snapshot.file_bytes : 0U;
+    return ctx ? (ctx->crypt ? ctx->crypt->keys->header.plain_bytes : ctx->snapshot.file_bytes) : 0U;
 }
 void raw_player_debug(FILE *file, const RawPlayerIo *ctx)
 {

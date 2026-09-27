@@ -27,6 +27,11 @@ const PlaybackRate g_playback_rates[PLAYBACK_RATE_COUNT] = {
     {3, 2, "1.5x"},
     {7, 4, "1.75x"},
     {2, 1, "2.0x"},
+    {3, 1, "3.0x"},
+    {4, 1, "4.0x"},
+    /* Keep existing indices stable: they are stored in resume history. */
+    {5, 2, "2.5x"},
+    {7, 2, "3.5x"},
 };
 const int g_subtitle_font_choices[SUBTITLE_FONT_CHOICE_COUNT] = {
     NSDL_FONT_TINYTYPE,

@@ -24,7 +24,7 @@ GCCFLAGS_BASE = -Wall -Wextra -Wno-unused-parameter -std=c99 -marm -mcpu=arm926e
 LDFLAGS = -Wl,--gc-sections -lSDL -flto -O3
 LDFLAGS += -Wl,--wrap=fopen,--wrap=fread,--wrap=fwrite,--wrap=fseek,--wrap=fclose,--wrap=fflush,--wrap=_open,--wrap=_read,--wrap=_write,--wrap=_lseek,--wrap=_close,--wrap=remove,--wrap=rename,--wrap=nuc_opendir,--wrap=nuc_readdir,--wrap=nuc_closedir
 LOADER_GXXFLAGS = -g -Os -Wall -Wextra -march=armv5te -fPIE -std=c++11 -fno-rtti -fno-exceptions -Wl,-Tldscript -Wl,--gc-sections -nostdlib -nostartfiles -ffreestanding -I ../../include
-PACKFLAGS = --name "ND Video Player" --author "GigaZelensky" --version 1 --ndless-min 45 --hww-support --uses-lcd-blit
+PACKFLAGS = --name "ND Video Player" --author "GigaZelensky" --version 1 --ndless-min 45 --hww-support --uses-lcd-blit --no-support-32mb
 
 ifeq ($(DEBUG),FALSE)
 	GCCFLAGS = $(GCCFLAGS_BASE) -Os -flto
@@ -40,7 +40,8 @@ HOT_PLAYER_SRCS = src/player/h264_lookahead.c src/player/codec_streaming.c src/p
 	src/player/playback_ui.c src/player/playback_loop.c src/player/subtitles.c \
 	src/player/input_timing_memory.c src/player/night_mode.c \
 	src/player/movie_open_scan.c src/player/platform_debug.c
-FAST_SRCS = src/codecs/h264bsd/% src/codecs/xvid/% src/codecs/mpeg4_xvid.c $(HOT_PLAYER_SRCS)
+FAST_SRCS = src/codecs/h264bsd/% src/codecs/xvid/% src/codecs/mpeg4_xvid.c \
+	src/crypto/bearssl/% src/movie/nve_crypto.c $(HOT_PLAYER_SRCS)
 
 XVID_DECODER_SRCS = \
 	src/codecs/xvid/xvid.c \

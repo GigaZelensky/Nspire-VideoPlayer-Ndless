@@ -4,6 +4,7 @@
 #include "native_interrupts.h"
 #include "storage_activity.h"
 #include "storage_mutation.h"
+#include "movie_crypto_session.h"
 #include "../platform/portable_reader_platform.h"
 #include "../storage/raw_file_reader.h"
 #include <errno.h>
@@ -19,6 +20,7 @@
 struct StorageReadStream {
     void *native;
     uint32_t bytes, inode;
+    NveReader *crypt;
 };
 typedef struct {
     PortableStorageSnapshot snapshot;
@@ -181,6 +183,19 @@ StorageReadStream *storage_read_stream_open(const char *path, int *error)
         set_error(error, EIO);
         return NULL;
     }
+    const NveKeys *keys = movie_crypto_keys(path);
+    if (keys) {
+        if (keys->header.physical_bytes != stream->bytes ||
+            !(stream->crypt = allocate(sizeof(*stream->crypt)))) {
+            portable_reader_platform_close(&platform, stream->native);
+            dispose(stream);
+            active = false;
+            native_critical_leave(entry_mask);
+            set_error(error, EIO);
+            return NULL;
+        }
+        nve_reader_init(stream->crypt, keys);
+    }
     ++handles;
     active = false;
     native_critical_leave(entry_mask);
@@ -188,9 +203,9 @@ StorageReadStream *storage_read_stream_open(const char *path, int *error)
 }
 uint32_t storage_read_stream_size(const StorageReadStream *stream)
 {
-    return stream ? stream->bytes : 0;
+    return stream ? (stream->crypt ? stream->crypt->keys->header.plain_bytes : stream->bytes) : 0;
 }
-int storage_read_stream_read_at(StorageReadStream *stream, uint32_t offset, void *destination,
+static int read_raw_at(StorageReadStream *stream, uint32_t offset, void *destination,
                                 uint32_t bytes, int *error)
 {
     unsigned entry_mask = native_interrupt_mask();
@@ -285,6 +300,30 @@ finished:
     }
     return (int)copied;
 }
+int storage_read_stream_read_at(StorageReadStream *stream, uint32_t offset, void *destination,
+                                uint32_t bytes, int *error)
+{
+    if (!stream || !stream->crypt) return read_raw_at(stream, offset, destination, bytes, error);
+    set_error(error, 0);
+    if (!stream->native) { set_error(error, EBADF); return -1; }
+    if (active || app_task_io_in_job()) { set_error(error, EBUSY); return -1; }
+    if (offset > storage_read_stream_size(stream)) { set_error(error, EINVAL); return -1; }
+    if (!bytes) return 0;
+    NveReader *r = stream->crypt;
+    if (!nve_reader_begin(r, offset, destination, bytes)) {
+        set_error(error, EINVAL);
+        return -1;
+    }
+    while (r->phase != NVE_READ_DONE && r->phase != NVE_READ_ERROR) {
+        if (r->phase == NVE_READ_FETCH) {
+            uint32_t count = r->unit_bytes + NVE_TAG_BYTES;
+            int result = read_raw_at(stream, nve_reader_physical_offset(r), r->block, count, error);
+            nve_reader_supplied(r, result == (int)count);
+        } else nve_reader_step(r);
+    }
+    if (r->phase == NVE_READ_ERROR) { set_error(error, EIO); return -1; }
+    return (int)bytes;
+}
 int storage_read_stream_close(StorageReadStream *stream, int *error)
 {
     unsigned entry_mask = native_interrupt_mask();
@@ -301,6 +340,10 @@ int storage_read_stream_close(StorageReadStream *stream, int *error)
     native_critical_leave(entry_mask);
     int failure = status ? native_error() : 0;
     stream->native = NULL;
+    if (stream->crypt) {
+        nve_wipe(stream->crypt, sizeof(*stream->crypt));
+        dispose(stream->crypt);
+    }
     if (handles)
         --handles;
     dispose(stream);

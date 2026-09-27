@@ -2,6 +2,7 @@
 #include "movie/nvp_validation.h"
 #include "timing_math.h"
 #include "raw_player_io.h"
+#include "movie_crypto_session.h"
 
 bool load_subtitles(
     Movie *movie,
@@ -246,6 +247,7 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
     loading_progress_tick(loading_progress, false);
 
     movie->file = path ? fopen(path, "rb") : NULL;
+    movie->encrypted = movie_crypto_keys(path) != NULL;
     if (!movie->file) {
         debug_failf("open failed: fopen");
         goto fail;
@@ -480,9 +482,10 @@ void movie_picker_timing_stop(void)
 void movie_picker_timing_tick(MovieFile *files, size_t count, size_t preferred)
 {
     MovieHeader header;
+    uint8_t prefix[NVE_HEADER_BYTES];
 
-    /* A cold header can require a filesystem-map scan. Discover lengths only
-     * after drawing the menu, with the same bounded reader used for playback.
+    /* A cold header can require a filesystem-map scan. Discover metadata
+     * during the menu entrance, with the same bounded reader used for playback.
      * The picker owns it until completion or cancellation before leaving. */
     if (!picker_timing_reader) {
         if (!files || !count)
@@ -498,18 +501,44 @@ void movie_picker_timing_tick(MovieFile *files, size_t count, size_t preferred)
         picker_timing_reader = raw_player_create(picker_timing_file->path);
         if (!picker_timing_reader) {
             picker_timing_file->timing_checked = true;
+            picker_timing_file->metadata_ready_ms = monotonic_clock_now_ms();
             picker_timing_file = NULL;
             return;
         }
     }
 
     raw_player_service(8U);
-    int result = raw_player_read(picker_timing_reader, 0, &header, sizeof(header), false);
+    uint32_t file_bytes = raw_player_file_bytes(picker_timing_reader);
+    size_t prefix_bytes = file_bytes < sizeof(prefix) ? file_bytes : sizeof(prefix);
+    int result = prefix_bytes >= sizeof(header)
+        ? raw_player_read(picker_timing_reader, 0, prefix, prefix_bytes, false) : -1;
     if (result == 0)
         return;
 
     MovieFile *file = picker_timing_file;
     file->timing_checked = true;
+    file->metadata_ready_ms = monotonic_clock_now_ms();
+    if (result > 0) {
+        file->encrypted = !memcmp(prefix, "NVE1", 4);
+        if (file->encrypted) {
+            NveHeader protected_header;
+            if (prefix_bytes == NVE_HEADER_BYTES && nve_header_parse(&protected_header, prefix, file_bytes)) {
+                /* This public header was needed for the lock/duration anyway.
+                 * Retain it so opening the password dialog needs no file I/O.
+                 * Its authentication tag is still checked after key derivation. */
+                file->encrypted_header = malloc(sizeof(protected_header));
+                if (file->encrypted_header) *file->encrypted_header = protected_header;
+                file->duration_ms = protected_header.duration_ms;
+                uint32_t frame = file->resume_frame < protected_header.frame_count
+                    ? file->resume_frame : protected_header.frame_count - 1U;
+                file->resume_ms = (uint32_t)((uint64_t)frame * protected_header.fps_den * 1000U / protected_header.fps_num);
+                file->resume_time_known = file->has_resume;
+            }
+            movie_picker_timing_stop();
+            return;
+        }
+        memcpy(&header, prefix, sizeof(header));
+    }
     if (result > 0 && memcmp(header.magic, "NVP1", 4) == 0 &&
         header.fps_num && header.fps_den && header.frame_count) {
         uint32_t frame = file->resume_frame < header.frame_count

@@ -3792,6 +3792,9 @@ def estimate_mpeg4_total_output_size(chunks: list[list[Mpeg4Frame]], sequence_he
 
 
 def encode(args: argparse.Namespace) -> EncodeStats:
+    if getattr(args, "encrypt", False):
+        # Check the optional dependency before spending time transcoding.
+        from cryptography.hazmat.primitives.ciphers import Cipher
     input_path = Path(args.input).resolve()
     if not input_path.is_file():
         raise FileNotFoundError(f"Input video not found: {input_path}")
@@ -4072,7 +4075,15 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                 quiet=args.quiet,
             )
 
-        with output_path.open("wb") as output_handle:
+        if getattr(args, "encrypt", False):
+            from nve_crypto import EncryptedWriter, read_password
+            password = read_password(args.password_file)
+            output_stream = EncryptedWriter(output_path, expected_output_size,
+                frame_count * 1000000 // int(round(fps * 1000)), password,
+                frame_count, int(round(fps * 1000)), 1000)
+        else:
+            output_stream = output_path.open("wb")
+        with output_stream as output_handle:
             output_started = True
             output_handle.write(b"\0" * HEADER_STRUCT.size)
 
@@ -4246,7 +4257,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeline-drift-tolerance-ms", type=float, default=500.0, help="Maximum allowed encoded duration drift before failing")
     parser.add_argument("--quiet", action="store_true", help="Silence progress logging")
     parser.add_argument("--preview-mp4", action="store_true", help="Also write a video-only .preview.mp4 alongside the .nvp.tns output for quick inspection")
+    parser.add_argument("--encrypt", action="store_true", help="Encrypt the NVP with a prompted password (AES-256; requires cryptography)")
+    parser.add_argument("--password-file", type=Path, help="Read the encryption password from a file instead of prompting")
     args = parser.parse_args(argv)
+    if args.password_file and not args.encrypt:
+        parser.error("--password-file requires --encrypt.")
     if args.chunk_frames < 0:
         parser.error("--chunk-frames must be zero or greater.")
     if args.max_chunk_kib < 0:

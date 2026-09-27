@@ -868,6 +868,7 @@ void draw_playback_title_strip(
     const PlaybackRate *playback_rate,
     const char *title,
     const char *detail,
+    bool encrypted,
     uint8_t mix
 )
 {
@@ -902,7 +903,7 @@ void draw_playback_title_strip(
     level_1_right = scale_badge.x - 6;
     level_2_right = speed_badge.x - 6;
     level_3_right = chrome_right_x_for_margin(8);
-    title_w = nSDL_GetStringWidth(fonts->white, title);
+    title_w = nSDL_GetStringWidth(fonts->white, title) + (encrypted ? 12 : 0);
     detail_w = has_detail ? nSDL_GetStringWidth(fonts->white, detail) : 0;
     required_w = (title_w > detail_w ? title_w : detail_w) + 16;
     if (required_w <= level_1_right - left_x) {
@@ -921,8 +922,8 @@ void draw_playback_title_strip(
     strip.y = (Sint16) y;
     strip.w = (Uint16) (right_x - left_x);
     strip.h = has_detail ? 30 : 20;
-    copy_fitted_text(fonts->white, title, fitted_title, sizeof(fitted_title), strip.w - 16);
-    text_x = strip.x + 8;
+    copy_fitted_text(fonts->white, title, fitted_title, sizeof(fitted_title), strip.w - 16 - (encrypted ? 12 : 0));
+    text_x = strip.x + 8 + (encrypted ? 12 : 0);
     if (has_detail) {
         copy_fitted_text(fonts->white, detail, fitted_detail, sizeof(fitted_detail), strip.w - 16);
         detail_x = strip.x + 8;
@@ -942,6 +943,7 @@ void draw_playback_title_strip(
         fill_rect_rgb565(screen, &glint, rgb565_lerp(ui_theme()->row_selected, UI_COLOR_WARM_WHITE, 72, 255));
     }
     if (mix > 48) {
+        if (encrypted) draw_lock_icon(screen, strip.x + 8, strip.y + (has_detail ? 4 : 5), mix);
         draw_ui_label(screen, fonts, text_x, strip.y + (has_detail ? 5 : 6), fitted_title);
         if (has_detail) {
             draw_ui_label(screen, fonts, detail_x, strip.y + 17, fitted_detail);
@@ -1148,14 +1150,20 @@ void draw_screenshot_preview_osd(
     int panel_x;
     int panel_y;
 
-    if (!screen || !fonts || !preview || !preview->label[0] ||
-        (!preview->request_id && (int32_t)(now_ms - preview->until_ms) > 0)) {
+    if (!screen || !fonts || !preview || !preview->label[0]) {
         return;
     }
 
     panel_x = 8;
     panel_y = 30;
-    if (preview->surface) draw_surface_panel(screen, preview->surface, panel_x, panel_y);
+    if (!preview->surface) {
+        uint32_t until = preview->request_id ? now_ms + SCREENSHOT_PREVIEW_MS : preview->until_ms;
+        draw_status_overlay_badge(screen, fonts, panel_x, panel_y, preview->label,
+            preview->started_ms, until, now_ms, 255);
+        return;
+    }
+    if (!preview->request_id && (int32_t)(now_ms - preview->until_ms) > 0) return;
+    draw_surface_panel(screen, preview->surface, panel_x, panel_y);
     draw_left_text_badge(screen, fonts, panel_x,
         panel_y + (preview->surface ? preview->surface->h + 8 : 0), preview->label);
 }
@@ -2608,6 +2616,7 @@ void render_movie(
 
     scale_morph_current_rects(movie, scale_morph, scale_mode, video_align_x, video_align_y, now_ms, &src, &dst);
     draw_movie_frame_background_rects(screen, movie, &src, &dst);
+    screenshot_set_protected_content(movie->encrypted);
     if (subtitle && subtitle_size >= 0) {
         SubtitleLayoutSpec subtitle_layout;
 
@@ -2695,6 +2704,7 @@ void render_movie(
             playback_rate,
             movie_title_text,
             movie_detail_text,
+            movie->encrypted,
             mix_product_u8(ui_mixes->title_strip, top_chrome_mix)
         );
     }

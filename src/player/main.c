@@ -1,6 +1,8 @@
 #include "player_internal.h"
 #include "storage_descriptors.h"
 #include "storage_read_stream.h"
+#include "performance_clock.h"
+#include "movie_crypto_session.h"
 
 int main(int argc, char **argv)
 {
@@ -23,23 +25,27 @@ int main(int argc, char **argv)
     }
 
     enable_relative_paths(argv);
+    performance_clock_start();
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         show_msgbox("ND Video Player", "Failed to initialize SDL.");
+        performance_clock_restore();
         return 1;
     }
     monotonic_clock_init();
-    screen = SDL_SetVideoMode(SCREEN_W, SCREEN_H, has_colors ? 16 : 8, SDL_SWSURFACE);
+    screen = SDL_SetVideoMode(SCREEN_W, SCREEN_H, 16, SDL_SWSURFACE);
     if (!screen) {
         show_msgbox("ND Video Player", "Failed to create the screen surface.");
         SDL_Quit();
         monotonic_clock_shutdown();
+        performance_clock_restore();
         return 1;
     }
     if (!lcd_init(screen_lcd_type())) {
         show_msgbox("ND Video Player", "Failed to initialize the LCD.");
         SDL_Quit();
         monotonic_clock_shutdown();
+        performance_clock_restore();
         return 1;
     }
     patch_cx2_lcd_edge_timing();
@@ -49,6 +55,7 @@ int main(int argc, char **argv)
         lcd_init(SCR_TYPE_INVALID);
         SDL_Quit();
         monotonic_clock_shutdown();
+        performance_clock_restore();
         return 1;
     }
     night_mode_init(&fonts);
@@ -91,6 +98,18 @@ int main(int argc, char **argv)
             }
             picker_opened_loading = true;
         }
+        if (!picker_opened_loading) {
+            int unlocked = unlock_movie_prompt(screen, &fonts, movie_path, NULL, NULL);
+            if (unlocked != 1) {
+                movie_crypto_clear();
+                if (!unlocked) { argc = 1; continue; }
+                result = unlocked;
+                return_home_after_exit = true;
+                open_scratchpad_after_exit = result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT;
+                suspend_after_exit = result == PLAY_MOVIE_RESULT_SUSPEND_EXIT;
+                break;
+            }
+        }
         result = play_movie(
             screen,
             &fonts,
@@ -100,6 +119,9 @@ int main(int argc, char **argv)
             resume_without_prompt,
             picker_opened_loading
         );
+        /* All movie and preview read handles have closed, including on error
+         * and on return to the picker. Never carry a key into the next video. */
+        movie_crypto_clear();
         argc = 1;
         if (result == PLAY_MOVIE_RESULT_AUTO_NEXT ||
             result == PLAY_MOVIE_RESULT_SWITCH_MOVIE) {
@@ -133,13 +155,6 @@ int main(int argc, char **argv)
     }
     display_power_restore(&g_display_power_state, monotonic_clock_now_ms());
     player_standby_shutdown();
-    if (return_home_after_exit && !suspend_after_exit) {
-        if (open_scratchpad_after_exit) {
-            yes_teacher_im_mathing();
-        } else {
-            return_to_os_home_menu();
-        }
-    }
     cleanup_deferred_playback_movie();
     clear_movie_picker_cache(&g_picker_cache);
     night_mode_shutdown();
@@ -148,15 +163,22 @@ int main(int argc, char **argv)
     free_fonts(&fonts);
     storage_descriptors_shutdown();
     storage_read_stream_shutdown();
+    movie_crypto_clear();
     lcd_init(SCR_TYPE_INVALID);
     SDL_Quit();
     sram_shutdown();
     monotonic_clock_shutdown();
-    if (suspend_after_exit) {
-        /* Hand the request to the OS only after its LCD/timer state and all
-         * movie/history resources have been restored and released. */
-        return_to_os_home_menu();
-        queue_os_suspend_shortcut();
+    performance_clock_restore();
+    /* Explicit Home/Scratchpad/standby navigation also belongs after cleanup. */
+    if (return_home_after_exit) {
+        if (open_scratchpad_after_exit)
+            yes_teacher_im_mathing();
+        else
+            return_to_os_home_menu();
+        if (suspend_after_exit)
+            queue_os_suspend_shortcut();
+    } else {
+        queue_os_redraw();
     }
     return (result == PLAY_MOVIE_RESULT_EXIT ||
         result == PLAY_MOVIE_RESULT_AUTO_NEXT ||

@@ -6,6 +6,10 @@
 static touchpad_report_t g_input_touchpad_report;
 static bool g_input_touchpad_sampled;
 static bool g_input_touchpad_ok;
+/* Position belongs to the app; touch tracking and button edges belong to
+ * each screen. Carry only coordinates across picker/resume/playback. */
+static int g_pointer_x = SCREEN_W / 2;
+static int g_pointer_y = SCREEN_H / 2;
 
 int player_touchpad_scan(touchpad_report_t *report)
 {
@@ -32,8 +36,8 @@ void pointer_init(PointerState *pointer)
 {
     memset(pointer, 0, sizeof(*pointer));
     pointer->info = touchpad_getinfo();
-    pointer->x = SCREEN_W / 2;
-    pointer->y = SCREEN_H / 2;
+    pointer->x = g_pointer_x;
+    pointer->y = g_pointer_y;
     pointer->fx = pointer->x << POINTER_FIXED_SHIFT;
     pointer->fy = pointer->y << POINTER_FIXED_SHIFT;
     if (pointer->info) {
@@ -99,12 +103,16 @@ bool pointer_update(PointerState *pointer)
                 }
             }
             if (pointer->tracking && (dx != 0 || dy != 0)) {
-                pointer->fx += (dx * SCREEN_W * POINTER_GAIN_NUM << POINTER_FIXED_SHIFT) / ((int) pointer->info->width * POINTER_GAIN_DEN);
-                pointer->fy -= (dy * SCREEN_H * POINTER_GAIN_NUM << POINTER_FIXED_SHIFT) / ((int) pointer->info->height * POINTER_GAIN_DEN);
+                /* Unlike a signed left shift, multiplication also defines
+                 * the negative deltas produced by left/down movement. */
+                pointer->fx += (dx * SCREEN_W * POINTER_GAIN_NUM * (1 << POINTER_FIXED_SHIFT)) / ((int) pointer->info->width * POINTER_GAIN_DEN);
+                pointer->fy -= (dy * SCREEN_H * POINTER_GAIN_NUM * (1 << POINTER_FIXED_SHIFT)) / ((int) pointer->info->height * POINTER_GAIN_DEN);
                 pointer->x = clamp_int(pointer->fx >> POINTER_FIXED_SHIFT, 0, SCREEN_W - 1);
                 pointer->y = clamp_int(pointer->fy >> POINTER_FIXED_SHIFT, 0, SCREEN_H - 1);
                 pointer->fx = pointer->x << POINTER_FIXED_SHIFT;
                 pointer->fy = pointer->y << POINTER_FIXED_SHIFT;
+                g_pointer_x = pointer->x;
+                g_pointer_y = pointer->y;
                 pointer->moved = true;
             }
             if (pointer->tracking) {
@@ -404,6 +412,21 @@ const PlaybackRate *playback_rate_for_index(size_t rate_index)
         return &g_playback_rates[PLAYBACK_RATE_DEFAULT_INDEX];
     }
     return &g_playback_rates[rate_index];
+}
+
+size_t playback_rate_step(size_t rate_index, int direction, bool wrap)
+{
+    /* Display order is independent of the stable IDs in saved settings. */
+    static const uint8_t order[PLAYBACK_RATE_COUNT] = {0, 1, 2, 3, 4, 5, 6, 7, 10, 8, 11, 9};
+    for (size_t i = 0; i < PLAYBACK_RATE_COUNT; ++i) {
+        if (order[i] != rate_index) continue;
+        if (!direction) return rate_index;
+        int next = (int)i + (direction < 0 ? -1 : 1);
+        if (next < 0) return wrap ? order[PLAYBACK_RATE_COUNT - 1U] : rate_index;
+        if (next >= (int)PLAYBACK_RATE_COUNT) return wrap ? order[0] : rate_index;
+        return order[next];
+    }
+    return PLAYBACK_RATE_DEFAULT_INDEX;
 }
 
 uint32_t movie_header_frame_time_ms(const MovieHeader *header, uint32_t frame_index)
@@ -901,6 +924,7 @@ void free_movie_files(MovieFile *files, size_t count)
         free(files[index].name);
         free(files[index].detail);
         free(files[index].path);
+        free(files[index].encrypted_header);
     }
     free(files);
 }

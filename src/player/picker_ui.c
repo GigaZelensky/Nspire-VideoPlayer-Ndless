@@ -1185,7 +1185,8 @@ void render_picker(
     uint32_t exit_elapsed_ms,
     uint8_t loading_mix,
     const char *loading_label,
-    int loading_phase
+    int loading_phase,
+    bool present_output
 )
 {
     const char *credit = "Made by GigaZelensky";
@@ -1211,6 +1212,7 @@ void render_picker(
         rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_BG_TOP, background_mix, 255),
         rgb565_lerp(UI_COLOR_BLACK, UI_COLOR_BG_BOTTOM, background_mix, 255)
     );
+    screenshot_set_protected_content(false);
     draw_glass_panel_faded(screen, &header, UI_COLOR_GUNMETAL, false, header_mix);
     fill_rect_rgb565(
         screen,
@@ -1266,7 +1268,7 @@ void render_picker(
         if (pointer && pointer->visible) {
             draw_cursor(screen, pointer->x, pointer->y);
         }
-        present_screen(screen);
+        if (present_output) present_screen(screen);
         return;
     }
     start_index = picker_scroll_start_clamped(count, scroll_start);
@@ -1303,6 +1305,11 @@ void render_picker(
             PICKER_INTRO_ANIM_MS - 120U,
             exit_elapsed_ms
         );
+        /* Reveal the complete row once its header is known; never shift an
+         * already visible title sideways to insert a late lock icon. */
+        uint8_t metadata_mix = files[index].timing_checked
+            ? ui_ease_out_cubic(now_ms - files[index].metadata_ready_ms, 120U) : 0;
+        if (row_intro_mix > metadata_mix) row_intro_mix = metadata_mix;
         int row_intro_offset_y = picker_intro_offset(row_intro_mix, 9);
         uint8_t resume_mix = resume_badge_hover_index == (int) index ? resume_badge_hover_mix : 0;
         uint8_t row_press_mix = pressed_row_index == (int) index ? press_mix : 0;
@@ -1326,7 +1333,7 @@ void render_picker(
         }
         selection_mix = (uint8_t) (((uint16_t) selection_mix * row_intro_mix + 127U) / 255U);
         int text_x = row.x + 4 + ((int) selection_mix * 8 + 127) / 255 + row_press_offset_x;
-        int text_y = y + row_intro_offset_y + row_press_offset_y;
+        int text_y = row.y + (row.h - NSP_FONT_HEIGHT) / 2 + row_press_offset_y;
         int text_right_limit = has_resume_badge
             ? resume_badge.x - 8
             : row.x + row.w - 12;
@@ -1354,6 +1361,11 @@ void render_picker(
             );
         }
         if (row_intro_mix > 42) {
+            if (files[index].encrypted) {
+                draw_lock_icon(screen, text_x, row.y + (row.h - 10) / 2 + row_press_offset_y, row_intro_mix);
+                text_x += 12;
+                text_max_width -= 12;
+            }
             copy_fitted_text(fonts->white, files[index].name, fitted_title, sizeof(fitted_title), text_max_width);
             draw_ui_label(screen, fonts, text_x, text_y, fitted_title);
         }
@@ -1481,6 +1493,6 @@ void render_picker(
     if (pointer && pointer->visible) {
         draw_cursor(screen, pointer->x, pointer->y);
     }
-    present_screen(screen);
+    if (present_output) present_screen(screen);
 }
 

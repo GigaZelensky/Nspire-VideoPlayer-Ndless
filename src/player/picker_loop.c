@@ -1,5 +1,31 @@
 #include "player_internal.h"
 
+typedef struct {
+    const Fonts *fonts;
+    MovieFile *files;
+    size_t count, scroll_start, selected, previous_selected;
+    int scroll_offset_y, pressed_row, pressed_resume;
+    uint32_t selection_started_ms, scene_ms, intro_started_ms;
+    uint8_t selected_mix, previous_mix, initial_press_mix, press_mix;
+    PointerState pointer;
+    const ScreenshotPreviewState *preview;
+} PickerUnlockBackdrop;
+
+static void draw_unlock_backdrop(SDL_Surface *screen, void *context, uint32_t closing_elapsed_ms)
+{
+    PickerUnlockBackdrop *view = context;
+    uint8_t eased = ui_ease_smoothstep(closing_elapsed_ms, PICKER_PRESS_RELEASE_ANIM_MS);
+    view->press_mix = view->initial_press_mix - (view->initial_press_mix * eased + 127U) / 255U;
+    /* Only the pressed control advances; retain the menu layout captured on
+     * entry. The modal draws the live cursor and presents the combined frame. */
+    render_picker(screen, view->fonts, view->files, view->count, view->scroll_start,
+        view->scroll_offset_y, view->selected, view->previous_selected,
+        view->selection_started_ms, view->selected_mix, view->previous_mix,
+        -1, 0, -1, 0, -1, 0, view->pressed_row, view->pressed_resume, view->press_mix,
+        &view->pointer, view->preview, view->scene_ms, view->intro_started_ms,
+        PICKER_EXIT_INACTIVE, 0, NULL, 0, false);
+}
+
 int pick_movie(
     SDL_Surface *screen,
     const Fonts *fonts,
@@ -405,7 +431,51 @@ int pick_movie(
             PICKER_PRESS_RELEASE_ANIM_MS
         );
         if (activated_index >= 0) {
-            movie_picker_timing_stop();
+            /* A cached unlock does not touch storage. Keep any background
+             * metadata handle until the dialog closes instead of draining
+             * and closing it on the click-to-animation path. */
+            if (!files[activated_index].encrypted_header) movie_picker_timing_stop();
+            if (!files[activated_index].timing_checked || !files[activated_index].duration_ms ||
+                files[activated_index].encrypted) {
+                /* Build the modal background without baking in the cursor.
+                 * Do not display this intermediate, cursor-free frame. */
+                PickerUnlockBackdrop backdrop = {
+                    .fonts = fonts, .files = files, .count = count,
+                    .scroll_start = scroll_draw_start, .scroll_offset_y = scroll_draw_offset_y,
+                    .selected = selected, .previous_selected = previous_selected,
+                    .selection_started_ms = selection_anim_started_ms,
+                    .selected_mix = selected_start_mix, .previous_mix = previous_start_mix,
+                    .pressed_row = pressed_row_index, .pressed_resume = pressed_resume_badge_index,
+                    .initial_press_mix = picker_press_mix, .scene_ms = now_ms,
+                    .intro_started_ms = intro_started_ms, .pointer = pointer, .preview = &screenshot_preview
+                };
+                backdrop.pointer.visible = false;
+                draw_unlock_backdrop(screen, &backdrop, 0);
+                int unlocked = unlock_movie_prompt(screen, fonts, files[activated_index].path,
+                    draw_unlock_backdrop, &backdrop);
+                movie_picker_timing_stop();
+                /* Continue from the state drawn under the modal's closing
+                 * fade. Normally the 94 ms release has already finished. */
+                picker_press_anim = (UiTransition){
+                    .initialized = true,
+                    .target_active = false,
+                    .start_mix = backdrop.press_mix,
+                    .current_mix = backdrop.press_mix,
+                    .started_ms = monotonic_clock_now_ms()
+                };
+                if (unlocked != 1) {
+                    clear_screenshot_preview(&screenshot_preview);
+                    if (unlocked) return unlocked;
+                    pointer_init(&pointer); pointer_update(&pointer);
+                    pointer_hover_guard_lock(&hover_guard, &pointer);
+                    prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
+                    prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
+                    /* Retain the target until its normal release reaches zero. */
+                    picker_press_canceled = true;
+                    enter_press_stage = 0;
+                    continue;
+                }
+            }
             uint32_t exit_started_ms = monotonic_clock_now_ms();
             PointerState hidden_pointer = pointer;
 
@@ -455,7 +525,8 @@ int pick_movie(
                     exit_elapsed_ms,
                     loading_mix,
                     "Loading",
-                    (int) ((exit_now_ms / 180U) % 3U)
+                    (int) ((exit_now_ms / 180U) % 3U),
+                    true
                 );
                 if (exit_elapsed_ms >= PICKER_EXIT_TO_LOADING_ANIM_MS && loading_mix >= 255) {
                     break;
@@ -508,7 +579,8 @@ int pick_movie(
             PICKER_EXIT_INACTIVE,
             0,
             NULL,
-            0
+            0,
+            true
         );
         if (screenshot_edge) {
             request_screenshot_in_directory(screen, directory, &screenshot_preview);
@@ -584,9 +656,29 @@ int pick_movie(
             clear_screenshot_preview(&screenshot_preview);
             return -1;
         }
-        /* Let the opening animation finish before opening metadata handles. */
-        if (!g_deferred_playback_movie && (uint32_t) (now_ms - intro_started_ms) >= PICKER_INTRO_ANIM_MS)
-            movie_picker_timing_tick(files, count, selected);
+        /* Resolve visible rows during the entrance; their title and lock
+         * share one reveal once the header arrives. */
+        if (!g_deferred_playback_movie) {
+            uint64_t metadata_started = monotonic_clock_now_ticks();
+            for (unsigned step = 0; step < 8; ++step) {
+                size_t metadata_index = count;
+                if (count && !files[selected].timing_checked) metadata_index = selected;
+                if (metadata_index == count) {
+                    for (size_t i = scroll_start; i < count && i < scroll_start + PICKER_VISIBLE_ROWS; ++i) {
+                        if (!files[i].timing_checked) { metadata_index = i; break; }
+                    }
+                }
+                if (metadata_index == count) {
+                    for (size_t i = 0; i < count; ++i) {
+                        if (!files[i].timing_checked) { metadata_index = i; break; }
+                    }
+                }
+                if (metadata_index == count) break;
+                movie_picker_timing_tick(files, count, metadata_index);
+                /* Spend at most a small slice of the menu's idle interval. */
+                if (monotonic_clock_now_ticks() - metadata_started >= 66U) break;
+            }
+        }
         player_delay_ms(16);
     }
 }

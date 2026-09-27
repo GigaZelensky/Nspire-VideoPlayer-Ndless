@@ -453,6 +453,69 @@ static inline uint32_t h264_rgb565_pair(const uint8_t *row, const int32_t *y_bas
 #endif
 }
 
+/* Probe exact repeated colors before choosing the cached loop. Keep the
+ * existing conversion loop for gradients and textured pictures. This decision
+ * affects speed only; every reused result has an exact 24-bit Y/U/V key. */
+static bool h264_repeated_flat_blocks(const uint8_t *y_plane, const uint8_t *u_plane,
+    const uint8_t *v_plane, size_t luma_stride, size_t chroma_stride, size_t width, size_t height)
+{
+    unsigned repeated = 0;
+    if (width < 4U || height < 2U) return false;
+    for (unsigned row = 0; row < 2U; ++row) {
+        size_t y = (((height - 2U) * row) / 2U) & ~(size_t)1U;
+        for (unsigned col = 0; col < 4U; ++col) {
+            size_t x = (((width - 4U) * col) / 4U) & ~(size_t)1U;
+            const uint8_t *p = y_plane + y * luma_stride + x;
+            size_t c = (y / 2U) * chroma_stride + x / 2U;
+            repeated += p[0] == p[1] && p[0] == p[luma_stride] &&
+                p[0] == p[luma_stride + 1U] && p[0] == p[2] &&
+                u_plane[c] == u_plane[c + 1U] && v_plane[c] == v_plane[c + 1U];
+        }
+    }
+    return repeated >= 2U;
+}
+
+/* Keep the cache's two values out of the ordinary loop's register allocation.
+ * Nothing is retained between frames or bands, and no extra buffer is needed. */
+static __attribute__((noinline)) bool h264_convert_repeated_flat_rows(
+    const uint8_t *restrict y_plane, const uint8_t *restrict u_plane, const uint8_t *restrict v_plane,
+    size_t luma_stride, size_t chroma_stride, uint16_t *restrict dst_pixels,
+    size_t dst_pitch_pixels, size_t width, size_t height)
+{
+    const int32_t *y_base = g_h264_color_tables->y_base;
+    const uint8_t *clip = g_h264_color_tables->clip;
+    uint32_t last_key = UINT32_MAX, last_pixel = 0;
+    for (size_t y = 0; y < height; y += 2U) {
+        const uint8_t *y0 = y_plane + y * luma_stride, *y1 = y0 + luma_stride;
+        const uint8_t *u = u_plane + y / 2U * chroma_stride, *v = v_plane + y / 2U * chroma_stride;
+        uint32_t *d0 = (uint32_t *)(void *)(dst_pixels + y * dst_pitch_pixels);
+        uint32_t *d1 = (uint32_t *)(void *)(dst_pixels + (y + 1U) * dst_pitch_pixels);
+#pragma GCC unroll 1
+        for (size_t x = 0; x < width; x += 2U) {
+            int32_t red, green, blue;
+            uint32_t sample = y0[x];
+            if (sample == y0[x + 1U] && sample == y1[x] && sample == y1[x + 1U]) {
+                uint32_t key = sample | ((uint32_t)u[x / 2U] << 8) | ((uint32_t)v[x / 2U] << 16);
+                if (key != last_key) {
+                    h264_compute_chroma_terms(u[x / 2U], v[x / 2U], &red, &green, &blue);
+                    int32_t luma = y_base[sample];
+                    uint32_t pixel = ((uint32_t)clip[(luma + red) >> 11] << 11) |
+                        ((uint32_t)clip[(luma + green) >> 10] << 5) | clip[(luma + blue) >> 11];
+                    last_key = key;
+                    last_pixel = pixel | (pixel << 16);
+                }
+                d0[x / 2U] = last_pixel;
+                d1[x / 2U] = last_pixel;
+            } else {
+                h264_compute_chroma_terms(u[x / 2U], v[x / 2U], &red, &green, &blue);
+                d0[x / 2U] = h264_rgb565_pair(y0 + x, y_base, clip, red, green, blue);
+                d1[x / 2U] = h264_rgb565_pair(y1 + x, y_base, clip, red, green, blue);
+            }
+        }
+    }
+    return true;
+}
+
 static inline bool blit_h264_planes_to_rgb565_rows(
     const Movie *movie,
     const uint8_t *restrict y_plane,
@@ -472,6 +535,10 @@ static inline bool blit_h264_planes_to_rgb565_rows(
 
     size_t y;
     if (!movie || !y_plane || !u_plane || !v_plane || !dst_pixels || !crop_width || !crop_height || ((crop_width | crop_height) & 1U)) return false;
+    if (try_flat && !((uintptr_t)dst_pixels & 3U) && !(dst_pitch_pixels & 1U) &&
+        h264_repeated_flat_blocks(y_plane, u_plane, v_plane, luma_stride, chroma_stride, crop_width, crop_height))
+        return h264_convert_repeated_flat_rows(y_plane, u_plane, v_plane, luma_stride, chroma_stride,
+            dst_pixels, dst_pitch_pixels, crop_width, crop_height);
     for (y=0;y<crop_height;y+=2U) {
         const uint8_t *y0=y_plane+y*luma_stride, *y1=y0+luma_stride;
         const uint8_t *u=u_plane+(y/2U)*chroma_stride, *v=v_plane+(y/2U)*chroma_stride;

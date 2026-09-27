@@ -786,7 +786,9 @@ void prepare_screenshot_preview(ScreenshotPreviewState *preview, SDL_Surface *sc
 
     preview->surface = thumbnail;
     snprintf(preview->label, sizeof(preview->label), "Saved %.72s", filename_from_path(saved_path));
-    preview->until_ms = monotonic_clock_now_ms() + SCREENSHOT_PREVIEW_MS;
+    uint32_t now = monotonic_clock_now_ms();
+    preview->started_ms = now ? now : 1U;
+    preview->until_ms = now + SCREENSHOT_PREVIEW_MS;
 }
 
 bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, const PointerState *pointer, bool show_ui, uint32_t now_ms)

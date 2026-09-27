@@ -32,6 +32,7 @@ The `.nvp` format used by the current player is:
 - native C/Ndless runtime
 - CX and CX II LCD paths through Ndless' native framebuffer modes
 - streamed playback from calculator storage
+- password-protected videos with authenticated AES-256 encryption
 - H.264 decode through `h264bsd`
 - MPEG-4 Part 2 decode through vendored Xvid sources
 - RGB565 output
@@ -41,7 +42,10 @@ The `.nvp` format used by the current player is:
 - subtitle support for text subtitle tracks
 - built-in subtitle font cycling
 - scale modes: `FIT`, `FILL`, `STRETCH`, `1:1`
-- playback speed control from `0.25x` to `2.0x`
+- playback speed control from `0.25x` to `4.0x`, including `2.5x` and `3.5x`
+- automatic CPU clocks: 240 MHz on CX/CX CAS (60 MHz AHB), 492 MHz on CX II variants
+- overclocking works while plugged in and is reapplied after in-app standby
+- previous clock settings restored on exit
 - screen brightness control with `Up` / `Down` and an on-screen percentage overlay
 - adjustable warm night filter
 - idle dimming, screen-off and automatic standby
@@ -53,8 +57,7 @@ The `.nvp` format used by the current player is:
 
 ## Current Limits
 
-- no audio yet
-- automatic standby returns to the OS first on firmware without in-player standby support
+- no audio playback (CX and CX II calculators have no built-in speakers)
 
 ## Battery Life
 
@@ -127,6 +130,30 @@ Night mode also works in the picker and resume prompt. Its intensity is remember
 - `S`: save a BMP screenshot
 - `Scratchpad`: save state and open OS Scratchpad
 - `Esc`: cancel and return
+
+### Encrypted Videos
+
+Locked movies ask for their password before loading. Type with the keyboard;
+hold `Shift` for uppercase and use `Tab` for symbols. `Enter` or a touchpad click presses the hovered
+control, or the outlined default (Unlock unless you select a symbol with the arrow keys).
+`Del` deletes and `Esc` cancels. Unlocking takes a while on the calculator;
+the progress indicator stays responsive. The key is cleared when you leave the video.
+Screenshots are disabled while an encrypted video is visible.
+
+Install `cryptography` with `python -m pip install cryptography`, then add
+`--encrypt` to your usual encoder command. It prompts for a password of up to
+128 printable ASCII characters. For scripts, use `--password-file PATH`.
+
+To encrypt an existing movie without re-encoding:
+
+```sh
+python tools/nve_crypto.py movie.nvp.tns locked.nvp.tns
+```
+
+Video, subtitles and the internal index are encrypted in independently verified
+16 KiB records, so seeking still works. File size grows by about 0.2%.
+The filename and duration stay visible; original files and any requested preview
+are kept unencrypted.
 
 ## Idle Power Management
 

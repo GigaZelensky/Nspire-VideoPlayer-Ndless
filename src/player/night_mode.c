@@ -90,7 +90,7 @@ bool night_mode_poll(uint32_t now_ms, bool allow_changes)
     bool down = ctrl && player_key_pressed(KEY_NSPIRE_DOWN);
     bool activity = toggle || up || down;
     bool status_was_visible = night_mode_status_visible(now_ms);
-    if (night_mode_update_keys(&g_night, toggle, up, down, now_ms, allow_changes && has_colors)) {
+    if (night_mode_update_keys(&g_night, toggle, up, down, now_ms, allow_changes)) {
         ++g_night_revision;
         if (g_night.enabled && !night_mode_ensure_surface()) {
             g_night.enabled = false;
@@ -106,7 +106,7 @@ bool night_mode_poll(uint32_t now_ms, bool allow_changes)
         night_mode_format_status();
         status_overlay_update_timing(now_ms, !status_was_visible, &g_night_status_started,
                                      &g_night_status_until);
-    } else if (allow_changes && has_colors && (up != down) && status_was_visible) {
+    } else if (allow_changes && (up != down) && status_was_visible) {
         /* Holding at 0/100 keeps the existing badge readable without creating
          * another state change or replaying its entrance animation. */
         status_overlay_update_timing(now_ms, false, &g_night_status_started, &g_night_status_until);
@@ -148,7 +148,7 @@ void night_mode_draw_status(SDL_Surface *screen, const Fonts *fonts, const SDL_R
 void *night_mode_present_pixels(SDL_Surface *screen)
 {
     int y;
-    if (!has_colors || !screen || screen->format->BitsPerPixel != 16 || !g_night_display_q8) {
+    if (!screen || screen->format->BitsPerPixel != 16 || !g_night_display_q8) {
         return screen ? screen->pixels : NULL;
     }
     if (!night_mode_ensure_surface())

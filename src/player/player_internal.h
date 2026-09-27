@@ -201,6 +201,9 @@ typedef struct {
     bool has_resume;
     bool resume_time_known;
     bool timing_checked;
+    bool encrypted;
+    uint32_t metadata_ready_ms;
+    struct NveHeader *encrypted_header;
 } MovieFile;
 
 typedef struct {
@@ -534,6 +537,7 @@ typedef struct {
 typedef struct {
     SDL_Surface *surface;
     char label[96];
+    uint32_t started_ms;
     uint32_t until_ms;
     uint32_t request_id;
     uint32_t revision;
@@ -724,7 +728,7 @@ typedef struct {
 } UiThemePalette;
 
 #define PLAYBACK_RATE_DEFAULT_INDEX 3U
-#define PLAYBACK_RATE_COUNT 8U
+#define PLAYBACK_RATE_COUNT 12U
 #define SUBTITLE_FONT_DEFAULT_INDEX 2U
 #define SUBTITLE_FONT_CHOICE_COUNT 5U
 #define SUBTITLE_FONT_OVERLAY_MS 1200U
@@ -764,6 +768,7 @@ static inline void h264_compute_chroma_terms(uint8_t u_sample, uint8_t v_sample,
 void return_to_os_home_menu(void);
 void yes_teacher_im_mathing(void);
 void queue_os_suspend_shortcut(void);
+void queue_os_redraw(void);
 bool key_pressed_edge(t_key key, bool *previous_state);
 int player_touchpad_scan(touchpad_report_t *report);
 bool player_key_pressed(t_key key);
@@ -868,8 +873,11 @@ bool save_screenshot_bitmap_in_directory(SDL_Surface *screen, const char *direct
 bool save_screenshot_bitmap(SDL_Surface *screen, const char *movie_path, char *saved_path, size_t saved_path_size);
 void prepare_screenshot_preview(ScreenshotPreviewState *preview, SDL_Surface *screen, const char *saved_path);
 void request_screenshot(SDL_Surface *screen, const char *movie_path, ScreenshotPreviewState *preview);
+/* Clear only after repainting all protected pixels, including old snapshots. */
+void screenshot_set_protected_content(bool protected_content);
 void request_screenshot_in_directory(SDL_Surface *screen, const char *directory, ScreenshotPreviewState *preview);
 bool screenshot_preview_tick(ScreenshotPreviewState *preview, uint32_t now_ms);
+bool screenshot_preview_animating(const ScreenshotPreviewState *preview, uint32_t now_ms);
 bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, const PointerState *pointer, bool show_ui, uint32_t now_ms);
 
 /* input_timing_memory.c */
@@ -890,6 +898,7 @@ void format_memory_compact(size_t bytes, char *buffer, size_t buffer_size);
 uint64_t movie_frame_interval_ticks(const Movie *movie);
 uint32_t tab_hold_frame_repeat_interval_ms(const Movie *movie);
 const PlaybackRate *playback_rate_for_index(size_t rate_index);
+size_t playback_rate_step(size_t rate_index, int direction, bool wrap);
 uint32_t movie_header_frame_time_ms(const MovieHeader *header, uint32_t frame_index);
 uint32_t movie_frame_time_ms(const Movie *movie, uint32_t frame_index);
 uint64_t movie_frame_time_scaled_ticks(const Movie *movie, uint32_t frame_index, const PlaybackRate *rate);
@@ -915,6 +924,13 @@ void free_movie_files(MovieFile *files, size_t count);
 void clear_movie_picker_cache(MoviePickerCache *cache);
 void movie_picker_timing_stop(void);
 void movie_picker_timing_tick(MovieFile *files, size_t count, size_t preferred);
+/* 1 authorized, 0 cancelled; explicit OS-exit results use PLAY_MOVIE_RESULT_*. */
+/* Optional backdrop redraw during closing; elapsed time starts with dismissal.
+ * The callback draws without a cursor or presentation. */
+typedef void (*UnlockBackdropDraw)(SDL_Surface *, void *, uint32_t closing_elapsed_ms);
+int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *path,
+                        UnlockBackdropDraw draw_backdrop, void *backdrop_context);
+void draw_lock_icon(SDL_Surface *screen, int x, int y, uint8_t mix);
 void free_history_store(HistoryStore *history);
 
 /* movie_resources.c */
@@ -994,7 +1010,7 @@ uint8_t picker_intro_mix_for_transition( uint32_t intro_started_ms, uint32_t now
 int picker_intro_offset(uint8_t mix, int distance);
 void picker_set_selected( size_t *selected, size_t *previous_selected, uint32_t *selection_anim_started_ms, size_t next_selected, uint32_t now_ms );
 size_t picker_adjacent_selection(size_t count, size_t selected, int direction);
-void render_picker( SDL_Surface *screen, const Fonts *fonts, MovieFile *files, size_t count, size_t scroll_start, int scroll_offset_y, size_t selected, size_t previous_selected, uint32_t selection_anim_started_ms, uint8_t selected_start_mix, uint8_t previous_start_mix, int movie_tooltip_index, uint8_t movie_tooltip_mix, int resume_badge_hover_index, uint8_t resume_badge_hover_mix, int resume_tooltip_index, uint8_t resume_tooltip_mix, int pressed_row_index, int pressed_resume_badge_index, uint8_t press_mix, const PointerState *pointer, const ScreenshotPreviewState *screenshot_preview, uint32_t now_ms, uint32_t intro_started_ms, uint32_t exit_elapsed_ms, uint8_t loading_mix, const char *loading_label, int loading_phase );
+void render_picker( SDL_Surface *screen, const Fonts *fonts, MovieFile *files, size_t count, size_t scroll_start, int scroll_offset_y, size_t selected, size_t previous_selected, uint32_t selection_anim_started_ms, uint8_t selected_start_mix, uint8_t previous_start_mix, int movie_tooltip_index, uint8_t movie_tooltip_mix, int resume_badge_hover_index, uint8_t resume_badge_hover_mix, int resume_tooltip_index, uint8_t resume_tooltip_mix, int pressed_row_index, int pressed_resume_badge_index, uint8_t press_mix, const PointerState *pointer, const ScreenshotPreviewState *screenshot_preview, uint32_t now_ms, uint32_t intro_started_ms, uint32_t exit_elapsed_ms, uint8_t loading_mix, const char *loading_label, int loading_phase, bool present_output );
 
 /* platform_debug.c */
 bool ensure_debug_ring_storage(void);
@@ -1174,7 +1190,7 @@ int draw_left_text_badge(SDL_Surface *screen, const Fonts *fonts, int left_x, in
 int draw_left_text_badge_animated( SDL_Surface *screen, const Fonts *fonts, int left_x, int y, const char *label, uint8_t mix, int offset_x );
 void draw_seek_delta_badge( SDL_Surface *screen, const Fonts *fonts, int32_t seek_ms, uint32_t started_ms, uint32_t hide_elapsed_ms, uint32_t now_ms );
 void draw_status_overlay_badge( SDL_Surface *screen, const Fonts *fonts, int left_x, int y, const char *label, uint32_t started_ms, uint32_t until_ms, uint32_t now_ms, uint8_t chrome_mix );
-void draw_playback_title_strip( SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *video_rect, ScaleMode scale_mode, const PlaybackRate *playback_rate, const char *title, const char *detail, uint8_t mix );
+void draw_playback_title_strip( SDL_Surface *screen, const Fonts *fonts, const SDL_Rect *video_rect, ScaleMode scale_mode, const PlaybackRate *playback_rate, const char *title, const char *detail, bool encrypted, uint8_t mix );
 void draw_centered_text_badge(SDL_Surface *screen, const Fonts *fonts, int center_x, int y, const char *label);
 int header_shortcut_badge_width(const Fonts *fonts, const char *key, const char *action);
 void draw_header_shortcut_badge( SDL_Surface *screen, const Fonts *fonts, int x, int y, const char *key, const char *action, uint8_t mix );

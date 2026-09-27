@@ -14,12 +14,15 @@ void draw_prompt_button(
     int press_offset_y = pressed_control_offset_y(press_mix);
     Uint16 base = rgb565_lerp(UI_COLOR_GUNMETAL, ui_theme()->row_selected, selection_mix, 255);
     int text_x;
+    /* Center the compact symbol keys; keep the larger buttons' optical lift. */
+    int text_y = draw_button.y + (draw_button.h - NSP_FONT_HEIGHT) / 2
+        - (draw_button.h > 16 ? 1 : 0) + press_offset_y;
 
     text_x = draw_button.x + (draw_button.w - nSDL_GetStringWidth(fonts->white, label)) / 2 + press_offset_x;
     draw_soft_glass_panel_mix(screen, &draw_button, pressed_control_base(base, press_mix), selection_mix);
     draw_pressed_control_reflection(screen, &draw_button, press_mix);
     draw_soft_glass_panel_rim(screen, &draw_button, base, max_u8(selection_mix, press_mix));
-    draw_ui_label(screen, fonts, text_x, draw_button.y + 6 + press_offset_y, label);
+    draw_ui_label(screen, fonts, text_x, text_y, label);
 }
 
 int prompt_resume_position(
@@ -745,6 +748,10 @@ int prompt_resume_position(
                 SDL_FreeSurface(prompt_surface);
             }
         }
+        /* A new movie can still have the previous movie in its loading
+         * snapshot. Retain that protection until the snapshot is gone. */
+        if (movie->encrypted || !loading_snapshot || !*loading_snapshot)
+            screenshot_set_protected_content(movie->encrypted);
         draw_screenshot_preview_osd(screen, fonts, &screenshot_preview, now_ms);
         night_mode_draw_status(screen, fonts, NULL, now_ms);
         if (pointer.visible) {

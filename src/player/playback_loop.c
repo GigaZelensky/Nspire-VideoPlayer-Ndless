@@ -349,7 +349,7 @@ int play_movie(
     static bool decoder_platform_attempted;
     if (!decoder_platform_attempted) {
         decoder_platform_attempted = true;
-        if (has_colors && sram_init() && sram_uses_native_clone()) h264bsdInitSramTables();
+        if (sram_init() && sram_uses_native_clone()) h264bsdInitSramTables();
     }
     cleanup_deferred_playback_movie();
     loading_progress_tick(&loading_progress, false);
@@ -1563,15 +1563,10 @@ int play_movie(
             speed_repeat_next_ms = now_ms + TAB_HOLD_FRAME_REPEAT_FALLBACK_INTERVAL_MS;
         }
         if (speed_delta != 0) {
-            bool speed_changed = false;
-
-            if (speed_delta < 0 && playback_rate_index > 0) {
-                playback_rate_index--;
-                speed_changed = true;
-            } else if (speed_delta > 0 && playback_rate_index + 1 < PLAYBACK_RATE_COUNT) {
-                playback_rate_index++;
-                speed_changed = true;
-            } else {
+            size_t next_rate = playback_rate_step(playback_rate_index, speed_delta, false);
+            bool speed_changed = next_rate != playback_rate_index;
+            playback_rate_index = next_rate;
+            if (!speed_changed) {
                 speed_repeat_direction = 0;
                 speed_repeat_next_ms = 0;
             }
@@ -1758,7 +1753,7 @@ int play_movie(
                     } else if (released_target == PLAYBACK_PRESS_SCALE) {
                         cycle_scale_mode_with_morph(&movie, &scale_morph, &scale_mode, video_align_x, video_align_y, now_ms);
                     } else if (released_target == PLAYBACK_PRESS_SPEED) {
-                        playback_rate_index = (playback_rate_index + 1) % PLAYBACK_RATE_COUNT;
+                        playback_rate_index = playback_rate_step(playback_rate_index, 1, true);
                         playback_rate = playback_rate_for_index(playback_rate_index);
                         reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
                     }
@@ -2144,6 +2139,7 @@ int play_movie(
                 scale_morph_animating(&scale_morph, render_now_ms) ||
                 ui_theme_transition_active() ||
                 night_mode_status_animating(render_now_ms) ||
+                screenshot_preview_animating(&screenshot_preview, render_now_ms) ||
                 (render_status_visible && playback_timed_badge_animating(render_now_ms,
                     status_overlay_started_ms, status_overlay_until, STATUS_BADGE_ANIM_MS, STATUS_BADGE_EXIT_ANIM_MS)) ||
                 seek_preview_surface_animating(&seek_preview, render_now_ms) ||
