@@ -25,27 +25,25 @@ int main(int argc, char **argv)
     }
 
     enable_relative_paths(argv);
-    performance_clock_start();
-
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         show_msgbox("ND Video Player", "Failed to initialize SDL.");
-        performance_clock_restore();
         return 1;
     }
     monotonic_clock_init();
+    performance_clock_start();
     screen = SDL_SetVideoMode(SCREEN_W, SCREEN_H, 16, SDL_SWSURFACE);
     if (!screen) {
         show_msgbox("ND Video Player", "Failed to create the screen surface.");
         SDL_Quit();
-        monotonic_clock_shutdown();
         performance_clock_restore();
+        monotonic_clock_shutdown();
         return 1;
     }
     if (!lcd_init(screen_lcd_type())) {
         show_msgbox("ND Video Player", "Failed to initialize the LCD.");
         SDL_Quit();
-        monotonic_clock_shutdown();
         performance_clock_restore();
+        monotonic_clock_shutdown();
         return 1;
     }
     patch_cx2_lcd_edge_timing();
@@ -54,8 +52,8 @@ int main(int argc, char **argv)
         show_msgbox("ND Video Player", "Failed to load fonts.");
         lcd_init(SCR_TYPE_INVALID);
         SDL_Quit();
-        monotonic_clock_shutdown();
         performance_clock_restore();
+        monotonic_clock_shutdown();
         return 1;
     }
     night_mode_init(&fonts);
@@ -167,8 +165,8 @@ int main(int argc, char **argv)
     lcd_init(SCR_TYPE_INVALID);
     SDL_Quit();
     sram_shutdown();
-    monotonic_clock_shutdown();
     performance_clock_restore();
+    monotonic_clock_shutdown();
     /* Explicit Home/Scratchpad/standby navigation also belongs after cleanup. */
     if (return_home_after_exit) {
         if (open_scratchpad_after_exit)

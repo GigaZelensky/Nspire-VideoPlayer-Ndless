@@ -7,9 +7,9 @@
 #define CLOCK_DIVIDER 0x90140020U
 #define CLOCK_PENDING 0x90140024U
 #define CLOCK_SOURCE 0x90140810U
-#define CLOCK_PLL_FIELDS 0xFF1F0011U
+#define CLOCK_PLL_FIELDS 0xFF1F0311U
 #define CLOCK_DIVIDER_FIELDS 0x00F00000U
-#define CLOCK_TARGET_PLL ((41U << 24) | (2U << 16) | 1U)
+#define CLOCK_TARGET_PLL ((41U << 24) | (2U << 16) | 0x301U)
 #define CLOCK_TARGET_HZ 492000000U
 #define CLOCK_POLL_LIMIT 200000U
 #define CX_CLOCK_LOAD 0x900B0000U
@@ -24,6 +24,8 @@ static struct {
     bool supported, owned, active;
     uint32_t asic, target_hz;
     uint32_t saved_pll, saved_divider, entry_hz, requests, polls;
+    uint32_t native_calls;
+    uint32_t saved_emi74, saved_emi1c, native_hash;
     int status;
 } clock_state;
 
@@ -67,64 +69,64 @@ static bool native_mapping(void)
     return (sram & 3U) == 2U && (sram & 0xFFF00000U) == 0xA4000000U;
 }
 
-static bool await_clock_irq(uint32_t pending_address, uint32_t pending_mask)
-{
-    /* Nover II enables interrupts to complete the PMU request. SDK msleep()
-     * temporarily masks other IRQ lines, so don't use it to await this IRQ.
-     * Poll the hardware acknowledgement with a finite CPU bound instead. */
-    native_critical_leave(0);
-    for (unsigned i = 0; i < CLOCK_POLL_LIMIT; ++i) {
-        ++clock_state.polls;
-        if (!(CLOCK_WORD(pending_address) & pending_mask))
-            return true;
-    }
-    return false;
-}
+/* Native SRAM copy of the OS's complete PLL/EMI transition. The checked
+ * block includes the worker, self-refresh helpers and their literal pool.
+ * This validates actual instructions, not an OS version number. */
+#define CX2_CLOCK_BLOCK 0xA40012C8U
+#define CX2_CLOCK_BLOCK_BYTES 0x258U
+#define CX2_CLOCK_BLOCK_FNV 0x8D914E2FU
+#define CX2_CLOCK_ENTRY 0xA4001444U
+#define EMI_CONTROL 0x90120004U
+#define EMI_TIMING74 0x90120074U
+#define EMI_TIMING1C 0x9012001CU
 
-static void set_divider(uint32_t fields)
+static uint32_t native_clock_hash(void)
 {
-    uint32_t current = CLOCK_WORD(CLOCK_DIVIDER);
-    if ((current & CLOCK_DIVIDER_FIELDS) != fields)
-        CLOCK_WORD(CLOCK_DIVIDER) = (current & ~(CLOCK_DIVIDER_FIELDS | 2U)) | fields;
+    const volatile uint8_t *code = (const volatile uint8_t *)(uintptr_t)CX2_CLOCK_BLOCK;
+    uint32_t hash = 2166136261U;
+    for (unsigned i = 0; i < CX2_CLOCK_BLOCK_BYTES; ++i)
+        hash = (hash ^ code[i]) * 16777619U;
+    return hash;
 }
 
 static bool apply_cx2(uint32_t pll_fields, uint32_t divider_fields)
 {
     unsigned saved = native_critical_enter();
     bool ok = false;
-    if (!native_mapping()) {
-        clock_state.status = -1;
-        goto done;
+    if (!native_mapping()) { clock_state.status = -1; goto done; }
+    /* This native worker applies divider zero. Require
+     * its normal entry configuration so restore never transiently removes
+     * a divider from a higher PLL frequency. */
+    if (divider_fields || CLOCK_WORD(CLOCK_DIVIDER) != 0x10000000U) {
+        clock_state.status = -11; goto done;
     }
-    if (CLOCK_WORD(CLOCK_DIVIDER) & 2U) {
-        clock_state.status = -2;
-        goto done;
+    clock_state.native_hash = native_clock_hash();
+    if (clock_state.native_hash != CX2_CLOCK_BLOCK_FNV) {
+        clock_state.status = -12; goto done;
     }
-    /* Raise a divider before raising the PLL; lower it only after the clock
-     * interrupt has completed. Avoid a transient overspeed during restore. */
-    uint32_t current_divider = CLOCK_WORD(CLOCK_DIVIDER) & CLOCK_DIVIDER_FIELDS;
-    if (divider_fields > current_divider)
-        set_divider(divider_fields);
-    uint32_t current_pll = CLOCK_WORD(CLOCK_PLL);
-    if ((current_pll & CLOCK_PLL_FIELDS) != pll_fields) {
-        CLOCK_WORD(CLOCK_PLL) = (current_pll & ~CLOCK_PLL_FIELDS) | pll_fields;
-        ++clock_state.requests;
+    if (!(CLOCK_WORD(CLOCK_SOURCE) & 0x10U) ||
+        (CLOCK_WORD(EMI_CONTROL) & 0x40CU) ||
+        (CLOCK_WORD(0xDC00000CU) & (1U << 15)) || CLOCK_WORD(CLOCK_PENDING)) {
+        clock_state.status = -13; goto done;
     }
-    __asm__ volatile("mcr p15,0,%0,c7,c10,4" :: "r"(0) : "memory");
-    if (!await_clock_irq(CLOCK_PENDING, 1U)) {
-        clock_state.status = -3;
-        goto done;
-    }
-    native_critical_enter();
-    set_divider(divider_fields);
-    __asm__ volatile("mcr p15,0,%0,c7,c10,4" :: "r"(0) : "memory");
-    if (!await_clock_irq(CLOCK_PENDING, 1U)) {
-        clock_state.status = -3;
-        goto done;
-    }
-    native_critical_enter();
+    bool restoring = pll_fields == clock_state.saved_pll &&
+                     divider_fields == clock_state.saved_divider;
+    uint32_t pll = (CLOCK_WORD(CLOCK_PLL) & ~CLOCK_PLL_FIELDS) | pll_fields;
+    /* These are the OS's highest frequency timing profile. Restore the
+     * actual entry timings instead of guessing them from the entry PLL. */
+    uint32_t timing74 = restoring ? clock_state.saved_emi74 : 0x55U;
+    uint32_t timing1c = restoring ? clock_state.saved_emi1c : 0x528U;
+    ++clock_state.requests;
+    ++clock_state.native_calls;
+    /* CPU IRQ/FIQ stay masked: IRQ15 wakes WFI without entering the OS.
+     * The SRAM worker enters DRAM self-refresh, commits the PLL through
+     * 0x90140020, updates EMI timings, exits self-refresh and acknowledges
+     * the PMU. It touches neither the DRAM stack nor app code in that span. */
+    ((void (*)(uint32_t, uint32_t, uint32_t))(uintptr_t)CX2_CLOCK_ENTRY)(pll, timing74, timing1c);
     ok = (CLOCK_WORD(CLOCK_PLL) & CLOCK_PLL_FIELDS) == pll_fields &&
-         (CLOCK_WORD(CLOCK_DIVIDER) & CLOCK_DIVIDER_FIELDS) == divider_fields;
+         CLOCK_WORD(CLOCK_DIVIDER) == 0x10000000U &&
+         CLOCK_WORD(EMI_TIMING74) == timing74 && CLOCK_WORD(EMI_TIMING1C) == timing1c &&
+         !(CLOCK_WORD(EMI_CONTROL) & 0x40CU);
     clock_state.status = ok ? 0 : -4;
 done:
     native_critical_leave(saved);
@@ -187,25 +189,34 @@ bool performance_clock_start(void)
                                   : CLOCK_WORD(CLOCK_PLL) & CLOCK_PLL_FIELDS;
         clock_state.saved_divider = cx ? 0U : CLOCK_WORD(CLOCK_DIVIDER) & CLOCK_DIVIDER_FIELDS;
         clock_state.entry_hz = cpu_hz();
+        if (!cx) {
+            clock_state.saved_emi74 = CLOCK_WORD(EMI_TIMING74);
+            clock_state.saved_emi1c = CLOCK_WORD(EMI_TIMING1C);
+        }
         clock_state.owned = true;
     }
     uint32_t target = cx ? CX_TARGET_CLOCK | (clock_state.saved_pll & 0xC0000000U) : CLOCK_TARGET_PLL;
     clock_state.active = apply(target, 0U) && cpu_hz() == clock_state.target_hz;
     if (!clock_state.active) {
         int failure = clock_state.status ? clock_state.status : -5;
-        performance_clock_restore();
-        clock_state.status = failure;
+        if (performance_clock_restore())
+            clock_state.status = failure;
     }
     return clock_state.active;
 }
 
-void performance_clock_restore(void)
+bool performance_clock_restore(void)
 {
-    if (!clock_state.owned) return;
-    if (apply(clock_state.saved_pll, clock_state.saved_divider)) {
+    if (!clock_state.owned) return true;
+    for (unsigned attempt = 0; attempt < 2U; ++attempt) {
+        if (!apply(clock_state.saved_pll, clock_state.saved_divider))
+            continue;
         clock_state.owned = false;
         clock_state.active = false;
+        return true;
     }
+    /* Keep ownership on failure so a later lifecycle cleanup can retry. */
+    return false;
 }
 
 void performance_clock_debug(FILE *file)
@@ -216,10 +227,10 @@ void performance_clock_debug(FILE *file)
     uint32_t config = clock_state.supported ? CLOCK_WORD(cx ? CX_CLOCK_CURRENT : CLOCK_PLL) : 0U;
     uint32_t pending = clock_state.supported ? CLOCK_WORD(cx ? CX_CLOCK_PENDING : CLOCK_PENDING) : 0U;
     uint32_t ahb_divisor = cx && !(config & 0x100U) ? ((config >> 12) & 7U) + 1U : 2U;
-    bool verified_active = clock_state.active && hz == clock_state.target_hz &&
-                           !(pending & (cx ? 2U : 1U));
+    bool configured_active = clock_state.active && hz == clock_state.target_hz &&
+                             !(pending & (cx ? 2U : 1U));
     fprintf(file, "performance_clock supported=%u active=%u status=%d entry_hz=%lu target_hz=%lu register_cpu_hz=%lu ahb_hz=%lu asic=%lx pll=%08lx divider=%08lx source=%08lx pending=%08lx requests=%lu polls=%lu\n",
-            clock_state.supported, verified_active, clock_state.status,
+            clock_state.supported, configured_active, clock_state.status,
             (unsigned long)clock_state.entry_hz, (unsigned long)clock_state.target_hz,
             (unsigned long)hz, (unsigned long)(hz / ahb_divisor), (unsigned long)clock_state.asic,
             (unsigned long)config,
@@ -227,4 +238,8 @@ void performance_clock_debug(FILE *file)
             (unsigned long)(clock_state.supported ? CLOCK_WORD(cx ? CX_CLOCK_LOAD : CLOCK_SOURCE) : 0U),
             (unsigned long)pending,
             (unsigned long)clock_state.requests, (unsigned long)clock_state.polls);
+    if (!cx && clock_state.supported)
+        fprintf(file, "performance_clock_native calls=%lu code_hash=%08lx emi74=%08lx emi1c=%08lx\n",
+                (unsigned long)clock_state.native_calls, (unsigned long)clock_state.native_hash,
+                (unsigned long)CLOCK_WORD(EMI_TIMING74), (unsigned long)CLOCK_WORD(EMI_TIMING1C));
 }

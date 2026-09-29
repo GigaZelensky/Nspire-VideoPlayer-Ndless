@@ -37,7 +37,8 @@ static void standby_bridge(void *unused)
     (void)unused;
     /* The only interrupt-enabled OS spans execute with genuine SRAM mapped. */
     if (standby_acquire()) {
-        performance_clock_restore();
+        if (!performance_clock_restore())
+            return;
         standby_entered = true;
         native_standby_run();
         performance_clock_start();

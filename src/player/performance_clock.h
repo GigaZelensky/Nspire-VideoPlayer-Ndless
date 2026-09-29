@@ -6,6 +6,6 @@
 /* Startup/exit and native-standby boundaries only, with original OS SRAM
  * mapped and app I/O drained. Never call from a playback frame or writer. */
 bool performance_clock_start(void);
-void performance_clock_restore(void);
+bool performance_clock_restore(void);
 void performance_clock_debug(FILE *file);
 #endif

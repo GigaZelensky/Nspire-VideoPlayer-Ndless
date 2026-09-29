@@ -1180,7 +1180,8 @@ typedef struct {
 	/** \brief Pointer to vtable for this context. */
 	const br_block_ctr_class *vtable;
 #ifndef BR_DOXYGEN_IGNORE
-	uint32_t skey[60];
+	/* ND Video Player: expanded once for the reader's short CTR slices. */
+	uint32_t skey[120];
 	unsigned num_rounds;
 #endif
 } br_aes_ct_ctr_keys;

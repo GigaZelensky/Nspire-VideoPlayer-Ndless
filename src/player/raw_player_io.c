@@ -31,6 +31,10 @@ struct RawPlayerIo {
     bool requested, running, ready, view, park, failed, stopping, discard_regions;
     uint32_t started, ended, completed_bytes, refreshes, handoffs, steps, max_step_ticks,
         foreground_ticks, physical_total, regions_total;
+    uint32_t crypto_steps, crypto_ticks, crypto_writer_ticks, crypto_max_ticks;
+    uint32_t crypto_slack_steps, crypto_slack_ticks;
+    uint32_t join_writer_ticks;
+    RawPlayerWaitStats last_wait;
     int error;
 };
 static RawPlayerIo *live;
@@ -40,6 +44,8 @@ typedef struct {
     int error, cache_status;
     uint32_t refreshes, handoffs, steps, foreground_ticks, max_step_ticks, physical, regions,
         cache_nodes, dirty_blocks, metadata_hits;
+    uint32_t crypto_steps, crypto_ticks, crypto_writer_ticks, crypto_max_ticks;
+    uint32_t crypto_slack_steps, crypto_slack_ticks;
     RawFileCosts costs;
     RawRegionCacheStats region_cache;
     StorageMutationStats mutations;
@@ -61,6 +67,12 @@ static void accumulate_reader_costs(RawPlayerIo *ctx)
 static RawPlayerReport report(const RawPlayerIo *ctx)
 {
     RawPlayerReport r = {0};
+    r.crypto_slack_steps = ctx->crypto_slack_steps;
+    r.crypto_slack_ticks = ctx->crypto_slack_ticks;
+    r.crypto_steps = ctx->crypto_steps;
+    r.crypto_ticks = ctx->crypto_ticks;
+    r.crypto_writer_ticks = ctx->crypto_writer_ticks;
+    r.crypto_max_ticks = ctx->crypto_max_ticks;
     r.error = ctx->error;
     r.cache_status = ctx->snapshot.status;
     r.refreshes = ctx->refreshes;
@@ -221,8 +233,74 @@ static void restore_cached_region(RawPlayerIo *ctx)
     if (r->costs.regions_started)
         --r->costs.regions_started;
 }
+/* Native writes own the flash controller and borrowed filesystem maps, not
+ * our private encrypted-record buffer. Once that ownership was handed back,
+ * bounded CPU-only crypto/copy work may run between writer slices. */
+static bool crypto_buffer_ready(const RawPlayerIo *ctx)
+{
+    return ctx->crypt && ctx->requested && !ctx->ready && !ctx->failed &&
+        !ctx->crypt_restart && !ctx->running && !ctx->park &&
+        provider_quiescent(ctx) &&
+        (ctx->crypt->phase == NVE_READ_VERIFY || ctx->crypt->phase == NVE_READ_DECRYPT ||
+         ctx->crypt->phase == NVE_READ_COPY);
+}
+static bool crypto_ram_only(const RawPlayerIo *ctx)
+{
+    return !ctx->view && crypto_buffer_ready(ctx);
+}
+static void advance_crypto(RawPlayerIo *ctx)
+{
+    ++ctx->crypto_steps;
+    nve_reader_step(ctx->crypt);
+    if (ctx->crypt->phase == NVE_READ_DONE) {
+        ctx->ready = true;
+        ctx->ended = counter();
+        ctx->completed_bytes = (uint32_t)ctx->bytes;
+    } else if (ctx->crypt->phase == NVE_READ_ERROR) {
+        ctx->failed = true;
+        ctx->error = -321;
+    }
+}
+bool raw_player_crypto_step(uint32_t spare_ticks)
+{
+    RawPlayerIo *ctx = live;
+    if (!ctx || !crypto_buffer_ready(ctx) || (storage_native_active() && ctx->view))
+        return false;
+    /* One CPU-only step: no view capture, map rebuild, NAND poll or writer
+     * service can run here. Leave 1 ms for presentation/input plus twice the
+     * measured crypto-step cost (1 ms before the first timing sample). */
+    uint64_t step_guard = ctx->crypto_max_ticks ? (uint64_t)ctx->crypto_max_ticks * 2U + 1U : 33U;
+    if ((uint64_t)spare_ticks <= 33U + step_guard)
+        return false;
+    uint32_t started = counter();
+    unsigned mask = native_critical_enter();
+    bool writer_owned = storage_native_active();
+    advance_crypto(ctx);
+    uint32_t ticks = started - counter();
+    ++ctx->steps;
+    ++ctx->crypto_slack_steps;
+    ctx->crypto_slack_ticks += ticks;
+    ctx->foreground_ticks += ticks;
+    ctx->crypto_ticks += ticks;
+    if (writer_owned) ctx->crypto_writer_ticks += ticks;
+    if (ticks > ctx->crypto_max_ticks) ctx->crypto_max_ticks = ticks;
+    if (ticks > ctx->max_step_ticks) ctx->max_step_ticks = ticks;
+    native_critical_leave(mask);
+    return true;
+}
+
+static bool native_blocks_reader(const RawPlayerIo *ctx)
+{
+    return (storage_native_active() || (native_requested && !ctx->running)) &&
+        !crypto_ram_only(ctx);
+}
+
 static void service_once(RawPlayerIo *ctx)
 {
+    if (crypto_ram_only(ctx)) {
+        advance_crypto(ctx);
+        return;
+    }
     if (ctx->failed) {
         /* ERROR is not a controller-ownership release. The CX backend can
          * finish cleanup on later steps after a delayed ready transition. */
@@ -266,14 +344,7 @@ static void service_once(RawPlayerIo *ctx)
             ctx->crypt_restart = false;
         }
         if (ctx->crypt->phase != NVE_READ_FETCH) {
-            nve_reader_step(ctx->crypt);
-            if (ctx->crypt->phase == NVE_READ_DONE) {
-                ctx->ready = true;
-                ctx->ended = counter();
-                ctx->completed_bytes = (uint32_t)ctx->bytes;
-            } else if (ctx->crypt->phase == NVE_READ_ERROR) {
-                ctx->failed = true; ctx->error = -321;
-            }
+            advance_crypto(ctx);
             return;
         }
     }
@@ -322,15 +393,16 @@ static void service_once(RawPlayerIo *ctx)
 }
 static void service(RawPlayerIo *ctx, uint32_t budget)
 {
-    if (storage_native_active() ||
+    if (native_blocks_reader(ctx) ||
         (ctx->failed ? provider_quiescent(ctx)
-                     : (!ctx->park &&
-                        (!ctx->requested || ctx->ready || (native_requested && !ctx->running)))))
+                     : (!ctx->park && (!ctx->requested || ctx->ready))))
         return;
     uint32_t start = counter();
     unsigned mask = native_critical_enter();
     do {
         uint32_t before = counter();
+        uint32_t crypto_before = ctx->crypto_steps;
+        bool writer_owned = storage_native_active();
         /* Keep the existing read batching for plain movies. Crypto steps do
          * more CPU work, so check the playback deadline after each one. */
         unsigned batch = ctx->crypt ? 1U : 4U;
@@ -338,15 +410,20 @@ static void service(RawPlayerIo *ctx, uint32_t budget)
             service_once(ctx);
             ++ctx->steps;
             if (ctx->failed || ctx->ready || (!ctx->requested && !ctx->park) ||
-                (native_requested && !ctx->running))
+                native_blocks_reader(ctx))
                 break;
         }
         uint32_t ticks = before - counter();
         ctx->foreground_ticks += ticks;
+        if (ctx->crypto_steps != crypto_before) {
+            ctx->crypto_ticks += ticks;
+            if (writer_owned) ctx->crypto_writer_ticks += ticks;
+            if (ticks > ctx->crypto_max_ticks) ctx->crypto_max_ticks = ticks;
+        }
         if (ticks > ctx->max_step_ticks)
             ctx->max_step_ticks = ticks;
         if (ctx->failed || ctx->ready || (!ctx->requested && !ctx->park) ||
-            (native_requested && !ctx->running))
+            native_blocks_reader(ctx))
             break;
     } while ((uint32_t)(start - counter()) < budget);
     native_critical_leave(mask);
@@ -503,7 +580,7 @@ void raw_player_destroy(RawPlayerIo *ctx)
     free(ctx);
     native_critical_leave(entry_mask);
 }
-int raw_player_read(RawPlayerIo *ctx, uint64_t offset, void *destination, size_t bytes, bool wait)
+static int raw_player_read_impl(RawPlayerIo *ctx, uint64_t offset, void *destination, size_t bytes, bool wait)
 {
     if (!ctx || !destination || !bytes || bytes > sizeof(ctx->buffer) || ctx->failed)
         return -1;
@@ -533,11 +610,44 @@ int raw_player_read(RawPlayerIo *ctx, uint64_t offset, void *destination, size_t
             ctx->ready = false;
             return 1;
         }
-        if (wait)
+        if (wait) {
+            uint32_t writer_started = counter();
             app_task_io_service(8U);
+            ctx->join_writer_ticks += writer_started - counter();
+        }
     } while (wait);
     return 0;
 }
+int raw_player_read(RawPlayerIo *ctx, uint64_t offset, void *destination, size_t bytes, bool wait)
+{
+    if (!ctx || !wait)
+        return raw_player_read_impl(ctx, offset, destination, bytes, wait);
+    uint32_t started = counter();
+    RawPlayerWaitStats before = {
+        0, ctx->foreground_ticks, ctx->crypto_ticks, ctx->join_writer_ticks,
+        ctx->physical_total + ctx->reader.page_reads,
+        ctx->regions_total + ctx->reader.regions_loaded, ctx->refreshes,
+        ctx->crypt ? (uint32_t)ctx->crypt->phase : UINT32_MAX
+    };
+    int result = raw_player_read_impl(ctx, offset, destination, bytes, wait);
+    ctx->last_wait = (RawPlayerWaitStats){
+        started - counter(), ctx->foreground_ticks - before.reader_ticks,
+        ctx->crypto_ticks - before.crypto_ticks,
+        ctx->join_writer_ticks - before.writer_service_ticks,
+        ctx->physical_total + ctx->reader.page_reads - before.physical_reads,
+        ctx->regions_total + ctx->reader.regions_loaded - before.region_rebuilds,
+        ctx->refreshes - before.view_captures, before.start_phase
+    };
+    return result;
+}
+bool raw_player_last_wait(const RawPlayerIo *ctx, RawPlayerWaitStats *out)
+{
+    if (!ctx || !out || !ctx->last_wait.wall_ticks)
+        return false;
+    *out = ctx->last_wait;
+    return true;
+}
+
 bool raw_player_idle(unsigned milliseconds)
 {
     RawPlayerIo *ctx = live;
@@ -608,6 +718,10 @@ void raw_player_debug(FILE *file, const RawPlayerIo *ctx)
         (unsigned long)r.physical, (unsigned long)r.regions, r.cache_status,
         (unsigned long)r.cache_nodes, (unsigned long)r.dirty_blocks,
         (unsigned long)r.metadata_hits);
+    fprintf(file, "raw_reader_crypto steps=%lu cpu_ticks=%lu during_writer_ticks=%lu max_step_ticks=%lu slack_steps=%lu slack_ticks=%lu\n",
+            (unsigned long)r.crypto_steps, (unsigned long)r.crypto_ticks,
+            (unsigned long)r.crypto_writer_ticks, (unsigned long)r.crypto_max_ticks,
+            (unsigned long)r.crypto_slack_steps, (unsigned long)r.crypto_slack_ticks);
     fprintf(file, "raw_reader_map_cache stores=%lu hits=%lu invalidations=%lu rejected=%lu\n",
             (unsigned long)r.region_cache.stores, (unsigned long)r.region_cache.hits,
             (unsigned long)r.region_cache.invalidations, (unsigned long)r.region_cache.rejected);

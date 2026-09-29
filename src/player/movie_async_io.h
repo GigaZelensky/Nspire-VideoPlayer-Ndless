@@ -24,4 +24,5 @@ int movie_async_read(struct Movie *movie, uint64_t offset, void *destination, si
 void player_delay_ms(unsigned milliseconds);
 void movie_async_debug(FILE *, const struct Movie *);
 void movie_async_service(struct Movie *, unsigned budget_ticks);
+bool movie_async_crypto_step(struct Movie *, uint32_t spare_ticks);
 #endif

@@ -26,6 +26,10 @@ void movie_async_service(Movie *movie, unsigned budget_ticks)
     if (movie_async_enabled(movie))
         raw_player_service(budget_ticks);
 }
+bool movie_async_crypto_step(Movie *movie, uint32_t spare_ticks)
+{
+    return movie_async_enabled(movie) && raw_player_crypto_step(spare_ticks);
+}
 bool movie_async_start(Movie *movie, const char *path)
 {
     if (!movie || movie->async_io || !g_clock.using_hw_timer || !path)
@@ -112,6 +116,18 @@ int movie_async_read(Movie *movie, uint64_t offset, void *destination, size_t by
     if (result == MOVIE_ASYNC_PENDING && wait) {
         ++movie->diag_async_waits;
         result = raw_player_read(state->raw, offset, destination, bytes, true);
+        RawPlayerWaitStats cost;
+        if (debug_is_runtime_logging_enabled() && raw_player_last_wait(state->raw, &cost) &&
+            cost.wall_ticks >= TIMER_TICKS_PER_SEC / 200U) {
+            debug_tracef("read_wait chunk=%d n=%lu wall=%lu read=%lu crypt=%lu writer=%lu pages=%lu regions=%lu views=%lu phase=%lu units=us",
+                chunk_index, (unsigned long)bytes,
+                (unsigned long)((uint64_t)cost.wall_ticks * 1000000U / TIMER_TICKS_PER_SEC),
+                (unsigned long)((uint64_t)cost.reader_ticks * 1000000U / TIMER_TICKS_PER_SEC),
+                (unsigned long)((uint64_t)cost.crypto_ticks * 1000000U / TIMER_TICKS_PER_SEC),
+                (unsigned long)((uint64_t)cost.writer_service_ticks * 1000000U / TIMER_TICKS_PER_SEC),
+                (unsigned long)cost.physical_reads, (unsigned long)cost.region_rebuilds,
+                (unsigned long)cost.view_captures, (unsigned long)cost.start_phase);
+        }
     }
     if (result == MOVIE_ASYNC_READY)
         collect_async_read(movie, state, chunk_index, bytes);

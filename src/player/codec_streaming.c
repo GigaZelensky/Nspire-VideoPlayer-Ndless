@@ -516,6 +516,35 @@ static __attribute__((noinline)) bool h264_convert_repeated_flat_rows(
     return true;
 }
 
+#if defined(__arm__) && !defined(__thumb__)
+/* One chroma sample covers a 2x2 block. The dense ARM loop keeps both output
+ * rows and all three chroma terms in registers, avoiding per-block spills. */
+_Static_assert(offsetof(H264ColorTables, u_to_blue) - offsetof(H264ColorTables, y_base) == 1024U &&
+               offsetof(H264ColorTables, u_to_green) - offsetof(H264ColorTables, y_base) == 2048U &&
+               offsetof(H264ColorTables, v_to_red) - offsetof(H264ColorTables, y_base) == 3072U &&
+               offsetof(H264ColorTables, v_to_green) - offsetof(H264ColorTables, y_base) == 4096U &&
+               offsetof(H264ColorTables, clip) - offsetof(H264ColorTables, y_base) == 5120U,
+               "ARM color table layout");
+extern void h264_rgb565_dense_pair_rows(const uint8_t *y0, const uint8_t *y1,
+    const uint8_t *u, const uint8_t *v, uint16_t *d0, uint16_t *d1,
+    const int32_t *y_table, unsigned pairs);
+
+static bool h264_convert_dense_rows(const uint8_t *y, const uint8_t *u, const uint8_t *v,
+    size_t luma_stride, size_t chroma_stride, uint16_t *dst,
+    size_t pitch, size_t width, size_t height)
+{
+    for (size_t row = 0; row < height; row += 2U) {
+        h264_rgb565_dense_pair_rows(y, y + luma_stride, u, v, dst, dst + pitch,
+                                   g_h264_color_tables->y_base, width / 2U);
+        y += 2U * luma_stride;
+        u += chroma_stride;
+        v += chroma_stride;
+        dst += 2U * pitch;
+    }
+    return true;
+}
+#endif
+
 static inline bool blit_h264_planes_to_rgb565_rows(
     const Movie *movie,
     const uint8_t *restrict y_plane,
@@ -535,6 +564,11 @@ static inline bool blit_h264_planes_to_rgb565_rows(
 
     size_t y;
     if (!movie || !y_plane || !u_plane || !v_plane || !dst_pixels || !crop_width || !crop_height || ((crop_width | crop_height) & 1U)) return false;
+#if defined(__arm__) && !defined(__thumb__)
+    if (!try_flat && crop_width >= 64U && !((uintptr_t)dst_pixels & 3U) && !(dst_pitch_pixels & 1U))
+        return h264_convert_dense_rows(y_plane, u_plane, v_plane, luma_stride,
+            chroma_stride, dst_pixels, dst_pitch_pixels, crop_width, crop_height);
+#endif
     if (try_flat && !((uintptr_t)dst_pixels & 3U) && !(dst_pitch_pixels & 1U) &&
         h264_repeated_flat_blocks(y_plane, u_plane, v_plane, luma_stride, chroma_stride, crop_width, crop_height))
         return h264_convert_repeated_flat_rows(y_plane, u_plane, v_plane, luma_stride, chroma_stride,
@@ -2353,9 +2387,10 @@ void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerSt
         uint32_t service_started_ms=spare_ms?monotonic_clock_now_ms():0U;
         current_chunk = prefetch_target_chunk(movie);
         if (current_chunk < 0) return;
-        /* Decide before polling the reader: even a pending-read poll spends
-         * a bounded SPI slice. At high playback rates the post-render decode
-         * deadline is already due, so deep lookahead belongs in real slack. */
+        /* Submit/collect only checks completion; explicit service below
+         * advances physical reads and crypto. At high playback rates the
+         * post-render decode deadline can already be due, so distant reads
+         * belong in real slack while low runway still earns a bounded slice. */
         uint32_t buffered_end=movie->chunk_index[current_chunk].first_frame+
             movie->chunk_index[current_chunk].frame_count;
         for(int n=current_chunk+1;n<current_chunk+PREFETCH_CHUNK_COUNT+1 &&
@@ -2380,6 +2415,9 @@ void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerSt
         size_t before_read=work?work->read_offset:0;
         if (work && !prefetch_read_step(movie, work, true, 0)) clear_prefetched_chunk(work);
         if(movie_async_enabled(movie) && work && work->state==PREFETCH_READING && work->read_offset==before_read){
+            /* A pending-read poll only checks completion. Preserve the real
+             * remaining slack here: shrinking it to the 1 ms guard can starve
+             * the reader even while repeated polls appear to be working. */
             unsigned service_ticks=prefetch_async_remaining_ticks(runway,spare_ms,
                 spare_ms?monotonic_clock_now_ms()-service_started_ms:0U);
             if(!service_ticks)return;

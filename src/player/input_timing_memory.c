@@ -902,6 +902,14 @@ void wait_until_ticks_playback(Movie *movie, uint64_t target_ticks, const Pointe
             now_ticks=monotonic_clock_now_ticks();
             if(progressed){writer_turn=true;continue;}
         }
+        /* Physical storage keeps its conservative deadline guard. Already-read
+         * crypto data has small, measured CPU quanta, so use the short tail
+         * that would otherwise spin while the encrypted buffer falls behind. */
+        if (movie && movie->encrypted && target_ticks > now_ticks &&
+            target_ticks - now_ticks <= sleep_guard_ticks && movie_async_crypto_step(movie, (uint32_t)(target_ticks - now_ticks))) {
+            now_ticks = monotonic_clock_now_ticks();
+            continue;
+        }
         if (target_ticks > now_ticks && target_ticks - now_ticks > sleep_guard_ticks) {
             /* A native transaction can exceed its cooperative slice (6.2 ms
              * observed). Near due, retain CPU sleep but don't start a writer;

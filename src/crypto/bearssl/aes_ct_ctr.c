@@ -31,8 +31,17 @@ void
 br_aes_ct_ctr_init(br_aes_ct_ctr_keys *ctx,
 	const void *key, size_t len)
 {
+	uint32_t compressed[60];
 	ctx->vtable = &br_aes_ct_ctr_vtable;
-	ctx->num_rounds = br_aes_ct_keysched(ctx->skey, key, len);
+	ctx->num_rounds = br_aes_ct_keysched(compressed, key, len);
+	/* The cooperative reader decrypts only 64 bytes per call. Retain the
+	 * expanded schedule instead of rebuilding and wiping it for every slice.
+	 * The owning NveKeys is wiped when the movie's unlock session ends. */
+	memset(ctx->skey, 0, sizeof ctx->skey);
+	if (ctx->num_rounds) {
+		br_aes_ct_skey_expand(ctx->skey, ctx->num_rounds, compressed);
+	}
+	nve_wipe(compressed, sizeof compressed);
 }
 
 static void
@@ -56,9 +65,7 @@ br_aes_ct_ctr_run(const br_aes_ct_ctr_keys *ctx,
 	unsigned char *buf;
 	const unsigned char *ivbuf;
 	uint32_t iv0, iv1, iv2;
-	uint32_t sk_exp[120];
-
-	br_aes_ct_skey_expand(sk_exp, ctx->num_rounds, ctx->skey);
+	const uint32_t *sk_exp = ctx->skey;
 	ivbuf = iv;
 	iv0 = br_dec32le(ivbuf);
 	iv1 = br_dec32le(ivbuf + 4);
@@ -106,7 +113,6 @@ br_aes_ct_ctr_run(const br_aes_ct_ctr_keys *ctx,
 		len -= 32;
 		cc += 2;
 	}
-	nve_wipe(sk_exp, sizeof sk_exp);
 	return cc;
 }
 

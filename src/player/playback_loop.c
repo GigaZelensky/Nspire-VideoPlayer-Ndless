@@ -1924,7 +1924,8 @@ int play_movie(
              * auto-next or the end-of-video pause. There is nothing to decode
              * ahead at that boundary. */
             uint64_t decode_due = (realtime_frame_skip || movie.current_frame + 1U >= movie.header.frame_count) ? next_frame_due_ticks :
-                playback_decode_due(next_frame_due_ticks, scaled_interval, monotonic_clock_ticks_per_second());
+                playback_decode_due(next_frame_due_ticks, scaled_interval, monotonic_clock_ticks_per_second(),
+                    movie.h264.foreground_decode_peak_ms);
             if (now_ticks >= decode_due) {
                 uint64_t elapsed_ticks = now_ticks - playback_anchor_ticks;
                 uint32_t frames_to_advance = movie_frames_from_scaled_ticks(&movie, elapsed_ticks, playback_rate);
@@ -2332,14 +2333,26 @@ int play_movie(
             {
                 uint64_t capture_wait_started = playback_capture_active(&movie) ? monotonic_clock_now_ticks() : 0;
                 playback_phase(&movie, PLAYER_CRASH_WAIT, paused, playback_rate);
-                player_delay_ms((paused_input_grace || playback_input_grace) ? 2 : 16);
+                if (paused && !paused_ui_busy && !help_menu_open && !g_display_power_state.off &&
+                    h264_lookahead_active(&movie) && h264_lookahead_queued(&movie) < 8U) {
+                    /* Use the existing quiet pause interval to prepare a small
+                     * reserve. Lookahead owns separate pixels: the paused image
+                     * stays unchanged, and its wait still responds to input.
+                     * Do not add a buffering delay when playback resumes. */
+                    uint64_t until = monotonic_clock_now_ticks() +
+                        ((uint64_t)monotonic_clock_ticks_per_second() * 16U + 999U) / 1000U;
+                    wait_until_ticks_playback(&movie, until, &pointer);
+                } else {
+                    player_delay_ms((paused_input_grace || playback_input_grace) ? 2 : 16);
+                }
                 if (playback_capture_active(&movie)) playback_capture_stage(&movie, CAPTURE_WAIT, capture_wait_started, monotonic_clock_now_ticks());
             }
         } else {
             uint64_t after_render_ticks = monotonic_clock_now_ticks();
             uint64_t work_due_ticks = (realtime_frame_skip || movie.current_frame + 1U >= movie.header.frame_count) ? next_frame_due_ticks :
                 playback_decode_due(next_frame_due_ticks,
-                    movie_frame_time_scaled_ticks(&movie, 1, playback_rate), monotonic_clock_ticks_per_second());
+                    movie_frame_time_scaled_ticks(&movie, 1, playback_rate), monotonic_clock_ticks_per_second(),
+                    movie.h264.foreground_decode_peak_ms);
             uint64_t spare_ticks = work_due_ticks > after_render_ticks ? (work_due_ticks - after_render_ticks) : 0;
             uint32_t spare_ms = monotonic_clock_ticks_to_ms(spare_ticks);
             uint64_t wait_target_ticks = work_due_ticks;
