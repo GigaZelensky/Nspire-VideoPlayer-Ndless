@@ -154,7 +154,7 @@ static inline void player_prefetch_data(const void *ptr)
 #define DISPLAY_IDLE_DIM_OFF_MS 120000U
 #define DISPLAY_IDLE_OFF_FADE_MS 800U
 #define DISPLAY_OFF_SUSPEND_MS 60000U
-#define DEBUG_RING_SIZE 8192
+#define DEBUG_RING_SIZE 512
 #define DEBUG_LINE_LEN 192
 #define DEBUG_SNAPSHOT_INTERVAL_MS 1000U
 #define DEBUG_TRACE_FOREGROUND_MS 12U
@@ -246,6 +246,9 @@ typedef struct {
     HistoryEntry default_settings;
     bool has_default_settings;
     UiThemeId theme_id;
+    unsigned clock_mhz;
+    bool clock_keep_after_exit;
+    bool has_clock_preference;
 } HistoryStore;
 
 typedef struct {
@@ -443,6 +446,7 @@ typedef struct {
     bool p;
     bool r;
     bool n;
+    bool o;
     bool ctrl;
     bool on;
 } PlaybackKeySnapshot;
@@ -771,6 +775,7 @@ void queue_os_suspend_shortcut(void);
 void queue_os_redraw(void);
 bool key_pressed_edge(t_key key, bool *previous_state);
 int player_touchpad_scan(touchpad_report_t *report);
+bool player_touchpad_button_down(void);
 bool player_key_pressed(t_key key);
 bool on_key_pressed_edge(bool *previous_state);
 bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progress);
@@ -855,6 +860,8 @@ bool load_history_store_from_path(const char *history_path, HistoryStore *histor
 bool load_history_store(const char *movie_path, HistoryStore *history);
 bool save_history_store_to_path(const char *history_path, const HistoryStore *history);
 bool save_history_store(const char *movie_path, const HistoryStore *history);
+unsigned history_load_clock_preference(bool *keep_after_exit);
+bool history_save_clock_preference(unsigned mhz, bool keep_after_exit);
 void ui_load_theme_for_directory(const char *directory);
 void ui_write_theme_for_directory(const char *directory);
 void ui_save_theme_for_directory(const char *directory);
@@ -883,6 +890,7 @@ bool update_seek_bar_preview(Movie *movie, SeekBarPreviewState *preview, const P
 /* input_timing_memory.c */
 void pointer_init(PointerState *pointer);
 bool pointer_update(PointerState *pointer);
+void pointer_update_captured(PointerState *pointer);
 void pointer_hover_guard_reset(PointerHoverGuard *guard);
 void pointer_hover_guard_lock(PointerHoverGuard *guard, const PointerState *pointer);
 bool pointer_hover_guard_allows(PointerHoverGuard *guard, const PointerState *pointer);
@@ -920,6 +928,7 @@ bool prefetch_abort_requested(const PointerState *pointer);
 void wait_until_ticks_playback(Movie *movie, uint64_t target_ticks, const PointerState *pointer);
 bool playback_prepare_ahead(Movie *movie, uint64_t target_ticks, const PointerState *pointer);
 int load_ready_chunk(Movie *movie, int chunk_index);
+int reload_h264_chunk_step(Movie *movie, int chunk_index, size_t *offset, unsigned budget_ticks);
 void free_movie_files(MovieFile *files, size_t count);
 void clear_movie_picker_cache(MoviePickerCache *cache);
 void movie_picker_timing_stop(void);
@@ -1035,6 +1044,7 @@ void player_service_writes(const Movie *movie);
 bool player_standby(SDL_Surface *screen, Movie *movie, const char *path, bool is_directory,
     ScreenshotPreviewState *preview);
 void player_standby_shutdown(void);
+void player_standby_debug(FILE *file);
 enum {
     CAPTURE_RENDER_SCHEDULED_FRAME = 1U << 0,
     CAPTURE_RENDER_FRAME_CHANGED = 1U << 1,
@@ -1272,6 +1282,12 @@ void draw_ui_label_ink_left(SDL_Surface *screen, const Fonts *fonts, int ink_lef
 void draw_ui_label_ink_right(SDL_Surface *screen, const Fonts *fonts, int ink_right_x, int y, const char *label);
 void draw_overlay_backdrop_dim(SDL_Surface *screen, uint8_t dim_mix);
 void draw_cursor(SDL_Surface *screen, int x, int y);
+void remove_captured_cursor(SDL_Surface *screen, SDL_Surface *snapshot);
+bool clock_menu_poll(SDL_Surface *screen, const Fonts *fonts, Movie *movie, PointerState *pointer, bool footer, const char *path);
+bool clock_menu_consumed_input(void);
+void clock_menu_sync_shortcut(void);
+void clock_menu_queue_shortcut(void);
+void clock_menu_draw_footer(SDL_Surface *screen, const Fonts *fonts, int offset_y, uint8_t mix);
 void compute_video_rects( const Movie *movie, ScaleMode scale_mode, VideoAlign video_align_x, VideoAlign video_align_y, SDL_Rect *src, SDL_Rect *dst );
 bool clip_scaled_rects_to_screen( const SDL_Rect *src, const SDL_Rect *dst, int source_w, int source_h, SDL_Rect *clipped_src, SDL_Rect *clipped_dst );
 void draw_surface_frame_scaled_clipped( SDL_Surface *screen, SDL_Surface *surface, const SDL_Rect *src, const SDL_Rect *dst );

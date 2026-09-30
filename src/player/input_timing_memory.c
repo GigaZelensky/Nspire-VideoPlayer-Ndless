@@ -6,6 +6,7 @@
 static touchpad_report_t g_input_touchpad_report;
 static bool g_input_touchpad_sampled;
 static bool g_input_touchpad_ok;
+static bool g_input_touchpad_physical_down;
 /* Position belongs to the app; touch tracking and button edges belong to
  * each screen. Carry only coordinates across picker/resume/playback. */
 static int g_pointer_x = SCREEN_W / 2;
@@ -18,8 +19,14 @@ int player_touchpad_scan(touchpad_report_t *report)
     result = touchpad_scan(&g_input_touchpad_report);
     g_input_touchpad_sampled = true;
     g_input_touchpad_ok = result == 0;
+    if (g_input_touchpad_ok) g_input_touchpad_physical_down = g_input_touchpad_report.pressed != 0;
     if (report) *report = g_input_touchpad_report;
     return result;
+}
+
+bool player_touchpad_button_down(void)
+{
+    return g_input_touchpad_physical_down;
 }
 
 bool player_key_pressed(t_key key)
@@ -136,6 +143,18 @@ bool pointer_update(PointerState *pointer)
     pointer->release_edge = !current_down && previous_down;
     pointer->down = current_down;
     return click_edge;
+}
+
+void pointer_update_captured(PointerState *pointer)
+{
+    pointer_update(pointer);
+    if (!g_input_touchpad_sampled || !g_input_touchpad_ok) return;
+    /* The pad's direction label follows finger position while its physical
+     * switch stays pressed. A center-initiated drag owns that switch until
+     * release; crossing into an arrow zone must not end or re-arm it. */
+    pointer->down = g_input_touchpad_report.pressed != 0;
+    pointer->press_edge = false;
+    pointer->release_edge = !pointer->down;
 }
 
 void pointer_hover_guard_reset(PointerHoverGuard *guard)
@@ -594,6 +613,7 @@ bool playback_wait_key_pending(void)
     return
         isKeyPressed(KEY_NSPIRE_ESC) ||
         isKeyPressed(KEY_NSPIRE_ENTER) ||
+        isKeyPressed(KEY_NSPIRE_O) ||
         isKeyPressed(KEY_NSPIRE_SPACE) ||
         isKeyPressed(KEY_NSPIRE_TAB) ||
         isKeyPressed(KEY_NSPIRE_CAT) ||
@@ -694,6 +714,7 @@ static void playback_key_snapshot_sample(PlaybackKeySnapshot *snapshot, bool ref
     snapshot->p = isKeyPressed(KEY_NSPIRE_P);
     snapshot->r = isKeyPressed(KEY_NSPIRE_R);
     snapshot->n = isKeyPressed(KEY_NSPIRE_N);
+    snapshot->o = isKeyPressed(KEY_NSPIRE_O);
     snapshot->ctrl = isKeyPressed(KEY_NSPIRE_CTRL);
     snapshot->on = on_key_pressed() ? true : false;
 }
@@ -749,6 +770,7 @@ bool playback_key_snapshot_new_press(PlaybackKeySnapshot *snapshot)
     pending = key_snapshot_new_press(KEY_NSPIRE_P, &snapshot->p) || pending;
     pending = key_snapshot_new_press(KEY_NSPIRE_R, &snapshot->r) || pending;
     pending = key_snapshot_new_press(KEY_NSPIRE_N, &snapshot->n) || pending;
+    pending = key_snapshot_new_press(KEY_NSPIRE_O, &snapshot->o) || pending;
     pending = key_snapshot_new_press(KEY_NSPIRE_CTRL, &snapshot->ctrl) || pending;
     pending = on_key_snapshot_new_press(&snapshot->on) || pending;
     return pending;

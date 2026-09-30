@@ -593,6 +593,17 @@ int play_movie(
         if (capture_input) playback_capture_tick(&movie, capture_input_started, paused || help_menu_open || g_display_power_state.off);
         bool scheduled_frame_advanced = false;
         bool touchpad_click = pointer_update(&pointer);
+        if (clock_menu_poll(screen, fonts, &movie, &pointer, false, path)) {
+            prev_esc = isKeyPressed(KEY_NSPIRE_ESC); prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
+            prev_on = on_key_pressed();
+            playback_pointer_press_active = playback_pause_key_press_active = false;
+            playback_press_target = PLAYBACK_PRESS_NONE;
+            render_gate.valid = false;
+            playback_capture_tick(&movie, monotonic_clock_now_ticks(), paused || help_menu_open);
+            reset_playback_timeline(&movie, playback_rate_for_index(playback_rate_index),
+                &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            continue;
+        }
         bool pointer_click = touchpad_click;
         bool pending_seek_consumed_click = false;
         uint64_t now_ticks = monotonic_clock_now_ticks();

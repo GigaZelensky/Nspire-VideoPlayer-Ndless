@@ -31,6 +31,10 @@ typedef struct {
     uint32_t background_color_bands_64, background_color_bands_tail;
     uint32_t max_background_tail_ticks, color_tail_guard_ticks;
     uint64_t decode_ticks, color_ticks;
+    uint32_t recoveries, recovery_frames;
+    uint32_t failed_frame, failure_visible_frame, failure_queued;
+    int failure_chunk;
+    char failure_reason[128];
     bool active, partial;
 } H264LookaheadStats;
 
@@ -40,8 +44,10 @@ bool h264_lookahead_begin(struct Movie *movie);
 bool h264_lookahead_active(const struct Movie *movie);
 
 /* One macroblock batch or row-band conversion against an absolute deadline.
- * Never starts a cold/unfinished read. Returns whether work was performed. */
+ * Normal decoding uses ready chunks; error recovery may advance a bounded
+ * nonblocking reload. Returns whether work was performed. */
 bool h264_lookahead_step(struct Movie *movie, uint64_t deadline_ticks);
+bool h264_lookahead_reloading(const struct Movie *movie);
 
 /* Consume a queued exact frame without decoding. The framebuffer and its
  * allocation are swapped, so this is independent of image dimensions. */

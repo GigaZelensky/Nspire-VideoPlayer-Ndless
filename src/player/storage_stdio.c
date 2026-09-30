@@ -43,7 +43,6 @@ int __wrap_fflush(FILE *file)
 }
 
 extern int __real_remove(const char *);
-extern int __real_rename(const char *, const char *);
 extern DIR *__real_nuc_opendir(const char *);
 extern struct dirent *__real_nuc_readdir(DIR *);
 extern int __real_nuc_closedir(DIR *);
@@ -52,11 +51,6 @@ int __wrap_remove(const char *path)
 {
     raw_player_before_native();
     return __real_remove(path);
-}
-int __wrap_rename(const char *from, const char *to)
-{
-    raw_player_before_native();
-    return __real_rename(from, to);
 }
 DIR *__wrap_nuc_opendir(const char *path)
 {

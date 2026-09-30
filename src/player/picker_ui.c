@@ -532,6 +532,8 @@ void loading_progress_tick(LoadingProgress *progress, bool force)
     if (!progress || !progress->screen || !progress->fonts) {
         return;
     }
+    /* Finish the current loading operation before entering a clock modal. */
+    clock_menu_queue_shortcut();
     now_ms = monotonic_clock_now_ms();
     if (!force &&
         progress->last_draw_ms != 0 &&
@@ -1260,6 +1262,7 @@ void render_picker(
             rgb565_lerp(picker_background_color_at_y_mix(footer_accent.y, background_mix), ui_theme()->footer_accent_top, footer_mix, 255),
             rgb565_lerp(picker_background_color_at_y_mix(footer_accent.y, background_mix), UI_COLOR_ACCENT_DEEP, footer_mix, 255)
         );
+        clock_menu_draw_footer(screen, fonts, footer_offset_y, footer_mix);
         if (footer_mix > 54) {
             draw_ui_label(screen, fonts, 12, SCREEN_H - 17 + footer_offset_y, credit);
         }
@@ -1473,6 +1476,7 @@ void render_picker(
             rgb565_lerp(picker_background_color_at_y_mix(footer_accent.y, background_mix), UI_COLOR_ACCENT_DEEP, footer_mix, 255)
         );
         snprintf(footer, sizeof(footer), "%lu %s", (unsigned long) count, count == 1 ? "file" : "files");
+        clock_menu_draw_footer(screen, fonts, footer_offset_y, footer_mix);
         if (footer_mix > 54) {
             draw_ui_label(screen, fonts, 12, SCREEN_H - 17 + footer_offset_y, credit);
             draw_ui_label(screen, fonts, SCREEN_W - 12 - nSDL_GetStringWidth(fonts->white, footer), SCREEN_H - 17 + footer_offset_y, footer);

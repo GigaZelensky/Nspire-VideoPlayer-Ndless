@@ -1,6 +1,7 @@
 #include "native_standby_guard.h"
 #include "native_file_io.h"
 #include "native_interrupts.h"
+#include "native_firmware.h"
 #include "native_display_hold.h"
 #include "native_busy_hold.h"
 #include "native_cursor_hold.h"
@@ -121,16 +122,48 @@ static int release_native_ownership(NativeStandbyGuard *backend)
     return 0;
 }
 
+static uint32_t acquire_task, acquire_magic, acquire_flags, acquire_slice, acquire_mask;
+static void capture_acquire_state(void)
+{
+    acquire_task = acquire_magic = acquire_flags = acquire_slice = acquire_mask = 0;
+    unsigned saved = native_critical_enter();
+    PortableReaderPlatform mapping = {0};
+    if (!portable_reader_platform_refresh(&mapping)) goto done;
+    const PortableView *view = portable_reader_platform_view(&mapping);
+    if (!view || !view->allow_span(view->context, 0x1148F060U, 0x24U, PORTABLE_DATA)) goto done;
+    acquire_task = guard_word(0x1148F060U);
+    acquire_mask = guard_word(0x1148F080U);
+    if ((acquire_task & 3U) || !view->allow_span(view->context, acquire_task, 0x48U, PORTABLE_DATA)) goto done;
+    acquire_magic = guard_word(acquire_task + 0x0CU);
+    acquire_flags = guard_word(acquire_task + 0x18U);
+    acquire_slice = guard_word(acquire_task + 0x40U);
+done:
+    native_critical_leave(saved);
+}
+void native_standby_guard_debug(FILE *file)
+{
+    if (file) fprintf(file, "guard_task=%08lx magic=%08lx flags=%08lx slice=%lu kernel_mask=%08lx\n",
+        (unsigned long)acquire_task, (unsigned long)acquire_magic, (unsigned long)acquire_flags,
+        (unsigned long)acquire_slice, (unsigned long)acquire_mask);
+}
+
+static const char *acquire_stage = "not-attempted";
+const char *native_standby_guard_stage(void) { return acquire_stage; }
+
 int native_standby_guard_acquire(NativeStandbyGuard *backend)
 {
     int result;
     NativeFileIo validation = {0};
+    acquire_stage = "entry-state";
     if (!backend || backend->apd_held || backend->input_held || backend->display_held ||
         backend->busy_held || backend->active || backend->cursor_held)
         return NATIVE_FILE_IO_BAD_STATE;
+    capture_acquire_state();
+    acquire_stage = "file-adapter";
     result = native_file_io_init(&validation);
     if (result)
         return result;
+    acquire_stage = "guard-fingerprint";
     if (!guard_platform())
         return NATIVE_FILE_IO_UNSUPPORTED;
     backend->supported = true;
@@ -157,15 +190,21 @@ int native_standby_guard_acquire(NativeStandbyGuard *backend)
     /* Keep the OS mirror-to-LCD DMA disabled across standby/resume. */
     /* The GUI's current event is this Ndless application. Stop its busy timer
      * before the display-control and standby spans enable OS interrupts. */
+    acquire_stage = "busy-cursor";
     result = native_busy_hold_acquire(&backend->busy_held);
-    if (!result)
+    if (!result) {
+        acquire_stage = "display-copier";
         result = native_display_hold_acquire(&backend->display_held);
-    if (!result)
+    }
+    if (!result) {
+        acquire_stage = "pointer-cursor";
         result = native_cursor_hold_acquire(&backend->cursor_held);
+    }
     if (result) {
         int cleanup = release_native_ownership(backend);
         return cleanup ? cleanup : result;
     }
+    acquire_stage = "ready";
     return 0;
 }
 

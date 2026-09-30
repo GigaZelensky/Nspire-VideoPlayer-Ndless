@@ -17,7 +17,13 @@ typedef struct {
     CaptureTiming io_timing[CAPTURE_IO_KIND_COUNT];
     uint64_t io_bytes[CAPTURE_IO_KIND_COUNT];
     CaptureFrame frames[CAPTURE_FRAME_CAPACITY], pending_frame;
-    CaptureIo io[CAPTURE_IO_CAPACITY];
+    CaptureFrame recent[CAPTURE_RECENT_CAPACITY];
+    uint32_t recent_next, recent_count, event_next, event_count;
+    uint64_t recent_overwritten, events_overwritten, context_until, last_saved;
+    struct { uint64_t ticks; uint32_t frame, missed; } events[CAPTURE_EVENT_CAPACITY];
+    CaptureIo io[CAPTURE_IO_CAPACITY], recent_io[32];
+    uint64_t io_sequence, saved_io_sequence, recent_io_overwritten;
+    uint32_t recent_io_next, recent_io_count;
     uint32_t frame_next, frame_count, io_next, io_count;
     uint64_t frames_overwritten, io_overwritten;
     uint64_t presented, skipped, presentation_late, over_budget, lateness_ticks, max_lateness;
@@ -179,6 +185,19 @@ void playback_capture_frame_begin(const Movie *movie, uint32_t target_frame, uin
     g_capture->pending = true;
 }
 
+static void capture_keep_recent_io(void)
+{
+    uint64_t first = g_capture->io_sequence - g_capture->recent_io_count + 1U;
+    for (unsigned n = 0; n < g_capture->recent_io_count; ++n) {
+        if (first + n <= g_capture->saved_io_sequence) continue;
+        size_t index = (capture_ring_oldest(g_capture->recent_io_next, g_capture->recent_io_count, 32U) + n) % 32U;
+        size_t slot = capture_ring_push_index(&g_capture->io_next, &g_capture->io_count,
+            &g_capture->io_overwritten, CAPTURE_IO_CAPACITY);
+        g_capture->io[slot] = g_capture->recent_io[index];
+        g_capture->saved_io_sequence = first + n;
+    }
+}
+
 static void capture_finish_frame(const Movie *movie, uint64_t now, bool presented)
 {
     unsigned i;
@@ -188,6 +207,8 @@ static void capture_finish_frame(const Movie *movie, uint64_t now, bool presente
     frame->chunk = (uint32_t)movie_chunk_for_frame(movie, frame->frame);
     frame->ahead_after = (uint16_t)h264_lookahead_queued(movie);
     frame->ahead_next_frame = h264_lookahead_next_frame(movie);
+    uint32_t previous_events = g_capture->cadence.events;
+    uint32_t previous_missed = g_capture->cadence.missed_intervals;
     if (presented) {
         playback_cadence_present(&g_capture->cadence, now, frame->frame, frame->interval_ticks);
         uint64_t late = now > frame->due_ticks ? now - frame->due_ticks : 0;
@@ -211,9 +232,37 @@ static void capture_finish_frame(const Movie *movie, uint64_t now, bool presente
         frame->stage[i] = capture_ticks32(g_capture->period[i], &frame->flags);
     if (frame->flags & CAPTURE_FRAME_OVERFLOW)
         ++g_capture->interval_overflows;
-    slot = capture_ring_push_index(&g_capture->frame_next, &g_capture->frame_count,
-                                   &g_capture->frames_overwritten, CAPTURE_FRAME_CAPACITY);
-    g_capture->frames[slot] = *frame;
+    bool lag = g_capture->cadence.events != previous_events;
+    if (lag) frame->flags |= CAPTURE_FRAME_LAG;
+    slot = capture_ring_push_index(&g_capture->recent_next, &g_capture->recent_count,
+                                   &g_capture->recent_overwritten, CAPTURE_RECENT_CAPACITY);
+    g_capture->recent[slot] = *frame;
+    if (lag) {
+        size_t event = capture_ring_push_index(&g_capture->event_next, &g_capture->event_count,
+                                               &g_capture->events_overwritten, CAPTURE_EVENT_CAPACITY);
+        g_capture->events[event].ticks = now;
+        g_capture->events[event].frame = frame->frame;
+        g_capture->events[event].missed = g_capture->cadence.missed_intervals - previous_missed;
+        g_capture->context_until = now + (uint64_t)g_capture->tick_hz * 2U;
+        capture_keep_recent_io();
+        /* Copy the lead-in only when a lag occurs. Overlapping windows share
+         * rows; normal playback just updates the small recent-frame ring. */
+        for (unsigned n = 0; n < g_capture->recent_count; ++n) {
+            size_t index = (capture_ring_oldest(g_capture->recent_next, g_capture->recent_count,
+                CAPTURE_RECENT_CAPACITY) + n) % CAPTURE_RECENT_CAPACITY;
+            const CaptureFrame *row = &g_capture->recent[index];
+            if (row->at_ticks <= g_capture->last_saved) continue;
+            slot = capture_ring_push_index(&g_capture->frame_next, &g_capture->frame_count,
+                &g_capture->frames_overwritten, CAPTURE_FRAME_CAPACITY);
+            g_capture->frames[slot] = *row;
+            g_capture->last_saved = row->at_ticks;
+        }
+    } else if (now <= g_capture->context_until && now > g_capture->last_saved) {
+        slot = capture_ring_push_index(&g_capture->frame_next, &g_capture->frame_count,
+            &g_capture->frames_overwritten, CAPTURE_FRAME_CAPACITY);
+        g_capture->frames[slot] = *frame;
+        g_capture->last_saved = now;
+    }
     g_capture->pending = false;
     g_capture->transition = false;
     memset(g_capture->period, 0, sizeof(g_capture->period));
@@ -268,14 +317,16 @@ void playback_capture_io(Movie *movie, int kind, int chunk, uint32_t bytes, uint
     g_capture->io_bytes[kind] += bytes;
     if (kind <= CAPTURE_IO_SEEK)
         playback_capture_stage(movie, CAPTURE_IO, started, ended);
-    slot = capture_ring_push_index(&g_capture->io_next, &g_capture->io_count,
-                                   &g_capture->io_overwritten, CAPTURE_IO_CAPACITY);
-    event = &g_capture->io[slot];
+    slot = capture_ring_push_index(&g_capture->recent_io_next, &g_capture->recent_io_count,
+                                   &g_capture->recent_io_overwritten, 32U);
+    ++g_capture->io_sequence;
+    event = &g_capture->recent_io[slot];
     event->at_ticks = started;
     event->duration_ticks = ended - started;
     event->kind = (uint8_t)kind;
     event->chunk = chunk;
     event->bytes = bytes;
+    if (ended <= g_capture->context_until) capture_keep_recent_io();
 }
 
 static void export_settings(FILE *file, const char *label, const CaptureSettings *s)
@@ -323,7 +374,7 @@ void playback_capture_export(FILE *file, const Movie *movie)
     ended = g_capture->stopped;
     elapsed = ended - g_capture->started;
     active_us = capture_ticks_to_us(g_capture->active_ticks, g_capture->tick_hz);
-    fprintf(file, "capture_version=2 build=%s %s compiler=%s\n", __DATE__, __TIME__, __VERSION__);
+    fprintf(file, "capture_version=3 build=%s %s compiler=%s\n", __DATE__, __TIME__, __VERSION__);
     fprintf(file, "media_name=%s\n", g_capture->media_name);
     H264LookaheadStats ahead;
     h264_lookahead_get_stats(movie, &ahead);
@@ -353,6 +404,10 @@ void playback_capture_export(FILE *file, const Movie *movie)
         (unsigned long long)capture_ticks_to_us(ahead.max_background_tail_ticks,
                                                 g_capture->tick_hz),
         (unsigned long long)capture_ticks_to_us(ahead.color_tail_guard_ticks, g_capture->tick_hz));
+    fprintf(file, "decode_ahead_recovery completed=%lu replayed_frames=%lu failed_frame=%lu visible_frame=%lu queued_at_failure=%lu chunk=%d reason=%s\n",
+        (unsigned long)ahead.recoveries, (unsigned long)ahead.recovery_frames,
+        (unsigned long)ahead.failed_frame, (unsigned long)ahead.failure_visible_frame,
+        (unsigned long)ahead.failure_queued, ahead.failure_chunk, ahead.failure_reason);
     fprintf(
         file,
         "decode_ahead_memory budget_bytes=%lu reserve_bytes=%lu free_begin_valid=%u free_begin_bytes=%lu free_last_valid=%u free_last_bytes=%lu checks=%lu headroom_denials=%lu allocation_failures=%lu (DYNA_available_is_not_largest_contiguous_block; checks_only_at_begin_or_new_slot)\n",
@@ -457,14 +512,24 @@ void playback_capture_export(FILE *file, const Movie *movie)
         (unsigned long long)g_capture->io_overwritten,
         (unsigned long)g_capture->interval_overflows);
     fputs(
-        "capture_notes: due is the scheduled render-start time; smooth mode decodes ahead of due and waits before rendering, skip mode retains clock-driven decoding. over_one_frame_budget means present>=due+interval. Stage times are inclusive: IO/color overlap decode, IO overlaps prefetch, night/LCD overlap render. Background decode/color are reported separately in decode_ahead_us/color_ahead_us and overlap wait; frame/chunk identify presentation, not the decoder horizon. wait_input_us is nested in wait, and wait_touchpad_us is nested in wait_input; their timing counts measure actual wait polls and touchpad bus scans. writer_service_us measures explicit after-present/paused service. wait_io_service_us measures explicit roomy-wait I/O turns and overlaps wait; additional implicit idle work remains inside wait. Foreground H264 color conversion has a separate stage; MPEG4 conversion remains inside decode. Rows sum work since the preceding scheduled presentation; UI-only renders are included in render timing but excluded from effective FPS. Settings transitions reset row accumulators, not totals. Bookkeeping/text_format are measured overhead subsets; timer-read/cache overhead is not calibrated. The detailed capture stays in RAM until export; D also enables the separate asynchronous recovery journal.\n",
+        "capture_notes: due is the scheduled render-start time; smooth mode decodes ahead of due and waits before rendering, skip mode retains clock-driven decoding. over_one_frame_budget means present>=due+interval. Stage times are inclusive: IO/color overlap decode, IO overlaps prefetch, night/LCD overlap render. Background decode/color are reported separately in decode_ahead_us/color_ahead_us and overlap wait; frame/chunk identify presentation, not the decoder horizon. wait_input_us is nested in wait, and wait_touchpad_us is nested in wait_input; their timing counts measure actual wait polls and touchpad bus scans. writer_service_us measures explicit after-present/paused service. wait_io_service_us measures explicit roomy-wait I/O turns and overlaps wait; additional implicit idle work remains inside wait. Foreground H264 color conversion has a separate stage; MPEG4 conversion remains inside decode. Rows sum work since the preceding scheduled presentation; UI-only renders are included in render timing but excluded from effective FPS. Settings transitions reset row accumulators, not totals. Bookkeeping/text_format are measured overhead subsets; timer-read/cache overhead is not calibrated. Frame details retain lag windows in bounded RAM until export; gaps between windows are intentionally omitted, and lifetime totals cover the full recording; D also enables the separate asynchronous recovery journal.\n",
         file);
     fputs(
-        "frame_flags: 1=presented 2=settings_or_pause_transition 4=timing_saturated 8=night_enabled 16=frame_skip_enabled\n",
+        "frame_flags: 1=presented 2=settings_or_pause_transition 4=timing_saturated 8=night_enabled 16=frame_skip_enabled 32=lag_event\n",
         file);
     fputs(
         "io_kinds: 1=sync_read 2=prefetch_read 3=seek_preview_read 4=decoder_reset 5=sequential_decoder_reuse 6=independent_read_wall_time 7=async_screenshot_filesystem_wall_time (6/7 asynchronous wall time, not CPU execution time; spans crossing D-start are clipped)\n",
         file);
+    fprintf(file, "capture_mode=lag_windows pre_frames=%u post_seconds=2 event_count=%lu events_overwritten=%llu\n",
+        CAPTURE_RECENT_CAPACITY, (unsigned long)g_capture->event_count, (unsigned long long)g_capture->events_overwritten);
+    fputs("lag_events_csv: at_us,frame,missed_intervals\n", file);
+    for (i = 0; i < g_capture->event_count; ++i) {
+        size_t index = (capture_ring_oldest(g_capture->event_next, g_capture->event_count,
+            CAPTURE_EVENT_CAPACITY) + i) % CAPTURE_EVENT_CAPACITY;
+        fprintf(file, "%llu,%lu,%lu\n", (unsigned long long)capture_ticks_to_us(
+            g_capture->events[index].ticks - g_capture->started, g_capture->tick_hz),
+            (unsigned long)g_capture->events[index].frame, (unsigned long)g_capture->events[index].missed);
+    }
     fputs(
         "frames_csv: at_us,frame,chunk,due_us,lateness_us,interval_us,skipped,rate_num,rate_den,flags,night_percent,scale_mode,input_us,decode_us,render_us,prefetch_us,wait_us,io_us,bookkeeping_us,text_format_us,h264_color_us,night_filter_us,lcd_transfer_us,screenshot_encode_us,decode_ahead_us,color_ahead_us,wait_input_us,wait_touchpad_us,writer_service_us,wait_io_service_us,ahead_before,ahead_after,ahead_next_frame\n",
         file);

@@ -1505,6 +1505,18 @@ void draw_overlay_backdrop_dim(SDL_Surface *screen, uint8_t dim_mix)
     dim_rect_rgb565(screen, &veil, alpha);
 }
 
+static Uint16 cursor_backdrop[12 * 12];
+static SDL_Surface *cursor_backdrop_screen;
+static SDL_Rect cursor_backdrop_rect;
+void remove_captured_cursor(SDL_Surface *screen, SDL_Surface *snapshot)
+{
+    if (screen != cursor_backdrop_screen || !surface_is_rgb565(snapshot)) return;
+    SDL_Rect r = cursor_backdrop_rect;
+    for (int y = 0; y < r.h; ++y)
+        memcpy((uint8_t *)snapshot->pixels + (r.y + y) * snapshot->pitch + r.x * 2,
+               cursor_backdrop + y * 12, r.w * 2);
+}
+
 void draw_cursor(SDL_Surface *screen, int x, int y)
 {
     static Uint16 cursor_pixels[12 * 12];
@@ -1556,6 +1568,14 @@ void draw_cursor(SDL_Surface *screen, int x, int y)
         }
     }
     if (cursor_surface) {
+        if (surface_is_rgb565(screen) && x >= 0 && y >= 0 && x < screen->w && y < screen->h) {
+            cursor_backdrop_rect = (SDL_Rect){x, y, screen->w - x < 12 ? screen->w - x : 12,
+                screen->h - y < 12 ? screen->h - y : 12};
+            for (int row = 0; row < cursor_backdrop_rect.h; ++row)
+                memcpy(cursor_backdrop + row * 12, (uint8_t *)screen->pixels + (y + row) * screen->pitch + x * 2,
+                       cursor_backdrop_rect.w * 2);
+            cursor_backdrop_screen = screen;
+        }
         SDL_BlitSurface(cursor_surface, NULL, screen, &dst);
     }
 }

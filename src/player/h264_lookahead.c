@@ -37,6 +37,11 @@ struct H264Lookahead {
     uint32_t color_ticks_per_row_q8;
     uint32_t color_tail_guard;
     bool decoder_touched;
+    bool recovering, producer_failed;
+    int recovery_chunk;
+    size_t recovery_offset;
+    uint32_t recovery_target;
+    const char *failure_stage;
     bool have_pump_sample, have_finish_sample, have_color_sample;
     bool have_color_tail_sample;
 };
@@ -306,6 +311,8 @@ bool h264_lookahead_begin(Movie *movie)
     if (ahead->frame_bytes != bytes)
         return false;
     ahead->head = ahead->count = 0U;
+    ahead->recovering = ahead->producer_failed = false;
+    ahead->recovery_chunk = -1;
     ahead->have_prepared_frame = false;
     ahead->consumed = 0U;
     ahead->zero_advance_retries = 0U;
@@ -331,6 +338,56 @@ bool h264_lookahead_begin(Movie *movie)
     return true;
 }
 
+bool h264_lookahead_reloading(const Movie *movie)
+{
+    return h264_lookahead_active(movie) && movie->h264_lookahead->recovery_chunk >= 0;
+}
+
+static void ahead_note_failure(Movie *movie, struct H264Lookahead *ahead)
+{
+    ++ahead->stats.failures;
+    if (ahead->recovering) return; /* Retain the original decoder failure if recovery also fails. */
+    ahead->stats.failed_frame = ahead->next_frame;
+    ahead->stats.failure_visible_frame = movie->current_frame;
+    ahead->stats.failure_chunk = movie->loaded_chunk;
+    ahead->stats.failure_queued = ahead->count;
+    snprintf(ahead->stats.failure_reason, sizeof(ahead->stats.failure_reason), "%s: %s",
+        ahead->failure_stage ? ahead->failure_stage : "unknown", debug_last_error());
+}
+
+static void ahead_recover(Movie *movie, struct H264Lookahead *ahead)
+{
+    ahead_note_failure(movie, ahead);
+    int chunk = movie_chunk_for_frame(movie, ahead->next_frame);
+    /* Never retry indefinitely. Keep valid RGB frames even if rebuilding the
+     * decoder fails; the existing foreground fallback handles their end. */
+    if (ahead->recovering || chunk < 0 || !reset_h264_decoder(movie)) {
+        ahead->producer_failed = true;
+        ahead->recovery_chunk = -1;
+        return;
+    }
+    ahead->recovering = true;
+    ahead->recovery_target = ahead->next_frame;
+    const ChunkIndexEntry *entry = &movie->chunk_index[chunk];
+    /* The decoder was fully reset. Start at the chunk's parameter sets,
+     * rather than assuming an interior IDR repeats SPS/PPS headers. */
+    ahead->next_frame = entry->first_frame;
+    ahead->recovery_chunk = chunk;
+    ahead->recovery_offset = 0;
+    ahead->consumed = 0;
+    ahead->zero_advance_retries = 0;
+    ahead->access_unit = NULL;
+    ahead->picture = NULL;
+    ahead->output_slot = NULL;
+    ahead->color_row = 0;
+    ahead->stats.partial = false;
+    ahead->decoder_touched = true;
+    invalidate_loaded_chunk_state(movie);
+    debug_tracef("lookahead recovery visible=%lu target=%lu restart=%lu queued=%u reason=%s",
+        (unsigned long)movie->current_frame, (unsigned long)ahead->recovery_target,
+        (unsigned long)ahead->next_frame, ahead->count, ahead->stats.failure_reason);
+}
+
 /* 1 means work happened, 0 means yield/full/end/not-ready, -1 means failure.
  * A ready DPB picture may survive between calls, but no later access unit is
  * decoded until it has been converted into a queue-owned RGB565 buffer. */
@@ -348,6 +405,17 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground)
     bool picture_ready = false, pending = false;
     uint8_t *picture = NULL;
 
+    if (ahead->producer_failed) return -1;
+    if (ahead->recovery_chunk >= 0) {
+        if (foreground) return -1; /* No reserve left: use the ordinary fallback. */
+        if (!ahead_time_fits(deadline, ahead_ticks_ms(ahead, 5U))) return 0;
+        ahead->failure_stage = "recovery read";
+        int loaded = reload_h264_chunk_step(movie, ahead->recovery_chunk,
+            &ahead->recovery_offset, ahead_ticks_ms(ahead, 3U));
+        if (loaded < 0) return -1;
+        if (loaded > 0) ahead->recovery_chunk = -1;
+        return 1;
+    }
     if (ahead->count >= ahead->stats.capacity || ahead->next_frame >= movie->header.frame_count)
         return 0;
     if (!foreground) {
@@ -371,6 +439,7 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground)
         int ready;
         if (chunk < 0)
             return -1;
+        ahead->failure_stage = "chunk";
         ready = foreground ? (load_chunk(movie, chunk) ? 1 : -1) : load_ready_chunk(movie, chunk);
         if (!ready) {
             ++ahead->stats.chunk_waits;
@@ -400,6 +469,7 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground)
                 ahead->idr_first = ahead->idr_end = 0;
             }
         }
+        ahead->failure_stage = "access unit";
         start = movie->frame_offsets[local];
         end =
             local + 1U < entry->frame_count ? movie->frame_offsets[local + 1U] : movie->chunk_size;
@@ -453,6 +523,7 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground)
         ahead->decoder_touched = true;
         movie->h264.chunk_dirty = true;
         started = monotonic_clock_now_ticks();
+        ahead->failure_stage = "decode";
         if (!pump_h264_access_unit(movie, movie->h264.decoder, ahead->access_unit,
                                    ahead->access_unit_size, &ahead->consumed,
                                    &ahead->zero_advance_retries, macroblock_budget, true,
@@ -524,6 +595,17 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground)
             return pending ? 1 : -1;
         if (!picture)
             return -1;
+        if (ahead->recovering && ahead->next_frame < ahead->recovery_target) {
+            movie->decoded_local_frame = (int)ahead->working_local_frame;
+            ++ahead->next_frame;
+            ++ahead->stats.recovery_frames;
+            ahead->consumed = 0;
+            ahead->zero_advance_retries = 0;
+            ahead->access_unit = NULL;
+            ahead->output_slot = NULL;
+            ahead->stats.partial = false;
+            return 1; /* Reconstruct references without replacing queued RGB. */
+        }
         ahead->picture = picture;
         movie->decoded_local_frame = (int)ahead->working_local_frame;
         /* Conversion gets its own quantum: return to input/presentation after
@@ -537,6 +619,7 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground)
     if (!rows)
         return 0;
     started = monotonic_clock_now_ticks();
+    ahead->failure_stage = "color";
     if (!blit_h264_picture_rows_to_target(movie, ahead->picture, slot->pixels,
                                           movie->header.video_width, ahead->color_row, rows,
                                           &ahead->color_flat))
@@ -587,6 +670,10 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground)
     ahead->color_row += rows;
     if (ahead->color_row < movie->header.video_height)
         return 1;
+    if (ahead->recovering) {
+        ahead->recovering = false;
+        ++ahead->stats.recoveries;
+    }
     slot->frame = ahead->next_frame++;
     slot->chunk = ahead->idr_chunk;
     slot->idr_first = ahead->idr_first;
@@ -616,12 +703,9 @@ bool h264_lookahead_step(Movie *movie, uint64_t deadline_ticks)
     if (!h264_lookahead_active(movie))
         return false;
     ahead = movie->h264_lookahead;
+    if (ahead->producer_failed) return false;
     result = ahead_produce(movie, deadline_ticks, false);
-    if (result < 0) {
-        ++ahead->stats.failures;
-        movie->h264.decoder_failed = true;
-        h264_lookahead_cancel(movie);
-    }
+    if (result < 0) ahead_recover(movie, ahead);
     return result > 0;
 }
 
@@ -695,7 +779,7 @@ int h264_lookahead_prepare_target(Movie *movie, uint32_t target_frame)
         return 0;
     if (result > 0 && ahead->count && ahead->frames[ahead->head].frame == target_frame)
         return 1;
-    ++ahead->stats.failures;
+    if (!ahead->producer_failed) ahead_note_failure(movie, ahead);
     movie->h264.decoder_failed = true;
     h264_lookahead_cancel(movie);
     return -1;
@@ -732,6 +816,8 @@ void h264_lookahead_cancel(Movie *movie)
     if (ahead->stats.active)
         ++ahead->stats.cancellations;
     ahead->stats.active = false;
+    ahead->recovering = ahead->producer_failed = false;
+    ahead->recovery_chunk = -1;
     ahead->have_prepared_frame = false;
     ahead->stats.partial = false;
     ahead->head = ahead->count = 0U;

@@ -115,6 +115,7 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
     for (unsigned i = 0; i < sizeof(previous) / sizeof(previous[0]); ++i)
         previous[i] = isKeyPressed(*text_keys[i]);
     bool prev_enter = isKeyPressed(KEY_NSPIRE_ENTER), prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
+    bool prev_return = isKeyPressed(KEY_NSPIRE_RET), return_armed = false;
     bool prev_del = isKeyPressed(KEY_NSPIRE_DEL), prev_tab = isKeyPressed(KEY_NSPIRE_TAB);
     bool prev_on = on_key_pressed(), prev_scratch = isKeyPressed(KEY_NSPIRE_SCRATCHPAD);
     bool prev_up = false, prev_down = false, prev_left = false, prev_right = false;
@@ -135,10 +136,12 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
         pointer_update(&pointer);
         uint32_t now = monotonic_clock_now_ms();
         night_mode_poll(now, false);
+        clock_menu_sync_shortcut();
         bool esc = key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc);
         bool on = on_key_pressed_edge(&prev_on);
         bool scratch = key_pressed_edge(KEY_NSPIRE_SCRATCHPAD, &prev_scratch);
         bool enter = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter);
+        bool return_edge = key_pressed_edge(KEY_NSPIRE_RET, &prev_return);
         bool tab = key_pressed_edge(KEY_NSPIRE_TAB, &prev_tab);
         bool del = key_pressed_edge(KEY_NSPIRE_DEL, &prev_del);
         if (g_display_power_state.off_fade_active || g_display_power_state.idle_restore_active)
@@ -162,8 +165,9 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
             if (closing) break;
             /* A release while the screen is off must not activate a stale
              * Enter/touchpad press when the screen wakes again. */
-            if (armed >= 0 || enter_target >= 0) {
+            if (armed >= 0 || enter_target >= 0 || return_armed) {
                 armed = enter_target = -1;
+                return_armed = false;
                 for (unsigned i = 0; i < 3; ++i) ui_transition_init(&press[i], false);
             }
             if (display_power_should_suspend(&g_display_power_state, now)) {
@@ -242,7 +246,15 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
             int activation_target = hot >= 0 ? hot
                 : symbols_ready && symbol_keyboard_focus ? symbol_selection : 102;
             if (working && activation_target != 100) activation_target = -1;
-            if (enter && armed < 0 && !pointer.down) {
+            if (return_edge && !working) {
+                return_armed = true;
+                armed = enter_target = -1;
+            }
+            if (return_armed && !prev_return) {
+                action = 102;
+                return_armed = false;
+            }
+            if (enter && !return_armed && armed < 0 && !pointer.down) {
                 enter_hover_target = hot >= 0;
                 enter_target = activation_target;
             }
@@ -250,7 +262,7 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
                 if (!enter_hover_target || hot == enter_target) action = enter_target;
                 enter_target = -1;
             }
-            if (pointer.press_edge && enter_target < 0) {
+            if (pointer.press_edge && !return_armed && enter_target < 0) {
                 pointer_hover_target = hot >= 0;
                 armed = activation_target;
             }
@@ -312,7 +324,8 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
                 SDL_Rect draw_panel = offset_sdl_rect(&panel, dx, dy);
                 SDL_Rect draw_field = offset_sdl_rect(&field, dx, dy);
                 draw_soft_glass_panel_body_from_y(target, &draw_panel, draw_panel.y, UI_COLOR_GUNMETAL);
-                SDL_Rect accent = {draw_panel.x + 2, draw_panel.y + 1, draw_panel.w - 4, 1};
+                int top_inset = soft_panel_inset_for_row(0, draw_panel.h);
+                SDL_Rect accent = {draw_panel.x + top_inset, draw_panel.y, draw_panel.w - 2 * top_inset, 1};
                 draw_vertical_gradient(target, &accent, UI_COLOR_ACCENT, UI_COLOR_ACCENT_DEEP);
                 draw_lock_icon(target, 25 + dx, panel.y + 8 + dy, 255);
                 draw_ui_label(target, fonts, 39 + dx, panel.y + 9 + dy, "Unlock video");
@@ -362,7 +375,8 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
                     int id = (int)i + 100;
                     bool enabled = !working || id == 100;
                     bool held = !closing && enabled && ((pointer.down && armed == id && (!pointer_hover_target || hot == id)) ||
-                        (prev_enter && enter_target == id && (!enter_hover_target || hot == id)));
+                        (prev_enter && enter_target == id && (!enter_hover_target || hot == id)) ||
+                        (return_armed && prev_return && id == 102));
                     uint8_t h = ui_transition_update(&hover[i], enabled && hot == id, now, UI_HOVER_ANIM_MS);
                     uint8_t p = ui_transition_update_press_ex(&press[i], held,
                         now, UI_PRESS_ANIM_MS, PICKER_PRESS_RELEASE_ANIM_MS);

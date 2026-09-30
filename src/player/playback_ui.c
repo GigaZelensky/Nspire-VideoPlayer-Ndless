@@ -1767,7 +1767,7 @@ static void draw_help_menu_contents(SDL_Surface *screen, const Fonts *fonts, con
         {"^", "Subtitle position"},
         {"+ / -", "Subtitle size"},
         {"F / T", "Subtitle font / track"},
-        {"M", "Memory overlay"},
+        {"M / O", "Memory / processor speed"},
         {"C / D", "Theme / debug logging"},
         {"S", "Save BMP screenshot"},
         {"TOUCHPAD", "Move cursor / show UI"},

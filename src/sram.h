@@ -13,7 +13,8 @@ void sram_shutdown(void);
 bool sram_with_native_mapping(void (*operation)(void *), void *context);
 void *sram_alloc(size_t size, size_t alignment);
 bool sram_is_enabled(void);
-/* CX II remaps native SRAM; original CX only borrows its identity tail. */
+/* Whether the CX II clone is currently mapped, excluding native callbacks.
+ * Original CX only borrows its identity tail and never maps a clone. */
 bool sram_uses_native_clone(void);
 size_t sram_bytes_used(void);
 size_t sram_bytes_capacity(void);

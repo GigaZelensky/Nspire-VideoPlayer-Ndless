@@ -126,6 +126,17 @@ int pick_movie(
     while (1) {
         screenshot_preview_tick(&screenshot_preview, monotonic_clock_now_ms());
         bool pointer_click = pointer_update(&pointer);
+        if (clock_menu_poll(screen, fonts, NULL, &pointer, true, directory)) {
+            prev_esc = isKeyPressed(KEY_NSPIRE_ESC); prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
+            prev_on = on_key_pressed();
+            pressed_row_index = pressed_resume_badge_index = -1;
+            enter_press_stage = 0;
+            ui_transition_init(&picker_press_anim, false);
+            pointer_hover_guard_lock(&hover_guard, &pointer);
+            continue;
+        }
+        bool footer_input = clock_menu_consumed_input();
+        if (footer_input) pointer_click = false;
         uint32_t now_ms = monotonic_clock_now_ms();
         if (g_display_power_state.off_fade_active || g_display_power_state.idle_restore_active) {
             display_power_tick_transition(&g_display_power_state, now_ms);
@@ -140,11 +151,11 @@ int pick_movie(
         bool keypad_8_edge = key_pressed_edge(KEY_NSPIRE_8, &prev_8);
         bool screenshot_edge = key_pressed_edge(KEY_NSPIRE_S, &prev_s);
         bool scratchpad_edge = key_pressed_edge(KEY_NSPIRE_SCRATCHPAD, &prev_scratchpad);
-        bool esc_edge = key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc);
+        bool esc_edge = key_pressed_edge(KEY_NSPIRE_ESC, &prev_esc) && !footer_input;
         bool esc_down = prev_esc;
         bool theme_edge = key_pressed_edge(KEY_NSPIRE_C, &prev_c);
         bool on_edge = on_key_pressed_edge(&prev_on);
-        bool enter_edge = key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) || (!ctrl_down && keypad_5_edge);
+        bool enter_edge = (key_pressed_edge(KEY_NSPIRE_ENTER, &prev_enter) || (!ctrl_down && keypad_5_edge)) && !footer_input;
         bool enter_down = prev_enter || (!ctrl_down && prev_5);
         bool up_edge = (key_pressed_edge(KEY_NSPIRE_UP, &prev_up) || keypad_8_edge) && !ctrl_down;
         bool down_edge = (key_pressed_edge(KEY_NSPIRE_DOWN, &prev_down) || keypad_2_edge) && !ctrl_down;
@@ -152,7 +163,7 @@ int pick_movie(
         bool down_down = !ctrl_down && (prev_down || prev_2);
         bool left_edge = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left) || (!ctrl_down && keypad_4_edge);
         bool right_edge = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right) || (!ctrl_down && keypad_6_edge);
-        bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer);
+        bool pointer_hover_allowed = !footer_input && pointer_hover_guard_allows(&hover_guard, &pointer);
         int next_hover_scroll_direction = pointer_hover_allowed && !pointer.down
             ? picker_hover_scroll_direction(count, scroll_start, &pointer)
             : 0;
@@ -334,7 +345,7 @@ int pick_movie(
         if (movie_tooltip_mix == 0 && tooltip_index < 0) {
             movie_tooltip_anim_index = -1;
         }
-        if (pointer.press_edge) {
+        if (pointer.press_edge && !footer_input) {
             picker_press_canceled = false;
             if (count > 0 && resume_hovered_index >= 0) {
                 pressed_resume_badge_index = resume_hovered_index;
@@ -395,7 +406,7 @@ int pick_movie(
             }
             enter_press_stage = 0;
         }
-        if (!picker_press_canceled && enter_press_stage == 0 && pointer.release_edge && count > 0) {
+        if (!picker_press_canceled && enter_press_stage == 0 && pointer.release_edge && !footer_input && count > 0) {
             if (pressed_resume_badge_index >= 0 && resume_hovered_index == pressed_resume_badge_index) {
                 activated_index = pressed_resume_badge_index;
                 activated_resume = true;
@@ -413,7 +424,7 @@ int pick_movie(
             }
         }
         picker_press_hot = !picker_press_canceled && (
-            (enter_press_stage == 1 && (pressed_row_index >= 0 || pressed_resume_badge_index >= 0)) || (pointer.down && (
+            (enter_press_stage == 1 && (pressed_row_index >= 0 || pressed_resume_badge_index >= 0)) || (pointer.down && !footer_input && (
             (pressed_resume_badge_index >= 0 && (
                 (pressed_selected_fallback && pressed_resume_badge_index == (int) selected) ||
                 resume_hovered_index == pressed_resume_badge_index

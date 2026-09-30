@@ -700,6 +700,7 @@ bool debug_dump_session(const char *path, const Movie *movie, const char *reason
     fputs("ND Video Player diagnostic log\n", log_file);
     movie_async_debug(log_file,movie);
     crash_recorder_debug(log_file);
+    player_standby_debug(log_file);
     fprintf(log_file, "reason=%s\n", reason ? reason : "unknown");
     fprintf(log_file, "last_error=%s\n", debug_last_error());
     fprintf(log_file, "verbose_logging=%u\n", debug_is_runtime_logging_enabled() ? 1U : 0U);

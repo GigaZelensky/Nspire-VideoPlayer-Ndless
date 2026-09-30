@@ -37,6 +37,7 @@ static size_t g_sram_pool_capacity = 0;
 static size_t g_sram_pool_offset = 0;
 static bool g_sram_enabled = false;
 static bool g_sram_direct = false;
+static bool g_sram_native_mapping = false;
 
 static uint32_t g_sram_table_offset;
 static uint32_t g_sram_saved_zero, g_sram_saved_alias, g_sram_saved_pool;
@@ -546,6 +547,7 @@ bool sram_with_native_mapping(void (*operation)(void *), void *context)
     sram_set_ttbr0(g_sram_original_ttbr0);
     sram_invalidate_tlb();
     sram_invalidate_icache();
+    g_sram_native_mapping = true;
     sram_critical_leave(saved);
 
     operation(context);
@@ -572,6 +574,7 @@ bool sram_with_native_mapping(void (*operation)(void *), void *context)
     sram_invalidate_tlb();
     sram_invalidate_icache();
     memcpy(g_sram_pool, backup, g_sram_pool_capacity);
+    g_sram_native_mapping = false;
     /* Pool clients retain the same EE addresses and allocation watermark. */
     sram_critical_leave(saved);
     return true;
@@ -639,5 +642,7 @@ uint32_t sram_expected_ttbr(void)
 
 bool sram_uses_native_clone(void)
 {
-    return g_sram_enabled && !g_sram_direct;
+    /* Memory validators must describe the current mapping during a native
+     * callback, not merely whether the player allocated a clone. */
+    return g_sram_enabled && !g_sram_direct && !g_sram_native_mapping;
 }

@@ -43,9 +43,9 @@ The `.nvp` format used by the current player is:
 - built-in subtitle font cycling
 - scale modes: `FIT`, `FILL`, `STRETCH`, `1:1`
 - playback speed control from `0.25x` to `4.0x`, including `2.5x` and `3.5x`
-- automatic CPU clocks: 240 MHz on CX/CX CAS (60 MHz AHB), 492 MHz on CX II variants
-- overclocking works while plugged in and is reapplied after in-app standby
-- previous clock settings restored on exit
+- selectable CPU clocks: default 132 MHz on CX/CX CAS and 396 MHz on CX II, selectable up to 240 / 492 MHz
+- the selected speed works on battery and USB, and is reapplied after in-app standby
+- restore the previous clock speed on exit, or keep the selected speed
 - screen brightness control with `Up` / `Down` and an on-screen percentage overlay
 - adjustable warm night filter
 - idle dimming, screen-off and automatic standby
@@ -97,6 +97,7 @@ The list row shows `Rick and Morty S07E03`. Hover briefly to see the clean title
 - `Left` / `Right` or keypad `4` / `6`: seek `-5s` / `+5s`
 - keypad `7` / `9`: switch to the previous / next video in the current directory
 - `Up` / `Down` or keypad `8` / `2`: increase / decrease screen brightness
+- `O`: processor speed menu (also available from the MHz label in the picker footer)
 - `N`: toggle night mode
 - `Ctrl` + touchpad `Up` / `Down`: enable night mode, then adjust its intensity; hold to repeat. At 0%, night mode is off.
 - `Tab`: single-frame step while paused, hold to repeat
@@ -120,6 +121,19 @@ The list row shows `Rick and Morty S07E03`. Hover briefly to see the clean title
 
 Night mode also works in the picker and resume prompt. Its intensity is remembered while the app is open.
 
+### Processor Speed
+
+Click the MHz label or press `O` in the picker, playback or resume screen.
+Click the track, drag the knob, or use Left/Right or 4/6. The orange mark shows
+the applied speed. **Test** compares the selected speed with the default,
+then restores the previous setting. **Apply** changes this session;
+the choice is saved in `ndhistory.ts.tns` only on normal app exit. A reset or crash
+won't save a new choice. The short benchmark measures speed, not long-term stability.
+
+Default uses the normal unplugged speed even on USB: 132 MHz on CX and
+396 MHz on CX II. Exit restores the OS's original clock settings unless
+**Keep speed after exit** is checked. This option is saved with the selected speed.
+
 ### Resume Prompt
 
 - `Left` / `Right` or keypad `4` / `6`: choose `CONTINUE` or `START OVER`
@@ -136,6 +150,7 @@ Night mode also works in the picker and resume prompt. Its intensity is remember
 Locked movies ask for their password before loading. Type with the keyboard;
 hold `Shift` for uppercase and use `Tab` for symbols. `Enter` or a touchpad click presses the hovered
 control, or the outlined default (Unlock unless you select a symbol with the arrow keys).
+`Return` always presses Unlock. Playback shortcuts stay disabled while entering a password.
 `Del` deletes and `Esc` cancels. Unlocking takes a while on the calculator;
 the progress indicator stays responsive. The key is cleared when you leave the video.
 Screenshots are disabled while an encrypted video is visible.
@@ -323,7 +338,13 @@ Run `python tools/encode_ndless_video.py --help` for the full CLI.
 
 ## Diagnostics
 
-Debug logging is off by default. Press `D` during playback to start or stop a performance recording, then leave the movie normally to save `ndvideo-debug.log` beside it. No diagnostic files are written unless you enable `D`.
+Debug logging is off by default. Press `D` during playback to start or stop a
+recording, then leave the movie normally to save `ndvideo-debug.log` beside it.
+Recording ends with that movie; auto-next does not overwrite its files.
+Totals cover the entire run; frame details keep 128 frames before each lag
+and two seconds afterward. Overlapping windows are merged. Storage is bounded,
+and the log reports if older detail was replaced. No diagnostic files are
+written unless you enable `D`. Standby details are included in the same log.
 
 The `M` overlay shows:
 

@@ -177,6 +177,14 @@ int prompt_resume_position(
     while (1) {
         screenshot_preview_tick(&screenshot_preview, monotonic_clock_now_ms());
         bool pointer_click = pointer_update(&pointer);
+        if (!prompt_closing && clock_menu_poll(screen, fonts, movie, &pointer, false, path)) {
+            prev_esc = isKeyPressed(KEY_NSPIRE_ESC); prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
+            prev_on = on_key_pressed();
+            pressed_button = -1; enter_button_press_stage = 0;
+            ui_transition_init(&button_press_anim, false);
+            pointer_hover_guard_lock(&hover_guard, &pointer);
+            continue;
+        }
         bool pointer_hover_allowed = pointer_hover_guard_allows(&hover_guard, &pointer);
         uint32_t now_ms = monotonic_clock_now_ms();
         bool night_input = night_mode_poll(now_ms, !g_display_power_state.off);

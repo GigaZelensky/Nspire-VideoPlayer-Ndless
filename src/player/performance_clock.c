@@ -9,16 +9,15 @@
 #define CLOCK_SOURCE 0x90140810U
 #define CLOCK_PLL_FIELDS 0xFF1F0311U
 #define CLOCK_DIVIDER_FIELDS 0x00F00000U
-#define CLOCK_TARGET_PLL ((41U << 24) | (2U << 16) | 0x301U)
-#define CLOCK_TARGET_HZ 492000000U
 #define CLOCK_POLL_LIMIT 200000U
 #define CX_CLOCK_LOAD 0x900B0000U
 #define CX_CLOCK_APPLY 0x900B000CU
 #define CX_CLOCK_PENDING 0x900B0014U
 #define CX_CLOCK_CURRENT 0x900B0024U
 #define CX_CLOCK_FIELDS 0xC07FF1FEU
-#define CX_TARGET_CLOCK ((40U << 15) | (1U << 21) | (1U << 1) | (3U << 12))
-#define CX_TARGET_HZ 240000000U
+
+static unsigned preference_mhz;
+static bool preference_keep_after_exit;
 
 static struct {
     bool supported, owned, active;
@@ -89,15 +88,26 @@ static uint32_t native_clock_hash(void)
     return hash;
 }
 
+static bool cx2_clock_control_idle(uint32_t control)
+{
+    /* The PMU control word also retains the last command's upper bits.
+     * Native clock change writes 0x10000100; standby writes 0x80000008.
+     * Their request bits self-clear, leaving 0x10000000 or 0x80000000.
+     * Neither upper value is a frequency divider. Accept the idle states,
+     * including reset, while still refusing an outstanding request. */
+    uint32_t command = control & ~CLOCK_DIVIDER_FIELDS;
+    return command == 0U || command == 0x10000000U || command == 0x80000000U;
+}
+
 static bool apply_cx2(uint32_t pll_fields, uint32_t divider_fields)
 {
     unsigned saved = native_critical_enter();
     bool ok = false;
     if (!native_mapping()) { clock_state.status = -1; goto done; }
-    /* This native worker applies divider zero. Require
-     * its normal entry configuration so restore never transiently removes
-     * a divider from a higher PLL frequency. */
-    if (divider_fields || CLOCK_WORD(CLOCK_DIVIDER) != 0x10000000U) {
+    /* The worker applies divider zero. Check the actual divider separately
+     * from the last-command bits, so a normal standby return remains usable. */
+    uint32_t control = CLOCK_WORD(CLOCK_DIVIDER);
+    if (divider_fields || (control & CLOCK_DIVIDER_FIELDS) || !cx2_clock_control_idle(control)) {
         clock_state.status = -11; goto done;
     }
     clock_state.native_hash = native_clock_hash();
@@ -106,14 +116,24 @@ static bool apply_cx2(uint32_t pll_fields, uint32_t divider_fields)
     }
     if (!(CLOCK_WORD(CLOCK_SOURCE) & 0x10U) ||
         (CLOCK_WORD(EMI_CONTROL) & 0x40CU) ||
-        (CLOCK_WORD(0xDC00000CU) & (1U << 15)) || CLOCK_WORD(CLOCK_PENDING)) {
+        (CLOCK_WORD(0xDC00000CU) & (1U << 15))) {
         clock_state.status = -13; goto done;
     }
+    /* Standby/display activity can leave PMU status pending. The OS's other
+     * clock leaf (1000029c in the checked driver) acknowledges old status
+     * before its clock request. Do the same, then check the actual IRQ line:
+     * status bits alone do not imply a live interrupt or a failed restore. */
+    uint32_t pending = CLOCK_WORD(CLOCK_PENDING);
+    if (pending) CLOCK_WORD(CLOCK_PENDING) = pending;
+    __asm__ volatile("mcr p15,0,%0,c7,c10,4" :: "r"(0) : "memory");
+    unsigned wait = 64U;
+    while ((CLOCK_WORD(0xDC000008U) & (1U << 15)) && --wait) { }
+    if (!wait) { clock_state.status = -13; goto done; }
     bool restoring = pll_fields == clock_state.saved_pll &&
                      divider_fields == clock_state.saved_divider;
     uint32_t pll = (CLOCK_WORD(CLOCK_PLL) & ~CLOCK_PLL_FIELDS) | pll_fields;
-    /* These are the OS's highest frequency timing profile. Restore the
-     * actual entry timings instead of guessing them from the entry PLL. */
+    /* All selectable CX II rates use the OS's highest timing profile.
+     * Restore the actual entry timings, including USB's lower clock profile. */
     uint32_t timing74 = restoring ? clock_state.saved_emi74 : 0x55U;
     uint32_t timing1c = restoring ? clock_state.saved_emi1c : 0x528U;
     ++clock_state.requests;
@@ -123,8 +143,9 @@ static bool apply_cx2(uint32_t pll_fields, uint32_t divider_fields)
      * 0x90140020, updates EMI timings, exits self-refresh and acknowledges
      * the PMU. It touches neither the DRAM stack nor app code in that span. */
     ((void (*)(uint32_t, uint32_t, uint32_t))(uintptr_t)CX2_CLOCK_ENTRY)(pll, timing74, timing1c);
+    control = CLOCK_WORD(CLOCK_DIVIDER);
     ok = (CLOCK_WORD(CLOCK_PLL) & CLOCK_PLL_FIELDS) == pll_fields &&
-         CLOCK_WORD(CLOCK_DIVIDER) == 0x10000000U &&
+         (control & CLOCK_DIVIDER_FIELDS) == divider_fields && cx2_clock_control_idle(control) &&
          CLOCK_WORD(EMI_TIMING74) == timing74 && CLOCK_WORD(EMI_TIMING1C) == timing1c &&
          !(CLOCK_WORD(EMI_CONTROL) & 0x40CU);
     clock_state.status = ok ? 0 : -4;
@@ -183,7 +204,9 @@ bool performance_clock_start(void)
     bool cx = clock_state.asic == 0x101U;
     clock_state.supported = cx || clock_state.asic == 0x202U;
     if (!clock_state.supported) return false;
-    clock_state.target_hz = cx ? CX_TARGET_HZ : CLOCK_TARGET_HZ;
+    unsigned mhz = preference_mhz ? preference_mhz : (cx ? 132U : 396U);
+    clock_state.target_hz = mhz * 1000000U;
+    if (!performance_clock_valid_mhz(preference_mhz)) return false;
     if (!clock_state.owned) {
         clock_state.saved_pll = cx ? CLOCK_WORD(CX_CLOCK_CURRENT) & CX_CLOCK_FIELDS
                                   : CLOCK_WORD(CLOCK_PLL) & CLOCK_PLL_FIELDS;
@@ -195,7 +218,9 @@ bool performance_clock_start(void)
         }
         clock_state.owned = true;
     }
-    uint32_t target = cx ? CX_TARGET_CLOCK | (clock_state.saved_pll & 0xC0000000U) : CLOCK_TARGET_PLL;
+    uint32_t target = cx
+        ? ((mhz / 6U) << 15) | (1U << 21) | (1U << 1) | ((preference_mhz ? 3U : 1U) << 12) | (clock_state.saved_pll & 0xC0000000U)
+        : ((mhz / 12U) << 24) | (2U << 16) | 0x301U;
     clock_state.active = apply(target, 0U) && cpu_hz() == clock_state.target_hz;
     if (!clock_state.active) {
         int failure = clock_state.status ? clock_state.status : -5;
@@ -217,6 +242,17 @@ bool performance_clock_restore(void)
     }
     /* Keep ownership on failure so a later lifecycle cleanup can retry. */
     return false;
+}
+
+bool performance_clock_finish(bool normal_exit)
+{
+    if (!normal_exit || !preference_keep_after_exit)
+        return performance_clock_restore();
+    /* Final cleanup may have used native display/power routines. Verify the
+     * selected clock again before handing it to the OS without restoring. */
+    if (!performance_clock_start()) return false;
+    clock_state.owned = clock_state.active = false;
+    return true;
 }
 
 void performance_clock_debug(FILE *file)
@@ -243,3 +279,79 @@ void performance_clock_debug(FILE *file)
                 (unsigned long)clock_state.native_calls, (unsigned long)clock_state.native_hash,
                 (unsigned long)CLOCK_WORD(EMI_TIMING74), (unsigned long)CLOCK_WORD(EMI_TIMING1C));
 }
+
+/* Pending choices belong to this app session. Only the normal main() exit
+ * commits them; a reset during Test or playback cannot save a new choice. */
+unsigned performance_clock_selection(void) { return preference_mhz; }
+bool performance_clock_keep_after_exit(void) { return preference_keep_after_exit; }
+unsigned performance_clock_current_mhz(void) { return clock_state.supported ? cpu_hz() / 1000000U : 0U; }
+unsigned performance_clock_max_mhz(void) { return clock_state.asic == 0x202U ? 492U : 240U; }
+unsigned performance_clock_default_mhz(void) { return clock_state.asic == 0x202U ? 396U : 132U; }
+unsigned performance_clock_option_count(void) { return (performance_clock_max_mhz() - performance_clock_default_mhz()) / 12U + 1U; }
+unsigned performance_clock_option(unsigned index)
+{
+    return performance_clock_default_mhz() + index * 12U;
+}
+bool performance_clock_valid_mhz(unsigned mhz)
+{
+    if (!mhz) return true;
+    bool cx2 = CLOCK_WORD(0x900A0000U) == 0x202U;
+    return mhz % 12U == 0U && mhz >= (cx2 ? 396U : 132U) && mhz <= (cx2 ? 492U : 240U);
+}
+bool performance_clock_choose(unsigned mhz, bool keep_after_exit)
+{
+    if (!performance_clock_valid_mhz(mhz)) return false;
+    unsigned previous = preference_mhz;
+    if (mhz == performance_clock_default_mhz()) mhz = 0;
+    preference_mhz = mhz;
+    if (!performance_clock_start()) {
+        preference_mhz = previous;
+        performance_clock_start();
+        return false;
+    }
+    preference_keep_after_exit = keep_after_exit;
+    return true;
+}
+void performance_clock_load(unsigned mhz, bool keep_after_exit)
+{
+    bool valid = performance_clock_valid_mhz(mhz);
+    preference_mhz = valid ? mhz : 0;
+    preference_keep_after_exit = valid && keep_after_exit;
+}
+
+extern void performance_clock_benchmark_loop(unsigned iterations);
+static uint32_t benchmark(void)
+{
+    if ((CLOCK_WORD(0x900C0008U) & 0xCFU) != 0x82U || !(CLOCK_WORD(0x900C0080U) & 2U)) return 0;
+    unsigned saved = native_critical_enter();
+    uint32_t samples[3];
+    performance_clock_benchmark_loop(256U);
+    for (unsigned i = 0; i < 3U; ++i) {
+        uint32_t started = CLOCK_WORD(0x900C0004U);
+        performance_clock_benchmark_loop(131072U);
+        samples[i] = started - CLOCK_WORD(0x900C0004U);
+    }
+    native_critical_leave(saved);
+    if (!samples[0] || !samples[1] || !samples[2] || samples[0] > 32768U || samples[1] > 32768U || samples[2] > 32768U) return 0;
+    if (samples[0] > samples[1]) { uint32_t t = samples[0]; samples[0] = samples[1]; samples[1] = t; }
+    if (samples[1] > samples[2]) { uint32_t t = samples[1]; samples[1] = samples[2]; samples[2] = t; }
+    return samples[0] > samples[1] ? samples[0] : samples[1];
+}
+bool performance_clock_test(unsigned mhz, uint32_t *before, uint32_t *after)
+{
+    unsigned previous = preference_mhz;
+    *before = *after = 0;
+    if (!performance_clock_valid_mhz(mhz) || !performance_clock_restore()) return false;
+    preference_mhz = 0;
+    if (performance_clock_start()) *before = benchmark();
+    bool baseline_restored = performance_clock_restore();
+    preference_mhz = mhz;
+    bool applied = baseline_restored && *before && performance_clock_start();
+    if (applied) *after = benchmark();
+    bool restored = performance_clock_restore();
+    preference_mhz = previous;
+    bool resumed = restored && performance_clock_start();
+    return applied && *after && resumed;
+}
+
+int performance_clock_status(void) { return clock_state.status; }

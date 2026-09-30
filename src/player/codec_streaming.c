@@ -1390,6 +1390,35 @@ retry:
     return true;
 }
 
+/* Recovery reloads mutated compressed bytes without blocking presentation.
+ * Ordinary prefetch pauses while this request owns the reader. */
+int reload_h264_chunk_step(Movie *movie, int chunk_index, size_t *offset, unsigned budget_ticks)
+{
+    if (!movie || !offset || chunk_index < 0 || (uint32_t)chunk_index >= movie->header.chunk_count ||
+        !movie_async_enabled(movie)) return -1;
+    const ChunkIndexEntry *entry = &movie->chunk_index[chunk_index];
+    if (entry->packed_size != entry->unpacked_size || !movie->chunk_storage ||
+        movie->chunk_storage_capacity < entry->unpacked_size || *offset > entry->packed_size) return -1;
+    if (*offset < entry->packed_size) {
+        size_t amount = entry->packed_size - *offset;
+        if (amount > MOVIE_ASYNC_BLOCK_BYTES) amount = MOVIE_ASYNC_BLOCK_BYTES;
+        int result = movie_async_read(movie, (uint64_t)entry->offset + *offset,
+            movie->chunk_storage + *offset, amount, chunk_index, false);
+        if (result == MOVIE_ASYNC_PENDING) {
+            movie_async_service(movie, budget_ticks);
+            return 0;
+        }
+        if (result != MOVIE_ASYNC_READY) return -1;
+        *offset += amount;
+        if (*offset < entry->packed_size) return 0;
+    }
+    movie->chunk_storage_size = entry->unpacked_size;
+    if (!configure_chunk_view(movie, chunk_index)) return -1;
+    movie->loaded_chunk = chunk_index;
+    movie->decoded_local_frame = -1;
+    return 1;
+}
+
 int load_ready_chunk(Movie *movie, int chunk_index)
 {
     if(!movie || !movie_uses_h264(movie) || chunk_index<0 ||
@@ -2368,6 +2397,7 @@ bool should_prioritize_next_chunk_io(const Movie *movie, int current_chunk)
 
 void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerState *abort_pointer)
 {
+    if (h264_lookahead_reloading(movie)) return;
     uint32_t time_slice_ms;
     int current_chunk;
     int budget;

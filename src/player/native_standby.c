@@ -145,22 +145,36 @@ static bool ram_range(uintptr_t address, size_t bytes)
     return address >= 0x10000000U && address <= 0x12000000U - bytes;
 }
 
+static uintptr_t rejected_address;
+static uint32_t rejected_expected, rejected_actual;
+static uint32_t checked_task, checked_flags, checked_slice, checked_cpsr, checked_control, checked_ttbr;
+static bool standby_expect(uintptr_t address, uint32_t expected)
+{
+    uint32_t actual = standby_read32(address);
+    if (actual == expected) return true;
+    rejected_address = address; rejected_expected = expected; rejected_actual = actual;
+    return false;
+}
+
 static int standby_code_gate(void)
 {
+    rejected_address = rejected_expected = rejected_actual = 0;
     if (!native_firmware_memory())
         return STANDBY_PLATFORM;
     for (size_t i = 0; i < sizeof(fingerprints) / sizeof(fingerprints[0]); ++i)
         for (unsigned j = 0; j < 4; ++j)
-            if (standby_read32(fingerprints[i].address + 4U * j) != fingerprints[i].words[j])
+            if (!standby_expect(fingerprints[i].address + 4U * j, fingerprints[i].words[j]))
                 return STANDBY_FINGERPRINT;
-    if (standby_read32(0x10429230U) != 0x1148F060U || standby_read32(0x10C52E4CU) != SRAM_LEAF ||
-        standby_read32(0x10001DD8U) != 0x10000080U || standby_read32(0x1042ABA4U) != OS_L1_TABLE ||
-        standby_read32(0x10006A5CU) != 1001U || standby_read32(0x100102ACU) != 1001U ||
-        standby_read32(0x10004BDCU) != 1002U || standby_read32(0x10004C7CU) != 0x90130000U ||
-        standby_read32(0x10004C6CU) != 0xE5830014U)
+    if (!standby_expect(0x10429230U, 0x1148F060U) || !standby_expect(0x10C52E4CU, SRAM_LEAF) ||
+        !standby_expect(0x10001DD8U, 0x10000080U) || !standby_expect(0x1042ABA4U, OS_L1_TABLE) ||
+        !standby_expect(0x10006A5CU, 1001U) || !standby_expect(0x100102ACU, 1001U) ||
+        !standby_expect(0x10004BDCU, 1002U) || !standby_expect(0x10004C7CU, 0x90130000U) ||
+        !standby_expect(0x10004C6CU, 0xE5830014U))
         return STANDBY_FINGERPRINT;
     return STANDBY_OK;
 }
+
+int native_standby_preflight_status(void) { return standby_code_gate(); }
 
 bool native_standby_supported(void)
 {
@@ -177,6 +191,7 @@ static int standby_gate(void)
     if (code_status)
         return code_status;
     task = standby_read32(0x1148F060U);
+    checked_task = task;
     if ((task & 3U) || !ram_range(task, 0x48) || standby_read32(task + 0x0c) != 0x5441534BU)
         return STANDBY_TASK;
     char task_name[9];
@@ -185,12 +200,14 @@ static int standby_gate(void)
     task_name[8] = '\0';
     uint32_t flags = standby_read32(task + 0x18);
     uint32_t task_slice = standby_read32(task + 0x40);
+    checked_flags = flags; checked_slice = task_slice;
     if (strcmp(task_name, "gui") || ((flags >> 16) & 255U) != 50U || !((flags >> 24) & 255U) ||
         !task_slice)
         return STANDBY_TASK;
     cpsr = standby_cpsr();
     ttbr = standby_ttbr();
     uint32_t control = standby_control();
+    checked_cpsr = cpsr; checked_ttbr = ttbr; checked_control = control;
     /* The leaf restores these ARM control bits to enabled on its return.
      * Require the standard SVC, IRQ-masked Ndless entry and matching bits. */
     if ((cpsr & 0x1fU) != 0x13U || !(cpsr & 0x80U) || (control & 0x1007U) != 0x1007U)
@@ -295,4 +312,15 @@ void native_standby_run(void)
 int native_standby_status(void)
 {
     return last_result.gate_result ? last_result.gate_result : last_result.attempt_result;
+}
+
+void native_standby_debug(FILE *file)
+{
+    if (!file) return;
+    fprintf(file, "native_last gate=%d attempt=%d mismatch_address=%08lx expected=%08lx actual=%08lx\n",
+        last_result.gate_result, last_result.attempt_result, (unsigned long)rejected_address,
+        (unsigned long)rejected_expected, (unsigned long)rejected_actual);
+    fprintf(file, "task=%08lx flags=%08lx slice=%lu cpsr=%08lx control=%08lx ttbr=%08lx\n",
+        (unsigned long)checked_task, (unsigned long)checked_flags, (unsigned long)checked_slice,
+        (unsigned long)checked_cpsr, (unsigned long)checked_control, (unsigned long)checked_ttbr);
 }

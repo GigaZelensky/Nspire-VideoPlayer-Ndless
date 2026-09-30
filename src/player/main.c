@@ -30,6 +30,9 @@ int main(int argc, char **argv)
         return 1;
     }
     monotonic_clock_init();
+    bool keep_clock;
+    unsigned saved_clock = history_load_clock_preference(&keep_clock);
+    performance_clock_load(saved_clock, keep_clock);
     performance_clock_start();
     screen = SDL_SetVideoMode(SCREEN_W, SCREEN_H, 16, SDL_SWSURFACE);
     if (!screen) {
@@ -92,6 +95,7 @@ int main(int argc, char **argv)
                 break;
             }
             if (picker_result != 0) {
+                result = PLAY_MOVIE_RESULT_APP_EXIT;
                 break;
             }
             picker_opened_loading = true;
@@ -117,6 +121,9 @@ int main(int argc, char **argv)
             resume_without_prompt,
             picker_opened_loading
         );
+        /* D records one movie. Its saved log and journal must survive an
+         * automatic switch to the next file in the directory. */
+        debug_set_runtime_logging(false);
         /* All movie and preview read handles have closed, including on error
          * and on return to the picker. Never carry a key into the next video. */
         movie_crypto_clear();
@@ -165,7 +172,14 @@ int main(int argc, char **argv)
     lcd_init(SCR_TYPE_INVALID);
     SDL_Quit();
     sram_shutdown();
-    performance_clock_restore();
+    bool normal_exit = !suspend_after_exit &&
+        (result == PLAY_MOVIE_RESULT_EXIT || result == PLAY_MOVIE_RESULT_APP_EXIT ||
+         result == PLAY_MOVIE_RESULT_HOME_EXIT || result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT);
+    bool clock_finished = performance_clock_finish(normal_exit);
+    if (clock_finished && normal_exit) {
+        if (!history_save_clock_preference(performance_clock_selection(), performance_clock_keep_after_exit()))
+            show_msgbox("Clock settings", "Could not save the clock preference.");
+    }
     monotonic_clock_shutdown();
     /* Explicit Home/Scratchpad/standby navigation also belongs after cleanup. */
     if (return_home_after_exit) {

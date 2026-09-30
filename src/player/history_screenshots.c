@@ -1,4 +1,5 @@
 #include "player_internal.h"
+#include "performance_clock.h"
 
 void strip_filename(char *path)
 {
@@ -178,6 +179,20 @@ static void history_store_set_default_settings(
     history->has_default_settings = true;
 }
 
+static bool history_parse_clock_line(const char *line, unsigned *value, bool *keep_after_exit)
+{
+    if (strncmp(line, "@clock\t", 7)) return false;
+    char *end;
+    unsigned long mhz = strtoul(line + 7, &end, 10);
+    if (end == line + 7 || *end != '\t' ||
+        (mhz && (mhz < 132U || mhz > 492U || mhz % 12U))) return false;
+    const char *flag = end + 1;
+    if ((*flag != '0' && *flag != '1') || flag[1 + strspn(flag + 1, " \t\r\n")]) return false;
+    *value = (unsigned)mhz;
+    *keep_after_exit = *flag == '1';
+    return true;
+}
+
 bool load_history_store_from_path(const char *history_path, HistoryStore *history)
 {
     FILE *file;
@@ -212,6 +227,11 @@ bool load_history_store_from_path(const char *history_path, HistoryStore *histor
         HistoryEntry entry;
 
         history_entry_init_defaults(&entry);
+        if (version >= 5 && strncmp(line, "@clock\t", 7) == 0) {
+            if (history_parse_clock_line(line, &history->clock_mhz, &history->clock_keep_after_exit))
+                history->has_clock_preference = true;
+            continue;
+        }
         if (version >= 5 && strncmp(line, "@theme\t", 7) == 0) {
             history->theme_id = ui_theme_clamp((int) strtol(line + 7, NULL, 10));
             continue;
@@ -326,6 +346,8 @@ bool save_history_store_to_path(const char *history_path, const HistoryStore *hi
     }
     fputs(HISTORY_MAGIC_V6 "\n", file);
     fprintf(file, "@theme\t%u\n", (unsigned) ui_theme_clamp((int) history->theme_id));
+    if (history->has_clock_preference)
+        fprintf(file, "@clock\t%u\t%u\n", history->clock_mhz, history->clock_keep_after_exit ? 1U : 0U);
     fprintf(
         file,
         "@settings\t%u\t%u\t%u\t%u\t%u\t%d\t%u\t%d\t%d\n",
@@ -358,8 +380,9 @@ bool save_history_store_to_path(const char *history_path, const HistoryStore *hi
             history->entries[index].path
         );
     }
-    fclose(file);
-    return true;
+    bool ok = !ferror(file);
+    if (fclose(file)) ok = false;
+    return ok;
 }
 
 bool save_history_store(const char *movie_path, const HistoryStore *history)
@@ -368,6 +391,48 @@ bool save_history_store(const char *movie_path, const HistoryStore *history)
 
     history_path_for_movie(movie_path, history_path, sizeof(history_path));
     return save_history_store_to_path(history_path, history);
+}
+
+/* Clock speed belongs to the player's directory, not an individual movie.
+ * Resume/theme writes preserve the stored value; only normal app exit calls
+ * the save helper with the newly selected speed. */
+unsigned history_load_clock_preference(bool *keep_after_exit)
+{
+    *keep_after_exit = false;
+    /* Only the settings header is needed before clock setup. The picker
+     * loads resume entries later; don't allocate/read them twice at startup. */
+    FILE *file = fopen(HISTORY_FILE_NAME, "rb");
+    if (file) {
+        char line[128];
+        unsigned mhz = 0;
+        bool found = false;
+        if (fgets(line, sizeof(line), file) &&
+            (!strncmp(line, HISTORY_MAGIC_V6, 5) || !strncmp(line, HISTORY_MAGIC_V5, 5))) {
+            while (fgets(line, sizeof(line), file) && line[0] == '@') {
+                if (history_parse_clock_line(line, &mhz, keep_after_exit)) { found = true; break; }
+            }
+        }
+        fclose(file);
+        if (found) return mhz;
+    }
+
+    return 0;
+}
+
+bool history_save_clock_preference(unsigned mhz, bool keep_after_exit)
+{
+    if (!performance_clock_valid_mhz(mhz)) return false;
+    HistoryStore history;
+    bool ok = load_history_store_from_path(HISTORY_FILE_NAME, &history);
+    if (ok && (!history.has_clock_preference || history.clock_mhz != mhz ||
+               history.clock_keep_after_exit != keep_after_exit)) {
+        history.clock_mhz = mhz;
+        history.clock_keep_after_exit = keep_after_exit;
+        history.has_clock_preference = true;
+        ok = save_history_store_to_path(HISTORY_FILE_NAME, &history);
+    }
+    free_history_store(&history);
+    return ok;
 }
 
 void ui_load_theme_for_directory(const char *directory)
