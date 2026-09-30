@@ -388,10 +388,25 @@ static void ahead_recover(Movie *movie, struct H264Lookahead *ahead)
         (unsigned long)ahead->next_frame, ahead->count, ahead->stats.failure_reason);
 }
 
+static void ahead_discard_picture(Movie *movie, struct H264Lookahead *ahead)
+{
+    movie->decoded_local_frame = (int)ahead->working_local_frame;
+    if (ahead->recovering && ahead->next_frame < ahead->recovery_target)
+        ++ahead->stats.recovery_frames;
+    ++ahead->next_frame;
+    ahead->consumed = 0;
+    ahead->zero_advance_retries = 0;
+    ahead->access_unit = NULL;
+    ahead->picture = NULL;
+    ahead->output_slot = NULL;
+    ahead->color_row = 0;
+    ahead->stats.partial = false;
+}
+
 /* 1 means work happened, 0 means yield/full/end/not-ready, -1 means failure.
- * A ready DPB picture may survive between calls, but no later access unit is
- * decoded until it has been converted into a queue-owned RGB565 buffer. */
-static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground)
+ * Finish converting a DPB picture before decoding another, unless recovery
+ * or realtime catch-up explicitly discards that picture's display output. */
+static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint32_t discard_before)
 {
     struct H264Lookahead *ahead = movie->h264_lookahead;
     H264LookaheadFrame *slot;
@@ -418,6 +433,10 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground)
     }
     if (ahead->count >= ahead->stats.capacity || ahead->next_frame >= movie->header.frame_count)
         return 0;
+    if (ahead->picture && ahead->next_frame < discard_before) {
+        ahead_discard_picture(movie, ahead);
+        return 1;
+    }
     if (!foreground) {
         uint32_t initial_guard;
         if (ahead->picture) {
@@ -595,15 +614,9 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground)
             return pending ? 1 : -1;
         if (!picture)
             return -1;
-        if (ahead->recovering && ahead->next_frame < ahead->recovery_target) {
-            movie->decoded_local_frame = (int)ahead->working_local_frame;
-            ++ahead->next_frame;
-            ++ahead->stats.recovery_frames;
-            ahead->consumed = 0;
-            ahead->zero_advance_retries = 0;
-            ahead->access_unit = NULL;
-            ahead->output_slot = NULL;
-            ahead->stats.partial = false;
+        if ((ahead->recovering && ahead->next_frame < ahead->recovery_target) ||
+            ahead->next_frame < discard_before) {
+            ahead_discard_picture(movie, ahead);
             return 1; /* Reconstruct references without replacing queued RGB. */
         }
         ahead->picture = picture;
@@ -704,7 +717,7 @@ bool h264_lookahead_step(Movie *movie, uint64_t deadline_ticks)
         return false;
     ahead = movie->h264_lookahead;
     if (ahead->producer_failed) return false;
-    result = ahead_produce(movie, deadline_ticks, false);
+    result = ahead_produce(movie, deadline_ticks, false, 0);
     if (result < 0) ahead_recover(movie, ahead);
     return result > 0;
 }
@@ -774,7 +787,7 @@ int h264_lookahead_prepare_target(Movie *movie, uint32_t target_frame)
         ahead->next_frame != target_frame)
         return 0;
     ++ahead->stats.queue_misses;
-    result = ahead_produce(movie, 0U, true);
+    result = ahead_produce(movie, 0U, true, 0);
     if (!ahead->stats.active)
         return 0;
     if (result > 0 && ahead->count && ahead->frames[ahead->head].frame == target_frame)
@@ -804,6 +817,34 @@ int h264_lookahead_finish_target(Movie *movie, uint32_t target_frame)
     if (h264_lookahead_take(movie, target_frame))
         return 1;
     return -1;
+}
+
+int h264_lookahead_finish_realtime_target(Movie *movie, uint32_t target_frame)
+{
+    if (!h264_lookahead_active(movie) || target_frame <= movie->current_frame ||
+        target_frame >= movie->header.frame_count) return 0;
+    struct H264Lookahead *ahead = movie->h264_lookahead;
+    ahead->have_prepared_frame = false;
+    /* Retire only frames older than the clock's target. Buffers stay owned
+     * by the ring, so a timing-mode switch never frees or reloads them. */
+    while (ahead->count && ahead->frames[ahead->head].frame < target_frame) {
+        ahead->head = (ahead->head + 1U) % ahead->stats.capacity;
+        --ahead->count;
+    }
+    ahead->stats.queued = ahead->count;
+    if (ahead->count) return ahead_take(movie, target_frame, true) ? 1 : 0;
+    if (ahead->next_frame > target_frame) return 0;
+    ++ahead->stats.queue_misses;
+    while (!ahead->count) {
+        int result = ahead_produce(movie, 0U, true, target_frame);
+        if (result <= 0) {
+            if (!ahead->producer_failed) ahead_note_failure(movie, ahead);
+            movie->h264.decoder_failed = true;
+            h264_lookahead_cancel(movie);
+            return -1;
+        }
+    }
+    return ahead_take(movie, target_frame, false) ? 1 : 0;
 }
 
 void h264_lookahead_cancel(Movie *movie)

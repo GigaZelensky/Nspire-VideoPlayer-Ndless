@@ -515,7 +515,7 @@ int play_movie(
     tab_hold_repeat_interval_ms = tab_hold_frame_repeat_interval_ms(&movie);
     /* Start cooperative reads before filling the decoded-frame reserve. */
     movie_async_start(&movie, path);
-    movie.lookahead_enabled=!realtime_frame_skip && movie_uses_h264(&movie);
+    movie.lookahead_enabled=movie_uses_h264(&movie);
     if(movie.lookahead_enabled && !h264_lookahead_begin(&movie))movie.lookahead_enabled=false;
     player_crash_trace_begin(&movie, path, paused, playback_rate_for_index(playback_rate_index));
     if (!resume_prompt_returned) {
@@ -1338,9 +1338,7 @@ int play_movie(
         }
         if (frame_skip_mode_edge) {
             realtime_frame_skip = !realtime_frame_skip;
-            movie.lookahead_enabled=!realtime_frame_skip && movie_uses_h264(&movie);
-            if(realtime_frame_skip){h264_lookahead_cancel(&movie);h264_lookahead_destroy(&movie);}
-            else if(movie.lookahead_enabled)h264_lookahead_begin(&movie);
+            /* R changes presentation timing, not decoder/buffer ownership. */
             snprintf(
                 status_overlay_text,
                 sizeof(status_overlay_text),
@@ -2034,7 +2032,9 @@ int play_movie(
                                 playback_capture_stage(&movie, CAPTURE_BOOKKEEPING, capture_setup_started, capture_decode_started);
                             }
                             playback_phase(&movie, PLAYER_CRASH_DECODE, paused, playback_rate);
-                            if (!decode_to_frame(&movie, target_frame)) {
+                            int realtime_ready = realtime_frame_skip
+                                ? h264_lookahead_finish_realtime_target(&movie, target_frame) : 0;
+                            if (realtime_ready <= 0 && !decode_to_frame(&movie, target_frame)) {
                                 if (capture_decode) playback_capture_stage(&movie, CAPTURE_DECODE, capture_decode_started, monotonic_clock_now_ticks());
                                 report_movie_decode_failure(&movie, path, "playback advance");
                                 result = -1;

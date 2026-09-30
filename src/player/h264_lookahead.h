@@ -65,6 +65,11 @@ unsigned h264_lookahead_prepared_depth(const struct Movie *movie, uint32_t targe
  * -1: decoding failed. Finishes existing partial work; never decodes twice. */
 int h264_lookahead_finish_target(struct Movie *movie, uint32_t target_frame);
 
+/* Present a forward clock-selected frame, retaining later queued frames and
+ * any partial decode. Catch-up reconstructs references without coloring
+ * pictures already too late to display. Same return convention as above. */
+int h264_lookahead_finish_realtime_target(struct Movie *movie, uint32_t target_frame);
+
 /* A seek/recovery cancellation invalidates mutated compressed bytes and
  * partial decoder state before normal decoding. Pause/rate changes retain it. */
 void h264_lookahead_cancel(struct Movie *movie);
