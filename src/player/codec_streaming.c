@@ -827,7 +827,12 @@ bool pump_h264_access_unit(
         } else if (result == H264BSD_PENDING) {
             *out_pending = true;
         } else if (result != H264BSD_RDY) {
-            debug_failf("%s decode error result=%lu read=%lu", label, (unsigned long) result, (unsigned long) read_bytes);
+            playback_capture_decoder_error(movie, decoder);
+            debug_failf("%s decode error stage=%s result=%lu detail=%lu read=%lu consumed=%lu/%lu mb=%lu bit=%lu",
+                label, decoder->errorReason ? decoder->errorReason : "unknown",
+                (unsigned long)result, (unsigned long)decoder->errorDetail, (unsigned long)read_bytes,
+                (unsigned long)*inout_consumed, (unsigned long)frame_size,
+                (unsigned long)decoder->slice->currMbAddr, (unsigned long)decoder->errorBit);
             return false;
         }
 
@@ -1125,7 +1130,7 @@ PrefetchedChunk *find_prefetch_work_chunk(Movie *movie, int current_chunk, int m
         if (candidate->chunk_index < wanted_min || candidate->chunk_index > wanted_max) {
             continue;
         }
-        if (candidate->state == PREFETCH_IDLE || candidate->state == PREFETCH_READY) {
+        if (candidate->state != PREFETCH_READING) {
             continue;
         }
         if (!best || candidate->chunk_index < best->chunk_index) {
@@ -1183,7 +1188,8 @@ static bool prefetch_read_step_impl(Movie *movie, PrefetchedChunk *chunk, bool r
             if (chunk->read_offset == entry->packed_size) chunk->state = PREFETCH_READY;
             return true;
         }
-        /* Native failure already joined its worker: legacy I/O is safe now. */
+        /* The failed reader has relinquished storage ownership. Stdio below
+         * uses the foreground independent reader through our descriptors. */
     }
     if (respect_deadline) {
         int32_t time_left_ms = (int32_t) (deadline_ms - monotonic_clock_now_ms());
@@ -2144,7 +2150,10 @@ void prefetch_do_work(
                 (int) slot->state,
                 (unsigned long) slot->read_offset
             );
-            clear_prefetched_chunk(slot);
+            /* Retain a failed slot until it leaves the prefetch horizon.
+             * Retrying it every frame stalls healthy buffered playback;
+             * load_chunk still gets one foreground attempt when needed. */
+            slot->state = PREFETCH_FAILED;
             break;
         }
         if (slot->read_offset == previous_read_offset && slot->state != PREFETCH_READY) {
@@ -2395,6 +2404,24 @@ bool should_prioritize_next_chunk_io(const Movie *movie, int current_chunk)
     return frames_remaining <= guard_frames;
 }
 
+bool prefetch_wait_step(Movie *movie, uint32_t spare_ticks)
+{
+    if (!movie_async_enabled(movie) || h264_lookahead_reloading(movie)) return false;
+    if (!movie_async_needs_request(movie)) return movie_async_read_step(movie, spare_ticks);
+    /* Publish at most one completed 32 KiB block, or submit its successor.
+     * Only existing slots are used: no allocation, input scan, native view
+     * capture, or writer handoff belongs in the final presentation wait.
+     * Leave 2 ms for the bounded copy/bookkeeping and presentation. */
+    if (spare_ticks <= (monotonic_clock_ticks_per_second() * 2U + 999U) / 1000U)
+        return false;
+    int current_chunk = prefetch_target_chunk(movie);
+    if (current_chunk < 0) return false;
+    PrefetchedChunk *work = find_prefetch_work_chunk(movie, current_chunk, PREFETCH_CHUNK_COUNT);
+    if (!work) return false;
+    if (!prefetch_read_step(movie, work, true, 0)) work->state = PREFETCH_FAILED;
+    return true;
+}
+
 void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerState *abort_pointer)
 {
     if (h264_lookahead_reloading(movie)) return;
@@ -2443,7 +2470,7 @@ void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerSt
         prefetch_ahead(movie, current_chunk, 1, PREFETCH_CHUNK_COUNT);
         work = find_prefetch_work_chunk(movie, current_chunk, PREFETCH_CHUNK_COUNT);
         size_t before_read=work?work->read_offset:0;
-        if (work && !prefetch_read_step(movie, work, true, 0)) clear_prefetched_chunk(work);
+        if (work && !prefetch_read_step(movie, work, true, 0)) work->state = PREFETCH_FAILED;
         if(movie_async_enabled(movie) && work && work->state==PREFETCH_READING && work->read_offset==before_read){
             /* A pending-read poll only checks completion. Preserve the real
              * remaining slack here: shrinking it to the 1 ms guard can starve
@@ -2454,7 +2481,7 @@ void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerSt
             movie_async_service(movie,service_ticks);
             /* Publish a block completed in that slice instead of leaving its
              * READY bytes parked until the next video frame. */
-            if(!prefetch_read_step(movie,work,true,0))clear_prefetched_chunk(work);
+            if(!prefetch_read_step(movie,work,true,0))work->state=PREFETCH_FAILED;
         }
         return;
     }
@@ -2560,7 +2587,7 @@ void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerSt
                 PrefetchedChunk *slot = find_prefetch_work_chunk(movie, current_chunk, 1);
                 if (slot && !prefetch_abort_requested(abort_pointer) &&
                     !prefetch_read_step_impl(movie, slot, true, io_deadline_ms, true)) {
-                    clear_prefetched_chunk(slot);
+                    slot->state = PREFETCH_FAILED;
                 }
             } else {
                 prefetch_do_work(
@@ -3040,6 +3067,23 @@ bool playback_prepare_ahead(Movie *movie,uint64_t target_ticks,const PointerStat
     uint64_t now=monotonic_clock_now_ticks();
     uint32_t guard=monotonic_clock_ticks_per_second()*2U/1000U;
     if(target_ticks<=now || target_ticks-now<=guard)return false;
+    bool read_progress = false;
+    uint32_t read_guard = (monotonic_clock_ticks_per_second() * 8U + 999U) / 1000U;
+    if (movie_async_enabled(movie) && !h264_lookahead_reloading(movie) &&
+        movie->prefetch_wait_frame != movie->current_frame + 1U && target_ticks - now >= read_guard) {
+        /* A productive decoder must not monopolize every presentation wait.
+         * Give reads one early turn per displayed frame, while the current
+         * image is ready and there is room for a bounded controller step.
+         * The existing prefetch policy caps service at 4 ms and keeps its
+         * storage ownership/deadline checks. Reserve another 4 ms here. */
+        movie->prefetch_wait_frame = movie->current_frame + 1U;
+        prefetch_tick(movie, false, 5U, pointer);
+        uint64_t ended = monotonic_clock_now_ticks();
+        playback_capture_stage(movie, CAPTURE_PREFETCH, now, ended);
+        read_progress = ended > now;
+        now = ended;
+        if (target_ticks <= now || target_ticks - now <= guard) return read_progress;
+    }
     uint64_t started=now;
     playback_capture_ahead_scope(movie,true);
     bool progressed=h264_lookahead_step(movie,target_ticks-guard);
@@ -3056,5 +3100,5 @@ bool playback_prepare_ahead(Movie *movie,uint64_t target_ticks,const PointerStat
             playback_capture_stage(movie,CAPTURE_PREFETCH,ended,monotonic_clock_now_ticks());
         }
     }
-    return progressed;
+    return progressed || read_progress;
 }

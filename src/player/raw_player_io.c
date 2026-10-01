@@ -11,6 +11,12 @@
 #include "../platform/portable_reader_platform.h"
 #include "../storage/raw_file_reader.h"
 #define REG(a) (*(volatile uint32_t *)(uintptr_t)(a))
+typedef struct {
+    uint32_t failures, retries, recovered;
+    uint32_t reason, phase, unit, progress, copied, bytes;
+    uint64_t offset;
+    uint8_t cipher_hash[32], tag[32], header_tag[32];
+} RawCryptoErrors;
 struct RawPlayerIo {
     PortableReaderPlatform platform;
     void *input;
@@ -20,6 +26,8 @@ struct RawPlayerIo {
     uint8_t buffer[32768];
     NveReader *crypt;
     bool crypt_restart;
+    bool crypt_retried;
+    RawCryptoErrors crypto_errors;
     unsigned overlay_count;
     RawFileOverlay metadata_overlays[PORTABLE_STORAGE_CLEAN_MAX];
     uint32_t metadata_total;
@@ -33,6 +41,7 @@ struct RawPlayerIo {
         foreground_ticks, physical_total, regions_total;
     uint32_t crypto_steps, crypto_ticks, crypto_writer_ticks, crypto_max_ticks;
     uint32_t crypto_slack_steps, crypto_slack_ticks;
+    uint32_t read_slack_steps, read_slack_ticks, read_slack_max_ticks;
     uint32_t join_writer_ticks;
     RawPlayerWaitStats last_wait;
     int error;
@@ -42,10 +51,12 @@ static int create_error;
 static bool native_requested;
 typedef struct {
     int error, cache_status;
+    RawCryptoErrors crypto_errors;
     uint32_t refreshes, handoffs, steps, foreground_ticks, max_step_ticks, physical, regions,
         cache_nodes, dirty_blocks, metadata_hits;
     uint32_t crypto_steps, crypto_ticks, crypto_writer_ticks, crypto_max_ticks;
     uint32_t crypto_slack_steps, crypto_slack_ticks;
+    uint32_t read_slack_steps, read_slack_ticks, read_slack_max_ticks;
     RawFileCosts costs;
     RawRegionCacheStats region_cache;
     StorageMutationStats mutations;
@@ -67,6 +78,10 @@ static void accumulate_reader_costs(RawPlayerIo *ctx)
 static RawPlayerReport report(const RawPlayerIo *ctx)
 {
     RawPlayerReport r = {0};
+    r.read_slack_steps = ctx->read_slack_steps;
+    r.read_slack_ticks = ctx->read_slack_ticks;
+    r.read_slack_max_ticks = ctx->read_slack_max_ticks;
+    r.crypto_errors = ctx->crypto_errors;
     r.crypto_slack_steps = ctx->crypto_slack_steps;
     r.crypto_slack_ticks = ctx->crypto_slack_ticks;
     r.crypto_steps = ctx->crypto_steps;
@@ -256,7 +271,33 @@ static void advance_crypto(RawPlayerIo *ctx)
         ctx->ready = true;
         ctx->ended = counter();
         ctx->completed_bytes = (uint32_t)ctx->bytes;
+        if (ctx->crypt_retried) {
+            ++ctx->crypto_errors.recovered;
+            ctx->crypt_retried = false;
+        }
     } else if (ctx->crypt->phase == NVE_READ_ERROR) {
+        NveReader *r = ctx->crypt;
+        RawCryptoErrors *e = &ctx->crypto_errors;
+        ++e->failures;
+        e->reason = r->error; e->phase = r->error_phase; e->unit = r->unit;
+        e->progress = r->progress; e->copied = r->copied;
+        e->offset = ctx->offset; e->bytes = (uint32_t)ctx->bytes;
+        memcpy(e->cipher_hash, r->error_cipher_hash, sizeof(e->cipher_hash));
+        memcpy(e->tag, r->error_tag, sizeof(e->tag));
+        if (r->error == NVE_ERROR_AUTH)
+            memcpy(e->header_tag, r->keys->header.bytes + NVE_HEADER_AUTH_BYTES, sizeof(e->header_tag));
+        else memset(e->header_tag, 0, sizeof(e->header_tag));
+        /* A failed authentication publishes no bytes. Retry once from a
+         * fresh filesystem view, still in budgeted steps and with full tag
+         * verification. Persistent corruption remains an error. */
+        if (r->error == NVE_ERROR_AUTH && !ctx->crypt_retried) {
+            ctx->crypt_retried = true;
+            ++e->retries;
+            ctx->crypt_restart = true;
+            ctx->discard_regions = ctx->park = true;
+            raw_region_cache_clear(&ctx->region_cache);
+            return;
+        }
         ctx->failed = true;
         ctx->error = -321;
     }
@@ -428,6 +469,44 @@ static void service(RawPlayerIo *ctx, uint32_t budget)
     } while ((uint32_t)(start - counter()) < budget);
     native_critical_leave(mask);
 }
+bool raw_player_read_step(uint32_t spare_ticks)
+{
+    RawPlayerIo *ctx = live;
+    if (!ctx || !ctx->requested || !ctx->view || ctx->park || ctx->failed || ctx->ready ||
+        storage_native_active() || (native_requested && !ctx->running) ||
+        (ctx->region_cache.view_active &&
+         storage_mutation_epoch() != ctx->region_cache.view_epoch)) return false;
+    /* Record-boundary setup stays within the owned reader; it cannot capture
+     * a filesystem view or enter native I/O. Canceled/failed crypto requests
+     * still restart through normal service. */
+    if (ctx->crypt && (ctx->crypt_restart
+            ? (ctx->crypt->phase != NVE_READ_IDLE && ctx->crypt->phase != NVE_READ_DONE)
+            : ctx->crypt->phase != NVE_READ_FETCH)) return false;
+    /* Keep 1 ms for presentation plus twice the largest observed warm step.
+     * Before the first observation reserve another full millisecond. Native
+     * view capture and ownership transfers still use the roomy-wait path. */
+    uint64_t step_guard = ctx->read_slack_max_ticks ?
+        (uint64_t)ctx->read_slack_max_ticks * 2U + 1U : 33U;
+    if ((uint64_t)spare_ticks <= 33U + step_guard) return false;
+    uint32_t started = counter();
+    unsigned mask = native_critical_enter();
+    service_once(ctx);
+    uint32_t elapsed = started - counter();
+    ++ctx->steps;
+    ctx->foreground_ticks += elapsed;
+    if (elapsed > ctx->max_step_ticks) ctx->max_step_ticks = elapsed;
+    ++ctx->read_slack_steps;
+    ctx->read_slack_ticks += elapsed;
+    if (elapsed > ctx->read_slack_max_ticks) ctx->read_slack_max_ticks = elapsed;
+    native_critical_leave(mask);
+    return true;
+}
+bool raw_player_needs_request(const RawPlayerIo *ctx)
+{
+    return ctx && !ctx->failed && !ctx->park && !ctx->stopping &&
+        (!ctx->requested || ctx->ready);
+}
+
 RawPlayerIo *raw_player_create(const char *path)
 {
     create_error = 0;
@@ -484,6 +563,7 @@ void raw_player_cancel(RawPlayerIo *ctx)
     ctx->requested = false;
     ctx->ready = false;
     ctx->crypt_restart = true;
+    ctx->crypt_retried = false;
     if (ctx->running)
         raw_file_cancel(&ctx->reader);
     ctx->park = true;
@@ -595,6 +675,7 @@ static int raw_player_read_impl(RawPlayerIo *ctx, uint64_t offset, void *destina
         ctx->ready = false;
         ctx->crypt_restart = true;
         ctx->started = counter();
+        ctx->crypt_retried = false;
     }
     do {
         /* Nonblocking submit/collect must not secretly spend another reader
@@ -722,6 +803,27 @@ void raw_player_debug(FILE *file, const RawPlayerIo *ctx)
             (unsigned long)r.crypto_steps, (unsigned long)r.crypto_ticks,
             (unsigned long)r.crypto_writer_ticks, (unsigned long)r.crypto_max_ticks,
             (unsigned long)r.crypto_slack_steps, (unsigned long)r.crypto_slack_ticks);
+    fprintf(file, "raw_reader_read_slack steps=%lu cpu_ticks=%lu max_step_ticks=%lu\n",
+        (unsigned long)r.read_slack_steps, (unsigned long)r.read_slack_ticks,
+        (unsigned long)r.read_slack_max_ticks);
+    const RawCryptoErrors *e = &r.crypto_errors;
+    static const char *reasons[] = {"none", "keys", "io", "authentication", "state"};
+    static const char *phases[] = {"idle", "fetch", "verify", "decrypt", "copy", "done", "error"};
+    fprintf(file, "raw_reader_crypto_errors failures=%lu retries=%lu recovered=%lu reason=%s phase=%s record=%lu progress=%lu copied=%lu offset=%llu bytes=%lu\n",
+        (unsigned long)e->failures, (unsigned long)e->retries, (unsigned long)e->recovered,
+        e->reason < sizeof(reasons) / sizeof(reasons[0]) ? reasons[e->reason] : "invalid",
+        e->phase < sizeof(phases) / sizeof(phases[0]) ? phases[e->phase] : "invalid", (unsigned long)e->unit,
+        (unsigned long)e->progress, (unsigned long)e->copied,
+        (unsigned long long)e->offset, (unsigned long)e->bytes);
+    if (e->reason == NVE_ERROR_AUTH) {
+        fputs("raw_reader_auth cipher_sha256=", file);
+        for (unsigned i = 0; i < 32U; ++i) fprintf(file, "%02x", e->cipher_hash[i]);
+        fputs(" stored_tag=", file);
+        for (unsigned i = 0; i < 32U; ++i) fprintf(file, "%02x", e->tag[i]);
+        fputs(" header_tag=", file);
+        for (unsigned i = 0; i < 32U; ++i) fprintf(file, "%02x", e->header_tag[i]);
+        fputc('\n', file);
+    }
     fprintf(file, "raw_reader_map_cache stores=%lu hits=%lu invalidations=%lu rejected=%lu\n",
             (unsigned long)r.region_cache.stores, (unsigned long)r.region_cache.hits,
             (unsigned long)r.region_cache.invalidations, (unsigned long)r.region_cache.rejected);

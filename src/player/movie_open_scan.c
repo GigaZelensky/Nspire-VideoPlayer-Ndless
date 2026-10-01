@@ -1,4 +1,6 @@
 #include "player_internal.h"
+#include "storage_read_stream.h"
+#include <errno.h>
 #include "movie/nvp_validation.h"
 #include "timing_math.h"
 #include "raw_player_io.h"
@@ -245,7 +247,8 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
     movie->file = path ? fopen(path, "rb") : NULL;
     movie->encrypted = movie_crypto_keys(path) != NULL;
     if (!movie->file) {
-        debug_failf("open failed: fopen");
+        debug_failf("open failed: %s (%d), errno=%d", storage_read_stream_open_stage(),
+            storage_read_stream_open_status(), errno);
         goto fail;
     }
     movie->current_file_pos = 0;

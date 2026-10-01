@@ -33,6 +33,61 @@ static PortableReaderPlatform platform;
 static ReadScratch *scratch;
 static unsigned handles;
 static bool active;
+typedef struct {
+    const char *stage;
+    int status, native_error;
+    uint32_t asic, control, ttbr, dacr, capabilities, fault;
+} StorageOpenFailure;
+static StorageOpenFailure open_failure;
+static struct {
+    bool valid;
+    uint32_t offset, bytes, raw_error, nand_error, cx_error;
+    int error;
+    NandPageKind kind;
+    CxNandSnapshot cx;
+    uint8_t cx_id[4];
+} read_failure;
+static void record_open_failure(const char *stage, int status, uint32_t fault)
+{
+    open_failure.stage = stage;
+    open_failure.status = status;
+    open_failure.native_error = portable_reader_platform_errno(&platform);
+    open_failure.asic = platform.asic;
+    open_failure.control = platform.control;
+    open_failure.ttbr = platform.ttbr;
+    open_failure.dacr = platform.dacr;
+    open_failure.capabilities = platform.exports.capabilities;
+    open_failure.fault = fault;
+}
+const char *storage_read_stream_open_stage(void)
+{
+    return open_failure.stage ? open_failure.stage : "stdio";
+}
+int storage_read_stream_open_status(void) { return open_failure.status; }
+void storage_read_stream_debug(FILE *file)
+{
+    if (open_failure.stage)
+        fprintf(file, "last_open_failure stage=%s status=%d native_errno=%d asic=%lx control=%08lx ttbr=%08lx dacr=%08lx capabilities=%lx fault=%08lx\n",
+            open_failure.stage, open_failure.status, open_failure.native_error,
+            (unsigned long)open_failure.asic, (unsigned long)open_failure.control,
+            (unsigned long)open_failure.ttbr, (unsigned long)open_failure.dacr,
+            (unsigned long)open_failure.capabilities, (unsigned long)open_failure.fault);
+    if (read_failure.valid) {
+        fprintf(file, "last_read_failure errno=%d offset=%lu bytes=%lu raw_error=%lu nand_error=%lu kind=%u\n",
+            read_failure.error, (unsigned long)read_failure.offset, (unsigned long)read_failure.bytes,
+            (unsigned long)read_failure.raw_error, (unsigned long)read_failure.nand_error,
+            (unsigned)read_failure.kind);
+        if (read_failure.kind == NAND_PAGE_CX_PL351)
+            fprintf(file, "cx_nand error=%lu id=%02x,%02x,%02x,%02x asic=%08lx pid=%02x,%02x,%02x,%02x status=%08lx config=%08lx ecc_status=%08lx ecc_config=%08lx\n",
+                (unsigned long)read_failure.cx_error,
+                read_failure.cx_id[0], read_failure.cx_id[1], read_failure.cx_id[2], read_failure.cx_id[3],
+                (unsigned long)read_failure.cx.asic,
+                read_failure.cx.peripheral_id[0], read_failure.cx.peripheral_id[1],
+                read_failure.cx.peripheral_id[2], read_failure.cx.peripheral_id[3],
+                (unsigned long)read_failure.cx.memc_status, (unsigned long)read_failure.cx.memif_cfg,
+                (unsigned long)read_failure.cx.ecc_status, (unsigned long)read_failure.cx.ecc_config);
+    }
+}
 static void set_error(int *out, int value)
 {
     if (out)
@@ -129,19 +184,25 @@ static void drain_reader(void)
 StorageReadStream *storage_read_stream_open(const char *path, int *error)
 {
     unsigned entry_mask = native_interrupt_mask();
+    open_failure = (StorageOpenFailure){0};
     set_error(error, 0);
     if (!path || !*path) {
+        record_open_failure("path", EINVAL, 0);
         set_error(error, EINVAL);
         return NULL;
     }
-    if (!claim(true, error))
+    if (!claim(true, error)) {
+        record_open_failure("ownership", EBUSY, 0);
         return NULL;
+    }
     if (!workspace(error)) {
+        record_open_failure("workspace", ENOMEM, 0);
         active = false;
         return NULL;
     }
     StorageReadStream *stream = allocate(sizeof(*stream));
     if (!stream) {
+        record_open_failure("allocation", ENOMEM, 0);
         active = false;
         set_error(error, ENOMEM);
         return NULL;
@@ -150,6 +211,7 @@ StorageReadStream *storage_read_stream_open(const char *path, int *error)
     int status = portable_reader_platform_init(&platform);
     native_critical_leave(mask);
     if (status) {
+        record_open_failure("platform", status, platform.exports.last_rejected);
         dispose(stream);
         active = false;
         set_error(error, ENOSYS);
@@ -159,6 +221,7 @@ StorageReadStream *storage_read_stream_open(const char *path, int *error)
     native_critical_leave(entry_mask);
     if (!stream->native) {
         int failure = native_error();
+        record_open_failure("native open", platform.status, 0);
         dispose(stream);
         active = false;
         set_error(error, failure);
@@ -174,6 +237,7 @@ StorageReadStream *storage_read_stream_open(const char *path, int *error)
     platform.table_valid = false;
     native_critical_leave(mask);
     if (status) {
+        record_open_failure("filesystem", status, scratch->snapshot.fault);
         /* No raw command was issued. Native close is safe after releasing the
          * read-only RAM observation, and consumes its native stream. */
         portable_reader_platform_close(&platform, stream->native);
@@ -187,6 +251,7 @@ StorageReadStream *storage_read_stream_open(const char *path, int *error)
     if (keys) {
         if (keys->header.physical_bytes != stream->bytes ||
             !(stream->crypt = allocate(sizeof(*stream->crypt)))) {
+            record_open_failure("encryption", EIO, 0);
             portable_reader_platform_close(&platform, stream->native);
             dispose(stream);
             active = false;
@@ -291,6 +356,22 @@ read:
     }
     failure = 0;
 finished:
+    if (failure) {
+        /* Preserve the controller's passive identification/error snapshot
+         * before cancellation or closing the last stream clears its state. */
+        read_failure.valid = true;
+        read_failure.offset = offset;
+        read_failure.bytes = bytes;
+        read_failure.error = timed_out ? ETIMEDOUT : failure;
+        read_failure.raw_error = r->error;
+        read_failure.nand_error = r->nand.error;
+        read_failure.kind = platform.kind;
+        if (platform.kind == NAND_PAGE_CX_PL351) {
+            read_failure.cx_error = r->nand.engine.cx.error;
+            read_failure.cx = r->nand.engine.cx.snapshot;
+            for (unsigned i = 0; i < 4U; ++i) read_failure.cx_id[i] = r->nand.engine.cx.id[i];
+        }
+    }
     drain_reader();
     release(entry_mask);
     if (failure) {

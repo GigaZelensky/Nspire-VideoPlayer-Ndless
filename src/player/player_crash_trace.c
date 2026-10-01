@@ -50,7 +50,7 @@ static void crash_trace_snapshot(const Movie *movie, unsigned phase, uint64_t no
         crash_trace.minimum_stack = io.minimum_stack_remaining;
     memset(&crash_trace.last, 0, sizeof(crash_trace.last));
     crash_trace.last.monotonic_ticks = now;
-    w[0] = 4U;
+    w[0] = 5U;
     w[1] = crash_trace.build_id;
     /* A successful recorder start established the exact native platform gate. */
     w[2] = crash_trace_word(0x90090000U);
@@ -85,8 +85,15 @@ static void crash_trace_snapshot(const Movie *movie, unsigned phase, uint64_t no
     w[26] = runtime.dynamic_pool_available_bytes;
     w[28] = io.minimum_stack_remaining;
     w[29] = io.io_phases;
-    /* Payload v4 leaves retired OS scheduler/cursor/watchdog observations
-     * reserved. Writer counters describe the player's cooperative contexts. */
+    /* Payload v5 uses the retired scheduler/cursor/watchdog words for the
+     * latest decoder failure: frame, FNV stage, detail, bit and failure count. */
+    uint32_t failure[5];
+    playback_capture_decoder_checkpoint(movie, failure);
+    w[27] = failure[0];
+    w[30] = failure[1];
+    w[31] = failure[2];
+    w[32] = failure[3];
+    w[33] = failure[4];
     w[34] = screen.lcd_control;
     w[35] = screen.pwm_duty;
     w[36] = screen.pwm_period;

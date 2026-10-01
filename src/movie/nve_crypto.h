@@ -49,6 +49,8 @@ bool nve_kdf_finish(NveKdf *, NveKeys *);
 
 typedef enum { NVE_READ_IDLE, NVE_READ_FETCH, NVE_READ_VERIFY, NVE_READ_DECRYPT,
                NVE_READ_COPY, NVE_READ_DONE, NVE_READ_ERROR } NveReadPhase;
+typedef enum { NVE_ERROR_NONE, NVE_ERROR_KEYS, NVE_ERROR_IO,
+               NVE_ERROR_AUTH, NVE_ERROR_STATE } NveReadError;
 typedef struct {
     const NveKeys *keys;
     uint8_t block[NVE_RECORD_BYTES + NVE_TAG_BYTES];
@@ -56,6 +58,9 @@ typedef struct {
     uint8_t *destination;
     uint32_t offset, bytes, copied, unit, unit_bytes, progress, cached_unit;
     NveReadPhase phase;
+    NveReadError error;
+    NveReadPhase error_phase;
+    uint8_t error_cipher_hash[32], error_tag[32];
 } NveReader;
 void nve_reader_init(NveReader *, const NveKeys *);
 bool nve_reader_begin(NveReader *, uint32_t offset, void *destination, uint32_t bytes);

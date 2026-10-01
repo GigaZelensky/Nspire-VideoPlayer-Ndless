@@ -155,6 +155,9 @@ typedef struct storage
                                  1 previous frame used if available */
     u32* conversionBuffer; // used to perform yuv conversion
     size_t conversionBufferSize;
+    /* Failure context only; no per-macroblock profiling on successful input. */
+    const char *errorReason;
+    u32 errorDetail, errorBit;
 } storage_t;
 
 /*------------------------------------------------------------------------------

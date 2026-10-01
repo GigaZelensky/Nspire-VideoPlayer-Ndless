@@ -30,6 +30,15 @@ bool movie_async_crypto_step(Movie *movie, uint32_t spare_ticks)
 {
     return movie_async_enabled(movie) && raw_player_crypto_step(spare_ticks);
 }
+bool movie_async_read_step(Movie *movie, uint32_t spare_ticks)
+{
+    return movie_async_enabled(movie) && raw_player_read_step(spare_ticks);
+}
+bool movie_async_needs_request(const Movie *movie)
+{
+    const MovieAsyncIo *state = movie ? movie->async_io : NULL;
+    return state && raw_player_needs_request(state->raw);
+}
 bool movie_async_start(Movie *movie, const char *path)
 {
     if (!movie || movie->async_io || !g_clock.using_hw_timer || !path)
@@ -136,8 +145,8 @@ int movie_async_read(Movie *movie, uint64_t offset, void *destination, size_t by
     if (result < 0) {
         ++movie->diag_async_failures;
         movie->diag_async_native_error = raw_player_error(state->raw);
-        debug_tracef("independent reader error=%d; switching to foreground independent reads",
-                     movie->diag_async_native_error);
+        debug_failf("independent reader error=%d chunk=%d offset=%llu bytes=%lu; foreground fallback",
+            movie->diag_async_native_error, chunk_index, (unsigned long long)offset, (unsigned long)bytes);
         movie_async_stop(movie);
     }
     return result;

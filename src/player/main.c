@@ -20,43 +20,43 @@ int main(int argc, char **argv)
     bool suspend_after_exit = false;
 
     if (argc < 1) {
-        show_msgbox("ND Video Player", "Ndless did not provide argv[0].");
+        report_app_failure(NULL, "startup-failure", "Ndless did not provide argv[0].");
         return 1;
     }
 
     enable_relative_paths(argv);
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        show_msgbox("ND Video Player", "Failed to initialize SDL.");
+        report_app_failure(argv[0], "startup-failure", "Failed to initialize SDL.");
         return 1;
     }
     monotonic_clock_init();
     bool keep_clock;
-    unsigned saved_clock = history_load_clock_preference(&keep_clock);
+    unsigned saved_clock = history_load_clock_preference(argv[0], &keep_clock);
     performance_clock_load(saved_clock, keep_clock);
     performance_clock_start();
     screen = SDL_SetVideoMode(SCREEN_W, SCREEN_H, 16, SDL_SWSURFACE);
     if (!screen) {
-        show_msgbox("ND Video Player", "Failed to create the screen surface.");
         SDL_Quit();
         performance_clock_restore();
         monotonic_clock_shutdown();
+        report_app_failure(argv[0], "startup-failure", "Failed to create the screen surface.");
         return 1;
     }
     if (!lcd_init(screen_lcd_type())) {
-        show_msgbox("ND Video Player", "Failed to initialize the LCD.");
         SDL_Quit();
         performance_clock_restore();
         monotonic_clock_shutdown();
+        report_app_failure(argv[0], "startup-failure", "Failed to initialize the LCD.");
         return 1;
     }
     patch_cx2_lcd_edge_timing();
     display_power_init(&g_display_power_state, monotonic_clock_now_ms());
     if (!init_fonts(&fonts)) {
-        show_msgbox("ND Video Player", "Failed to load fonts.");
         lcd_init(SCR_TYPE_INVALID);
         SDL_Quit();
         performance_clock_restore();
         monotonic_clock_shutdown();
+        report_app_failure(argv[0], "startup-failure", "Failed to load fonts.");
         return 1;
     }
     night_mode_init(&fonts);
@@ -177,10 +177,11 @@ int main(int argc, char **argv)
          result == PLAY_MOVIE_RESULT_HOME_EXIT || result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT);
     bool clock_finished = performance_clock_finish(normal_exit);
     if (clock_finished && normal_exit) {
-        if (!history_save_clock_preference(performance_clock_selection(), performance_clock_keep_after_exit()))
-            show_msgbox("Clock settings", "Could not save the clock preference.");
+        if (!history_save_clock_preference(argv[0], performance_clock_selection(), performance_clock_keep_after_exit()))
+            report_app_failure(argv[0], "settings-save-failure", "Could not save the clock preference.");
     }
     monotonic_clock_shutdown();
+    show_pending_movie_error();
     /* Explicit Home/Scratchpad/standby navigation also belongs after cleanup. */
     if (return_home_after_exit) {
         if (open_scratchpad_after_exit)

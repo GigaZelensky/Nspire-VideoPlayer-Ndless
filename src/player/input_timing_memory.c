@@ -932,6 +932,13 @@ void wait_until_ticks_playback(Movie *movie, uint64_t target_ticks, const Pointe
             now_ticks = monotonic_clock_now_ticks();
             continue;
         }
+        if (movie && target_ticks > now_ticks && target_ticks - now_ticks <= sleep_guard_ticks &&
+            prefetch_wait_step(movie, (uint32_t)(target_ticks - now_ticks))) {
+            uint64_t ended = monotonic_clock_now_ticks();
+            playback_capture_stage(movie, CAPTURE_PREFETCH, now_ticks, ended);
+            now_ticks = ended;
+            continue;
+        }
         if (target_ticks > now_ticks && target_ticks - now_ticks > sleep_guard_ticks) {
             /* A native transaction can exceed its cooperative slice (6.2 ms
              * observed). Near due, retain CPU sleep but don't start a writer;

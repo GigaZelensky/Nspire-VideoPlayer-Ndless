@@ -1,14 +1,16 @@
 #include "cx_nand_reader.h"
+#include "../platform/nspire_hardware.h"
 #include <string.h>
 
-/* The CX uses PL351 interface 0. Its ready and ECC registers differ from
- * interface 1; see ARM DDI0380G, Table 2-2 and the interface register banks. */
+/* Match the native CX PL351 transaction boundaries: release CE on each
+ * data access, use byte transfers for STATUS/READID, and poll chip status
+ * before switching back to the page data stream. */
 #define CTRL 0x8fff1000U
-#define DATA 0x81080000U
-#define DATA_LAST 0x81280000U
+#define DATA 0x81280000U
 #define CMD_STATUS 0x81000380U
 #define CMD_ID 0x81200480U
 #define CMD_PAGE 0x81918000U
+#define CMD_READ_MODE 0x81000000U
 enum {
     STATUS_ISSUE,
     STATUS_READ,
@@ -20,7 +22,9 @@ enum {
     PAGE_ECC,
     PUBLISH,
     DRAIN_ISSUE,
-    DRAIN_READ
+    DRAIN_READ,
+    PAGE_STATUS_READ,
+    PAGE_READ_MODE
 };
 
 static uint32_t rd(CxNandReader *r, uint32_t address)
@@ -30,6 +34,16 @@ static uint32_t rd(CxNandReader *r, uint32_t address)
 static void wr(CxNandReader *r, uint32_t address, uint32_t value)
 {
     r->bus.write32(r->bus.context, address, value);
+}
+static bool supported_id(const uint8_t id[4])
+{
+    /* Legacy extended-ID 128 MiB x8 SLC parts. Check geometry rather than
+     * requiring the emulator's Samsung manufacturer/device tuple. A1/F1/D1
+     * identify the 128 MiB x8 class; byte 3 describes page/OOB/erase sizes.
+     * The mounted FlashFX layout is independently validated by the caller. */
+    return id[0] != 0U && id[0] != 0xffU &&
+        (id[1] == 0xa1U || id[1] == 0xf1U || id[1] == 0xd1U) &&
+        !(id[2] & 0x0cU) && (id[3] & 0x77U) == 0x15U;
 }
 static unsigned parity(uint32_t word)
 {
@@ -98,7 +112,7 @@ static bool passive_gate(CxNandReader *r)
 {
     CxNandSnapshot *s = &r->snapshot;
     s->asic = rd(r, 0x900a0000U);
-    if (s->asic != 0x101U) {
+    if (!nspire_asic_is_cx(s->asic)) {
         r->error = CX_NAND_UNSUPPORTED_CONTROLLER;
         return false;
     }
@@ -241,7 +255,7 @@ CxNandStatus cx_nand_step(CxNandReader *r, uint32_t now, uint32_t budget)
         r->phase = draining ? DRAIN_READ : STATUS_READ;
     } else if (r->phase == STATUS_READ || r->phase == DRAIN_READ) {
         bool draining = r->phase == DRAIN_READ;
-        r->last_chip_status = rd(r, DATA_LAST) & 255U;
+        r->last_chip_status = r->bus.read8(r->bus.context, DATA);
         if (!(r->last_chip_status & 0x40U)) {
             r->phase = draining ? DRAIN_ISSUE : STATUS_ISSUE;
             return r->status;
@@ -261,32 +275,43 @@ CxNandStatus cx_nand_step(CxNandReader *r, uint32_t now, uint32_t budget)
     } else if (r->phase == ID_READ) {
         for (unsigned i = 0; i < 4U; ++i)
             r->id[i] = r->bus.read8(r->bus.context, DATA);
-        (void)rd(r, DATA_LAST); /* Explicit CE release; ignore remaining ID bytes. */
         r->quiescent = true;
-        if (r->id[0] != 0xecU || r->id[1] != 0xa1U || (r->id[2] & 0x0fU) != 1U ||
-            r->id[3] != 0x15U) {
+        if (!supported_id(r->id)) {
             r->error = CX_NAND_UNSUPPORTED_GEOMETRY;
             return terminal(r, CX_NAND_ERROR);
         }
         r->identified = true;
         return terminal(r, CX_NAND_DONE);
     } else if (r->phase == PAGE_ISSUE) {
-        /* Discard stale ready-edge latch, issue 00 + two column/two row
-         * addresses +30. No NAND data write is ever issued by this module.
-         */
-        wr(r, CTRL + 12U, 8U);
+        /* Issue 00 + two column/two row addresses + 30. */
         wr(r, CMD_PAGE, (r->page << 16) | r->read_column);
         r->quiescent = false;
         r->phase = PAGE_READY;
     } else if (r->phase == PAGE_READY) {
-        if (rd(r, CTRL) & 0x20U)
-            r->phase = PAGE_DATA;
+        wr(r, CMD_STATUS, 0);
+        r->phase = PAGE_STATUS_READ;
+    } else if (r->phase == PAGE_STATUS_READ) {
+        r->last_chip_status = r->bus.read8(r->bus.context, DATA);
+        if (!(r->last_chip_status & 0x40U)) {
+            r->phase = PAGE_READY;
+        } else if (r->last_chip_status & 1U) {
+            r->quiescent = true;
+            r->error = CX_NAND_CHIP_FAILURE;
+            return terminal(r, CX_NAND_ERROR);
+        } else {
+            r->phase = PAGE_READ_MODE;
+        }
+    } else if (r->phase == PAGE_READ_MODE) {
+        /* STATUS temporarily changes the output stream. Native CX reads
+         * send a command-only 00 before fetching data at the retained column. */
+        wr(r, CMD_READ_MODE, 0);
+        r->phase = PAGE_DATA;
     } else if (r->phase == PAGE_DATA) {
         if (budget > 128U)
             budget = 128U;
         budget &= ~3U;
         while (budget && r->position < r->transfer_bytes) {
-            uint32_t word = rd(r, r->position + 4U == r->transfer_bytes ? DATA_LAST : DATA);
+            uint32_t word = rd(r, DATA);
             for (unsigned i = 0; i < 4U; ++i)
                 r->data[r->position + i] = (uint8_t)(word >> (8U * i));
             r->position += 4U;

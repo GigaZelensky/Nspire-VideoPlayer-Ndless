@@ -204,6 +204,7 @@ void debug_failf(const char *fmt, ...)
     va_start(args, fmt);
     vsnprintf(g_last_error_message, sizeof(g_last_error_message), fmt, args);
     va_end(args);
+    playback_capture_failure(g_last_error_message);
     debug_tracef("%s", g_last_error_message);
 }
 
@@ -292,7 +293,7 @@ bool ensure_prefetch_budget(Movie *movie, int requested_chunk, size_t required_b
     return true;
 }
 
-void debug_log_path_for_movie(const char *movie_path, char *log_path, size_t log_path_size)
+static void report_path_for_movie(const char *movie_path, const char *name, char *log_path, size_t log_path_size)
 {
     char directory[MAX_PATH_LEN];
     char *slash;
@@ -301,7 +302,7 @@ void debug_log_path_for_movie(const char *movie_path, char *log_path, size_t log
         return;
     }
     if (!movie_path || movie_path[0] == '\0') {
-        snprintf(log_path, log_path_size, "ndvideo-debug.log");
+        snprintf(log_path, log_path_size, "%s", name);
         return;
     }
 
@@ -312,10 +313,44 @@ void debug_log_path_for_movie(const char *movie_path, char *log_path, size_t log
     }
     if (slash) {
         *slash = '\0';
-        snprintf(log_path, log_path_size, "%s/%s", directory, "ndvideo-debug.log");
+        snprintf(log_path, log_path_size, "%s/%s", directory, name);
     } else {
-        snprintf(log_path, log_path_size, "ndvideo-debug.log");
+        snprintf(log_path, log_path_size, "%s", name);
     }
+}
+
+static char pending_movie_error[192];
+
+void show_pending_movie_error(void)
+{
+    if (!pending_movie_error[0]) return;
+    /* main calls this after restoring native SRAM, display and clocks. */
+    show_msgbox("ND Video Player", pending_movie_error);
+    pending_movie_error[0] = '\0';
+}
+
+void debug_log_path_for_movie(const char *movie_path, char *log_path, size_t log_path_size)
+{
+    report_path_for_movie(movie_path, "ndvideo-debug.log", log_path, log_path_size);
+}
+
+static bool save_failure_report(const char *path, const Movie *movie, const char *reason)
+{
+    char log_path[MAX_PATH_LEN];
+    /* Keep a fatal report separate from an earlier D recording. No recording
+     * buffers or periodic writes are enabled just to report this failure. */
+    report_path_for_movie(path, "ndvideo-error.log.tns", log_path, sizeof(log_path));
+    return debug_dump_failure(log_path, movie, reason);
+}
+
+void report_app_failure(const char *app_path, const char *reason, const char *message)
+{
+    debug_failf("%s", message);
+    bool saved = save_failure_report(app_path, NULL, reason);
+    char text[192];
+    snprintf(text, sizeof(text), "%.120s\n%s", message,
+        saved ? "See ndvideo-error.log.tns." : "Error report could not be saved.");
+    show_msgbox("ND Video Player", text);
 }
 
 void report_movie_decode_failure(Movie *movie, const char *movie_path, const char *reason)
@@ -323,8 +358,6 @@ void report_movie_decode_failure(Movie *movie, const char *movie_path, const cha
     player_crash_trace_end(movie, PLAYER_CRASH_ERROR);
     movie_async_stop(movie);
     screenshot_writer_shutdown();
-    char log_path[MAX_PATH_LEN];
-    char message[192];
 
     if (movie) {
         debug_tracef(
@@ -338,34 +371,28 @@ void report_movie_decode_failure(Movie *movie, const char *movie_path, const cha
     } else {
         debug_tracef("decode failed reason=%s", reason ? reason : "unknown");
     }
-    debug_log_path_for_movie(movie_path, log_path, sizeof(log_path));
-    bool saved = debug_dump_session(log_path, movie, "decode-failure");
+    bool saved = save_failure_report(movie_path, movie, "decode-failure");
     snprintf(
-        message,
-        sizeof(message),
-        "Movie decode failed.\n%s%s",
-        debug_last_error(), saved ? "\nSee ndvideo-debug.log." : ""
+        pending_movie_error,
+        sizeof(pending_movie_error),
+        "Movie decode failed.\n%.120s%s",
+        debug_last_error(), saved ? "\nSee ndvideo-error.log.tns." : "\nError report could not be saved."
     );
-    show_msgbox("ND Video Player", message);
 }
 
 void report_movie_open_failure(const char *movie_path)
 {
     player_crash_trace_end(NULL, PLAYER_CRASH_ERROR);
     screenshot_writer_shutdown();
-    char log_path[MAX_PATH_LEN];
-    char message[192];
 
     debug_tracef("open failed: %s", debug_last_error());
-    debug_log_path_for_movie(movie_path, log_path, sizeof(log_path));
-    bool saved = debug_dump_session(log_path, NULL, "open-failure");
+    bool saved = save_failure_report(movie_path, NULL, "open-failure");
     snprintf(
-        message,
-        sizeof(message),
-        "Failed to open movie file.\n%s%s",
-        debug_last_error(), saved ? "\nSee ndvideo-debug.log." : ""
+        pending_movie_error,
+        sizeof(pending_movie_error),
+        "Failed to open movie file.\n%.120s%s",
+        debug_last_error(), saved ? "\nSee ndvideo-error.log.tns." : "\nError report could not be saved."
     );
-    show_msgbox("ND Video Player", message);
 }
 
 uint16_t read_le16(const uint8_t *src)

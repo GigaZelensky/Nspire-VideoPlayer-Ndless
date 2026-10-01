@@ -839,6 +839,7 @@ uint32_t second_next_chunk_prefetch_window_frames(const Movie *movie, int curren
 bool should_prefetch_second_next_chunk(Movie *movie, int current_chunk);
 bool should_prioritize_next_chunk_io(const Movie *movie, int current_chunk);
 void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerState *abort_pointer);
+bool prefetch_wait_step(Movie *movie, uint32_t spare_ticks);
 int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index);
 bool decode_h264_frame_with_progress( Movie *movie, uint32_t frame_index, bool blit_output, H264FramePublishPredicate predicate, H264DecodedFrameHook hook, void *userdata );
 bool decode_h264_frame( Movie *movie, uint32_t frame_index, bool blit_output );
@@ -860,8 +861,8 @@ bool load_history_store_from_path(const char *history_path, HistoryStore *histor
 bool load_history_store(const char *movie_path, HistoryStore *history);
 bool save_history_store_to_path(const char *history_path, const HistoryStore *history);
 bool save_history_store(const char *movie_path, const HistoryStore *history);
-unsigned history_load_clock_preference(bool *keep_after_exit);
-bool history_save_clock_preference(unsigned mhz, bool keep_after_exit);
+unsigned history_load_clock_preference(const char *app_path, bool *keep_after_exit);
+bool history_save_clock_preference(const char *app_path, unsigned mhz, bool keep_after_exit);
 void ui_load_theme_for_directory(const char *directory);
 void ui_write_theme_for_directory(const char *directory);
 void ui_save_theme_for_directory(const char *directory);
@@ -970,6 +971,9 @@ void init_sram_movie_chunk_buffer(void);
 uint32_t h264_prefetch_io_min_spare_ms(const Movie *movie);
 void debug_trace_runtime_snapshot( Movie *movie, bool paused, uint32_t spare_ms, const PlaybackRate *playback_rate, const char *tag );
 bool debug_dump_session(const char *path, const Movie *movie, const char *reason);
+bool debug_dump_failure(const char *path, const Movie *movie, const char *reason);
+void report_app_failure(const char *app_path, const char *reason, const char *message);
+void show_pending_movie_error(void);
 void debug_log_sram_status(void);
 
 /* picker_loop.c */
@@ -1060,6 +1064,9 @@ enum {
 /* Nonexclusive gate reasons, sampled before the render gate mutates its state. */
 void playback_capture_render_reason(const Movie *movie, uint32_t reasons);
 bool playback_capture_available(const Movie *movie);
+void playback_capture_failure(const char *reason);
+void playback_capture_decoder_error(const Movie *movie, const storage_t *decoder);
+void playback_capture_decoder_checkpoint(const Movie *movie, uint32_t words[5]);
 bool playback_capture_start(const Movie *movie, const char *movie_path);
 void playback_capture_stop(const Movie *movie);
 void playback_capture_release(void);

@@ -41,6 +41,7 @@ typedef enum {
     PREFETCH_IDLE = 0,
     PREFETCH_READING,
     PREFETCH_READY,
+    PREFETCH_FAILED,
 } PrefetchState;
 
 typedef struct {
@@ -126,6 +127,7 @@ typedef struct Movie {
     uint32_t last_read_bytes;
     uint32_t last_read_time_ms;
     uint32_t prefetch_read_bytes_per_ms;
+    uint32_t prefetch_wait_frame; /* Presentation index + 1; zero before first read turn. */
     uint32_t diag_last_snapshot_ms;
     uint32_t diag_prefetch_tick_count;
     uint32_t diag_active_prefetch_tick_count;

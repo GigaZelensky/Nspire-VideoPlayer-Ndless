@@ -1,5 +1,7 @@
 #include "player_internal.h"
 #include "crash_recorder.h"
+#include "storage_read_stream.h"
+#include "performance_clock.h"
 
 static bool player_is_power_of_two(size_t value)
 {
@@ -674,7 +676,7 @@ void debug_trace_runtime_snapshot(
         (unsigned long) movie->diag_render_max_ms);
 }
 
-bool debug_dump_session(const char *path, const Movie *movie, const char *reason)
+static bool debug_dump_report(const char *path, const Movie *movie, const char *reason, bool failure)
 {
     FILE *log_file;
     char *log_buffer;
@@ -683,7 +685,7 @@ bool debug_dump_session(const char *path, const Movie *movie, const char *reason
     bool qpc_in_sram = false;
     bool deblocking_in_sram = false;
 
-    if (!path || (!debug_is_runtime_logging_enabled() && !playback_capture_available(movie))) {
+    if (!path || (!failure && !debug_is_runtime_logging_enabled() && !playback_capture_available(movie))) {
         return false;
     }
 
@@ -698,6 +700,11 @@ bool debug_dump_session(const char *path, const Movie *movie, const char *reason
     if (log_buffer) setvbuf(log_file, log_buffer, _IOFBF, 16384U);
 
     fputs("ND Video Player diagnostic log\n", log_file);
+    fprintf(log_file, "build=%s %s hwtype=%u hwsubtype=%u ndless_rev=%u os_entry=%08lx\n",
+        __DATE__, __TIME__, nl_hwtype(), nl_hwsubtype(), nl_ndless_rev(),
+        (unsigned long)*(volatile uint32_t *)0x10000020U);
+    storage_read_stream_debug(log_file);
+    performance_clock_debug(log_file);
     movie_async_debug(log_file,movie);
     crash_recorder_debug(log_file);
     player_standby_debug(log_file);
@@ -794,6 +801,16 @@ bool debug_dump_session(const char *path, const Movie *movie, const char *reason
     if (fclose(log_file) != 0) saved = false;
     free(log_buffer);
     return saved;
+}
+
+bool debug_dump_session(const char *path, const Movie *movie, const char *reason)
+{
+    return debug_dump_report(path, movie, reason, false);
+}
+
+bool debug_dump_failure(const char *path, const Movie *movie, const char *reason)
+{
+    return debug_dump_report(path, movie, reason, true);
 }
 
 void debug_log_sram_status(void)

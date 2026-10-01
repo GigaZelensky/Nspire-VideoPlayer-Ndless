@@ -57,7 +57,7 @@ typedef struct {
 /* Passive reads only; false does not issue a NAND command. */
 bool cx_nand_init(CxNandReader *, CxNandBus);
 bool cx_nand_init_layout(CxNandReader *, CxNandBus, CxNandLayout);
-/* Status/READID only. Known EC A1 xx 15, 8-bit, one SLC die, 128MiB only.
+/* Status/READID only. Legacy 128 MiB x8 SLC, 2 KiB+64 pages, 128 KiB erase blocks.
  * Requires exclusive ownership, caller-supplied monotonic wrap-safe clock.
  */
 bool cx_nand_identify(CxNandReader *, uint32_t now, uint32_t timeout_ticks);

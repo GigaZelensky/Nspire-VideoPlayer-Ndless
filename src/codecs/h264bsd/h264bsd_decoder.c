@@ -149,6 +149,15 @@ u32 h264bsdInit(storage_t *pStorage, u32 noOutputReordering)
 
 ------------------------------------------------------------------------------*/
 
+static u32 decode_error(storage_t *storage, const strmData_t *stream,
+                        const char *reason, u32 detail, u32 result)
+{
+    storage->errorReason = reason;
+    storage->errorDetail = detail;
+    storage->errorBit = stream ? stream->strmBuffReadBits : 0;
+    return result;
+}
+
 u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
     u32 *readBytes)
 {
@@ -194,7 +203,7 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
         if (tmp != HANTRO_OK)
         {
             EPRINT("BYTE_STREAM");
-            return(H264BSD_ERROR);
+            return decode_error(pStorage, NULL, "byte-stream", tmp, H264BSD_ERROR);
         }
         /* store stream */
         pStorage->strm[0] = strm;
@@ -209,7 +218,7 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
         if (tmp != HANTRO_OK)
         {
             EPRINT("NAL_UNIT");
-            return(H264BSD_ERROR);
+            return decode_error(pStorage, &strm, "nal-header", tmp, H264BSD_ERROR);
         }
 
         /* Discard unspecified, reserved, SPS extension and auxiliary picture slices */
@@ -228,9 +237,9 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
         {
             EPRINT("ACCESS UNIT BOUNDARY CHECK");
             if (tmp == PARAM_SET_ERROR)
-                return(H264BSD_PARAM_SET_ERROR);
+                return decode_error(pStorage, &strm, "access-unit", tmp, H264BSD_PARAM_SET_ERROR);
             else
-                return(H264BSD_ERROR);
+                return decode_error(pStorage, &strm, "access-unit", tmp, H264BSD_ERROR);
         }
 
         if ( accessUnitBoundaryFlag )
@@ -246,7 +255,7 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
                 if (pStorage->pendingActivation)
                 {
                     EPRINT("Pending activation not completed");
-                    return (H264BSD_ERROR);
+                    return decode_error(pStorage, &strm, "pending-activation", 1U, H264BSD_ERROR);
                 }
 
                 if (!pStorage->validSliceInAccessUnit)
@@ -287,7 +296,7 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
                         EPRINT("SEQ_PARAM_SET");
                         FREE(seqParamSet.offsetForRefFrame);
                         FREE(seqParamSet.vuiParameters);
-                        return(H264BSD_ERROR);
+                        return decode_error(pStorage, &strm, "sps", tmp, H264BSD_ERROR);
                     }
                     tmp = h264bsdStoreSeqParamSet(pStorage, &seqParamSet);
                     break;
@@ -302,7 +311,7 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
                         FREE(picParamSet.topLeft);
                         FREE(picParamSet.bottomRight);
                         FREE(picParamSet.sliceGroupId);
-                        return(H264BSD_ERROR);
+                        return decode_error(pStorage, &strm, "pps", tmp, H264BSD_ERROR);
                     }
                     tmp = h264bsdStorePicParamSet(pStorage, &picParamSet);
                     break;
@@ -326,7 +335,8 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
                         pStorage->currentPicId    = picId;
 
                         tmp = h264bsdCheckPpsId(&strm, &ppsId);
-                        ASSERT(tmp == HANTRO_OK);
+                        if (tmp != HANTRO_OK)
+                            return decode_error(pStorage, &strm, "pps-id", tmp, H264BSD_ERROR);
                         /* store old activeSpsId and return headers ready
                          * indication if activeSps changes */
                         spsId = pStorage->activeSpsId;
@@ -344,10 +354,10 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
 
                             if(tmp == MEMORY_ALLOCATION_ERROR)
                             {
-                                return H264BSD_MEMALLOC_ERROR;
+                                return decode_error(pStorage, &strm, "parameter-activation", tmp, H264BSD_MEMALLOC_ERROR);
                             }
                             else
-                                return(H264BSD_PARAM_SET_ERROR);
+                                return decode_error(pStorage, &strm, "parameter-activation", tmp, H264BSD_PARAM_SET_ERROR);
                         }
 
                         if (spsId != pStorage->activeSpsId)
@@ -404,14 +414,14 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
                     if (pStorage->pendingActivation)
                     {
                         EPRINT("Pending activation not completed");
-                        return (H264BSD_ERROR);
+                        return decode_error(pStorage, &strm, "pending-activation", 1U, H264BSD_ERROR);
                     }
                     tmp = h264bsdDecodeSliceHeader(&strm, pStorage->sliceHeader + 1,
                         pStorage->activeSps, pStorage->activePps, &nalUnit);
                     if (tmp != HANTRO_OK)
                     {
                         EPRINT("SLICE_HEADER");
-                        return(H264BSD_ERROR);
+                        return decode_error(pStorage, &strm, "slice-header", tmp, H264BSD_ERROR);
                     }
                     if (h264bsdIsStartOfPicture(pStorage))
                     {
@@ -426,7 +436,7 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
                             if (tmp != HANTRO_OK)
                             {
                                 EPRINT("Gaps in frame num");
-                                return(H264BSD_ERROR);
+                                return decode_error(pStorage, &strm, "frame-num-gap", tmp, H264BSD_ERROR);
                             }
                         }
                         pStorage->currImage->data =
@@ -449,7 +459,7 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
                     if (tmp != HANTRO_OK)
                     {
                         EPRINT("Reordering");
-                        return(H264BSD_ERROR);
+                        return decode_error(pStorage, &strm, "reference-list", tmp, H264BSD_ERROR);
                     }
 
                     DEBUG(("SLICE DATA, FIRST %d\n",
@@ -467,7 +477,7 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
                         EPRINT("SLICE_DATA");
                         h264bsdMarkSliceCorrupted(pStorage,
                             pStorage->sliceHeader->firstMbInSlice);
-                        return(H264BSD_ERROR);
+                        return decode_error(pStorage, &strm, "slice-data", tmp, H264BSD_ERROR);
                     }
 
                     if (h264bsdIsEndOfPicture(pStorage))
@@ -503,7 +513,7 @@ u32 h264bsdDecode(storage_t *pStorage, u8 *byteStrm, u32 len, u32 picId,
             EPRINT("SLICE_DATA");
             h264bsdMarkSliceCorrupted(pStorage,
                 pStorage->sliceHeader->firstMbInSlice);
-            return(H264BSD_ERROR);
+            return decode_error(pStorage, &strm, "slice-resume", tmp, H264BSD_ERROR);
         }
         *readBytes = pStorage->prevBytesConsumed;
         if (h264bsdIsEndOfPicture(pStorage))

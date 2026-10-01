@@ -1,4 +1,5 @@
 #include "portable_reader_platform.h"
+#include "nspire_hardware.h"
 #include "arm926_ram_span.h"
 #include "../player/native_interrupts.h"
 #include "../player/storage_mutation.h"
@@ -109,7 +110,7 @@ int portable_reader_platform_init(PortableReaderPlatform *p)
     if (!(saved & 0x80U))
         return p->status = PORTABLE_READER_PLATFORM_MASK;
     p->asic = word(0x900a0000U, NULL);
-    if (p->asic == 0x101U)
+    if (nspire_asic_is_cx(p->asic))
         p->kind = NAND_PAGE_CX_PL351;
     else if (p->asic == 0x202U)
         p->kind = NAND_PAGE_CX2_SPI;

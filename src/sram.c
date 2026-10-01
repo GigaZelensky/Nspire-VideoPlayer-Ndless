@@ -1,4 +1,5 @@
 #include "sram.h"
+#include "platform/nspire_hardware.h"
 #include "platform/arm926_ram_span.h"
 
 #include <libndls.h>
@@ -253,7 +254,7 @@ static bool sram_init_cx(void)
 {
     unsigned saved = sram_critical_enter();
     uint32_t table = sram_get_ttbr0() & 0xffffc000U;
-    bool layout = sram_read_word(0x900a0000U, NULL) == 0x101U && sram_cx_layout(table);
+    bool layout = nspire_asic_is_cx(sram_read_word(0x900a0000U, NULL)) && sram_cx_layout(table);
     sram_critical_leave(saved);
     if (!layout) {
         sram_set_status_message("unrecognized cx SRAM layout");

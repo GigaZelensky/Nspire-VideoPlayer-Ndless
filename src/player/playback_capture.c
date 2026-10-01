@@ -4,9 +4,9 @@
 #include "native_screen_power.h"
 #include "native_standby.h"
 #include "private_writer.h"
-#include "performance_clock.h"
 
 #define CAPTURE_RENDER_REASON_COUNT 10U
+#define CAPTURE_FAILURE_CAPACITY 32U
 
 typedef struct {
     const Movie *movie;
@@ -35,9 +35,50 @@ typedef struct {
     uint32_t tick_hz, start_frame, end_frame;
     uint64_t render_reason_presented, render_reasons[CAPTURE_RENDER_REASON_COUNT];
     char media_name[160];
+    struct { uint64_t ticks; uint32_t visible, next; int chunk; char reason[DEBUG_LINE_LEN]; }
+        failures[CAPTURE_FAILURE_CAPACITY];
+    uint32_t failure_next, failure_count;
+    uint64_t failures_overwritten;
+    uint32_t decoder_checkpoint[5];
 } PlaybackCapture;
 
 static PlaybackCapture *g_capture;
+
+void playback_capture_decoder_error(const Movie *movie, const storage_t *decoder)
+{
+    if (!g_capture || !g_capture->active || g_capture->movie != movie || !decoder) return;
+    uint32_t *words = g_capture->decoder_checkpoint;
+    words[0] = h264_lookahead_next_frame(movie);
+    /* The fixed stage strings are encoded as FNV-1a in the binary journal;
+     * the text log also includes the human-readable stage name. */
+    uint32_t hash = 2166136261U;
+    const char *stage = decoder->errorReason ? decoder->errorReason : "unknown";
+    while (*stage) hash = (hash ^ (uint8_t)*stage++) * 16777619U;
+    words[1] = hash;
+    words[2] = decoder->errorDetail;
+    words[3] = decoder->errorBit;
+    ++words[4];
+}
+
+void playback_capture_decoder_checkpoint(const Movie *movie, uint32_t words[5])
+{
+    if (g_capture && g_capture->movie == movie)
+        memcpy(words, g_capture->decoder_checkpoint, sizeof(g_capture->decoder_checkpoint));
+    else memset(words, 0, 5U * sizeof(*words));
+}
+
+void playback_capture_failure(const char *reason)
+{
+    if (!g_capture || !g_capture->active || !reason) return;
+    size_t slot = capture_ring_push_index(&g_capture->failure_next, &g_capture->failure_count,
+        &g_capture->failures_overwritten, CAPTURE_FAILURE_CAPACITY);
+    const Movie *movie = g_capture->movie;
+    g_capture->failures[slot].ticks = monotonic_clock_now_ticks();
+    g_capture->failures[slot].visible = movie ? movie->current_frame : 0;
+    g_capture->failures[slot].next = movie ? h264_lookahead_next_frame(movie) : 0;
+    g_capture->failures[slot].chunk = movie ? movie->loaded_chunk : -1;
+    snprintf(g_capture->failures[slot].reason, sizeof(g_capture->failures[slot].reason), "%s", reason);
+}
 
 bool playback_capture_active(const Movie *movie)
 {
@@ -422,7 +463,6 @@ void playback_capture_export(FILE *file, const Movie *movie)
         hwtype(), is_cx2 ? 1U : 0U, is_touchpad ? 1U : 0U, (int)lcd_type(),
         g_clock.using_hw_timer ? 1U : 0U, (unsigned long)g_capture->tick_hz,
         g_clock.original_control, g_clock.original_speed);
-    performance_clock_debug(file);
     if (movie && movie->codec == MOVIE_CODEC_H264)
         fputs("color_conversion flat_reuse=exact_yuv cache_entries=1 cache_scope=conversion_band\n", file);
     fprintf(file,
@@ -522,6 +562,16 @@ void playback_capture_export(FILE *file, const Movie *movie)
         file);
     fprintf(file, "capture_mode=lag_windows pre_frames=%u post_seconds=2 event_count=%lu events_overwritten=%llu\n",
         CAPTURE_RECENT_CAPACITY, (unsigned long)g_capture->event_count, (unsigned long long)g_capture->events_overwritten);
+    fprintf(file, "capture_failures retained=%lu overwritten=%llu\n",
+        (unsigned long)g_capture->failure_count, (unsigned long long)g_capture->failures_overwritten);
+    for (i = 0; i < g_capture->failure_count; ++i) {
+        size_t index = (capture_ring_oldest(g_capture->failure_next, g_capture->failure_count,
+            CAPTURE_FAILURE_CAPACITY) + i) % CAPTURE_FAILURE_CAPACITY;
+        fprintf(file, "failure at_us=%llu visible=%lu next=%lu chunk=%d reason=%s\n",
+            (unsigned long long)capture_ticks_to_us(g_capture->failures[index].ticks - g_capture->started, g_capture->tick_hz),
+            (unsigned long)g_capture->failures[index].visible, (unsigned long)g_capture->failures[index].next,
+            g_capture->failures[index].chunk, g_capture->failures[index].reason);
+    }
     fputs("lag_events_csv: at_us,frame,missed_intervals\n", file);
     for (i = 0; i < g_capture->event_count; ++i) {
         size_t index = (capture_ring_oldest(g_capture->event_next, g_capture->event_count,

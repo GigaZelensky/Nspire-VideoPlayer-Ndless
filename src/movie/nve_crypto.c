@@ -133,6 +133,7 @@ bool nve_reader_begin(NveReader *r, uint32_t offset, void *destination, uint32_t
         return false;
     if (r->phase != NVE_READ_DONE && r->phase != NVE_READ_IDLE) nve_reader_cancel(r);
     r->offset = offset; r->bytes = bytes; r->copied = 0; r->destination = destination;
+    r->error = NVE_ERROR_NONE;
     select_unit(r);
     return true;
 }
@@ -140,11 +141,24 @@ uint32_t nve_reader_physical_offset(const NveReader *r)
 {
     return NVE_HEADER_BYTES + r->unit * (NVE_RECORD_BYTES + NVE_TAG_BYTES);
 }
+static void reader_error(NveReader *r, NveReadError error)
+{
+    NveReadPhase phase = r->phase;
+    if (error != NVE_ERROR_AUTH) {
+        memset(r->error_cipher_hash, 0, sizeof(r->error_cipher_hash));
+        memset(r->error_tag, 0, sizeof(r->error_tag));
+    }
+    nve_reader_cancel(r);
+    r->error = error;
+    r->error_phase = phase;
+    r->phase = NVE_READ_ERROR;
+}
+
 void nve_reader_supplied(NveReader *r, bool success)
 {
     if (!r || r->phase != NVE_READ_FETCH) return;
     r->cached_unit = UINT32_MAX;
-    if (!success) { nve_reader_cancel(r); r->phase = NVE_READ_ERROR; return; }
+    if (!success) { reader_error(r, NVE_ERROR_IO); return; }
     uint8_t index[8];
     put32(index, r->unit); put32(index + 4, r->unit_bytes);
     br_hmac_init(&r->mac, &r->keys->mac, 32);
@@ -157,7 +171,11 @@ void nve_reader_step(NveReader *r)
 {
     if (!r) return;
     if (!r->keys || !r->keys->valid) {
-        nve_reader_cancel(r); r->phase = NVE_READ_ERROR; return;
+        reader_error(r, NVE_ERROR_KEYS); return;
+    }
+    if ((r->phase == NVE_READ_VERIFY || r->phase == NVE_READ_DECRYPT) &&
+        (!r->unit_bytes || r->unit_bytes > NVE_RECORD_BYTES || r->progress >= r->unit_bytes)) {
+        reader_error(r, NVE_ERROR_STATE); return;
     }
     if (r->phase == NVE_READ_VERIFY) {
         uint32_t count = r->unit_bytes - r->progress;
@@ -169,7 +187,17 @@ void nve_reader_step(NveReader *r)
             br_hmac_out(&r->mac, tag);
             bool valid = equal_tag(tag, r->block + r->unit_bytes);
             nve_wipe(tag, sizeof(tag)); nve_wipe(&r->mac, sizeof(r->mac));
-            if (!valid) { nve_reader_cancel(r); r->phase = NVE_READ_ERROR; return; }
+            if (!valid) {
+                /* Fingerprint ciphertext and its public tag, never plaintext
+                 * or key material, before the rejected record is wiped. */
+                br_sha256_context hash;
+                br_sha256_init(&hash);
+                br_sha256_update(&hash, r->block, r->unit_bytes);
+                br_sha256_out(&hash, r->error_cipher_hash);
+                memcpy(r->error_tag, r->block + r->unit_bytes, NVE_TAG_BYTES);
+                nve_wipe(&hash, sizeof(hash));
+                reader_error(r, NVE_ERROR_AUTH); return;
+            }
             r->progress = 0; r->phase = NVE_READ_DECRYPT;
         }
     } else if (r->phase == NVE_READ_DECRYPT) {
@@ -181,6 +209,10 @@ void nve_reader_step(NveReader *r)
         if (r->progress == r->unit_bytes) { r->cached_unit = r->unit; r->phase = NVE_READ_COPY; }
     } else if (r->phase == NVE_READ_COPY) {
         uint32_t within = (r->offset + r->copied) % NVE_RECORD_BYTES;
+        if (!r->destination || r->cached_unit != r->unit || r->copied >= r->bytes ||
+            !r->unit_bytes || r->unit_bytes > NVE_RECORD_BYTES || within >= r->unit_bytes) {
+            reader_error(r, NVE_ERROR_STATE); return;
+        }
         uint32_t count = r->bytes - r->copied;
         if (count > r->unit_bytes - within) count = r->unit_bytes - within;
         if (count > 512U) count = 512U;

@@ -26,6 +26,10 @@ void raw_player_native_released(void);
 void raw_player_service(uint32_t budget_ticks);
 /* One guarded RAM-only crypto step; never starts physical storage work. */
 bool raw_player_crypto_step(uint32_t spare_ticks);
+/* One read step, including record boundaries, with an already-owned view. */
+bool raw_player_read_step(uint32_t spare_ticks);
+/* Only idle/READY requests may be submitted/collected in a short wait. */
+bool raw_player_needs_request(const RawPlayerIo *);
 void raw_player_after_clock_reset(RawPlayerIo *);
 int raw_player_error(const RawPlayerIo *);
 uint32_t raw_player_file_bytes(const RawPlayerIo *);
