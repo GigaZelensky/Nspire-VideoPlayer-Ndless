@@ -9,6 +9,7 @@
 #include <SDL/SDL.h>
 
 #include "codecs/codec.h"
+#include "codecs/hevc_decoder.h"
 #include "codecs/h264bsd/h264bsd_decoder.h"
 #include "movie/nvp_format.h"
 #include "player/playback_cadence.h"
@@ -66,8 +67,6 @@ typedef struct {
     bool decoder_initialized;
     bool decoder_failed;
     bool chunk_dirty;
-    uint16_t foreground_decode_avg_ms;
-    uint16_t foreground_decode_peak_ms;
 } H264DecoderContext;
 
 typedef struct {
@@ -76,10 +75,19 @@ typedef struct {
     bool discontinuity;
 } Mpeg4DecoderContext;
 
+typedef struct {
+    hevc_decoder_t *decoder;
+    const hevc_frame_t *picture;
+    const uint8_t *access_unit;
+    size_t access_unit_size;
+    bool decoder_failed;
+    uint64_t submitted_frames, decoded_ctus;
+} HevcDecoderContext;
+
 typedef struct Movie {
     FILE *file;
     struct MovieAsyncIo *async_io;
-    struct H264Lookahead *h264_lookahead;
+    struct VideoLookahead *video_lookahead;
     bool lookahead_enabled;
     bool diag_async_used;
     uint32_t diag_async_reads, diag_async_bytes, diag_async_waits;
@@ -119,11 +127,15 @@ typedef struct Movie {
     size_t chunk_size;
     int loaded_chunk;
     PrefetchedChunk prefetched[PREFETCH_CHUNK_COUNT];
+    unsigned prefetch_slots; /* Selected once from the validated movie index. */
     int decoded_local_frame;
     uint32_t current_frame;
     SDL_Surface *frame_surface;
     H264DecoderContext h264;
     Mpeg4DecoderContext mpeg4;
+    HevcDecoderContext hevc;
+    uint16_t foreground_decode_avg_ms, foreground_decode_peak_ms;
+    uint64_t foreground_pending_ticks;
     uint32_t last_read_bytes;
     uint32_t last_read_time_ms;
     uint32_t prefetch_read_bytes_per_ms;

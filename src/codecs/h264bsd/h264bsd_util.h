@@ -69,6 +69,11 @@
 #define END_OF_STREAM 0xFFFFFFFFU
 
 #define EMPTY_RESIDUAL_INDICATOR 0xFFFFFF
+/* Scalar transform output: a constant 4x4 residual uses its value in [1].
+ * Markers lie outside the checked sample range [-512,511]. */
+#define DC_RESIDUAL_INDICATOR 0xFFFFFE
+#define IS_RESIDUAL_DC(residual) ((residual)[0] == DC_RESIDUAL_INDICATOR)
+#define MARK_RESIDUAL_DC(residual, value) ((residual)[0] = DC_RESIDUAL_INDICATOR, (residual)[1] = (value))
 
 /* macro to mark a residual block empty, i.e. contain zero coefficients */
 #define MARK_RESIDUAL_EMPTY(residual) ((residual)[0] = EMPTY_RESIDUAL_INDICATOR)

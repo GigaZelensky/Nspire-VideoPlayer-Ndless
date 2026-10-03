@@ -694,29 +694,3 @@ int pick_movie(
     }
 }
 
-bool seek_delta_target_frame(const Movie *movie, int32_t delta_ms, uint32_t *out_target_frame)
-{
-    int64_t current_ms;
-    int64_t target_ms;
-    uint32_t duration_ms;
-    uint32_t target_frame;
-    if (!movie || !out_target_frame || movie->header.frame_count == 0) {
-        return false;
-    }
-    current_ms = (int64_t) movie_frame_time_ms(movie, movie->current_frame);
-    target_ms = current_ms + delta_ms;
-    duration_ms = movie_duration_ms(movie);
-    if (target_ms < 0) {
-        target_ms = 0;
-    }
-    if ((uint64_t) target_ms >= duration_ms) {
-        target_ms = duration_ms > 1 ? duration_ms - 1 : 0;
-    }
-    target_frame = movie_frames_from_ms(movie, (uint32_t) target_ms);
-    if (target_frame >= movie->header.frame_count) {
-        target_frame = movie->header.frame_count - 1;
-    }
-    *out_target_frame = target_frame;
-    return true;
-}
-

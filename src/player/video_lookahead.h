@@ -1,19 +1,19 @@
-#ifndef NDVIDEO_H264_LOOKAHEAD_H
-#define NDVIDEO_H264_LOOKAHEAD_H
+#ifndef NDVIDEO_VIDEO_LOOKAHEAD_H
+#define NDVIDEO_VIDEO_LOOKAHEAD_H
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 struct Movie;
-struct H264Lookahead;
+struct VideoLookahead;
 
-#define H264_LOOKAHEAD_MAX_FRAMES 512U
-#define H264_LOOKAHEAD_MAX_BYTES (24U * 1024U * 1024U)
-#define H264_LOOKAHEAD_FALLBACK_BYTES (10U * 1024U * 1024U)
-#define H264_LOOKAHEAD_HEADROOM_BYTES (6U * 1024U * 1024U)
-#define H264_LOOKAHEAD_ALLOCATION_ALLOWANCE 128U
-#define H264_LOOKAHEAD_COLOR_ROWS 16U
+#define VIDEO_LOOKAHEAD_MAX_FRAMES 512U
+#define VIDEO_LOOKAHEAD_MAX_BYTES (24U * 1024U * 1024U)
+#define VIDEO_LOOKAHEAD_FALLBACK_BYTES (10U * 1024U * 1024U)
+#define VIDEO_LOOKAHEAD_HEADROOM_BYTES (6U * 1024U * 1024U)
+#define VIDEO_LOOKAHEAD_ALLOCATION_ALLOWANCE 128U
+#define VIDEO_LOOKAHEAD_COLOR_ROWS 16U
 
 typedef struct {
     unsigned capacity, queued, peak_queued;
@@ -36,49 +36,50 @@ typedef struct {
     int failure_chunk;
     char failure_reason[128];
     bool active, partial;
-} H264LookaheadStats;
+} VideoLookaheadStats;
 
 /* Begin only after normal decode has established the displayed frame. The
  * decoder must not be changed behind an active lookahead instance. */
-bool h264_lookahead_begin(struct Movie *movie);
-bool h264_lookahead_active(const struct Movie *movie);
+bool video_lookahead_begin(struct Movie *movie);
+bool video_lookahead_active(const struct Movie *movie);
 
 /* One macroblock batch or row-band conversion against an absolute deadline.
  * Normal decoding uses ready chunks; error recovery may advance a bounded
  * nonblocking reload. Returns whether work was performed. */
-bool h264_lookahead_step(struct Movie *movie, uint64_t deadline_ticks);
-bool h264_lookahead_reloading(const struct Movie *movie);
+bool video_lookahead_step(struct Movie *movie, uint64_t deadline_ticks);
+bool video_lookahead_reloading(const struct Movie *movie);
 
 /* Consume a queued exact frame without decoding. The framebuffer and its
  * allocation are swapped, so this is independent of image dimensions. */
-bool h264_lookahead_take(struct Movie *movie, uint32_t target_frame);
+bool video_lookahead_take(struct Movie *movie, uint32_t target_frame);
 
 /* Complete a sequential target into the queue without changing the displayed
- * frame or framebuffer. 1: ready, 0: normal seek required, -1: failure. */
-int h264_lookahead_prepare_target(struct Movie *movie, uint32_t target_frame);
+ * frame or framebuffer. 1: ready, 2: more cooperative work needed, 0: seek required, -1: failure. */
+int video_lookahead_prepare_target(struct Movie *movie, uint32_t target_frame);
 
 /* Queue depth at the first preparation attempt, retained through interrupted
  * waits so capture still identifies foreground misses at eventual commit. */
-unsigned h264_lookahead_prepared_depth(const struct Movie *movie, uint32_t target_frame);
+unsigned video_lookahead_prepared_depth(const struct Movie *movie, uint32_t target_frame);
 
 /* 1: target presented, 0: inactive/nonsequential (normal seek required),
- * -1: decoding failed. Finishes existing partial work; never decodes twice. */
-int h264_lookahead_finish_target(struct Movie *movie, uint32_t target_frame);
+ * 2: more cooperative work needed, -1: decoding failed. Retains partial work. */
+int video_lookahead_finish_target(struct Movie *movie, uint32_t target_frame);
 
 /* Present a forward clock-selected frame, retaining later queued frames and
  * any partial decode. Catch-up reconstructs references without coloring
  * pictures already too late to display. Same return convention as above. */
-int h264_lookahead_finish_realtime_target(struct Movie *movie, uint32_t target_frame);
+bool video_lookahead_pending_realtime_target(const struct Movie *movie, uint32_t *target);
+int video_lookahead_finish_realtime_target(struct Movie *movie, uint32_t target_frame);
 
 /* A seek/recovery cancellation invalidates mutated compressed bytes and
  * partial decoder state before normal decoding. Pause/rate changes retain it. */
-void h264_lookahead_cancel(struct Movie *movie);
-void h264_lookahead_destroy(struct Movie *movie);
+void video_lookahead_cancel(struct Movie *movie);
+void video_lookahead_destroy(struct Movie *movie);
 
 /* The prefetch horizon follows decoding, independently of presentation. */
-uint32_t h264_lookahead_next_frame(const struct Movie *movie);
-unsigned h264_lookahead_queued(const struct Movie *movie);
-size_t h264_lookahead_memory_bytes(const struct Movie *movie);
-void h264_lookahead_get_stats(const struct Movie *movie, H264LookaheadStats *out);
+uint32_t video_lookahead_next_frame(const struct Movie *movie);
+unsigned video_lookahead_queued(const struct Movie *movie);
+size_t video_lookahead_memory_bytes(const struct Movie *movie);
+void video_lookahead_get_stats(const struct Movie *movie, VideoLookaheadStats *out);
 
 #endif

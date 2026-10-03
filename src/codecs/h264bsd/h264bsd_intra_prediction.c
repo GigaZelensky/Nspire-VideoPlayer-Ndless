@@ -969,7 +969,6 @@ void h264bsdAddResidual(u8 *data, i32 *residual, u32 blockNum)
     if (IS_RESIDUAL_EMPTY(residual))
         return;
 
-    RANGE_CHECK_ARRAY(residual, -512, 511, 16);
 
     if (blockNum < 16)
     {
@@ -985,6 +984,11 @@ void h264bsdAddResidual(u8 *data, i32 *residual, u32 blockNum)
     }
 
     tmp = data + y*width + x;
+    if (IS_RESIDUAL_DC(residual)) {
+        h264bsdAddDcResidual(tmp, width, tmp, width, residual[1]);
+        return;
+    }
+    RANGE_CHECK_ARRAY(residual, -512, 511, 16);
     for (i = 4; i; i--)
     {
         tmp1 = *residual++;

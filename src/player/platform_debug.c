@@ -1355,15 +1355,16 @@ void clear_seek_bar_preview_decode_job(SeekBarPreviewState *preview)
     }
 
     job = &preview->decode_job;
-    if (job->decoder) {
+    if (NDVIDEO_WITH_H264 && job->decoder) {
         if (job->decoder_initialized) {
             h264bsdShutdown(job->decoder);
         }
         h264bsdFree(job->decoder);
     }
-    if (job->mpeg4_decoder) {
+    if (NDVIDEO_WITH_MPEG4 && job->mpeg4_decoder) {
         mpeg4_xvid_destroy(job->mpeg4_decoder);
     }
+    if (job->hevc_decoder) player_hevc_decoder_destroy(job->hevc_decoder);
     free(job->chunk_storage);
     free(job->frame_offsets);
     free(job->pixels);

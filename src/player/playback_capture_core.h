@@ -6,7 +6,8 @@
 
 #define CAPTURE_FRAME_CAPACITY 4096U
 #define CAPTURE_RECENT_CAPACITY 128U
-#define CAPTURE_EVENT_CAPACITY 128U
+/* Compact event locations outlive the detailed frame windows on long runs. */
+#define CAPTURE_EVENT_CAPACITY 4096U
 #define CAPTURE_IO_CAPACITY 512U
 enum {
     CAPTURE_INPUT,

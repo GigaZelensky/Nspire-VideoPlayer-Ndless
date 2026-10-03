@@ -1,5 +1,22 @@
 .DEFAULT_GOAL := all
 DEBUG = FALSE
+CODECS ?= h264 mpeg4 hevc
+SUPPORTED_CODECS = h264 mpeg4 hevc
+ifneq ($(strip $(filter-out $(SUPPORTED_CODECS),$(CODECS))),)
+$(error Unknown codec in CODECS="$(CODECS)"; choose h264, mpeg4 and/or hevc)
+endif
+SELECTED_CODECS := $(strip $(foreach codec,$(SUPPORTED_CODECS),$(if $(filter $(codec),$(CODECS)),$(codec))))
+ifeq ($(SELECTED_CODECS),)
+$(error CODECS must select at least one codec)
+endif
+empty :=
+space := $(empty) $(empty)
+CODEC_TAG := $(subst $(space),-,$(SELECTED_CODECS))
+CODEC_SUFFIX := $(if $(filter-out h264-mpeg4-hevc,$(CODEC_TAG)),-$(CODEC_TAG))
+CODEC_FLAGS = -DNDVIDEO_WITH_H264=$(if $(filter h264,$(SELECTED_CODECS)),1,0) \
+	-DNDVIDEO_WITH_MPEG4=$(if $(filter mpeg4,$(SELECTED_CODECS)),1,0) \
+	-DNDVIDEO_WITH_HEVC=$(if $(filter hevc,$(SELECTED_CODECS)),1,0)
+OBJDIR = build/$(if $(filter TRUE,$(DEBUG)),debug,release)/$(CODEC_TAG)
 ifneq ($(wildcard ./external/Ndless-official/ndless-sdk/include/libndls.h),)
 SDKROOT ?= ./external/Ndless-official/ndless-sdk
 else
@@ -36,11 +53,11 @@ endif
 
 # Keep aggressive unrolling/alignment on decode, pixel, and frame-timing paths.
 # Picker, resource setup, and history code benefit from a smaller instruction footprint.
-HOT_PLAYER_SRCS = src/player/h264_lookahead.c src/player/codec_streaming.c src/player/render_primitives.c \
+HOT_PLAYER_SRCS = src/player/video_lookahead.c src/player/hevc_playback.c src/player/codec_streaming.c src/player/render_primitives.c \
 	src/player/playback_ui.c src/player/playback_loop.c src/player/subtitles.c \
 	src/player/input_timing_memory.c src/player/night_mode.c \
 	src/player/movie_open_scan.c src/player/platform_debug.c
-FAST_SRCS = src/codecs/h264bsd/% src/codecs/xvid/% src/codecs/mpeg4_xvid.c \
+FAST_SRCS = src/codecs/hevc/% src/codecs/hevc_decoder.cpp src/codecs/h264bsd/% src/codecs/xvid/% src/codecs/mpeg4_xvid.c \
 	src/crypto/bearssl/% src/movie/nve_crypto.c $(HOT_PLAYER_SRCS)
 
 XVID_DECODER_SRCS = \
@@ -75,41 +92,73 @@ XVID_DECODER_SRCS = \
 	src/codecs/xvid/utils/sram_tables.c \
 	src/codecs/xvid/utils/timer.c
 
-OBJS = $(patsubst %.c, %.o, $(shell find src -type d -name '.*' -prune -o -type f -name "*.c" -not -path "src/codecs/xvid/*" -print))
-OBJS += $(patsubst %.c, %.o, $(XVID_DECODER_SRCS))
-OBJS += $(patsubst %.cpp, %.o, $(shell find src -type d -name '.*' -prune -o -type f -name "*.cpp" -print))
-OBJS += $(patsubst %.S, %.o, $(shell find src -type d -name '.*' -prune -o -type f -name "*.S" -print))
+# GNU make's wildcard skips hidden directories, including nested worktrees.
+source_files = $(foreach entry,$(wildcard $(1)*),$(call source_files,$(entry)/,$(2)) $(filter $(2),$(entry)))
+SOURCES := $(filter-out src/codecs/xvid/%,$(call source_files,src/,%.c %.cpp %.S))
+ifeq ($(filter h264,$(SELECTED_CODECS)),)
+SOURCES := $(filter-out src/codecs/h264bsd/%,$(SOURCES))
+endif
+ifeq ($(filter mpeg4,$(SELECTED_CODECS)),)
+SOURCES := $(filter-out src/codecs/mpeg4_xvid.c,$(SOURCES))
+else
+SOURCES += $(XVID_DECODER_SRCS)
+endif
+ifeq ($(filter hevc,$(SELECTED_CODECS)),)
+SOURCES := $(filter-out src/codecs/hevc/% src/codecs/hevc_decoder.cpp,$(SOURCES))
+endif
+OBJS = $(addprefix $(OBJDIR)/,$(addsuffix .o,$(basename $(SOURCES))))
 EXE = ndvideo
-TNS = _$(EXE).tns
+TNS = _$(EXE)$(CODEC_SUFFIX).tns
 DISTDIR = dist
+RELEASEDIR = release
+ELF = $(OBJDIR)/$(EXE).elf
+ZEHN = $(OBJDIR)/$(EXE).zehn
+PLAYER = $(OBJDIR)/$(TNS)
 LEGACY_OBJS = src/player.o
+RELEASE_VARIANTS = h264 mpeg4 hevc h264-mpeg4 h264-hevc mpeg4-hevc h264-mpeg4-hevc
+RELEASE_TARGETS = $(addprefix release-,$(RELEASE_VARIANTS))
 
-.PHONY: all clean
+.PHONY: all clean release $(RELEASE_TARGETS)
 
-all: $(DISTDIR)/$(TNS)
-
-%.o: %.c
-	$(GCC) $(if $(filter $(FAST_SRCS),$<),$(FAST_GCCFLAGS),$(GCCFLAGS)) $(if $(filter src/codecs/xvid/%,$<),-Wno-incompatible-pointer-types,-Werror=incompatible-pointer-types) -MMD -MP -c $< -o $@
-
-%.o: %.cpp
-	$(GXX) $(GCCFLAGS) -MMD -MP -c $< -o $@
-
-%.o: %.S
-	$(AS) -c $< -o $@
-
-$(DISTDIR)/$(EXE).elf: $(OBJS)
+all: $(PLAYER)
 	mkdir -p $(DISTDIR)
-	$(LD) $^ -o $@ $(LDFLAGS)
+	cp "$(PLAYER)" "$(DISTDIR)/$(TNS)"
+	cp "$(ELF)" "$(DISTDIR)/$(EXE)$(CODEC_SUFFIX).elf"
+	cp "$(ZEHN)" "$(DISTDIR)/$(EXE)$(CODEC_SUFFIX).zehn"
+
+$(OBJDIR)/%.o: %.c Makefile
+	mkdir -p $(dir $@)
+	$(GCC) $(if $(filter $(FAST_SRCS),$<),$(FAST_GCCFLAGS),$(GCCFLAGS)) $(CODEC_FLAGS) $(if $(filter src/codecs/xvid/%,$<),-Wno-incompatible-pointer-types,-Werror=incompatible-pointer-types) -MMD -MP -c $< -o $@
+
+HEVC_GXXFLAGS = $(filter-out -std=c99,$(FAST_GCCFLAGS)) -std=c++11 -fno-exceptions -fno-rtti \
+    -DLIBDE265_STATIC_BUILD -DHAVE_STDINT_H -DHAVE_ALLOCA_H -Isrc/codecs/hevc
+
+$(OBJDIR)/%.o: %.cpp Makefile
+	mkdir -p $(dir $@)
+	$(GXX) $(HEVC_GXXFLAGS) $(CODEC_FLAGS) -MMD -MP -c $< -o $@
+
+$(OBJDIR)/%.o: %.S Makefile
+	mkdir -p $(dir $@)
+	$(AS) $(CODEC_FLAGS) -c $< -o $@
+
+$(ELF): $(OBJS)
+	$(LD) $^ -o $@ $(LDFLAGS) $(if $(filter hevc,$(SELECTED_CODECS)),-lstdc++)
 
 $(LOADER):
 	cd $(LOADER_DIR) && $(RAW_GXX) $(LOADER_GXXFLAGS) loader.cpp -o zehn_loader.tns.elf
 	$(OBJCOPY) --set-section-flags .pad=alloc,load,contents -O binary $(LOADER_ELF) $(LOADER)
 
-$(DISTDIR)/$(TNS): $(DISTDIR)/$(EXE).elf $(LOADER)
-	$(PACKZEHN) --input $< --output "$@" --zehn-output $(DISTDIR)/$(EXE).zehn --loader $(LOADER) $(PACKFLAGS)
+$(PLAYER): $(ELF) $(LOADER) tools/pack_zehn.py
+	$(PACKZEHN) --input $< --output "$@" --zehn-output $(ZEHN) --loader $(LOADER) $(PACKFLAGS)
+
+$(RELEASE_TARGETS): release-%:
+	$(MAKE) CODECS="$(subst -, ,$*)" all
+
+release: $(RELEASE_TARGETS)
+	$(PYTHON) tools/package_release.py --dist "$(DISTDIR)" --output "$(RELEASEDIR)" --notes build/release-notes.md
 
 clean:
-	rm -f $(OBJS) $(LEGACY_OBJS) "$(DISTDIR)/$(TNS)" $(DISTDIR)/$(EXE).elf $(DISTDIR)/$(EXE).zehn
+	rm -f $(OBJS) $(LEGACY_OBJS) $(PLAYER) $(ELF) $(ZEHN) "$(DISTDIR)/$(TNS)" $(DISTDIR)/$(EXE)$(CODEC_SUFFIX).elf $(DISTDIR)/$(EXE)$(CODEC_SUFFIX).zehn
 	rm -f $(OBJS:.o=.d)
 
 -include $(OBJS:.o=.d)

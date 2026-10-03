@@ -12,7 +12,9 @@ and codec open/reset/destroy/decode dispatch now goes through `MovieCodecOps`.
 - `platform_debug.c`: platform/display hooks, debug logging, clocks, and path helpers
 - `input_timing_memory.c`: pointer input, hover guards, memory stats, and frame timing
 - `movie_resources.c`: movie lifetime, fonts, SRAM, and codec global init
-- `codec_streaming.c`: chunk loading, prefetch, H.264/MPEG-4 decode, and seek preview decode
+- `codec_streaming.c`: chunk loading, prefetch, color conversion, and seek preview decode
+- `hevc_playback.c`: HEVC input and incremental decoder integration
+- `video_lookahead.c`: shared H.264/HEVC decode-ahead queue
 - `movie_open_scan.c`: `.nvp` opening, subtitle loading, file scanning, and picker cache model
 - `subtitles.c`: subtitle layout, wrapping, caching, and drawing
 - `render_primitives.c`: RGB565 drawing primitives, theme palette, panels, text metrics, and video rects
@@ -22,7 +24,8 @@ and codec open/reset/destroy/decode dispatch now goes through `MovieCodecOps`.
 - `picker_loop.c`: interactive movie picker loop
 - `resume_prompt.c`: resume prompt drawing and selection
 - `playback_loop.c`: movie playback loop
+- `playback_seek.c`: resumable seeks and input during catch-up
 
 The split is intentionally conservative: behavior-facing code stayed close to
 the original ordering, while common movie state moved to `src/movie/movie.h`
-and codec-specific state lives behind the H.264 and MPEG-4 decoder contexts.
+and codec-specific state lives behind the H.264, HEVC and MPEG-4 decoder contexts.

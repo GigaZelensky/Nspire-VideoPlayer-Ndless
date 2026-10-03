@@ -11,11 +11,11 @@ static void playback_phase(const Movie *movie,unsigned phase,bool paused,const P
     player_crash_trace_tick(movie,phase,paused,rate);
 }
 
-/* 1: committed for scheduled rendering, 2: prepared but an input-interrupted
+/* 1: committed for scheduled rendering, 2: decoding is pending or an input-interrupted
  * wait returned early, 0: use ordinary decoding/recovery. Keep
  * current_frame and the framebuffer on the visible image until the deadline;
  * the caller can still render pointer/chrome changes after an early return. */
-static int prepare_h264_presentation(Movie *movie, uint32_t target_frame,
+static int prepare_video_presentation(Movie *movie, uint32_t target_frame,
     uint64_t due_ticks, uint64_t interval_ticks, const PointerState *pointer,
     bool paused, const PlaybackRate *playback_rate, uint32_t *decode_elapsed_ms)
 {
@@ -25,10 +25,12 @@ static int prepare_h264_presentation(Movie *movie, uint32_t target_frame,
     int ready;
     *decode_elapsed_ms = 0;
     playback_phase(movie, PLAYER_CRASH_DECODE, paused, playback_rate);
-    ready = h264_lookahead_prepare_target(movie, target_frame);
+    ready = video_lookahead_prepare_target(movie, target_frame);
     prepared = monotonic_clock_now_ticks();
     if (capture) playback_capture_stage(movie, CAPTURE_DECODE, started, prepared);
     *decode_elapsed_ms = monotonic_clock_ticks_to_ms(prepared - started);
+    if (movie->codec == MOVIE_CODEC_HEVC) movie->foreground_pending_ticks += prepared - started;
+    if (ready == 2) return 2;
     if (ready <= 0) return 0;
 
     if (prepared < due_ticks) {
@@ -42,7 +44,7 @@ static int prepare_h264_presentation(Movie *movie, uint32_t target_frame,
     }
     /* Background work can fail/cancel a later image during the wait. Preserve
      * the ordinary decoder's existing reload/recovery path in that case. */
-    if (!h264_lookahead_active(movie) || !h264_lookahead_queued(movie)) return 0;
+    if (!video_lookahead_active(movie) || !video_lookahead_queued(movie)) return 0;
     started = monotonic_clock_now_ticks();
     if (started < due_ticks) return 2;
 
@@ -54,10 +56,11 @@ static int prepare_h264_presentation(Movie *movie, uint32_t target_frame,
         started = monotonic_clock_now_ticks();
         playback_capture_stage(movie, CAPTURE_BOOKKEEPING, setup_started, started);
     }
-    if (!h264_lookahead_take(movie, target_frame)) return 0;
+    if (!video_lookahead_take(movie, target_frame)) return 0;
     prepared = monotonic_clock_now_ticks();
     if (capture) playback_capture_stage(movie, CAPTURE_DECODE, started, prepared);
     *decode_elapsed_ms += monotonic_clock_ticks_to_ms(prepared - started);
+    if (movie->codec == MOVIE_CODEC_HEVC) movie->foreground_pending_ticks += prepared - started;
     return 1;
 }
 
@@ -279,6 +282,7 @@ int play_movie(
     int startup_history_index = -1;
     bool startup_has_resume = false;
     bool resume_prompt_returned = false;
+    PlaybackSeek seek = {0};
     int32_t pending_seek_ms = 0;
     uint32_t pending_seek_commit_at_ms = 0;
     int32_t seek_badge_ms = 0;
@@ -350,7 +354,7 @@ int play_movie(
     static bool decoder_platform_attempted;
     if (!decoder_platform_attempted) {
         decoder_platform_attempted = true;
-        if (sram_init() && sram_uses_native_clone()) h264bsdInitSramTables();
+        if (sram_init() && sram_uses_native_clone() && NDVIDEO_WITH_H264) h264bsdInitSramTables();
     }
     cleanup_deferred_playback_movie();
     loading_progress_tick(&loading_progress, false);
@@ -464,7 +468,7 @@ int play_movie(
                 decode_to_frame(&movie, 0);
             }
         } else {
-            if (resume_without_prompt && !decode_to_frame(&movie, resume_frame)) {
+            if (resume_without_prompt && !decode_to_frame_loading(&movie, resume_frame, &loading_progress)) {
                 finish_loading_transition(screen, &loading_snapshot, fonts, "Loading");
                 report_movie_decode_failure(&movie, path, "direct resume");
                 destroy_movie(&movie);
@@ -515,8 +519,8 @@ int play_movie(
     tab_hold_repeat_interval_ms = tab_hold_frame_repeat_interval_ms(&movie);
     /* Start cooperative reads before filling the decoded-frame reserve. */
     movie_async_start(&movie, path);
-    movie.lookahead_enabled=movie_uses_h264(&movie);
-    if(movie.lookahead_enabled && !h264_lookahead_begin(&movie))movie.lookahead_enabled=false;
+    movie.lookahead_enabled=movie_uses_decode_ahead(&movie);
+    if(movie.lookahead_enabled && !video_lookahead_begin(&movie))movie.lookahead_enabled=false;
     player_crash_trace_begin(&movie, path, paused, playback_rate_for_index(playback_rate_index));
     if (!resume_prompt_returned) {
         prefetch_tick(&movie, true, 1000, NULL);
@@ -592,6 +596,8 @@ int play_movie(
         uint64_t capture_input_started = capture_input ? monotonic_clock_now_ticks() : 0;
         if (capture_input) playback_capture_tick(&movie, capture_input_started, paused || help_menu_open || g_display_power_state.off);
         bool scheduled_frame_advanced = false;
+        bool hevc_decode_pending = false;
+        bool seek_work = false;
         bool touchpad_click = pointer_update(&pointer);
         if (clock_menu_poll(screen, fonts, &movie, &pointer, false, path)) {
             prev_esc = isKeyPressed(KEY_NSPIRE_ESC); prev_enter = isKeyPressed(KEY_NSPIRE_ENTER);
@@ -1010,7 +1016,7 @@ int play_movie(
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             show_ui = true;
         }
-        if (!pointer_click) {
+        if (!pointer_click && !seek.preview_pending) {
             bool allow_seek_preview = paused && show_ui && !help_menu_open;
             if (allow_seek_preview) {
                 update_seek_bar_preview(&movie, &seek_preview, &pointer, allow_seek_preview, now_ms);
@@ -1023,7 +1029,7 @@ int play_movie(
                     clear_seek_bar_preview(&seek_preview);
                 }
             }
-        } else {
+        } else if (pointer_click && !seek.preview_pending) {
             seek_preview.over_bar = false;
             if (!(show_ui && pointer.y >= SCREEN_H - UI_BAR_H && pointer.y < SCREEN_H)) {
                 clear_seek_bar_preview_decode_job(&seek_preview);
@@ -1061,7 +1067,7 @@ int play_movie(
                 next_seek_ms = seek_limit_ms;
             }
             pending_seek_ms = (int32_t) next_seek_ms;
-            pending_seek_commit_at_ms = now_ms + SEEK_STACK_DELAY_MS;
+            pending_seek_commit_at_ms = seek.active ? now_ms : now_ms + SEEK_STACK_DELAY_MS;
             if (pending_seek_ms != 0) {
                 if (previous_pending_seek_ms == 0 ||
                     seek_badge_ms == 0 ||
@@ -1080,113 +1086,27 @@ int play_movie(
             ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (pending_seek_ms != 0 &&
-            seek_delta_ms == 0 &&
-            !seek_left_down &&
-            !seek_right_down &&
-            (now_ms >= pending_seek_commit_at_ms || tab_edge || pointer_click)) {
+            (seek.active || (seek_delta_ms == 0 && !seek_left_down && !seek_right_down &&
+                (now_ms >= pending_seek_commit_at_ms || tab_edge || pointer_click)))) {
             uint32_t target_frame;
-            uint32_t seek_render_now_ms;
-            CommittedSeekRenderContext seek_context;
-
             pending_seek_consumed_click = pointer_click;
-            show_ui = true;
-            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
-            seek_badge_ms = pending_seek_ms;
-            seek_badge_hide_elapsed_ms = 0;
-            seek_render_now_ms = monotonic_clock_now_ms();
-            clear_seek_bar_preview(&seek_preview);
-            if (!seek_delta_target_frame(&movie, pending_seek_ms, &target_frame)) {
+            if (!playback_seek_relative_target(&movie, &seek, pending_seek_ms, &target_frame)) {
                 report_movie_decode_failure(&movie, path, "seek");
                 result = -1;
                 break;
             }
-            memset(&seek_context, 0, sizeof(seek_context));
-            seek_context.screen = screen;
-            seek_context.fonts = fonts;
-            seek_context.paused = paused;
-            seek_context.show_ui = true;
-            seek_context.scale_mode = scale_mode;
-            seek_context.scale_morph = &scale_morph;
-            seek_context.video_align_x = video_align_x;
-            seek_context.video_align_y = video_align_y;
-            seek_context.playback_rate = playback_rate;
-            seek_context.memory_overlay_mode = memory_overlay_mode;
-            seek_context.subtitle_cache = &subtitle_cache;
-            seek_context.subtitle_font_index = subtitle_font_index;
-            seek_context.subtitle_font_overlay_visible = seek_render_now_ms <= subtitle_font_overlay_until;
-            seek_context.subtitle_size = subtitle_size;
-            seek_context.subtitle_placement = subtitle_placement;
-            seek_context.movie_title_text = playback_title;
-            seek_context.movie_detail_text = playback_detail;
-            seek_context.status_overlay_text = status_overlay_text;
-            seek_context.status_overlay_started_ms = status_overlay_started_ms;
-            seek_context.status_overlay_until_ms = status_overlay_until;
-            seek_context.screenshot_preview = &screenshot_preview;
-            seek_context.seek_preview = &seek_preview;
-            seek_context.pointer = &pointer;
-            seek_context.pending_seek_ms = pending_seek_ms;
-            seek_context.seek_badge_ms = seek_badge_ms;
-            seek_context.seek_badge_started_ms = seek_badge_started_ms;
-            seek_context.seek_badge_hide_elapsed_ms = seek_badge_hide_elapsed_ms;
-            seek_context.ui_transitions = &ui_transitions;
-            seek_context.ui_mixes = &ui_mixes;
-            seek_context.playback_press_target = playback_press_target;
-            seek_context.playback_press_active =
-                playback_pause_key_press_active ||
-                playback_pointer_press_active ||
-                (playback_press_target == PLAYBACK_PRESS_PLAY && enter_down) ||
-                ui_time_before(seek_render_now_ms, playback_badge_press_until_ms);
-            seek_context.scale_press_active =
-                divide_down ||
-                (playback_press_target == PLAYBACK_PRESS_SCALE && enter_down) ||
-                ui_time_before(seek_render_now_ms, scale_badge_press_until_ms);
-            seek_context.speed_press_active =
-                speed_key_down ||
-                (playback_press_target == PLAYBACK_PRESS_SPEED && enter_down) ||
-                ui_time_before(seek_render_now_ms, speed_badge_press_until_ms);
-            seek_context.title_strip_active =
-                !help_menu_open &&
-                pointer.visible &&
-                pointer.y < PLAYBACK_TITLE_TOP_EDGE_PX;
-            seek_context.abort_on_input = true;
-            playback_key_snapshot_init(&seek_context.abort_key_snapshot);
-            seek_context.target_frame = target_frame;
-            playback_phase(&movie, PLAYER_CRASH_SEEK, paused, playback_rate);
-            if (!decode_to_frame_with_progress(
-                    &movie,
-                    target_frame,
-                    should_publish_committed_seek_frame,
-                    render_committed_seek_frame,
-                    &seek_context,
-                    &seek_context.abort_requested)) {
-                if (seek_context.abort_requested) {
-                    uint32_t abort_now_ms = monotonic_clock_now_ms();
-
-                    pending_seek_ms = 0;
-                    pending_seek_commit_at_ms = 0;
-                    seek_badge_hide_elapsed_ms = seek_badge_ms != 0 ? SEEK_BADGE_HIDE_PENDING : 0;
-                    reset_playback_timeline(
-                        &movie,
-                        playback_rate,
-                        &playback_anchor_ticks,
-                        &playback_anchor_frame,
-                        &next_frame_due_ticks
-                    );
-                    show_ui = true;
-                    ui_visible_until = abort_now_ms + POINTER_UI_TIMEOUT_MS;
-                    continue;
-                }
-                report_movie_decode_failure(&movie, path, "seek");
-                result = -1;
-                break;
-            }
+            if (!seek.preview_pending) clear_seek_bar_preview(&seek_preview);
+            playback_seek_request(&seek, target_frame, -1, &paused);
+            pause_icon_only = false;
+            ui_transition_update(&ui_transitions.pause_indicator, false, now_ms, UI_CHROME_ANIM_MS);
             hover_preview_needs_rebuffer = false;
             seek_badge_ms = pending_seek_ms;
-            seek_badge_hide_elapsed_ms = SEEK_BADGE_HIDE_PENDING;
+            seek_badge_hide_elapsed_ms = 0;
             pending_seek_ms = 0;
             pending_seek_commit_at_ms = 0;
             reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
             show_ui = true;
+            ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
         }
         if (pending_seek_consumed_click) {
             pointer_click = false;
@@ -1774,108 +1694,16 @@ int play_movie(
             if (pointer_click && show_ui_before_pointer_activation && pointer.y >= SCREEN_H - UI_BAR_H && pointer.y < SCREEN_H) {
                 int seek_marker_x = progress_bar_marker_x_from_pointer(&bar, pointer.x);
                 uint32_t target_frame;
-                uint32_t seek_render_now_ms;
-                CommittedSeekRenderContext seek_context;
-                bool used_preview_frame = false;
-
-                seek_render_now_ms = monotonic_clock_now_ms();
                 if (!progress_bar_target_frame_for_marker(&movie, &bar, seek_marker_x, &target_frame, NULL)) {
                     report_movie_decode_failure(&movie, path, "pointer seek");
                     result = -1;
                     break;
                 }
-                if (target_frame == movie.current_frame) {
-                    clear_seek_bar_preview(&seek_preview);
-                    suppress_seek_bar_preview_rebuild(&seek_preview, seek_marker_x, target_frame);
-                } else {
-                    memset(&seek_context, 0, sizeof(seek_context));
-                    seek_context.screen = screen;
-                    seek_context.fonts = fonts;
-                    seek_context.paused = paused;
-                    seek_context.show_ui = true;
-                    seek_context.scale_mode = scale_mode;
-                    seek_context.scale_morph = &scale_morph;
-                    seek_context.video_align_x = video_align_x;
-                    seek_context.video_align_y = video_align_y;
-                    seek_context.playback_rate = playback_rate;
-                    seek_context.memory_overlay_mode = memory_overlay_mode;
-                    seek_context.subtitle_cache = &subtitle_cache;
-                    seek_context.subtitle_font_index = subtitle_font_index;
-                    seek_context.subtitle_font_overlay_visible = seek_render_now_ms <= subtitle_font_overlay_until;
-                    seek_context.subtitle_size = subtitle_size;
-                    seek_context.subtitle_placement = subtitle_placement;
-                    seek_context.movie_title_text = playback_title;
-                    seek_context.movie_detail_text = playback_detail;
-                    seek_context.status_overlay_text = status_overlay_text;
-                    seek_context.status_overlay_started_ms = status_overlay_started_ms;
-                    seek_context.status_overlay_until_ms = status_overlay_until;
-                    seek_context.screenshot_preview = &screenshot_preview;
-                    seek_context.seek_preview = &seek_preview;
-                    seek_context.pointer = &pointer;
-                    seek_context.pending_seek_ms = 0;
-                    seek_context.seek_badge_ms = seek_badge_ms;
-                    seek_context.seek_badge_started_ms = seek_badge_started_ms;
-                    seek_context.seek_badge_hide_elapsed_ms = seek_badge_hide_elapsed_ms;
-                    seek_context.ui_transitions = &ui_transitions;
-                    seek_context.ui_mixes = &ui_mixes;
-                    seek_context.playback_press_target = playback_press_target;
-                    seek_context.playback_press_active =
-                        playback_pause_key_press_active ||
-                        playback_pointer_press_active ||
-                        (playback_press_target == PLAYBACK_PRESS_PLAY && enter_down) ||
-                        ui_time_before(seek_render_now_ms, playback_badge_press_until_ms);
-                    seek_context.scale_press_active =
-                        divide_down ||
-                        (playback_press_target == PLAYBACK_PRESS_SCALE && enter_down) ||
-                        ui_time_before(seek_render_now_ms, scale_badge_press_until_ms);
-                    seek_context.speed_press_active =
-                        speed_key_down ||
-                        (playback_press_target == PLAYBACK_PRESS_SPEED && enter_down) ||
-                        ui_time_before(seek_render_now_ms, speed_badge_press_until_ms);
-                    seek_context.title_strip_active =
-                        !help_menu_open &&
-                        pointer.visible &&
-                        pointer.y < PLAYBACK_TITLE_TOP_EDGE_PX;
-                    seek_context.abort_on_input = true;
-                    playback_key_snapshot_init(&seek_context.abort_key_snapshot);
-                    seek_context.target_frame = target_frame;
-                    playback_phase(&movie, PLAYER_CRASH_SEEK, paused, playback_rate);
-                    used_preview_frame = commit_seek_bar_preview_to_movie(&movie, &seek_preview, target_frame);
-                    clear_seek_bar_preview(&seek_preview);
-                    suppress_seek_bar_preview_rebuild(&seek_preview, seek_marker_x, target_frame);
-                    if (used_preview_frame) {
-                        render_committed_seek_frame(&movie, movie.current_frame, &seek_context);
-                    }
-                    if ((!used_preview_frame || movie.current_frame != target_frame) &&
-                        !decode_to_frame_with_progress(
-                            &movie,
-                            target_frame,
-                            should_publish_committed_seek_frame,
-                            render_committed_seek_frame,
-                            &seek_context,
-                            &seek_context.abort_requested)) {
-                        if (seek_context.abort_requested) {
-                            uint32_t abort_now_ms = monotonic_clock_now_ms();
-
-                            hover_preview_needs_rebuffer = false;
-                            reset_playback_timeline(
-                                &movie,
-                                playback_rate,
-                                &playback_anchor_ticks,
-                                &playback_anchor_frame,
-                                &next_frame_due_ticks
-                            );
-                            show_ui = true;
-                            ui_visible_until = abort_now_ms + POINTER_UI_TIMEOUT_MS;
-                            continue;
-                        }
-                        report_movie_decode_failure(&movie, path, "pointer seek");
-                        result = -1;
-                        break;
-                    }
-                    hover_preview_needs_rebuffer = false;
-                    reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
-                }
+                playback_seek_request(&seek, target_frame, seek_marker_x, &paused);
+                pause_icon_only = false;
+                ui_transition_update(&ui_transitions.pause_indicator, false, now_ms, UI_CHROME_ANIM_MS);
+                hover_preview_needs_rebuffer = false;
+                reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             } else if (pointer_click) {
                 bool was_paused = paused;
@@ -1905,6 +1733,18 @@ int play_movie(
                 ui_visible_until = now_ms + POINTER_UI_TIMEOUT_MS;
             }
         }
+        if (seek.active && (!paused || movie.current_frame == seek.target_frame)) {
+            seek_work = true;
+            playback_phase(&movie, PLAYER_CRASH_SEEK, paused, playback_rate);
+            if (!playback_seek_step(&movie, &seek, &seek_preview, &paused)) {
+                report_movie_decode_failure(&movie, path, "seek");
+                result = -1;
+                break;
+            }
+            reset_playback_timeline(&movie, playback_rate, &playback_anchor_ticks, &playback_anchor_frame, &next_frame_due_ticks);
+            if (!seek.active && seek_badge_ms != 0)
+                seek_badge_hide_elapsed_ms = SEEK_BADGE_HIDE_PENDING;
+        }
         if (restart_after_pause) {
             if (!playback_badge_press_triggered) {
                 trigger_playback_badge_press(&ui_transitions, &playback_badge_press_until_ms, now_ms);
@@ -1926,7 +1766,7 @@ int play_movie(
             capture_settings.night_percent = (uint8_t) night_mode_percent();
             playback_capture_state(&movie, &capture_settings, monotonic_clock_now_ticks());
         }
-        if (!paused && frame_interval_ticks > 0) {
+        if (!seek_work && !seek.active && !paused && frame_interval_ticks > 0) {
             now_ticks = monotonic_clock_now_ticks();
             uint64_t scaled_interval = movie_frame_time_scaled_ticks(&movie, 1, playback_rate);
             /* Keep the final frame for its full interval before repeat,
@@ -1934,23 +1774,24 @@ int play_movie(
              * ahead at that boundary. */
             uint64_t decode_due = (realtime_frame_skip || movie.current_frame + 1U >= movie.header.frame_count) ? next_frame_due_ticks :
                 playback_decode_due(next_frame_due_ticks, scaled_interval, monotonic_clock_ticks_per_second(),
-                    movie.h264.foreground_decode_peak_ms);
+                    movie.foreground_decode_peak_ms);
             if (now_ticks >= decode_due) {
                 uint64_t elapsed_ticks = now_ticks - playback_anchor_ticks;
                 uint32_t frames_to_advance = movie_frames_from_scaled_ticks(&movie, elapsed_ticks, playback_rate);
                 uint32_t target_frame = playback_anchor_frame + frames_to_advance;
+                bool finishing_realtime = video_lookahead_pending_realtime_target(&movie, &target_frame);
                 bool lagged = false;
                 uint32_t lag_frames = 0;
                 uint32_t late_ms = 0;
 
                 /* The decoder may run ahead of the display clock. Smooth
                  * playback always prepares exactly the next frame. */
-                if (!realtime_frame_skip && target_frame <= movie.current_frame)
+                if (!realtime_frame_skip && !finishing_realtime && target_frame <= movie.current_frame)
                     target_frame = movie.current_frame + 1U;
 
                 if (target_frame > movie.current_frame + 1U) {
                     lag_frames = target_frame - (movie.current_frame + 1U);
-                    if (!realtime_frame_skip) {
+                    if (!realtime_frame_skip && !finishing_realtime) {
                         target_frame = movie.current_frame + 1U;
                     }
                     lagged = true;
@@ -2004,7 +1845,8 @@ int play_movie(
                 } else {
                     bool waiting_for_presentation = false;
                     if (target_frame > movie.current_frame) {
-                        uint32_t decode_start_ms = monotonic_clock_now_ms();
+                        uint64_t foreground_started = monotonic_clock_now_ticks();
+                        uint32_t decode_start_ms = monotonic_clock_ticks_to_ms(foreground_started);
                         uint32_t decode_elapsed_ms = 0;
                         bool capture_decode = playback_capture_active(&movie);
                         uint64_t capture_decode_started = 0;
@@ -2017,8 +1859,8 @@ int play_movie(
                                 &movie, target_frame - playback_anchor_frame + 1U, playback_rate);
                         }
                         int prepared = 0;
-                        if (!realtime_frame_skip && h264_lookahead_active(&movie)) {
-                            prepared = prepare_h264_presentation(&movie, target_frame,
+                        if (!realtime_frame_skip && !finishing_realtime && video_lookahead_active(&movie)) {
+                            prepared = prepare_video_presentation(&movie, target_frame,
                                 capture_due, capture_next_due - capture_due, &pointer,
                                 paused, playback_rate, &decode_elapsed_ms);
                             waiting_for_presentation = prepared == 2;
@@ -2032,8 +1874,9 @@ int play_movie(
                                 playback_capture_stage(&movie, CAPTURE_BOOKKEEPING, capture_setup_started, capture_decode_started);
                             }
                             playback_phase(&movie, PLAYER_CRASH_DECODE, paused, playback_rate);
-                            int realtime_ready = realtime_frame_skip
-                                ? h264_lookahead_finish_realtime_target(&movie, target_frame) : 0;
+                            int realtime_ready = (realtime_frame_skip || finishing_realtime)
+                                ? video_lookahead_finish_realtime_target(&movie, target_frame) : 0;
+                            if (realtime_ready == 2) waiting_for_presentation = true;
                             if (realtime_ready <= 0 && !decode_to_frame(&movie, target_frame)) {
                                 if (capture_decode) playback_capture_stage(&movie, CAPTURE_DECODE, capture_decode_started, monotonic_clock_now_ticks());
                                 report_movie_decode_failure(&movie, path, "playback advance");
@@ -2042,13 +1885,24 @@ int play_movie(
                             }
                             if (capture_decode) playback_capture_stage(&movie, CAPTURE_DECODE, capture_decode_started, monotonic_clock_now_ticks());
                             decode_elapsed_ms = monotonic_clock_now_ms() - decode_start_ms;
+                            if (movie.codec == MOVIE_CODEC_HEVC)
+                                movie.foreground_pending_ticks += monotonic_clock_now_ticks() - foreground_started;
                         }
                         scheduled_frame_advanced = !waiting_for_presentation;
+                        hevc_decode_pending = movie.codec == MOVIE_CODEC_HEVC &&
+                            waiting_for_presentation && !video_lookahead_queued(&movie);
+                        if (capture_decode && movie.codec == MOVIE_CODEC_HEVC && waiting_for_presentation)
+                            playback_capture_defer_frame(&movie);
+                        if (movie.codec == MOVIE_CODEC_HEVC) {
+                            decode_elapsed_ms = scheduled_frame_advanced
+                                ? monotonic_clock_ticks_to_ms(movie.foreground_pending_ticks) : 0;
+                            if (scheduled_frame_advanced) movie.foreground_pending_ticks = 0;
+                        }
                         if (scheduled_frame_advanced || decode_elapsed_ms) {
                             if (debug_should_collect_metrics()) {
                                 movie.diag_foreground_decode_count++;
                             }
-                            record_h264_foreground_decode_time(&movie, decode_elapsed_ms);
+                            record_foreground_decode_time(&movie, decode_elapsed_ms);
                         }
                         if (debug_is_runtime_logging_enabled() && !playback_capture_active(&movie) &&
                             (decode_elapsed_ms >= DEBUG_TRACE_FOREGROUND_MS || lagged)) {
@@ -2156,7 +2010,10 @@ int play_movie(
                 (render_status_visible && playback_timed_badge_animating(render_now_ms,
                     status_overlay_started_ms, status_overlay_until, STATUS_BADGE_ANIM_MS, STATUS_BADGE_EXIT_ANIM_MS)) ||
                 seek_preview_surface_animating(&seek_preview, render_now_ms) ||
-                pending_seek_ms || seek_badge_ms || seek_bar_preview_decode_active(&seek_preview);
+                pending_seek_ms ||
+                (seek_badge_ms && (seek_badge_hide_elapsed_ms != 0U ||
+                    (uint32_t)(render_now_ms - seek_badge_started_ms) < SEEK_BADGE_ANIM_MS)) ||
+                seek_bar_preview_decode_active(&seek_preview);
             bool collect_render_metrics = debug_should_collect_metrics();
             uint32_t render_night_revision = night_mode_revision();
             bool render_pointer_changed = pointer_click || pointer_release_edge ||
@@ -2202,10 +2059,15 @@ int play_movie(
             }
             bool defer_ui_render = playback_defer_ui_render(&render_gate, movie.current_frame,
                 monotonic_clock_now_ticks(), next_frame_due_ticks, monotonic_clock_ticks_per_second(),
-                !paused && !help_menu_open && !realtime_frame_skip && frame_interval_ticks > 0,
+                !seek_work && !seek.active && !paused && !help_menu_open && !realtime_frame_skip && frame_interval_ticks > 0,
                 scheduled_frame_advanced || take_screenshot || seek_delta_ms || pending_seek_ms ||
                     on_edge || woke_from_idle_off ||
                     g_display_power_state.off || g_display_power_state.off_fade_active);
+            /* An overdue HEVC picture can span several input turns. Keep
+             * cursor/chrome animations responsive while preserving the last
+             * complete image; limit these extra LCD copies to normal UI rate. */
+            if (hevc_decode_pending && (uint32_t)(render_now_ms - render_gate.presented_ms) >= 16U)
+                defer_ui_render = false;
             if (!defer_ui_render && playback_render_needed(&render_gate, movie.current_frame, render_now_ms,
                     render_input_changed || take_screenshot, render_effects)) {
                 playback_phase(&movie, PLAYER_CRASH_RENDER, paused, playback_rate);
@@ -2311,7 +2173,7 @@ int play_movie(
             bool paused_input_grace = paused && ui_time_before(idle_now_ms, paused_ui_quiet_until_ms);
             bool playback_input_grace = ui_time_before(idle_now_ms, playback_input_prefetch_quiet_until_ms);
 
-            if (paused && !paused_input_grace && !playback_input_grace && seek_bar_preview_decode_active(&seek_preview)) {
+            if (paused && !seek.active && !paused_input_grace && !playback_input_grace && seek_bar_preview_decode_active(&seek_preview)) {
                 step_seek_bar_preview_decode(
                     &movie,
                     &seek_preview,
@@ -2329,7 +2191,7 @@ int play_movie(
                 playback_input_grace
             );
 
-            if (!paused_ui_busy) {
+            if (!paused_ui_busy && !seek.active) {
                 playback_phase(&movie, PLAYER_CRASH_PREFETCH, paused, playback_rate);
                 uint64_t capture_prefetch_started = playback_capture_active(&movie) ? monotonic_clock_now_ticks() : 0;
                 prefetch_tick(&movie, true, 1000, &pointer);
@@ -2344,8 +2206,8 @@ int play_movie(
             {
                 uint64_t capture_wait_started = playback_capture_active(&movie) ? monotonic_clock_now_ticks() : 0;
                 playback_phase(&movie, PLAYER_CRASH_WAIT, paused, playback_rate);
-                if (paused && !paused_ui_busy && !help_menu_open && !g_display_power_state.off &&
-                    h264_lookahead_active(&movie) && h264_lookahead_queued(&movie) < 8U) {
+                if (paused && !seek.active && !paused_ui_busy && !help_menu_open && !g_display_power_state.off &&
+                    video_lookahead_active(&movie) && video_lookahead_queued(&movie) < 8U) {
                     /* Use the existing quiet pause interval to prepare a small
                      * reserve. Lookahead owns separate pixels: the paused image
                      * stays unchanged, and its wait still responds to input.
@@ -2358,12 +2220,12 @@ int play_movie(
                 }
                 if (playback_capture_active(&movie)) playback_capture_stage(&movie, CAPTURE_WAIT, capture_wait_started, monotonic_clock_now_ticks());
             }
-        } else {
+        } else if (!seek.active && !seek_work) {
             uint64_t after_render_ticks = monotonic_clock_now_ticks();
             uint64_t work_due_ticks = (realtime_frame_skip || movie.current_frame + 1U >= movie.header.frame_count) ? next_frame_due_ticks :
                 playback_decode_due(next_frame_due_ticks,
                     movie_frame_time_scaled_ticks(&movie, 1, playback_rate), monotonic_clock_ticks_per_second(),
-                    movie.h264.foreground_decode_peak_ms);
+                    movie.foreground_decode_peak_ms);
             uint64_t spare_ticks = work_due_ticks > after_render_ticks ? (work_due_ticks - after_render_ticks) : 0;
             uint32_t spare_ms = monotonic_clock_ticks_to_ms(spare_ticks);
             uint64_t wait_target_ticks = work_due_ticks;
@@ -2465,4 +2327,3 @@ int play_movie(
     }
     return result;
 }
-

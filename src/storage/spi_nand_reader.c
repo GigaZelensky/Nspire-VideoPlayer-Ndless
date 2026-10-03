@@ -139,9 +139,10 @@ SpiNandStatus spi_nand_step(SpiNandReader *r, uint32_t now, uint32_t budget)
 {
     if (!r)
         return SPI_NAND_ERROR;
-    if (r->status != SPI_NAND_PENDING)
-        return r->status;
-    if (r->phase == RESET_WAIT) {
+    /* A reset timeout reports ERROR but does not release controller ownership.
+     * Keep polling cleanup on later steps so a delayed reset can finish and
+     * restore the saved registers before another reader/writer uses the bus. */
+    if (r->phase == RESET_WAIT && !r->quiescent) {
         if (!(rd(r, CONTROL) & 0x100U)) {
             wr(r, CONTROL, r->saved_control);
             wr(r, INT_STATUS, rd(r, INT_STATUS) | 1U);
@@ -154,6 +155,8 @@ SpiNandStatus spi_nand_step(SpiNandReader *r, uint32_t now, uint32_t budget)
         }
         return r->status;
     }
+    if (r->status != SPI_NAND_PENDING)
+        return r->status;
     if ((uint32_t)(now - r->started) >= r->timeout) {
         r->error = SPI_NAND_TIMEOUT;
         if (r->quiescent)

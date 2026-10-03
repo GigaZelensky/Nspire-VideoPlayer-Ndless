@@ -1500,6 +1500,10 @@ void h264bsdInterpolateMidHorQuarter(
 
 ------------------------------------------------------------------------------*/
 
+#if defined(__arm__) && !defined(__thumb__)
+extern void ippiInterpolateLuma_H264_8u_C1R_arm(const u8 *src, int srcStride,
+    u8 *dst, int dstStride, int dx, int dy, int width, int height);
+#endif
 void h264bsdPredictSamples(
   u8 *data,
   mv_t *mv,
@@ -1544,6 +1548,16 @@ void h264bsdPredictSamples(
 
     ASSERT(lumaFracPos[xFrac][yFrac] < 16);
 
+#if defined(__arm__) && !defined(__thumb__)
+    /* The ARM kernel assumes its six-tap neighborhood is present. Keep
+     * the existing edge replication path for all border samples. */
+    if (xInt >= 2 && yInt >= 2 &&
+        (u32)xInt + partWidth + 3U <= width &&
+        (u32)yInt + partHeight + 3U <= height) {
+        ippiInterpolateLuma_H264_8u_C1R_arm(refPic->data + yInt * width + xInt,
+            width, lumaPartData, 16, xFrac, yFrac, partWidth, partHeight);
+    } else
+#endif
     switch (lumaFracPos[xFrac][yFrac])
     {
         case 0: /* G */

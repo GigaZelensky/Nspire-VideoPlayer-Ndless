@@ -137,14 +137,26 @@ typedef struct
     mv_t mvdL0[4][4];
 } subMbPred_t;
 
+/* CAVLC validates counts in [0,16]. Keep the legacy SIMD layout for its
+ * external kernels; scalar decoding uses one-byte counts, padded so the
+ * per-macroblock clears and copies remain word-sized. */
+#if defined(H264DEC_NEON) && !defined(H264DEC_OMXDL)
+typedef i16 h264bsdCoeffCount;
+#define H264BSD_COEFF_STORAGE 27
+#elif defined(H264DEC_OMXDL)
+typedef u8 h264bsdCoeffCount;
+#define H264BSD_COEFF_STORAGE 27
+#else
+typedef u8 h264bsdCoeffCount;
+#define H264BSD_COEFF_STORAGE 28
+#endif
+
 typedef struct
 {
 #ifdef H264DEC_OMXDL
     u8 posCoefBuf[27*16*3];
-    u8 totalCoeff[27];
-#else
-    i16 totalCoeff[27];
 #endif
+    h264bsdCoeffCount totalCoeff[H264BSD_COEFF_STORAGE];
     i32 level[26][16];
     u32 coeffMap[24];
 } residual_t;
@@ -168,11 +180,7 @@ typedef struct mbStorage
     i32 filterOffsetB;
     u32 qpY;
     i32 chromaQpIndexOffset;
-#ifdef H264DEC_OMXDL
-    u8 totalCoeff[27];
-#else
-    i16 totalCoeff[27];
-#endif
+    h264bsdCoeffCount totalCoeff[H264BSD_COEFF_STORAGE];
     u8 intra4x4PredMode[16];
     u32 refPic[4];
     u8* refAddr[4];

@@ -1507,6 +1507,19 @@ static bool movie_h264_local_frame_is_idr(const Movie *movie, const ChunkIndexEn
     if (!movie_h264_local_frame_bounds(movie, entry, local_index, &start, &end)) {
         return false;
     }
+    if (movie->codec == MOVIE_CODEC_HEVC) {
+        const uint8_t *data = movie->chunk_bytes + start;
+        size_t bytes = end - start;
+        for (size_t i = 0; i + 4U < bytes; ++i) {
+            if (!data[i] && !data[i+1] && data[i+2] == 1U) {
+                unsigned type = (data[i+3] >> 1U) & 63U;
+                /* A framed HEVC AU contains one picture. Its first VCL NAL
+                 * identifies IDR/non-IDR before any coded slice payload. */
+                if (type < 32U) return type == 19U || type == 20U;
+            }
+        }
+        return false;
+    }
     return h264_frame_payload_contains_idr(movie->chunk_bytes + start, end - start);
 }
 
@@ -1570,7 +1583,7 @@ static void movie_debug_frame_progress(
     *chunk_total = entry->frame_count;
     segment_end = entry->frame_count;
 
-    if (movie_uses_h264(movie) &&
+    if (movie_uses_decode_ahead(movie) &&
             movie->debug_idr_cache_valid &&
             movie->debug_idr_cache_chunk == chunk_index &&
             movie->debug_idr_cache_start_local <= local_index &&
@@ -1578,7 +1591,7 @@ static void movie_debug_frame_progress(
             movie->debug_idr_cache_end_local <= entry->frame_count) {
         segment_start = movie->debug_idr_cache_start_local;
         segment_end = movie->debug_idr_cache_end_local;
-    } else if (movie_uses_h264(movie) &&
+    } else if (movie_uses_decode_ahead(movie) &&
             movie->loaded_chunk == chunk_index &&
             movie->frame_offsets &&
             movie->chunk_bytes) {
@@ -1601,7 +1614,7 @@ static void movie_debug_frame_progress(
         movie->debug_idr_cache_chunk = chunk_index;
         movie->debug_idr_cache_start_local = segment_start;
         movie->debug_idr_cache_end_local = segment_end;
-    } else if (movie_uses_h264(movie)) {
+    } else if (movie_uses_decode_ahead(movie)) {
         /* The decoder may be in a later chunk. Keep the exact visible chunk
          * progress above, but do not invent its unavailable IDR boundaries. */
         return;
@@ -2025,8 +2038,8 @@ static uint32_t movie_decoded_buffer_end(const Movie *movie)
     if (!movie || movie->current_frame >= movie->header.frame_count)
         return 0;
     uint32_t end = movie->current_frame + 1U;
-    unsigned queued = h264_lookahead_queued(movie);
-    uint32_t next = h264_lookahead_next_frame(movie);
+    unsigned queued = video_lookahead_queued(movie);
+    uint32_t next = video_lookahead_next_frame(movie);
     if (queued && next >= queued && next - queued == end)
         end = next > movie->header.frame_count ? movie->header.frame_count : next;
     return end;
@@ -2672,106 +2685,7 @@ void render_movie(
     present_screen(screen);
 }
 
-bool should_publish_committed_seek_frame(Movie *movie, uint32_t frame_index, void *userdata)
-{
-    (void) movie;
-    (void) frame_index;
-    (void) userdata;
-    return true;
-}
-
-bool render_committed_seek_frame(Movie *movie, uint32_t frame_index, void *userdata)
-{
-    CommittedSeekRenderContext *context = (CommittedSeekRenderContext *) userdata;
-    uint32_t now_ms;
-
-    if (!context || !context->screen || !context->fonts || !movie) {
-        return true;
-    }
-
-    now_ms = monotonic_clock_now_ms();
-    if (context->abort_on_input &&
-        (playback_key_snapshot_new_press(&context->abort_key_snapshot) ||
-            playback_wait_touchpad_click_pending(context->pointer))) {
-        context->abort_requested = true;
-        return false;
-    }
-    if (context->pointer) {
-        bool pointer_click = pointer_update(context->pointer);
-
-        if (pointer_click && context->abort_on_input) {
-            context->abort_requested = true;
-            return false;
-        }
-        if (context->pointer->moved ||
-            context->pointer->down ||
-            context->pointer->press_edge ||
-            context->pointer->release_edge) {
-            context->show_ui = true;
-        }
-        context->title_strip_active =
-            context->show_ui &&
-            context->pointer->visible &&
-            context->pointer->y < PLAYBACK_TITLE_TOP_EDGE_PX;
-    }
-    movie->current_frame = frame_index;
-    update_playback_ui_mixes(
-        context->ui_transitions,
-        context->ui_mixes,
-        context->fonts,
-        movie,
-        context->scale_mode,
-        context->scale_morph,
-        context->video_align_x,
-        context->video_align_y,
-        context->playback_rate,
-        context->show_ui,
-        false,
-        context->playback_press_target,
-        context->playback_press_active,
-        context->scale_press_active,
-        context->speed_press_active,
-        context->title_strip_active,
-        context->pointer,
-        now_ms
-    );
-    render_movie(
-        context->screen,
-        context->fonts,
-        movie,
-        context->paused,
-        context->show_ui,
-        false,
-        context->scale_mode,
-        context->scale_morph,
-        context->video_align_x,
-        context->video_align_y,
-        context->playback_rate,
-        context->memory_overlay_mode,
-        context->subtitle_cache,
-        context->subtitle_font_index,
-        context->subtitle_font_overlay_visible,
-        context->subtitle_size,
-        context->subtitle_placement,
-        context->movie_title_text,
-        context->movie_detail_text,
-        context->status_overlay_text,
-        context->status_overlay_started_ms,
-        context->status_overlay_until_ms,
-        context->screenshot_preview,
-        context->seek_preview,
-        now_ms,
-        context->pointer,
-        context->pending_seek_ms,
-        context->seek_badge_ms,
-        context->seek_badge_started_ms,
-        context->seek_badge_hide_elapsed_ms,
-        context->ui_mixes
-    );
-    return true;
-}
-
-bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview, uint32_t target_frame)
+bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview, uint32_t target_frame, VideoDecodePoll poll, void *userdata)
 {
     SeekPreviewDecodeJob *job;
     const ChunkIndexEntry *entry;
@@ -2780,6 +2694,7 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
     size_t chunk_bytes_offset;
     bool is_h264;
     bool is_mpeg4;
+    bool is_hevc;
 
     if (!movie || !preview) {
         return false;
@@ -2788,7 +2703,9 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
     job = &preview->decode_job;
     is_h264 = movie_uses_h264(movie);
     is_mpeg4 = movie->codec == MOVIE_CODEC_MPEG4;
-    if ((!is_h264 && !is_mpeg4) ||
+    is_hevc = movie->codec == MOVIE_CODEC_HEVC;
+    if ((!is_h264 && !is_mpeg4 && !is_hevc) ||
+        (is_hevc && !job->hevc_decoder) ||
         (is_h264 && !job->decoder) ||
         (is_mpeg4 && !job->mpeg4_decoder) ||
         !job->chunk_storage ||
@@ -2802,7 +2719,7 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
     if (job->active && target_frame > job->target_frame) {
         job->target_frame = target_frame;
     }
-    if (job->active && !finish_seek_bar_preview_pending_frame(movie, preview)) {
+    if (job->active && !finish_seek_bar_preview_pending_frame(movie, preview, poll, userdata)) {
         return false;
     }
 
@@ -2818,19 +2735,21 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
     }
     /* Adoption replaces the decoder and compressed storage. Cancel before
      * copying the preview's picture parameters: cancellation may reset them. */
-    h264_lookahead_cancel(movie);
+    video_lookahead_cancel(movie);
     if (is_h264 && !sync_h264_picture_params(movie, job->decoder, true)) {
         return false;
     }
 
     frame_pixels = (size_t) movie->header.video_width * movie->header.video_height;
     chunk_bytes_offset = (size_t) (job->chunk_bytes - job->chunk_storage);
-    if (is_h264 && movie->h264.decoder) {
+    if (NDVIDEO_WITH_H264 && is_h264 && movie->h264.decoder) {
         if (movie->h264.decoder_initialized) {
             h264bsdShutdown(movie->h264.decoder);
         }
         h264bsdFree(movie->h264.decoder);
-    } else if (is_mpeg4 && movie->mpeg4.decoder) {
+    } else if (is_hevc && movie->hevc.decoder) {
+        player_hevc_decoder_destroy(movie->hevc.decoder);
+    } else if (NDVIDEO_WITH_MPEG4 && is_mpeg4 && movie->mpeg4.decoder) {
         mpeg4_xvid_destroy(movie->mpeg4.decoder);
     }
     release_movie_chunk_storage(movie);
@@ -2842,6 +2761,12 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
         movie->h264.decoder = job->decoder;
         movie->h264.decoder_initialized = job->decoder_initialized;
         movie->h264.decoder_failed = false;
+    } else if (is_hevc) {
+        movie->hevc.decoder = job->hevc_decoder;
+        movie->hevc.picture = NULL;
+        movie->hevc.access_unit = NULL;
+        movie->hevc.access_unit_size = 0;
+        movie->hevc.decoder_failed = false;
     } else {
         movie->mpeg4.decoder = job->mpeg4_decoder;
     }
@@ -2857,7 +2782,7 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
     movie->decoded_local_frame = (int) (decoded_frame - entry->first_frame);
     if (is_h264) {
         movie->h264.chunk_dirty = true;
-    } else {
+    } else if (is_mpeg4) {
         movie->mpeg4.chunk_dirty = true;
         movie->mpeg4.discontinuity = false;
     }
@@ -2866,6 +2791,7 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
 
     job->decoder = NULL;
     job->mpeg4_decoder = NULL;
+    job->hevc_decoder = NULL;
     job->decoder_initialized = false;
     job->chunk_storage = NULL;
     job->chunk_storage_size = 0;
@@ -2873,7 +2799,7 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
     job->chunk_bytes = NULL;
     job->chunk_size = 0;
     clear_seek_bar_preview_decode_job(preview);
-    if (movie->lookahead_enabled && !h264_lookahead_begin(movie)) movie->lookahead_enabled=false;
+    if (movie->lookahead_enabled && !video_lookahead_begin(movie)) movie->lookahead_enabled=false;
     return true;
 }
 

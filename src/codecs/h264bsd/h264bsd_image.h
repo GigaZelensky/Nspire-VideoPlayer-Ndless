@@ -58,6 +58,8 @@ typedef struct
     4. Function prototypes
 ------------------------------------------------------------------------------*/
 
+void h264bsdAddDcResidual(u8 *dst, u32 dstStride, const u8 *src, u32 srcStride, i32 dc);
+
 void h264bsdWriteMacroblock(image_t *image, u8 *data);
 
 #ifndef H264DEC_OMXDL

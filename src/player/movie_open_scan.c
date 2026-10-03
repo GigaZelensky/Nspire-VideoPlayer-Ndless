@@ -271,11 +271,12 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
     movie->codec = movie_codec_from_header(&movie->header);
     movie->codec_ops = movie_codec_ops(movie->codec);
     if (!movie->codec_ops) {
-        debug_failf(
-            "open failed: unsupported version=%u flags=0x%04x",
-            (unsigned) movie->header.version,
-            (unsigned) movie->header.flags
-        );
+        if (movie->codec != MOVIE_CODEC_UNKNOWN)
+            debug_failf("%s codec not included in this build. Use _ndvideo.tns.",
+                movie_codec_name(movie->codec));
+        else
+            debug_failf("open failed: unsupported version=%u flags=0x%04x",
+                (unsigned)movie->header.version, (unsigned)movie->header.flags);
         goto fail;
     }
     debug_tracef(
@@ -309,6 +310,7 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
         debug_failf("open failed: invalid chunk index");
         goto fail;
     }
+    movie_configure_prefetch(movie);
     debug_tracef("open index loaded chunks=%lu", (unsigned long) movie->header.chunk_count);
     loading_progress_tick(loading_progress, false);
     framebuffer_words = (size_t) movie->header.video_width * movie->header.video_height;
@@ -341,7 +343,7 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
         debug_failf("open failed: SDL surface create");
         goto fail;
     }
-    if (!decode_to_frame(movie, 0)) {
+    if (!decode_to_frame_loading(movie, 0, loading_progress)) {
         debug_tracef("open failed during initial frame decode");
         goto fail;
     }

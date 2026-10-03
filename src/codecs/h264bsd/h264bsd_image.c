@@ -144,6 +144,22 @@ void h264bsdWriteMacroblock(image_t *image, u8 *data)
 }
 #endif
 #ifndef H264DEC_OMXDL
+/* DC-only blocks add the same residual to every sample. Bias the existing
+ * clipping table once instead of expanding and loading sixteen coefficients. */
+void h264bsdAddDcResidual(u8 *dst, u32 dstStride, const u8 *src, u32 srcStride, i32 dc)
+{
+    const u8 *clip = h264bsdClip + 512 + dc;
+    u32 row;
+    for (row = 0; row < 4; ++row) {
+        dst[0] = clip[src[0]];
+        dst[1] = clip[src[1]];
+        dst[2] = clip[src[2]];
+        dst[3] = clip[src[3]];
+        dst += dstStride;
+        src += srcStride;
+    }
+}
+
 /*------------------------------------------------------------------------------
 
     Function: h264bsdWriteOutputBlocks
@@ -216,7 +232,10 @@ void h264bsdWriteOutputBlocks(image_t *image, u32 mbNum, u8 *data,
         ASSERT(!((u32)tmp&0x3));
         ASSERT(!((u32)imageBlock&0x3));
 
-        if (IS_RESIDUAL_EMPTY(pRes))
+        if (IS_RESIDUAL_DC(pRes)) {
+            h264bsdAddDcResidual(imageBlock, picWidth, tmp, 16, pRes[1]);
+        }
+        else if (IS_RESIDUAL_EMPTY(pRes))
         {
             /*lint -e826 */
             i32 *in32 = (i32*)tmp;
@@ -290,7 +309,10 @@ void h264bsdWriteOutputBlocks(image_t *image, u32 mbNum, u8 *data,
         ASSERT(!((u32)tmp&0x3));
         ASSERT(!((u32)imageBlock&0x3));
 
-        if (IS_RESIDUAL_EMPTY(pRes))
+        if (IS_RESIDUAL_DC(pRes)) {
+            h264bsdAddDcResidual(imageBlock, picWidth, tmp, 8, pRes[1]);
+        }
+        else if (IS_RESIDUAL_EMPTY(pRes))
         {
             /*lint -e826 */
             i32 *in32 = (i32*)tmp;

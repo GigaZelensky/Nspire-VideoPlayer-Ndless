@@ -22,7 +22,7 @@
 #include "playback_capture_core.h"
 #include "movie_async_io.h"
 #include "screenshot_writer.h"
-#include "h264_lookahead.h"
+#include "video_lookahead.h"
 
 #define SCREEN_W 320
 #define SCREEN_H 240
@@ -551,6 +551,9 @@ typedef struct {
     MovieCodec codec;
     storage_t *decoder;
     void *mpeg4_decoder;
+    hevc_decoder_t *hevc_decoder;
+    size_t hevc_color_row;
+    bool hevc_flat;
     bool decoder_initialized;
     bool active;
     bool complete;
@@ -589,6 +592,7 @@ typedef struct {
 } SeekBarPreviewState;
 
 typedef bool (*H264FramePublishPredicate)(Movie *movie, uint32_t frame_index, void *userdata);
+typedef bool (*VideoDecodePoll)(void *userdata);
 typedef bool (*H264DecodedFrameHook)(Movie *movie, uint32_t frame_index, void *userdata);
 
 typedef struct {
@@ -600,46 +604,15 @@ typedef struct {
     uint32_t started_ms;
 } ScaleMorphState;
 
+/* A committed seek keeps its destination across input turns. Its temporary
+ * playing/paused state is independent of the state restored at the destination. */
 typedef struct {
-    SDL_Surface *screen;
-    const Fonts *fonts;
-    bool paused;
-    bool show_ui;
-    ScaleMode scale_mode;
-    ScaleMorphState *scale_morph;
-    VideoAlign video_align_x;
-    VideoAlign video_align_y;
-    const PlaybackRate *playback_rate;
-    MemoryOverlayMode memory_overlay_mode;
-    SubtitleSurfaceCache *subtitle_cache;
-    size_t subtitle_font_index;
-    bool subtitle_font_overlay_visible;
-    int subtitle_size;
-    SubtitlePlacement subtitle_placement;
-    const char *movie_title_text;
-    const char *movie_detail_text;
-    const char *status_overlay_text;
-    uint32_t status_overlay_started_ms;
-    uint32_t status_overlay_until_ms;
-    const ScreenshotPreviewState *screenshot_preview;
-    SeekBarPreviewState *seek_preview;
-    PointerState *pointer;
-    int32_t pending_seek_ms;
-    int32_t seek_badge_ms;
-    uint32_t seek_badge_started_ms;
-    uint32_t seek_badge_hide_elapsed_ms;
-    PlaybackUiTransitions *ui_transitions;
-    PlaybackUiMixes *ui_mixes;
-    PlaybackPressTarget playback_press_target;
-    bool playback_press_active;
-    bool scale_press_active;
-    bool speed_press_active;
-    bool title_strip_active;
-    PlaybackKeySnapshot abort_key_snapshot;
-    bool abort_on_input;
-    bool abort_requested;
+    bool active;
+    bool pause_after;
+    bool preview_pending;
     uint32_t target_frame;
-} CommittedSeekRenderContext;
+    int marker_x;
+} PlaybackSeek;
 
 typedef struct {
     bool initialized;
@@ -825,7 +798,7 @@ void update_h264_incremental_rate(uint16_t *avg_mbs_per_ms_q8, uint32_t elapsed_
 uint32_t h264_incremental_budget( const Movie *movie, const storage_t *decoder, uint16_t avg_mbs_per_ms_q8, uint32_t spare_ms );
 uint32_t seek_bar_preview_macroblock_budget( const Movie *movie, const storage_t *decoder, uint16_t avg_mbs_per_ms_q8, uint32_t spare_ms );
 void step_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, uint32_t deadline_ms);
-bool finish_seek_bar_preview_pending_frame(Movie *movie, SeekBarPreviewState *preview);
+bool finish_seek_bar_preview_pending_frame(Movie *movie, SeekBarPreviewState *preview, VideoDecodePoll poll, void *userdata);
 bool prefetch_chunk(Movie *movie, int chunk_index);
 void prefetch_ahead(Movie *movie, int current_chunk, int max_new_chunks, int max_new_distance);
 void prefetch_do_work( Movie *movie, int current_chunk, int max_work_distance, uint32_t deadline_ms, bool single_step, const PointerState *abort_pointer );
@@ -844,11 +817,32 @@ int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index);
 bool decode_h264_frame_with_progress( Movie *movie, uint32_t frame_index, bool blit_output, H264FramePublishPredicate predicate, H264DecodedFrameHook hook, void *userdata );
 bool decode_h264_frame( Movie *movie, uint32_t frame_index, bool blit_output );
 bool decode_mpeg4_frame_with_progress( Movie *movie, uint32_t frame_index, bool blit_output, H264FramePublishPredicate predicate, H264DecodedFrameHook hook, void *userdata );
+bool reset_hevc_decoder(Movie *movie);
+bool decode_hevc_frame(Movie *movie, uint32_t frame_index, bool blit_output);
+bool decode_hevc_frame_with_progress(Movie *movie, uint32_t frame_index, bool blit_output,
+    H264FramePublishPredicate predicate, H264DecodedFrameHook hook, VideoDecodePoll poll, void *userdata);
+bool decode_hevc_seek_step(Movie *movie, uint32_t frame_index,
+    H264FramePublishPredicate predicate, H264DecodedFrameHook hook, VideoDecodePoll poll, void *userdata);
+bool movie_uses_decode_ahead(const Movie *movie);
+bool video_decoder_ready(const Movie *movie);
+bool video_decoder_reset(Movie *movie);
+void video_decoder_mark_failed(Movie *movie);
+uint32_t video_decoder_total_units(const Movie *movie);
+uint32_t video_decoder_done_units(const Movie *movie);
+bool video_decoder_pump(Movie *movie, uint8_t *data, size_t size, size_t *consumed,
+    unsigned *retries, unsigned units, bool *ready, bool *pending, uint8_t **picture);
+void video_decoder_release_picture(Movie *movie);
+bool video_blit_picture_rows(Movie *movie, const uint8_t *picture, uint16_t *pixels,
+    size_t pitch, size_t first, size_t rows, bool *flat);
+bool blit_hevc_picture_rows(Movie *movie, const hevc_frame_t *picture, uint16_t *pixels,
+    size_t pitch, size_t first, size_t rows, bool *flat);
+
 bool decode_mpeg4_frame( Movie *movie, uint32_t frame_index, bool blit_output );
 void invalidate_loaded_chunk_state(Movie *movie);
 bool recover_failed_h264_playback_state(Movie *movie);
 bool decode_to_frame(Movie *movie, uint32_t frame_index);
-bool decode_to_frame_with_progress( Movie *movie, uint32_t frame_index, H264FramePublishPredicate predicate, H264DecodedFrameHook hook, void *userdata, bool *abort_requested );
+bool decode_to_frame_loading(Movie *movie, uint32_t frame_index, LoadingProgress *progress);
+bool decode_to_frame_with_progress( Movie *movie, uint32_t frame_index, H264FramePublishPredicate predicate, H264DecodedFrameHook hook, VideoDecodePoll poll, void *userdata, bool *abort_requested );
 
 /* history_screenshots.c */
 void strip_filename(char *path);
@@ -917,7 +911,7 @@ uint32_t movie_duration_ms(const Movie *movie);
 void reset_playback_timeline(Movie *movie, const PlaybackRate *playback_rate, uint64_t *anchor_ticks, uint32_t *anchor_frame, uint64_t *next_frame_due_ticks);
 bool step_movie_forward_one_frame(Movie *movie, bool *hover_preview_needs_rebuffer);
 uint16_t rolling_u16_average(uint16_t current, uint32_t sample_ms);
-void record_h264_foreground_decode_time(Movie *movie, uint32_t elapsed_ms);
+void record_foreground_decode_time(Movie *movie, uint32_t elapsed_ms);
 void record_debug_displayed_frame(Movie *movie, uint32_t now_ms);
 bool playback_wait_key_pending(void);
 void playback_key_snapshot_init(PlaybackKeySnapshot *snapshot);
@@ -944,10 +938,14 @@ void draw_lock_icon(SDL_Surface *screen, int x, int y, uint8_t mix);
 void free_history_store(HistoryStore *history);
 
 /* movie_resources.c */
-bool sram_movie_chunk_buffer_can_hold(size_t size);
+bool sram_movie_chunk_buffer_can_hold(const Movie *movie, size_t size);
+hevc_decoder_t *player_hevc_decoder_create(void);
+void player_hevc_decoder_destroy(hevc_decoder_t *decoder);
 /* Conservative future compressed-storage bound (SIZE_MAX if unavailable),
  * and currently resident owned bytes eligible as credit against that bound.
  * Bound scans the index once; current bytes is bounded by prefetch slot count. */
+unsigned movie_prefetch_slots(const Movie *movie);
+void movie_configure_prefetch(Movie *movie);
 size_t movie_lookahead_storage_bound(const Movie *movie);
 size_t movie_lookahead_storage_bytes(const Movie *movie);
 void *player_malloc_aligned(size_t size, size_t alignment, uint8_t **allocation);
@@ -978,7 +976,12 @@ void debug_log_sram_status(void);
 
 /* picker_loop.c */
 int pick_movie( SDL_Surface *screen, const Fonts *fonts, const char *directory, char *selected_path, size_t selected_size, bool *resume_without_prompt );
-bool seek_delta_target_frame(const Movie *movie, int32_t delta_ms, uint32_t *out_target_frame);
+
+/* playback_seek.c */
+bool playback_seek_relative_target(const Movie *movie, const PlaybackSeek *seek,
+    int32_t delta_ms, uint32_t *target);
+void playback_seek_request(PlaybackSeek *seek, uint32_t target, int marker_x, bool *paused);
+bool playback_seek_step(Movie *movie, PlaybackSeek *seek, SeekBarPreviewState *preview, bool *paused);
 
 /* picker_ui.c */
 SDL_Rect picker_row_rect_for_y(int row_y);
@@ -1075,6 +1078,7 @@ void playback_capture_reset_timeline(const Movie *movie);
 void playback_capture_state(const Movie *movie, const CaptureSettings *settings, uint64_t now);
 void playback_capture_stage(const Movie *movie, unsigned stage, uint64_t started, uint64_t ended);
 void playback_capture_ahead_scope(const Movie *movie, bool active);
+void playback_capture_defer_frame(const Movie *movie);
 void playback_capture_frame_begin(const Movie *movie, uint32_t target_frame, uint64_t due_ticks, uint64_t interval_ticks);
 void playback_capture_presented(const Movie *movie, uint64_t now);
 void playback_capture_io(Movie *movie, int kind, int chunk, uint32_t bytes, uint64_t started, uint64_t ended);
@@ -1232,9 +1236,7 @@ void draw_progress_track(SDL_Surface *screen, const SDL_Rect *bar_back, const SD
 void draw_progress_overlay(SDL_Surface *screen, const SDL_Rect *overlay);
 void draw_progress( SDL_Surface *screen, const Fonts *fonts, Movie *movie, uint32_t current_ms, bool paused, const PlaybackRate *playback_rate, uint32_t now_ms, const PointerState *pointer, int32_t pending_seek_ms, int32_t seek_badge_ms, uint32_t seek_badge_started_ms, uint32_t seek_badge_hide_elapsed_ms, SeekBarPreviewState *seek_preview, uint8_t preview_mix, uint8_t chrome_mix );
 void render_movie( SDL_Surface *screen, const Fonts *fonts, Movie *movie, bool paused, bool show_ui, bool help_menu_open, ScaleMode scale_mode, ScaleMorphState *scale_morph, VideoAlign video_align_x, VideoAlign video_align_y, const PlaybackRate *playback_rate, MemoryOverlayMode memory_overlay_mode, SubtitleSurfaceCache *subtitle_cache, size_t subtitle_font_index, bool subtitle_font_overlay_visible, int subtitle_size, SubtitlePlacement subtitle_placement, const char *movie_title_text, const char *movie_detail_text, const char *status_overlay_text, uint32_t status_overlay_started_ms, uint32_t status_overlay_until_ms, const ScreenshotPreviewState *screenshot_preview, SeekBarPreviewState *seek_preview, uint32_t now_ms, const PointerState *pointer, int32_t pending_seek_ms, int32_t seek_badge_ms, uint32_t seek_badge_started_ms, uint32_t seek_badge_hide_elapsed_ms, const PlaybackUiMixes *ui_mixes );
-bool should_publish_committed_seek_frame(Movie *movie, uint32_t frame_index, void *userdata);
-bool render_committed_seek_frame(Movie *movie, uint32_t frame_index, void *userdata);
-bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview, uint32_t target_frame);
+bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview, uint32_t target_frame, VideoDecodePoll poll, void *userdata);
 void draw_movie_frame_background( SDL_Surface *screen, Movie *movie, ScaleMode scale_mode, VideoAlign video_align_x, VideoAlign video_align_y, SDL_Rect *out_src, SDL_Rect *out_dst );
 
 /* render_primitives.c */

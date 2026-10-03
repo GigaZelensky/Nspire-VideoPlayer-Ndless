@@ -211,6 +211,8 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
             }
         }
         int action = -1;
+        /* Opening the symbol panel does not edit the password being checked. */
+        if (!closing && tab) { symbol_page = !symbol_page; symbol_keyboard_focus = false; }
         if (!closing && !working) {
             bool shift = isKeyPressed(KEY_NSPIRE_SHIFT);
             for (unsigned i = 0; i < sizeof(previous) / sizeof(previous[0]); ++i) {
@@ -225,7 +227,6 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
                 if (length) password[--length] = 0;
                 delete_at = now + (del ? 350U : 65U); activity = true;
             }
-            if (tab) { symbol_page = !symbol_page; symbol_keyboard_focus = false; }
             if (symbols_ready) {
                 bool left = key_pressed_edge(KEY_NSPIRE_LEFT, &prev_left);
                 bool right = key_pressed_edge(KEY_NSPIRE_RIGHT, &prev_right);
@@ -245,7 +246,7 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
              * cancels if the pointer leaves it; the default stays latched. */
             int activation_target = hot >= 0 ? hot
                 : symbols_ready && symbol_keyboard_focus ? symbol_selection : 102;
-            if (working && activation_target != 100) activation_target = -1;
+            if (working && activation_target != 100 && activation_target != 101) activation_target = -1;
             if (return_edge && !working) {
                 return_armed = true;
                 armed = enter_target = -1;
@@ -270,7 +271,7 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
                 if (armed >= 0 && (!pointer_hover_target || armed == hot)) action = armed;
                 armed = -1;
             }
-            if (working && action != 100) action = -1;
+            if (working && action != 100 && action != 101) action = -1;
             if (action == 100) {
                 closing = true; closed_at = now; working = false;
                 nve_wipe(password, sizeof(password)); length = 0;
@@ -360,11 +361,11 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
                     for (unsigned i = 0; i < sizeof(symbols) - 1; ++i) {
                         char label[2] = {symbols[i], 0};
                         SDL_Rect cell = offset_sdl_rect(&cells[i], dx + grid_dx, dy + grid_dy);
-                        bool held = !closing && ((pointer.down && armed == (int)i && (!pointer_hover_target || hot == (int)i)) ||
+                        bool held = !closing && !working && ((pointer.down && armed == (int)i && (!pointer_hover_target || hot == (int)i)) ||
                             (prev_enter && enter_target == (int)i && (!enter_hover_target || hot == (int)i)));
                         draw_prompt_button(grid_target, fonts, &cell, label,
-                            hot == (int)i ? 255 : 0, held ? 255 : 0);
-                        if (symbol_keyboard_focus && (int)i == symbol_selection)
+                            !working && hot == (int)i ? 255 : 0, held ? 255 : 0);
+                        if (!working && symbol_keyboard_focus && (int)i == symbol_selection)
                             draw_soft_glass_panel_rim(grid_target, &cell, UI_COLOR_GUNMETAL, 255);
                     }
                     end_faded_region_draw(target, grid_layer, &grid, &grid_old_clip, symbol_content_mix);
@@ -373,7 +374,7 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
                 const char *labels[] = {"Cancel", symbol_page ? "Keyboard" : "Symbols", working ? "Unlocking" : "Unlock"};
                 for (unsigned i = 0; i < 3; ++i) {
                     int id = (int)i + 100;
-                    bool enabled = !working || id == 100;
+                    bool enabled = !working || id == 100 || id == 101;
                     bool held = !closing && enabled && ((pointer.down && armed == id && (!pointer_hover_target || hot == id)) ||
                         (prev_enter && enter_target == id && (!enter_hover_target || hot == id)) ||
                         (return_armed && prev_return && id == 102));

@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "movie/nvp_format.h"
+#include "codec_config.h"
 
 struct Movie;
 

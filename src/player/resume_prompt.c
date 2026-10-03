@@ -101,7 +101,9 @@ int prompt_resume_position(
     if (resume_frame >= movie->header.frame_count) {
         resume_frame = movie->header.frame_count ? (movie->header.frame_count - 1) : 0;
     }
-    if (!decode_to_frame(movie, resume_frame)) {
+    LoadingProgress decode_progress;
+    loading_progress_init(&decode_progress, screen, *loading_snapshot, fonts, "Loading", true);
+    if (!decode_to_frame_loading(movie, resume_frame, &decode_progress)) {
         finish_loading_transition(screen, loading_snapshot, fonts, "Loading");
         return 0;
     }

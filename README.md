@@ -7,6 +7,9 @@ This project targets the **TI-Nspire CX**, **TI-Nspire CX II**, and **TI-Nspire 
 - `_ndvideo.tns`: the Ndless launcher
 - `*.nvp.tns`: movie containers produced by the encoder
 
+`_ndvideo.tns` includes all three codecs. Smaller player builds are also
+available; their filenames list the included codecs (`hevc` means H.265).
+
 ## Screenshots
 
 | Main menu | Continue watching | Playback controls |
@@ -22,18 +25,19 @@ This project targets the **TI-Nspire CX**, **TI-Nspire CX II**, and **TI-Nspire 
 The `.nvp` format used by the current player is:
 
 - H.264 Annex B video bitstream in legacy version 9/10 containers
-- H.264 or MPEG-4 Part 2 video in version 11 codec-tagged containers
+- H.264, H.265 (HEVC), or MPEG-4 Part 2 video in version 11 codec-tagged containers
 - chunked container with per-chunk frame tables
 - optional text subtitle tracks stored in the container
 - raw stored chunk payloads
 
 ## Features
 
-- native C/Ndless runtime
+- native Ndless runtime
 - CX and CX II LCD paths through Ndless' native framebuffer modes
 - streamed playback from calculator storage
 - password-protected videos with authenticated AES-256 encryption
 - H.264 decode through `h264bsd`
+- H.265 / HEVC decode through an optimized `libde265` port
 - MPEG-4 Part 2 decode through vendored Xvid sources
 - RGB565 output
 - direct storage reads on CX and CX II, with decoded frames prepared ahead for smoother playback
@@ -121,6 +125,10 @@ The list row shows `Rick and Morty S07E03`. Hover briefly to see the clean title
 
 Night mode also works in the picker and resume prompt. Its intensity is remembered while the app is open.
 
+Seeking shows the frames leading up to the destination. Play/pause works during
+that catch-up, and repeated seek presses extend the destination. On arrival,
+playback returns to the paused or playing state from before the seek.
+
 ### Processor Speed
 
 Click the MHz label or press `O` in the picker, playback or resume screen.
@@ -188,8 +196,9 @@ The built-in subtitle font cycle currently includes:
 
 - [src/player](src/player): native player shell and playback/UI implementation
 - [src/movie](src/movie): `.nvp` container format definitions
-- [src/codecs](src/codecs): codec adapters and vendored MPEG-4/Xvid decoder sources
+- [src/codecs](src/codecs): codec adapters and vendored decoder sources
 - [src/codecs/h264bsd](src/codecs/h264bsd): H.264 decoder sources
+- [src/codecs/hevc](src/codecs/hevc): H.265 / HEVC decoder sources
 - [src/initfini.c](src/initfini.c): startup / shutdown glue
 - [tools/encode_ndless_video.py](tools/encode_ndless_video.py): PC-side encoder
 - [tools/pack_zehn.py](tools/pack_zehn.py): Zehn packer used by the build
@@ -216,6 +225,18 @@ If you just want to run the player on a calculator, you do not have to build it 
 make
 ```
 
+Build only the codecs needed, or produce the complete release set:
+
+```bash
+make CODECS=h264
+make CODECS="h264 hevc"
+make release
+```
+
+Codec choices are `h264`, `mpeg4` and `hevc`, in any order. Each combination
+uses separate build objects. `make release` builds all seven combinations
+and packages them in `release/`.
+
 ### Build Output
 
 The build writes to [dist](dist):
@@ -224,9 +245,30 @@ The build writes to [dist](dist):
 - `ndvideo.elf`
 - `ndvideo.zehn`
 
+The release contains these player builds:
+
+| File | Included codecs |
+| --- | --- |
+| `_ndvideo.tns` | H.264, MPEG-4 Part 2, H.265 / HEVC |
+| `_ndvideo-h264.tns` | H.264 |
+| `_ndvideo-mpeg4.tns` | MPEG-4 Part 2 |
+| `_ndvideo-hevc.tns` | H.265 / HEVC |
+| `_ndvideo-h264-mpeg4.tns` | H.264, MPEG-4 Part 2 |
+| `_ndvideo-h264-hevc.tns` | H.264, H.265 / HEVC |
+| `_ndvideo-mpeg4-hevc.tns` | MPEG-4 Part 2, H.265 / HEVC |
+
+The smaller builds have the same controls and features. A video needing an
+omitted codec shows a message identifying the missing support. Movies use the
+same format across builds, including encrypted movies.
+
+`ndvideo-symbols.zip` holds the matching ELF and Zehn files for all seven builds.
+Checksums and shared license texts are included alongside the players.
+
 ## Encoder
 
-The encoder turns a normal video file into a streamed `.nvp.tns` movie. H.264 is still the default and writes legacy version 10 containers for compatibility. MPEG-4 Part 2 can be selected with `--codec mpeg4` and writes version 11 codec-tagged containers.
+The encoder turns a normal video file into a streamed `.nvp.tns` movie. H.264 is
+the default and writes version 10 containers. `--codec hevc` selects H.265;
+`--codec mpeg4` selects MPEG-4 Part 2. Both use version 11 containers.
 
 ### Python Requirements
 
@@ -245,6 +287,40 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mp4" --output ".\dist\vi
 ```powershell
 python .\tools\encode_ndless_video.py "C:\path\to\video.mp4" --codec mpeg4 --output ".\dist\video-mpeg4.nvp.tns"
 ```
+
+### H.265 / HEVC
+
+HEVC trades more decoding work for smaller files at similar image quality.
+It is especially useful for animation at modest frame rates; H.264 remains the
+better general-purpose choice when smooth playback matters more than file size.
+Detailed scenes and higher frame rates can still exceed the calculator's speed,
+even with an overclock. Smaller files do not necessarily decode faster.
+
+For example, a 320x180, 16 FPS animation encode went from 23.29 MiB in H.264 to
+12.39 MiB in HEVC at similar quality, with no lags reported at 1x on a CX II-T
+running at 492 MHz.
+
+```powershell
+python .\tools\encode_ndless_video.py "C:\path\to\animation.mkv" `
+  --codec hevc --fps 16 --max-width 320 --max-height 180 `
+  --stream-profile quality --crf 29.5 --preset veryslow `
+  --max-chunk-kib 64 --idr-frames auto --subtitle embedded `
+  --output ".\dist\animation-hevc.nvp.tns"
+```
+
+This is a starting point, not a fixed quality target. Lower CRF gives higher
+quality and larger files; CRF values are not equivalent between H.264 and HEVC.
+`--stream-profile fast` reduces decoding work at a detail cost. `balanced` and
+`quality` allow smaller coding blocks and spend more encoding time on compression.
+
+HEVC needs FFmpeg with `libx265` and a player version with HEVC support; older
+releases cannot play these files. The encoder selects the supported Main 8-bit
+settings automatically. Subtitles, encryption, previews and two-pass bitrate
+encoding work as usual. Encoding can take considerably longer than H.264.
+
+Use `--idr-frames auto` or a frame count. Oversized groups of frames are shortened
+automatically to fit the chunk limit. `--idr-frames byte-auto` and `--level` are
+H.264-only.
 
 ### Embedded Subtitles
 
@@ -308,6 +384,7 @@ When `--fps` caps or changes the framerate, the encoder timeline-samples frames 
 
 ### Main Encoder Options
 
+- `--codec`
 - `--output`
 - `--subtitle`
 - `--burn-subtitles`
@@ -343,8 +420,9 @@ recording, then leave the movie normally to save `ndvideo-debug.log` beside it.
 Recording ends with that movie; auto-next does not overwrite its files.
 Totals cover the entire run; frame details keep 128 frames before each lag
 and two seconds afterward. Overlapping windows are merged. Storage is bounded,
-and the log reports if older detail was replaced. No diagnostic files are
-written unless you enable `D`. Standby details are included in the same log.
+and the log reports if older detail was replaced. Routine recordings require
+`D`; failures can also save `ndvideo-error.log.tns`. Standby details are included
+in the same debug log.
 
 The `M` overlay shows:
 
@@ -370,3 +448,6 @@ The [examples](examples) folder includes a short packaged sample movie to try on
 ## License
 
 Unless noted otherwise, the software in this repository is licensed under the GNU General Public License, version 3. See [LICENSE](LICENSE).
+
+Bundled components' credits and licenses are collected in
+[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

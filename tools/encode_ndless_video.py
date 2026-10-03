@@ -33,7 +33,8 @@ VERSION = 10
 CODEC_TAGGED_VERSION = 11
 CODEC_FLAG_H264 = 0
 CODEC_FLAG_MPEG4 = 1
-CODEC_NAMES = ("h264", "mpeg4")
+CODEC_FLAG_HEVC = 2
+CODEC_NAMES = ("h264", "mpeg4", "hevc")
 SCREEN_W = 320
 SCREEN_H = 240
 HEADER_STRUCT = struct.Struct("<4sHHHHHHHHHHHHIIIII")
@@ -97,6 +98,7 @@ DEFAULT_BURN_SUBTITLE_SIZE = 1.0
 DEFAULT_BURN_SUBTITLE_HEIGHT_RATIO = 0.10
 BITMAP_SUBTITLE_BBOX_PADDING = 4
 FILTER_COMPLEX_SCRIPT_PLACEHOLDER = "__NVP_FILTER_COMPLEX_SCRIPT__"
+FILTER_SCRIPT_OPTIONS: dict[str, str] = {}
 HDR_TO_SDR_FILTERS = (
     "zscale=t=linear:npl=100",
     "format=gbrpf32le",
@@ -120,6 +122,11 @@ NAL_PPS = 8
 NAL_AUD = 9
 VCL_NAL_TYPES = {1, NAL_IDR}
 CHUNK_BOUNDARY_NAL_TYPES = {NAL_SPS, NAL_PPS, NAL_IDR}
+HEVC_NAL_IDR_TYPES = {19, 20}
+HEVC_NAL_PARAMETER_TYPES = {32, 33, 34}
+HEVC_NAL_AUD = 35
+HEVC_NAL_PREFIX_SEI = 39
+HEVC_NAL_SUFFIX_SEI = 40
 STREAM_PROFILES = ("fast", "balanced", "quality", "intra")
 MPEG4_VOP_START_CODE = 0xB6
 MPEG4_VOL_START_CODE_MIN = 0x20
@@ -264,6 +271,7 @@ class NalUnit:
 @dataclass(slots=True)
 class AccessUnit:
     nal_units: list[NalUnit]
+    codec: str = "h264"
 
     def contains_type(self, nal_type: int) -> bool:
         return any(unit.nal_type == nal_type for unit in self.nal_units)
@@ -2579,6 +2587,22 @@ def format_rate_control_label(*, crf: float, bitrate_kbps: int | None, two_pass:
     return f"1-pass ABR {bitrate_kbps} kb/s"
 
 
+def hevc_stream_profile_options(idr_frames: int, stream_profile: str, *, flexible_keyframes: bool = False) -> str:
+    """Main 8-bit streams with bounded, single-thread decoder work on the calculator."""
+    keyint = 1 if stream_profile == "intra" else idr_frames
+    lookahead = {"fast": 8, "balanced": 20, "quality": 60, "intra": 0}[stream_profile]
+    params = [
+        f"keyint={keyint}", f"min-keyint={1 if flexible_keyframes else keyint}",
+        "scenecut=0", "open-gop=0", "repeat-headers=1", "aud=1", "annexb=1",
+        "bframes=0", "ref=1", "slices=1", "wpp=0", "ctu=32",
+        "sao=0", "deblock=false", "weightp=0", "weightb=0", "temporal-mvp=0",
+        "info=0", f"rc-lookahead={lookahead}", "slow-firstpass=0",
+    ]
+    if stream_profile == "fast":
+        params += ["rect=0", "amp=0", "min-cu-size=16"]
+    return ":".join(params)
+
+
 def forced_keyframe_times_for_frames(frame_indices: list[int], fps: float) -> str:
     if fps <= 0:
         raise RuntimeError("Cannot derive forced keyframe timestamps without a valid output fps.")
@@ -2818,6 +2842,26 @@ def build_ffmpeg_command(
                 raise RuntimeError("CRF rate control selected without a CRF value.")
             command += ["-crf", str(crf)]
         command += ["-f", "h264", str(output_path)]
+    elif codec == "hevc":
+        x265_params = hevc_stream_profile_options(idr_frames, stream_profile, flexible_keyframes=flexible_keyframes)
+        if pass_number is not None:
+            if bitrate_kbps is None or passlog_path is None:
+                raise RuntimeError("Two-pass HEVC encoding requires both bitrate_kbps and passlog_path.")
+            # Escape FFmpeg's dictionary delimiters, including the Windows drive
+            # colon. Unlike -x265-stats, this also works with bundled FFmpeg 7.x.
+            stats_path = passlog_path.as_posix().replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+            x265_params += f":pass={pass_number}:stats={stats_path}"
+        command += ["-c:v", "libx265", "-preset", preset, "-profile:v", "main",
+                    "-pix_fmt", "yuv420p", "-x265-params", x265_params]
+        if force_keyframes_value:
+            command += ["-force_key_frames", force_keyframes_value, "-forced-idr", "1"]
+        if bitrate_kbps is not None:
+            command += ["-b:v", f"{bitrate_kbps}k"]
+        elif crf is not None:
+            command += ["-crf", str(crf)]
+        else:
+            raise RuntimeError("CRF rate control selected without a CRF value.")
+        command += ["-f", "hevc", str(output_path)]
     elif codec == "mpeg4":
         command += [
             "-c:v",
@@ -2864,8 +2908,17 @@ def materialize_filter_complex_script(
         return command
     filter_complex_script_path = temp_dir / "filter_complex.ffscript"
     filter_complex_script_path.write_text(filter_complex_script, encoding="utf-8")
+    if command[0] not in FILTER_SCRIPT_OPTIONS:
+        help_result = subprocess.run([command[0], "-hide_banner", "-h", "full"], capture_output=True,
+                                     text=True, encoding="utf-8", errors="replace", check=True)
+        help_text = help_result.stdout + help_result.stderr
+        # FFmpeg 9 removed the old spelling; 7.x still supports it.
+        FILTER_SCRIPT_OPTIONS[command[0]] = (
+            "-filter_complex_script" if "-filter_complex_script " in help_text else "-/filter_complex"
+        )
     return [
-        str(filter_complex_script_path) if part == FILTER_COMPLEX_SCRIPT_PLACEHOLDER else part
+        str(filter_complex_script_path) if part == FILTER_COMPLEX_SCRIPT_PLACEHOLDER
+        else FILTER_SCRIPT_OPTIONS[command[0]] if part == "-filter_complex_script" else part
         for part in command
     ]
 
@@ -2955,10 +3008,12 @@ def encode_h264_bitstream(
     quiet: bool,
     forced_keyframe_frames: list[int] | None = None,
     label_prefix: str = "FFmpeg",
+    codec: str = "h264",
 ) -> bytes:
-    with tempfile.TemporaryDirectory(prefix="nvp-h264-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix=f"nvp-{codec}-") as temp_dir:
         temp_dir_path = Path(temp_dir)
-        bitstream_path = temp_dir_path / "video.264"
+        suffix = "hevc" if codec == "hevc" else "264"
+        bitstream_path = temp_dir_path / f"video.{suffix}"
         command, filter_complex_script = build_ffmpeg_command(
             input_path=input_path,
             output_path=bitstream_path,
@@ -2985,10 +3040,12 @@ def encode_h264_bitstream(
             pass_number=None,
             passlog_path=None,
             quiet=quiet,
+            codec=codec,
         )
         if two_pass:
-            passlog_path = temp_dir_path / "x264-passlog"
-            pass1_output_path = temp_dir_path / "pass1.264"
+            passlog_name = "x265-passlog" if codec == "hevc" else "x264-passlog"
+            passlog_path = temp_dir_path / passlog_name
+            pass1_output_path = temp_dir_path / f"pass1.{suffix}"
             pass1_command, pass1_filter_script = build_ffmpeg_command(
                 input_path=input_path,
                 output_path=pass1_output_path,
@@ -3015,6 +3072,7 @@ def encode_h264_bitstream(
                 pass_number=1,
                 passlog_path=passlog_path,
                 quiet=quiet,
+                codec=codec,
             )
             run_ffmpeg_encode(
                 materialize_filter_complex_script(pass1_command, pass1_filter_script, temp_dir_path),
@@ -3050,6 +3108,7 @@ def encode_h264_bitstream(
                 pass_number=2,
                 passlog_path=passlog_path,
                 quiet=quiet,
+                codec=codec,
             )
             run_ffmpeg_encode(
                 materialize_filter_complex_script(pass2_command, pass2_filter_script, temp_dir_path),
@@ -3057,7 +3116,7 @@ def encode_h264_bitstream(
                 total_duration=encode_duration,
                 quiet=quiet,
             )
-            for passlog_candidate in temp_dir_path.glob("x264-passlog*"):
+            for passlog_candidate in temp_dir_path.glob(f"{passlog_name}*"):
                 passlog_candidate.unlink(missing_ok=True)
         else:
             run_ffmpeg_encode(
@@ -3265,6 +3324,9 @@ def group_nals_into_access_units(nal_units: list[NalUnit]) -> list[AccessUnit]:
 
 
 def chunk_has_independent_start(unit: AccessUnit) -> bool:
+    if unit.codec == "hevc":
+        return (any(unit.contains_type(nal_type) for nal_type in HEVC_NAL_IDR_TYPES)
+                and all(unit.contains_type(nal_type) for nal_type in HEVC_NAL_PARAMETER_TYPES))
     return unit.contains_type(NAL_IDR) and unit.contains_type(NAL_SPS) and unit.contains_type(NAL_PPS)
 
 
@@ -3274,10 +3336,12 @@ def align4(value: int) -> int:
 
 def access_unit_payload_size(unit: AccessUnit, *, keep_parameter_sets: bool) -> int:
     size = 0
+    parameter_types = (HEVC_NAL_PARAMETER_TYPES | {HEVC_NAL_PREFIX_SEI, HEVC_NAL_SUFFIX_SEI}
+                       if unit.codec == "hevc" else {NAL_SPS, NAL_PPS, NAL_SEI})
     for nal in unit.nal_units:
-        if nal.nal_type == NAL_AUD:
+        if nal.nal_type == (HEVC_NAL_AUD if unit.codec == "hevc" else NAL_AUD):
             continue
-        if not keep_parameter_sets and nal.nal_type in {NAL_SPS, NAL_PPS, NAL_SEI}:
+        if not keep_parameter_sets and nal.nal_type in parameter_types:
             continue
         size += len(nal.data)
     return size
@@ -3354,12 +3418,13 @@ def group_access_units_into_chunks(
     stream_profile: str,
 ) -> list[list[AccessUnit]]:
     chunks: list[list[AccessUnit]] = []
+    codec_label = "HEVC" if access_units and access_units[0].codec == "hevc" else "H.264"
     current: list[AccessUnit] = []
     frame_cap = chunk_frames if chunk_frames > 0 else None
     segments = split_access_units_into_segments(access_units, stream_profile)
 
     if not segments:
-        raise RuntimeError("The H.264 bitstream did not produce any `.nvp` chunks.")
+        raise RuntimeError(f"The {codec_label} bitstream did not produce any `.nvp` chunks.")
     if frame_cap is None and max_chunk_bytes is None:
         raise RuntimeError("Chunk grouping needs --max-chunk-kib > 0 or --chunk-frames > 0.")
 
@@ -3394,14 +3459,15 @@ def group_access_units_into_chunks(
         chunks.append(current)
 
     if not chunks:
-        raise RuntimeError("The H.264 bitstream did not produce any `.nvp` chunks.")
+        raise RuntimeError(f"The {codec_label} bitstream did not produce any `.nvp` chunks.")
 
     for index, chunk in enumerate(chunks):
         if not chunk:
-            raise RuntimeError("Encountered an empty chunk while grouping H.264 access units.")
+            raise RuntimeError(f"Encountered an empty chunk while grouping {codec_label} access units.")
         if not chunk_has_independent_start(chunk[0]):
+            parameter_label = "VPS/SPS/PPS/IDR" if codec_label == "HEVC" else "SPS/PPS/IDR"
             raise RuntimeError(
-                f"Chunk {index} does not start with SPS/PPS/IDR. "
+                f"Chunk {index} does not start with {parameter_label}. "
                 "Check the FFmpeg keyframe and repeat-headers settings."
             )
         if frame_cap is not None and len(chunk) > frame_cap:
@@ -3423,6 +3489,167 @@ def group_access_units_into_chunks(
 
 def bitstream_access_units(bitstream: bytes) -> list[AccessUnit]:
     return group_nals_into_access_units(parse_annex_b_nalus(bitstream))
+
+
+def hevc_bitstream_access_units(bitstream: bytes) -> list[AccessUnit]:
+    """Split single-layer HEVC Annex B without confusing multi-slice pictures."""
+    matches = list(START_CODE_RE.finditer(bitstream))
+    access_units: list[AccessUnit] = []
+    current: list[NalUnit] = []
+    current_has_vcl = False
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(bitstream)
+        offset = match.end()
+        if end - offset < 2:
+            raise RuntimeError("Truncated HEVC NAL header.")
+        first, second = bitstream[offset:offset + 2]
+        if first & 0x80 or ((first & 1) << 5) | (second >> 3) or (second & 7) != 1:
+            raise RuntimeError("HEVC requires a valid single-layer, temporal-ID-zero NAL header.")
+        nal_type = (first >> 1) & 0x3F
+        is_vcl = nal_type <= 31
+        if is_vcl and end - offset < 3:
+            raise RuntimeError("Truncated HEVC slice header.")
+        first_slice = is_vcl and bool(bitstream[offset + 2] & 0x80)
+        starts_next = (nal_type in HEVC_NAL_PARAMETER_TYPES | {HEVC_NAL_AUD, HEVC_NAL_PREFIX_SEI}
+                       or first_slice)
+        if current_has_vcl and starts_next:
+            access_units.append(AccessUnit(current, codec="hevc"))
+            current, current_has_vcl = [], False
+        if is_vcl and not current_has_vcl and not first_slice:
+            raise RuntimeError("HEVC picture begins with a dependent or non-first slice.")
+        current.append(NalUnit(nal_type, bitstream[match.start():end]))
+        current_has_vcl |= is_vcl
+    if current_has_vcl:
+        access_units.append(AccessUnit(current, codec="hevc"))
+    if not access_units:
+        raise RuntimeError("No decodable HEVC access units were found in the Annex B bitstream.")
+    if not chunk_has_independent_start(access_units[0]):
+        raise RuntimeError("HEVC stream must begin with VPS/SPS/PPS and a closed IDR picture.")
+    return access_units
+
+
+def prepare_hevc_repair_reference(
+    segments: list[ChunkSegment], encode_options: dict, output_path: Path, temp_dir: Path,
+) -> None:
+    """Select repair frames after the original subtitle/crop/HDR/fps pipeline."""
+    options = dict(encode_options)
+    for key in ("two_pass", "preview_output_path", "label_prefix"):
+        options.pop(key, None)
+    options.update(output_path=output_path, pass_number=None, passlog_path=None,
+                   forced_keyframe_frames=None)
+    command, script = build_ffmpeg_command(**options)
+    command = command[:command.index("-c:v")]
+    if script is None:
+        vf_index = command.index("-vf")
+        script = f"[0:v]{command[vf_index + 1]}[vout];"
+        del command[vf_index:vf_index + 2]
+        command += ["-filter_complex_script", FILTER_COMPLEX_SCRIPT_PLACEHOLDER, "-map", "[vrepair]"]
+    else:
+        command[command.index("-map") + 1] = "[vrepair]"
+    selection = "+".join(
+        f"between(n\\,{segment.first_frame}\\,{segment.first_frame + len(segment.access_units) - 1})"
+        for segment in segments
+    )
+    fps_text = format_fps_value(encode_options["fps"])
+    script = script.rstrip(";\n") + f";[vout]select={selection},setpts=N/({fps_text}*TB)[vrepair];"
+    total_frames = sum(len(segment.access_units) for segment in segments)
+    command += ["-an", "-sn", "-dn", "-c:v", "ffv1", "-level", "3", "-g", "1",
+                "-pix_fmt", "yuv420p", "-frames:v", str(total_frames), "-f", "matroska", str(output_path)]
+    run_ffmpeg_encode(materialize_filter_complex_script(command, script, temp_dir),
+                      label="HEVC repair reference", total_duration=total_frames / encode_options["fps"],
+                      quiet=encode_options["quiet"])
+
+
+def repair_hevc_oversized_gops(
+    bitstream: bytes, *, encode_options: dict, hard_max_chunk_bytes: int,
+) -> tuple[bytes, list[dict]]:
+    """Shorten only oversized closed GOPs without re-encoding the whole stream."""
+    units = hevc_bitstream_access_units(bitstream)
+    segments = split_access_units_into_segments(units, encode_options["stream_profile"])
+    oversized = [segment for segment in segments if segment.blob_size > hard_max_chunk_bytes]
+    if not oversized:
+        return bitstream, []
+    for segment in oversized:
+        if len(segment.access_units) == 1:
+            raise ChunkTooLargeError(first_frame=segment.first_frame, frame_count=1,
+                                     blob_size=segment.blob_size, max_bytes=hard_max_chunk_bytes,
+                                     label="HEVC single-frame GOP")
+    # Keeping delimiters here preserves every unaffected Annex B byte. The normal
+    # container writer still strips AUDs when it packs the access units.
+    if b"".join(unit.bytes() for unit in units) != bitstream:
+        raise RuntimeError("Cannot safely repair a HEVC stream with data outside its access units.")
+    quiet = encode_options["quiet"]
+    log(f"Repairing {len(oversized)} oversized HEVC GOP(s) with shorter closed IDRs; "
+        "all other GOPs remain unchanged.", quiet=quiet)
+    replacements: dict[int, bytes] = {}
+    reports: list[dict] = []
+    fps = encode_options["fps"]
+    budgeted = encode_options["bitrate_kbps"] is not None
+    with tempfile.TemporaryDirectory(prefix="nvp-hevc-repair-") as temp_name:
+        temp_dir = Path(temp_name)
+        reference = temp_dir / "reference.mkv"
+        prepare_hevc_repair_reference(oversized, encode_options, reference, temp_dir)
+        cursor = 0
+        for number, segment in enumerate(oversized, 1):
+            count = len(segment.access_units)
+            clip = temp_dir / "gop.mkv"
+            # Frame trimming of the small reference avoids fractional-timestamp
+            # rounding or source seeking changing the first repaired frame.
+            clip_command = [imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", str(reference), "-vf",
+                            f"trim=start_frame={cursor}:end_frame={cursor + count},setpts=PTS-STARTPTS",
+                            "-frames:v", str(count), "-an", "-sn", "-dn", "-c:v", "ffv1", "-level", "3",
+                            "-g", "1", "-pix_fmt", "yuv420p", "-r", format_fps_value(fps), str(clip)]
+            run_ffmpeg_encode(clip_command, label=f"HEVC repair clip {number}/{len(oversized)}",
+                              total_duration=count / fps, quiet=quiet)
+            cursor += count
+            budget = sum(access_unit_payload_size(unit, keep_parameter_sets=True) for unit in segment.access_units)
+            bitrate = max(1, int(budget * 8 * fps / count / 1000 * 0.98))
+            budget_interval = int(count * hard_max_chunk_bytes / segment.blob_size * 0.9)
+            interval = max(1, min(encode_options["idr_frames"] // 2, count // 2, budget_interval))
+            repair_options = dict(encode_options)
+            repair_options.update(input_path=clip, source_width=encode_options["width"],
+                                  source_height=encode_options["height"], source_fps=fps, crop_rect=None,
+                                  start=0.0, duration=None, encode_duration=count / fps, hdr_to_sdr=False,
+                                  burn_subtitle=None, preview_output_path=None, two_pass=budgeted,
+                                  forced_keyframe_frames=None, codec="hevc")
+            for attempt in range(1, 7):
+                repair_options.update(idr_frames=interval, bitrate_kbps=bitrate if budgeted else None,
+                                      label_prefix=f"HEVC repair {number}/{len(oversized)} attempt {attempt}")
+                repaired = encode_h264_bitstream(**repair_options)
+                repaired_units = hevc_bitstream_access_units(repaired)
+                if len(repaired_units) != count:
+                    raise RuntimeError(f"HEVC repair changed frame count at frame {segment.first_frame}: "
+                                       f"expected {count}, got {len(repaired_units)}.")
+                repaired_bytes = sum(access_unit_payload_size(unit, keep_parameter_sets=True) for unit in repaired_units)
+                repaired_segments = split_access_units_into_segments(repaired_units, encode_options["stream_profile"])
+                largest = max(item.blob_size for item in repaired_segments)
+                if (not budgeted or repaired_bytes <= budget) and largest <= hard_max_chunk_bytes:
+                    replacements[segment.first_frame] = repaired
+                    reports.append(dict(first_frame=segment.first_frame, frame_count=count,
+                                        original_payload_bytes=budget, repaired_payload_bytes=repaired_bytes,
+                                        original_gop_bytes=segment.blob_size, max_repaired_gop_bytes=largest,
+                                        idr_frames=interval, bitrate_kbps=bitrate if budgeted else None,
+                                        crf=None if budgeted else encode_options["crf"], attempts=attempt))
+                    log(f"HEVC GOP {segment.first_frame}-{segment.first_frame + count - 1}: "
+                        f"IDRs <= {interval}, largest {format_binary_size(largest)}, "
+                        f"payload {repaired_bytes}/{budget} bytes.", quiet=quiet)
+                    break
+                if largest > hard_max_chunk_bytes:
+                    if interval == 1:
+                        raise ChunkTooLargeError(first_frame=segment.first_frame, frame_count=count,
+                                                 blob_size=largest, max_bytes=hard_max_chunk_bytes,
+                                                 label="HEVC repaired GOP")
+                    interval = max(1, interval // 2)
+                if budgeted and repaired_bytes > budget:
+                    bitrate = max(1, min(bitrate - 1, int(bitrate * budget / repaired_bytes * 0.98)))
+            else:
+                raise RuntimeError(f"HEVC GOP at frame {segment.first_frame} could not meet its byte bounds "
+                                   "after six targeted repairs; lower --idr-frames or raise --max-chunk-kib.")
+    result = b"".join(replacements.get(segment.first_frame, b"".join(unit.bytes() for unit in segment.access_units))
+                      for segment in segments)
+    if len(hevc_bitstream_access_units(result)) != len(units):
+        raise RuntimeError("HEVC repair changed the complete stream frame count.")
+    return result, reports
 
 
 @dataclass(slots=True)
@@ -3577,9 +3804,9 @@ def summarize_chunk_oversize(
     return oversize_count, len(chunks), max(chunk_blob_sizes) if chunk_blob_sizes else 0
 
 
-def write_preview_mp4_from_bitstream(bitstream: bytes, preview_output_path: Path, fps: float, *, quiet: bool) -> None:
+def write_preview_mp4_from_bitstream(bitstream: bytes, preview_output_path: Path, fps: float, *, quiet: bool, codec: str = "h264") -> None:
     with tempfile.TemporaryDirectory(prefix="nvp-preview-") as temp_dir:
-        bitstream_path = Path(temp_dir) / "video.264"
+        bitstream_path = Path(temp_dir) / ("video.hevc" if codec == "hevc" else "video.264")
         bitstream_path.write_bytes(bitstream)
         write_preview_mp4(bitstream_path, preview_output_path, fps, quiet=quiet)
 
@@ -3678,10 +3905,12 @@ def encode_h264_bitstream_byte_auto(
 
 def build_access_unit_payload(unit: AccessUnit, *, keep_parameter_sets: bool) -> bytes:
     payload = bytearray()
+    parameter_types = (HEVC_NAL_PARAMETER_TYPES | {HEVC_NAL_PREFIX_SEI, HEVC_NAL_SUFFIX_SEI}
+                       if unit.codec == "hevc" else {NAL_SPS, NAL_PPS, NAL_SEI})
     for nal in unit.nal_units:
-        if nal.nal_type == NAL_AUD:
+        if nal.nal_type == (HEVC_NAL_AUD if unit.codec == "hevc" else NAL_AUD):
             continue
-        if not keep_parameter_sets and nal.nal_type in {NAL_SPS, NAL_PPS, NAL_SEI}:
+        if not keep_parameter_sets and nal.nal_type in parameter_types:
             continue
         payload.extend(nal.data)
     return bytes(payload)
@@ -3890,8 +4119,10 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             args.max_height,
         )
 
-        if args.codec == "h264":
+        if args.codec in {"h264", "hevc"}:
             encode_profile_label = f"profile {args.stream_profile}"
+            if args.codec == "hevc":
+                encode_profile_label = f"codec HEVC, {encode_profile_label}"
             encode_rate_label = format_rate_control_label(
                 crf=args.crf,
                 bitrate_kbps=args.bitrate_kbps,
@@ -3935,8 +4166,12 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         sequence_headers = b""
         header_version = VERSION
         header_flags = CODEC_FLAG_H264
+        hevc_repairs: list[dict] = []
 
-        if args.codec == "h264":
+        if args.codec in {"h264", "hevc"}:
+            codec_label = "HEVC" if args.codec == "hevc" else "H.264"
+            if args.codec == "hevc" and idr_mode == BYTE_AUTO_IDR_MODE:
+                raise RuntimeError("--idr-frames byte-auto is only supported for H.264.")
             if idr_mode == BYTE_AUTO_IDR_MODE and args.stream_profile != "intra":
                 if max_chunk_bytes is None:
                     raise RuntimeError("--idr-frames byte-auto requires --max-chunk-kib > 0.")
@@ -3981,7 +4216,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                     bitrate_kbps=args.bitrate_kbps,
                 )
                 log(f"IDR cadence: every {idr_frames} frame(s) ({idr_frame_reason}).", quiet=args.quiet)
-                bitstream = encode_h264_bitstream(
+                encode_options = dict(
                     input_path=input_path,
                     source_width=video_probe.storage_width,
                     source_height=video_probe.storage_height,
@@ -4005,15 +4240,24 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                     burn_subtitle_size=args.burn_subtitle_size,
                     preview_output_path=preview_output_path,
                     quiet=args.quiet,
+                    codec=args.codec,
                 )
+                bitstream = encode_h264_bitstream(**encode_options)
+                if args.codec == "hevc" and hard_max_chunk_bytes is not None:
+                    bitstream, hevc_repairs = repair_hevc_oversized_gops(
+                        bitstream, encode_options=encode_options, hard_max_chunk_bytes=hard_max_chunk_bytes,
+                    )
+                    if hevc_repairs and preview_output_path is not None:
+                        write_preview_mp4_from_bitstream(bitstream, preview_output_path, fps,
+                                                        quiet=args.quiet, codec="hevc")
             log(
-                f"FFmpeg produced {len(bitstream) / 1024:.1f} KiB of Annex B H.264 in {time.time() - start_time:.1f}s "
+                f"FFmpeg produced {len(bitstream) / 1024:.1f} KiB of Annex B {codec_label} in {time.time() - start_time:.1f}s "
                 f"({idr_frame_reason}).",
                 quiet=args.quiet,
             )
-            access_units = bitstream_access_units(bitstream)
+            access_units = hevc_bitstream_access_units(bitstream) if args.codec == "hevc" else bitstream_access_units(bitstream)
             if not access_units:
-                raise RuntimeError("No frames were found in the encoded H.264 bitstream.")
+                raise RuntimeError(f"No frames were found in the encoded {codec_label} bitstream.")
             chunks = group_access_units_into_chunks(
                 access_units,
                 args.chunk_frames,
@@ -4028,7 +4272,10 @@ def encode(args: argparse.Namespace) -> EncodeStats:
                 subtitle_tracks=subtitle_tracks,
             )
             frame_count = len(access_units)
-            raw_video_label = "raw H.264"
+            raw_video_label = f"raw {codec_label}"
+            if args.codec == "hevc":
+                header_version = CODEC_TAGGED_VERSION
+                header_flags = CODEC_FLAG_HEVC
         else:
             if idr_mode == BYTE_AUTO_IDR_MODE:
                 raise RuntimeError("--idr-frames byte-auto is only supported for H.264.")
@@ -4138,7 +4385,7 @@ def encode(args: argparse.Namespace) -> EncodeStats:
             frame_cursor = 0
             pack_start_time = time.time()
             for chunk_number, frame_chunk in enumerate(chunks, start=1):
-                if args.codec == "h264":
+                if args.codec in {"h264", "hevc"}:
                     chunk_payload, frame_offsets = build_chunk_blob(frame_chunk, args.stream_profile)
                 else:
                     chunk_payload, frame_offsets = build_mpeg4_chunk_blob(frame_chunk, sequence_headers)
@@ -4256,7 +4503,10 @@ def encode(args: argparse.Namespace) -> EncodeStats:
         )
         with stats_path.open("w", encoding="utf-8") as stats_handle:
             stats_started = True
-            json.dump(asdict(stats), stats_handle, indent=2)
+            stats_data = asdict(stats)
+            if args.codec == "hevc":
+                stats_data["gop_repairs"] = hevc_repairs
+            json.dump(stats_data, stats_handle, indent=2)
         log(
             f"Wrote {output_path.name}: {bytes_written / (1024 * 1024):.2f} MiB | "
             f"{frame_count} frames | {len(chunks)} chunks | {raw_video_label} {len(bitstream) / 1024:.1f} KiB",
@@ -4293,12 +4543,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--idr-frames", default="auto", help="Maximum frames between forced IDR access units; use 'auto' for bitrate-derived cadence or 'byte-auto' to refine IDRs from measured chunk byte boundaries")
     parser.add_argument("--max-chunk-kib", type=int, default=DEFAULT_MAX_CHUNK_KIB, help="Maximum stored chunk size target in KiB; 0 disables the byte cap")
     parser.add_argument("--max-chunk-overshoot-percent", type=float, default=DEFAULT_MAX_CHUNK_OVERSHOOT_PERCENT, help="Allowed single-GOP chunk overshoot above --max-chunk-kib before failing; set 0 for a hard cap")
-    parser.add_argument("--crf", type=float, default=24.0, help="libx264 CRF quality target (fractional values allowed, ignored when --bitrate-kbps is set)")
+    parser.add_argument("--crf", type=float, default=24.0, help="libx264/libx265 CRF quality target (fractional values allowed, ignored when --bitrate-kbps is set)")
     parser.add_argument("--bitrate-kbps", type=int, help="Target average video bitrate in kb/s for ABR mode")
-    parser.add_argument("--two-pass", action="store_true", help="Run a 2-pass ABR encode; H.264 requires --bitrate-kbps, MPEG-4 defaults to 500 kb/s")
-    parser.add_argument("--preset", default="slow", help="libx264 preset")
+    parser.add_argument("--two-pass", action="store_true", help="Run a 2-pass ABR encode; H.264/HEVC require --bitrate-kbps, MPEG-4 defaults to 500 kb/s")
+    parser.add_argument("--preset", default="slow", help="libx264/libx265 preset")
     parser.add_argument("--level", default="1.3", help="Target H.264 level")
-    parser.add_argument("--stream-profile", choices=STREAM_PROFILES, default="fast", help="Decoder-complexity profile: fast is smoothest, balanced/quality trade more CPU for better image quality")
+    parser.add_argument("--stream-profile", choices=STREAM_PROFILES, default="fast", help="Speed/quality profile; HEVC fast uses larger coding units for less decode work at a detail cost, balanced/quality keep full coding-unit flexibility and increase encoder lookahead, intra makes every frame independent")
     parser.add_argument("--start", type=float, default=0.0, help="Optional clip start offset in seconds")
     parser.add_argument("--duration", type=float, help="Optional clip duration in seconds")
     parser.add_argument("--timeline-drift-tolerance-ms", type=float, default=500.0, help="Maximum allowed encoded duration drift before failing")
@@ -4331,8 +4581,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--idr-frames byte-auto is only supported with --codec h264.")
     if args.bitrate_kbps is not None and args.bitrate_kbps <= 0:
         parser.error("--bitrate-kbps must be greater than zero.")
-    if args.two_pass and args.codec == "h264" and args.bitrate_kbps is None:
-        parser.error("--two-pass requires --bitrate-kbps with --codec h264.")
+    if args.two_pass and args.codec in {"h264", "hevc"} and args.bitrate_kbps is None:
+        parser.error(f"--two-pass requires --bitrate-kbps with --codec {args.codec}.")
     if args.timeline_drift_tolerance_ms < 0:
         parser.error("--timeline-drift-tolerance-ms must be zero or greater.")
     if args.crop and args.active_aspect:

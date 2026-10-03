@@ -48,7 +48,7 @@ void playback_capture_decoder_error(const Movie *movie, const storage_t *decoder
 {
     if (!g_capture || !g_capture->active || g_capture->movie != movie || !decoder) return;
     uint32_t *words = g_capture->decoder_checkpoint;
-    words[0] = h264_lookahead_next_frame(movie);
+    words[0] = video_lookahead_next_frame(movie);
     /* The fixed stage strings are encoded as FNV-1a in the binary journal;
      * the text log also includes the human-readable stage name. */
     uint32_t hash = 2166136261U;
@@ -75,7 +75,7 @@ void playback_capture_failure(const char *reason)
     const Movie *movie = g_capture->movie;
     g_capture->failures[slot].ticks = monotonic_clock_now_ticks();
     g_capture->failures[slot].visible = movie ? movie->current_frame : 0;
-    g_capture->failures[slot].next = movie ? h264_lookahead_next_frame(movie) : 0;
+    g_capture->failures[slot].next = movie ? video_lookahead_next_frame(movie) : 0;
     g_capture->failures[slot].chunk = movie ? movie->loaded_chunk : -1;
     snprintf(g_capture->failures[slot].reason, sizeof(g_capture->failures[slot].reason), "%s", reason);
 }
@@ -209,7 +209,7 @@ void playback_capture_frame_begin(const Movie *movie, uint32_t target_frame, uin
     memset(&g_capture->pending_frame, 0, sizeof(g_capture->pending_frame));
     g_capture->pending_frame.frame = target_frame;
     g_capture->pending_frame.ahead_before =
-        (uint16_t)h264_lookahead_prepared_depth(movie, target_frame);
+        (uint16_t)video_lookahead_prepared_depth(movie, target_frame);
     g_capture->pending_frame.skipped =
         target_frame > movie->current_frame ? target_frame - movie->current_frame - 1U : 0;
     g_capture->pending_frame.due_ticks = due_ticks;
@@ -224,6 +224,14 @@ void playback_capture_frame_begin(const Movie *movie, uint32_t target_frame, uin
     if (g_capture->settings.frame_skip)
         g_capture->pending_frame.flags |= CAPTURE_FRAME_SKIP_ENABLED;
     g_capture->pending = true;
+}
+
+/* A cooperative decoder can return to input/UI handling before its target
+ * exists. Keep accumulated timings, but do not attribute that UI-only flip to
+ * an image that has not been presented. */
+void playback_capture_defer_frame(const Movie *movie)
+{
+    if (playback_capture_active(movie)) g_capture->pending = false;
 }
 
 static void capture_keep_recent_io(void)
@@ -246,8 +254,8 @@ static void capture_finish_frame(const Movie *movie, uint64_t now, bool presente
     CaptureFrame *frame = &g_capture->pending_frame;
     frame->at_ticks = now;
     frame->chunk = (uint32_t)movie_chunk_for_frame(movie, frame->frame);
-    frame->ahead_after = (uint16_t)h264_lookahead_queued(movie);
-    frame->ahead_next_frame = h264_lookahead_next_frame(movie);
+    frame->ahead_after = (uint16_t)video_lookahead_queued(movie);
+    frame->ahead_next_frame = video_lookahead_next_frame(movie);
     uint32_t previous_events = g_capture->cadence.events;
     uint32_t previous_missed = g_capture->cadence.missed_intervals;
     if (presented) {
@@ -417,8 +425,8 @@ void playback_capture_export(FILE *file, const Movie *movie)
     active_us = capture_ticks_to_us(g_capture->active_ticks, g_capture->tick_hz);
     fprintf(file, "capture_version=3 build=%s %s compiler=%s\n", __DATE__, __TIME__, __VERSION__);
     fprintf(file, "media_name=%s\n", g_capture->media_name);
-    H264LookaheadStats ahead;
-    h264_lookahead_get_stats(movie, &ahead);
+    VideoLookaheadStats ahead;
+    video_lookahead_get_stats(movie, &ahead);
     fprintf(
         file,
         "decode_ahead lifetime=1 active=%u capacity=%u queued=%u peak_queued=%u bytes=%lu background_frames=%lu foreground_frames=%lu hits=%lu misses=%lu chunk_waits=%lu cancellations=%lu failures=%lu slices=%lu max_pump_us=%llu max_color_us=%llu max_background_pump_us=%llu max_background_color_us=%llu total_decode_us=%llu total_color_us=%llu partial=%u base_band_rows=%u background_slices_8=%lu background_slices_16=%lu background_slices_32=%lu color_rows_max=64 background_color_bands_16=%lu background_color_bands_32=%lu background_color_bands_64=%lu background_color_bands_tail=%lu background_slices_4=%lu max_background_tail_us=%llu color_tail_guard_us=%llu\n",
@@ -436,7 +444,7 @@ void playback_capture_export(FILE *file, const Movie *movie)
                                                 g_capture->tick_hz),
         (unsigned long long)capture_ticks_to_us(ahead.decode_ticks, g_capture->tick_hz),
         (unsigned long long)capture_ticks_to_us(ahead.color_ticks, g_capture->tick_hz),
-        ahead.partial ? 1U : 0U, H264_LOOKAHEAD_COLOR_ROWS,
+        ahead.partial ? 1U : 0U, VIDEO_LOOKAHEAD_COLOR_ROWS,
         (unsigned long)ahead.background_slices_8, (unsigned long)ahead.background_slices_16,
         (unsigned long)ahead.background_slices_32, (unsigned long)ahead.background_color_bands_16,
         (unsigned long)ahead.background_color_bands_32,
@@ -451,8 +459,8 @@ void playback_capture_export(FILE *file, const Movie *movie)
         (unsigned long)ahead.failure_queued, ahead.failure_chunk, ahead.failure_reason);
     fprintf(
         file,
-        "decode_ahead_memory budget_bytes=%lu reserve_bytes=%lu free_begin_valid=%u free_begin_bytes=%lu free_last_valid=%u free_last_bytes=%lu checks=%lu headroom_denials=%lu allocation_failures=%lu (DYNA_available_is_not_largest_contiguous_block; checks_only_at_begin_or_new_slot)\n",
-        (unsigned long)ahead.budget_bytes, (unsigned long)ahead.reserve_bytes,
+        "decode_ahead_memory compressed_slots=%u budget_bytes=%lu reserve_bytes=%lu free_begin_valid=%u free_begin_bytes=%lu free_last_valid=%u free_last_bytes=%lu checks=%lu headroom_denials=%lu allocation_failures=%lu (DYNA_available_is_not_largest_contiguous_block; checks_only_at_begin_or_new_slot)\n",
+        movie_prefetch_slots(movie), (unsigned long)ahead.budget_bytes, (unsigned long)ahead.reserve_bytes,
         ahead.memory_known_at_begin ? 1U : 0U, (unsigned long)ahead.free_bytes_at_begin,
         ahead.memory_known ? 1U : 0U, (unsigned long)ahead.free_bytes_last,
         (unsigned long)ahead.memory_checks, (unsigned long)ahead.memory_denials,
@@ -463,8 +471,14 @@ void playback_capture_export(FILE *file, const Movie *movie)
         hwtype(), is_cx2 ? 1U : 0U, is_touchpad ? 1U : 0U, (int)lcd_type(),
         g_clock.using_hw_timer ? 1U : 0U, (unsigned long)g_capture->tick_hz,
         g_clock.original_control, g_clock.original_speed);
-    if (movie && movie->codec == MOVIE_CODEC_H264)
+    if (movie_uses_decode_ahead(movie))
         fputs("color_conversion flat_reuse=exact_yuv cache_entries=1 cache_scope=conversion_band\n", file);
+    if (NDVIDEO_WITH_HEVC && movie && movie->codec == MOVIE_CODEC_HEVC)
+        fprintf(file, "hevc submitted_frames=%llu decoded_ctus=%llu ctu_size=%u failed=%u workspace_bytes=%lu workspace_sram=%u\n",
+            (unsigned long long)movie->hevc.submitted_frames,
+            (unsigned long long)movie->hevc.decoded_ctus,
+            hevc_ctu_size(movie->hevc.decoder), movie->hevc.decoder_failed ? 1U : 0U,
+            (unsigned long)hevc_working_memory_size(), hevc_external_memory(movie->hevc.decoder) ? 1U : 0U);
     fprintf(file,
             "platform_features screen_power_profile=%u standby_profile=%u async_writer_profile=%u detection=driver_code_and_mapping\n",
             native_screen_power_supported() ? 1U : 0U, native_standby_supported() ? 1U : 0U,

@@ -369,7 +369,7 @@ MemoryStats query_memory_stats(const Movie *movie)
     stats.used_bytes += chunk_prefetch_bytes;
     stats.used_bytes += screenshot_writer_pending_bytes();
     stats.used_bytes += app_task_io_memory_bytes();
-    stats.used_bytes += h264_lookahead_memory_bytes(movie);
+    stats.used_bytes += video_lookahead_memory_bytes(movie);
     stats.total_bytes = APP_RAM_TARGET_BYTES;
     stats.free_bytes = stats.total_bytes > stats.used_bytes
         ? (stats.total_bytes - stats.used_bytes)
@@ -536,7 +536,7 @@ uint16_t rolling_u16_average(uint16_t current, uint32_t sample_ms)
     return (uint16_t) (((current * 7U) + sample_ms + 4U) / 8U);
 }
 
-void record_h264_foreground_decode_time(Movie *movie, uint32_t elapsed_ms)
+void record_foreground_decode_time(Movie *movie, uint32_t elapsed_ms)
 {
     uint32_t average_ms;
     uint32_t peak_ms;
@@ -545,12 +545,12 @@ void record_h264_foreground_decode_time(Movie *movie, uint32_t elapsed_ms)
         return;
     }
 
-    average_ms = rolling_u16_average(movie->h264.foreground_decode_avg_ms, elapsed_ms);
+    average_ms = rolling_u16_average(movie->foreground_decode_avg_ms, elapsed_ms);
     if (average_ms > 1000U) {
         average_ms = 1000U;
     }
 
-    peak_ms = movie->h264.foreground_decode_peak_ms;
+    peak_ms = movie->foreground_decode_peak_ms;
     if (elapsed_ms > peak_ms) {
         peak_ms = elapsed_ms;
     } else if (peak_ms > elapsed_ms) {
@@ -560,8 +560,8 @@ void record_h264_foreground_decode_time(Movie *movie, uint32_t elapsed_ms)
         peak_ms = 1000U;
     }
 
-    movie->h264.foreground_decode_avg_ms = (uint16_t) average_ms;
-    movie->h264.foreground_decode_peak_ms = (uint16_t) peak_ms;
+    movie->foreground_decode_avg_ms = (uint16_t) average_ms;
+    movie->foreground_decode_peak_ms = (uint16_t) peak_ms;
 }
 
 void record_debug_displayed_frame(Movie *movie, uint32_t now_ms)

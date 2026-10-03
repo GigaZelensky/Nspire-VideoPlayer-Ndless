@@ -1,5 +1,5 @@
 #include "player_internal.h"
-#include "h264_lookahead.h"
+#include "video_lookahead.h"
 #include "native_runtime_stats.h"
 
 typedef struct {
@@ -8,27 +8,29 @@ typedef struct {
     uint32_t frame;
     int chunk;
     uint32_t idr_first, idr_end;
-} H264LookaheadFrame;
+} VideoLookaheadFrame;
 
-struct H264Lookahead {
-    H264LookaheadFrame frames[H264_LOOKAHEAD_MAX_FRAMES];
-    H264LookaheadStats stats;
+struct VideoLookahead {
+    VideoLookaheadFrame frames[VIDEO_LOOKAHEAD_MAX_FRAMES];
+    VideoLookaheadStats stats;
     size_t frame_bytes;
     size_t storage_bound;
     unsigned head, count, allocated_slots;
     uint32_t prepared_frame;
     unsigned prepared_depth;
     bool have_prepared_frame;
+    bool realtime_pending;
+    uint32_t realtime_target;
     uint32_t next_frame, tick_hz;
     int idr_chunk;
     uint32_t idr_first, idr_end;
-    uint32_t margin_ticks, slice_ceiling_ticks, wide_floor_ticks;
+    uint32_t margin_ticks, slice_ceiling_ticks, wide_floor_ticks, foreground_slice_ticks;
     size_t consumed;
     unsigned zero_advance_retries;
     uint8_t *access_unit;
     size_t access_unit_size;
     uint32_t working_local_frame;
-    H264LookaheadFrame *output_slot;
+    VideoLookaheadFrame *output_slot;
     uint8_t *picture;
     size_t color_row;
     bool color_flat;
@@ -46,7 +48,7 @@ struct H264Lookahead {
     bool have_color_tail_sample;
 };
 
-static uint32_t ahead_ticks_ms(const struct H264Lookahead *ahead, unsigned ms)
+static uint32_t ahead_ticks_ms(const struct VideoLookahead *ahead, unsigned ms)
 {
     return (uint32_t)(((uint64_t)ahead->tick_hz * ms + 999U) / 1000U);
 }
@@ -61,7 +63,7 @@ static uint32_t ahead_elapsed(uint64_t begin, uint64_t end)
  * as a permanent prohibition on using spare time. Lifetime maxima remain in
  * diagnostics. Each conversion band/deblocking operation is indivisible,
  * so its measured cost plus a guard must fit before starting it. */
-static void ahead_update_guard(struct H264Lookahead *ahead, uint32_t *guard, bool *have_sample,
+static void ahead_update_guard(struct VideoLookahead *ahead, uint32_t *guard, bool *have_sample,
                                uint32_t elapsed)
 {
     uint32_t margin = elapsed / 8U;
@@ -85,7 +87,7 @@ static bool ahead_time_fits(uint64_t deadline, uint32_t needed)
     return deadline > now && deadline - now >= needed;
 }
 
-static uint32_t ahead_four_mb_guard(const struct H264Lookahead *ahead)
+static uint32_t ahead_four_mb_guard(const struct VideoLookahead *ahead)
 {
     uint64_t cost = ((uint64_t)ahead->pump_ticks_per_mb_q8 + 63U) >> 6;
     uint64_t margin = cost / 8U;
@@ -95,7 +97,7 @@ static uint32_t ahead_four_mb_guard(const struct H264Lookahead *ahead)
     return cost + margin > UINT32_MAX ? UINT32_MAX : (uint32_t)(cost + margin);
 }
 
-static unsigned ahead_macroblock_budget(struct H264Lookahead *ahead, uint32_t total_mbs,
+static unsigned ahead_macroblock_budget(struct VideoLookahead *ahead, uint32_t total_mbs,
                                         uint32_t decoded_mbs, uint64_t deadline)
 {
     uint32_t remaining = total_mbs > decoded_mbs ? total_mbs - decoded_mbs : 1U;
@@ -135,7 +137,7 @@ static unsigned ahead_macroblock_budget(struct H264Lookahead *ahead, uint32_t to
     return available >= ahead_four_mb_guard(ahead) ? 4U : 0U;
 }
 
-static void ahead_memory_sample(Movie *movie, struct H264Lookahead *ahead, bool beginning)
+static void ahead_memory_sample(Movie *movie, struct VideoLookahead *ahead, bool beginning)
 {
     NativeRuntimeStats memory;
     size_t current = movie_lookahead_storage_bytes(movie);
@@ -145,19 +147,19 @@ static void ahead_memory_sample(Movie *movie, struct H264Lookahead *ahead, bool 
     ahead->stats.memory_known = (memory.valid_flags & NATIVE_RUNTIME_STATS_DYNAMIC_POOL) != 0;
     ahead->stats.free_bytes_last =
         ahead->stats.memory_known ? memory.dynamic_pool_available_bytes : 0U;
-    ahead->stats.reserve_bytes = growth > SIZE_MAX - H264_LOOKAHEAD_HEADROOM_BYTES
+    ahead->stats.reserve_bytes = growth > SIZE_MAX - VIDEO_LOOKAHEAD_HEADROOM_BYTES
                                      ? SIZE_MAX
-                                     : H264_LOOKAHEAD_HEADROOM_BYTES + growth;
+                                     : VIDEO_LOOKAHEAD_HEADROOM_BYTES + growth;
     if (beginning) {
         ahead->stats.memory_known_at_begin = ahead->stats.memory_known;
         ahead->stats.free_bytes_at_begin = ahead->stats.free_bytes_last;
     }
 }
 
-static void ahead_select_capacity(Movie *movie, struct H264Lookahead *ahead)
+static void ahead_select_capacity(Movie *movie, struct VideoLookahead *ahead)
 {
     size_t slot_charge =
-        ahead->frame_bytes + PLAYER_CACHE_LINE_SIZE + H264_LOOKAHEAD_ALLOCATION_ALLOWANCE;
+        ahead->frame_bytes + PLAYER_CACHE_LINE_SIZE + VIDEO_LOOKAHEAD_ALLOCATION_ALLOWANCE;
     uint64_t owned_charge = ahead->stats.allocated_bytes;
     uint64_t budget;
     unsigned capacity;
@@ -165,7 +167,7 @@ static void ahead_select_capacity(Movie *movie, struct H264Lookahead *ahead)
     if (ahead->storage_bound == SIZE_MAX || ahead->stats.reserve_bytes == SIZE_MAX)
         budget = 0U;
     else if (!ahead->stats.memory_known)
-        budget = H264_LOOKAHEAD_FALLBACK_BYTES;
+        budget = VIDEO_LOOKAHEAD_FALLBACK_BYTES;
     else {
         /* Retained queue buffers already reduced the free-pool counter.
          * Credit them when choosing a TOTAL queue budget on a later seek. */
@@ -173,12 +175,12 @@ static void ahead_select_capacity(Movie *movie, struct H264Lookahead *ahead)
         budget =
             available > ahead->stats.reserve_bytes ? available - ahead->stats.reserve_bytes : 0U;
     }
-    if (budget > H264_LOOKAHEAD_MAX_BYTES)
-        budget = H264_LOOKAHEAD_MAX_BYTES;
+    if (budget > VIDEO_LOOKAHEAD_MAX_BYTES)
+        budget = VIDEO_LOOKAHEAD_MAX_BYTES;
     ahead->stats.budget_bytes = (size_t)budget;
     capacity = budget > sizeof(*ahead) ? (unsigned)((budget - sizeof(*ahead)) / slot_charge) : 0U;
-    if (capacity > H264_LOOKAHEAD_MAX_FRAMES)
-        capacity = H264_LOOKAHEAD_MAX_FRAMES;
+    if (capacity > VIDEO_LOOKAHEAD_MAX_FRAMES)
+        capacity = VIDEO_LOOKAHEAD_MAX_FRAMES;
     /* Only begin/rebegin calls this with no queued/partial output. Swapping
      * the display buffer never leaves it owned by a queue slot, so trimming
      * these unused high slots cannot free the currently displayed image. */
@@ -194,13 +196,13 @@ static void ahead_select_capacity(Movie *movie, struct H264Lookahead *ahead)
         ++ahead->stats.memory_denials;
 }
 
-static bool ahead_allocate_slot(Movie *movie, struct H264Lookahead *ahead, unsigned slot)
+static bool ahead_allocate_slot(Movie *movie, struct VideoLookahead *ahead, unsigned slot)
 {
-    H264LookaheadFrame *frame = &ahead->frames[slot];
+    VideoLookaheadFrame *frame = &ahead->frames[slot];
     if (frame->pixels)
         return true;
     size_t slot_bytes = ahead->frame_bytes + PLAYER_CACHE_LINE_SIZE;
-    size_t slot_charge = slot_bytes + H264_LOOKAHEAD_ALLOCATION_ALLOWANCE;
+    size_t slot_charge = slot_bytes + VIDEO_LOOKAHEAD_ALLOCATION_ALLOWANCE;
     ahead_memory_sample(movie, ahead, false);
     bool denied = ahead->storage_bound == SIZE_MAX || ahead->stats.reserve_bytes == SIZE_MAX;
     if (!denied && ahead->stats.memory_known)
@@ -210,9 +212,9 @@ static bool ahead_allocate_slot(Movie *movie, struct H264Lookahead *ahead, unsig
         /* If the validated counter disappears, stop growth beyond the old
          * conservative budget; never discard already queued pictures. */
         uint64_t charge = (uint64_t)ahead->stats.allocated_bytes +
-                          (uint64_t)ahead->allocated_slots * H264_LOOKAHEAD_ALLOCATION_ALLOWANCE;
-        denied = charge > H264_LOOKAHEAD_FALLBACK_BYTES ||
-                 slot_charge > H264_LOOKAHEAD_FALLBACK_BYTES - charge;
+                          (uint64_t)ahead->allocated_slots * VIDEO_LOOKAHEAD_ALLOCATION_ALLOWANCE;
+        denied = charge > VIDEO_LOOKAHEAD_FALLBACK_BYTES ||
+                 slot_charge > VIDEO_LOOKAHEAD_FALLBACK_BYTES - charge;
     }
     if (denied) {
         ++ahead->stats.memory_denials;
@@ -229,7 +231,7 @@ static bool ahead_allocate_slot(Movie *movie, struct H264Lookahead *ahead, unsig
     return true;
 }
 
-static unsigned ahead_color_rows(struct H264Lookahead *ahead, size_t remaining, uint64_t deadline)
+static unsigned ahead_color_rows(struct VideoLookahead *ahead, size_t remaining, uint64_t deadline)
 {
     uint64_t now = monotonic_clock_now_ticks();
     if (deadline <= now)
@@ -248,29 +250,28 @@ static unsigned ahead_color_rows(struct H264Lookahead *ahead, size_t remaining, 
         if (cost + margin <= slice_ceiling && cost + margin <= available)
             return rows;
     }
-    uint32_t guard = remaining < H264_LOOKAHEAD_COLOR_ROWS && ahead->have_color_tail_sample
+    uint32_t guard = remaining < VIDEO_LOOKAHEAD_COLOR_ROWS && ahead->have_color_tail_sample
                          ? ahead->color_tail_guard
                          : ahead->color_guard;
     if (available < guard)
         return 0U;
-    return remaining < H264_LOOKAHEAD_COLOR_ROWS ? (unsigned)remaining : H264_LOOKAHEAD_COLOR_ROWS;
+    return remaining < VIDEO_LOOKAHEAD_COLOR_ROWS ? (unsigned)remaining : VIDEO_LOOKAHEAD_COLOR_ROWS;
 }
 
-bool h264_lookahead_active(const Movie *movie)
+bool video_lookahead_active(const Movie *movie)
 {
-    return movie && movie->h264_lookahead && movie->h264_lookahead->stats.active;
+    return movie && movie->video_lookahead && movie->video_lookahead->stats.active;
 }
 
-bool h264_lookahead_begin(Movie *movie)
+bool video_lookahead_begin(Movie *movie)
 {
-    struct H264Lookahead *ahead;
+    struct VideoLookahead *ahead;
     uint64_t bytes;
     const ChunkIndexEntry *entry;
 
-    if (h264_lookahead_active(movie))
+    if (video_lookahead_active(movie))
         return true;
-    if (!movie || movie->codec != MOVIE_CODEC_H264 || !movie->h264.decoder ||
-        !movie->h264.decoder_initialized || movie->h264.decoder_failed || !movie->framebuffer ||
+    if (!movie || !video_decoder_ready(movie) || !movie->framebuffer ||
         !movie->chunk_index || movie->loaded_chunk < 0 ||
         (uint32_t)movie->loaded_chunk >= movie->header.chunk_count ||
         movie->current_frame >= movie->header.frame_count)
@@ -282,9 +283,9 @@ bool h264_lookahead_begin(Movie *movie)
         return false;
 
     bytes = (uint64_t)movie->header.video_width * movie->header.video_height * sizeof(uint16_t);
-    if (!bytes || bytes > H264_LOOKAHEAD_MAX_BYTES - sizeof(*ahead) - PLAYER_CACHE_LINE_SIZE)
+    if (!bytes || bytes > VIDEO_LOOKAHEAD_MAX_BYTES - sizeof(*ahead) - PLAYER_CACHE_LINE_SIZE)
         return false;
-    ahead = movie->h264_lookahead;
+    ahead = movie->video_lookahead;
     if (!ahead) {
         ahead = calloc(1U, sizeof(*ahead));
         if (!ahead)
@@ -301,12 +302,16 @@ bool h264_lookahead_begin(Movie *movie)
         ahead->margin_ticks = ahead_ticks_ms(ahead, 1U);
         ahead->slice_ceiling_ticks = ahead_ticks_ms(ahead, 4U);
         ahead->wide_floor_ticks = ahead_ticks_ms(ahead, 8U);
+        /* A late HEVC frame has no presentation slack left. Up to 8 ms of
+         * useful work per input turn avoids repeating the full UI scan for
+         * every CTU, while still checking keys more than once per UI frame. */
+        ahead->foreground_slice_ticks = ahead_ticks_ms(ahead, 8U);
         ahead->pump_guard = ahead_ticks_ms(ahead, 2U);
         ahead->pump_ticks_per_mb_q8 = ahead->pump_guard * 32U;
         ahead->finish_guard = ahead_ticks_ms(ahead, 6U);
         ahead->color_guard = ahead->margin_ticks;
         ahead->color_ticks_per_row_q8 = ahead->color_guard * 16U;
-        movie->h264_lookahead = ahead;
+        movie->video_lookahead = ahead;
     }
     if (ahead->frame_bytes != bytes)
         return false;
@@ -314,6 +319,8 @@ bool h264_lookahead_begin(Movie *movie)
     ahead->recovering = ahead->producer_failed = false;
     ahead->recovery_chunk = -1;
     ahead->have_prepared_frame = false;
+    ahead->realtime_pending = false;
+    movie->foreground_pending_ticks = 0;
     ahead->consumed = 0U;
     ahead->zero_advance_retries = 0U;
     ahead->picture = NULL;
@@ -338,12 +345,12 @@ bool h264_lookahead_begin(Movie *movie)
     return true;
 }
 
-bool h264_lookahead_reloading(const Movie *movie)
+bool video_lookahead_reloading(const Movie *movie)
 {
-    return h264_lookahead_active(movie) && movie->h264_lookahead->recovery_chunk >= 0;
+    return video_lookahead_active(movie) && movie->video_lookahead->recovery_chunk >= 0;
 }
 
-static void ahead_note_failure(Movie *movie, struct H264Lookahead *ahead)
+static void ahead_note_failure(Movie *movie, struct VideoLookahead *ahead)
 {
     ++ahead->stats.failures;
     if (ahead->recovering) return; /* Retain the original decoder failure if recovery also fails. */
@@ -355,13 +362,13 @@ static void ahead_note_failure(Movie *movie, struct H264Lookahead *ahead)
         ahead->failure_stage ? ahead->failure_stage : "unknown", debug_last_error());
 }
 
-static void ahead_recover(Movie *movie, struct H264Lookahead *ahead)
+static void ahead_recover(Movie *movie, struct VideoLookahead *ahead)
 {
     ahead_note_failure(movie, ahead);
     int chunk = movie_chunk_for_frame(movie, ahead->next_frame);
     /* Never retry indefinitely. Keep valid RGB frames even if rebuilding the
      * decoder fails; the existing foreground fallback handles their end. */
-    if (ahead->recovering || chunk < 0 || !reset_h264_decoder(movie)) {
+    if (ahead->recovering || chunk < 0 || !video_decoder_reset(movie)) {
         ahead->producer_failed = true;
         ahead->recovery_chunk = -1;
         return;
@@ -388,8 +395,9 @@ static void ahead_recover(Movie *movie, struct H264Lookahead *ahead)
         (unsigned long)ahead->next_frame, ahead->count, ahead->stats.failure_reason);
 }
 
-static void ahead_discard_picture(Movie *movie, struct H264Lookahead *ahead)
+static void ahead_discard_picture(Movie *movie, struct VideoLookahead *ahead)
 {
+    video_decoder_release_picture(movie);
     movie->decoded_local_frame = (int)ahead->working_local_frame;
     if (ahead->recovering && ahead->next_frame < ahead->recovery_target)
         ++ahead->stats.recovery_frames;
@@ -408,8 +416,8 @@ static void ahead_discard_picture(Movie *movie, struct H264Lookahead *ahead)
  * or realtime catch-up explicitly discards that picture's display output. */
 static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint32_t discard_before)
 {
-    struct H264Lookahead *ahead = movie->h264_lookahead;
-    H264LookaheadFrame *slot;
+    struct VideoLookahead *ahead = movie->video_lookahead;
+    VideoLookaheadFrame *slot;
     const ChunkIndexEntry *entry;
     uint32_t local, total_mbs, decoded_mbs;
     size_t start, end;
@@ -442,7 +450,7 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
         if (ahead->picture) {
             size_t remaining_rows = movie->header.video_height - ahead->color_row;
             initial_guard =
-                remaining_rows < H264_LOOKAHEAD_COLOR_ROWS && ahead->have_color_tail_sample
+                remaining_rows < VIDEO_LOOKAHEAD_COLOR_ROWS && ahead->have_color_tail_sample
                     ? ahead->color_tail_guard
                     : ahead->color_guard;
         } else {
@@ -469,7 +477,7 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
         if (previous_chunk != movie->loaded_chunk)
             ahead->decoder_touched = true;
         if (movie->loaded_chunk < 0 || (uint32_t)movie->loaded_chunk >= movie->header.chunk_count ||
-            !movie->frame_offsets || !movie->chunk_bytes || !movie->h264.decoder)
+            !movie->frame_offsets || !movie->chunk_bytes || !video_decoder_ready(movie))
             return -1;
         entry = &movie->chunk_index[movie->loaded_chunk];
         if (ahead->next_frame < entry->first_frame)
@@ -511,7 +519,7 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
              * Retain every completed frame and continue with the smaller ring. */
             ahead->stats.capacity = ahead->allocated_slots;
             if (!ahead->stats.capacity) {
-                h264_lookahead_cancel(movie);
+                video_lookahead_cancel(movie);
                 return 0;
             }
             ahead->head %= ahead->stats.capacity;
@@ -530,23 +538,37 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
     slot = ahead->output_slot;
 
     if (!ahead->picture) {
-        total_mbs = h264_incremental_total_mbs(movie, movie->h264.decoder);
-        decoded_mbs = ahead->stats.partial ? movie->h264.decoder->slice->numDecodedMbs : 0U;
+        total_mbs = video_decoder_total_units(movie);
+        decoded_mbs = ahead->stats.partial ? video_decoder_done_units(movie) : 0U;
         /* The final batch can also perform full-picture deblocking and DPB
          * bookkeeping. Reserve its independently measured high-water cost. */
         macroblock_budget =
             foreground ? 0U : ahead_macroblock_budget(ahead, total_mbs, decoded_mbs, deadline);
         if (!foreground && !macroblock_budget)
             return 0;
+        if (!foreground && NDVIDEO_WITH_HEVC && movie->codec == MOVIE_CODEC_HEVC) {
+            unsigned ctu = hevc_ctu_size(movie->hevc.decoder);
+            unsigned minimum = ctu ? (ctu / 16U) * (ctu / 16U) : 4U;
+            /* A CTU cannot yield internally. Never admit one using a cost
+             * estimate for a smaller batch of 16x16 equivalent units. */
+            if (macroblock_budget < minimum) {
+                uint64_t cost = ((uint64_t)ahead->pump_ticks_per_mb_q8 * minimum + 255U) >> 8;
+                uint64_t margin = cost / 8U;
+                if (margin < ahead->margin_ticks) margin = ahead->margin_ticks;
+                cost += margin;
+                if (total_mbs - decoded_mbs <= minimum && cost < ahead->finish_guard)
+                    cost = ahead->finish_guard;
+                if (cost > UINT32_MAX || !ahead_time_fits(deadline, (uint32_t)cost)) return 0;
+                macroblock_budget = minimum;
+            }
+        }
         ahead->stats.partial = true;
         ahead->decoder_touched = true;
-        movie->h264.chunk_dirty = true;
         started = monotonic_clock_now_ticks();
         ahead->failure_stage = "decode";
-        if (!pump_h264_access_unit(movie, movie->h264.decoder, ahead->access_unit,
-                                   ahead->access_unit_size, &ahead->consumed,
-                                   &ahead->zero_advance_retries, macroblock_budget, true,
-                                   "lookahead", &picture_ready, &pending, &picture))
+        if (!video_decoder_pump(movie, ahead->access_unit, ahead->access_unit_size,
+                                   &ahead->consumed, &ahead->zero_advance_retries,
+                                   macroblock_budget, &picture_ready, &pending, &picture))
             return -1;
         finished = monotonic_clock_now_ticks();
         elapsed = ahead_elapsed(started, finished);
@@ -577,7 +599,7 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
                 ahead_update_guard(ahead, &ahead->finish_guard, &ahead->have_finish_sample,
                                    normalized > UINT32_MAX ? UINT32_MAX : (uint32_t)normalized);
             } else {
-                uint32_t after_mbs = movie->h264.decoder->slice->numDecodedMbs;
+                uint32_t after_mbs = video_decoder_done_units(movie);
                 if (after_mbs > decoded_mbs) {
                     uint32_t actual_mbs = after_mbs - decoded_mbs;
                     uint64_t normalized, sample_q8;
@@ -627,13 +649,14 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
             return 1;
     }
     size_t rows = movie->header.video_height - ahead->color_row;
+    if (foreground && movie->codec == MOVIE_CODEC_HEVC && rows > 16U) rows = 16U;
     if (!foreground)
         rows = ahead_color_rows(ahead, rows, deadline);
     if (!rows)
         return 0;
     started = monotonic_clock_now_ticks();
     ahead->failure_stage = "color";
-    if (!blit_h264_picture_rows_to_target(movie, ahead->picture, slot->pixels,
+    if (!video_blit_picture_rows(movie, ahead->picture, slot->pixels,
                                           movie->header.video_width, ahead->color_row, rows,
                                           &ahead->color_flat))
         return -1;
@@ -683,6 +706,7 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
     ahead->color_row += rows;
     if (ahead->color_row < movie->header.video_height)
         return 1;
+    video_decoder_release_picture(movie);
     if (ahead->recovering) {
         ahead->recovering = false;
         ++ahead->stats.recoveries;
@@ -709,13 +733,13 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
     return 1;
 }
 
-bool h264_lookahead_step(Movie *movie, uint64_t deadline_ticks)
+bool video_lookahead_step(Movie *movie, uint64_t deadline_ticks)
 {
-    struct H264Lookahead *ahead;
+    struct VideoLookahead *ahead;
     int result;
-    if (!h264_lookahead_active(movie))
+    if (!video_lookahead_active(movie))
         return false;
-    ahead = movie->h264_lookahead;
+    ahead = movie->video_lookahead;
     if (ahead->producer_failed) return false;
     result = ahead_produce(movie, deadline_ticks, false, 0);
     if (result < 0) ahead_recover(movie, ahead);
@@ -724,13 +748,13 @@ bool h264_lookahead_step(Movie *movie, uint64_t deadline_ticks)
 
 static bool ahead_take(Movie *movie, uint32_t target_frame, bool queued_hit)
 {
-    struct H264Lookahead *ahead;
-    H264LookaheadFrame *slot;
+    struct VideoLookahead *ahead;
+    VideoLookaheadFrame *slot;
     uint16_t *old_pixels;
     uint8_t *old_allocation;
-    if (!h264_lookahead_active(movie))
+    if (!video_lookahead_active(movie))
         return false;
-    ahead = movie->h264_lookahead;
+    ahead = movie->video_lookahead;
     if (!ahead->count || ahead->frames[ahead->head].frame != target_frame)
         return false;
     slot = &ahead->frames[ahead->head];
@@ -762,104 +786,138 @@ static bool ahead_take(Movie *movie, uint32_t target_frame, bool queued_hit)
     return true;
 }
 
-bool h264_lookahead_take(Movie *movie, uint32_t target_frame)
+bool video_lookahead_take(Movie *movie, uint32_t target_frame)
 {
     return ahead_take(movie, target_frame, true);
 }
 
-int h264_lookahead_prepare_target(Movie *movie, uint32_t target_frame)
+int video_lookahead_prepare_target(Movie *movie, uint32_t target_frame)
 {
-    struct H264Lookahead *ahead;
+    struct VideoLookahead *ahead;
     int result;
-    if (!h264_lookahead_active(movie))
+    if (!video_lookahead_active(movie))
         return 0;
-    ahead = movie->h264_lookahead;
+    ahead = movie->video_lookahead;
     if (target_frame != movie->current_frame + 1U)
         return 0;
     if (!ahead->have_prepared_frame || ahead->prepared_frame != target_frame) {
         ahead->prepared_frame = target_frame;
         ahead->prepared_depth = ahead->count;
         ahead->have_prepared_frame = true;
+        if (!ahead->count) ++ahead->stats.queue_misses;
     }
     if (ahead->count && ahead->frames[ahead->head].frame == target_frame)
         return 1;
     if (target_frame != movie->current_frame + 1U || ahead->count ||
         ahead->next_frame != target_frame)
         return 0;
-    ++ahead->stats.queue_misses;
-    result = ahead_produce(movie, 0U, true, 0);
+    uint64_t quantum_end = movie->codec == MOVIE_CODEC_HEVC
+        ? monotonic_clock_now_ticks() + ahead->foreground_slice_ticks : 0;
+    do {
+        result = ahead_produce(movie, 0U, true, 0);
+    } while (movie->codec == MOVIE_CODEC_HEVC && result > 0 && !ahead->count &&
+             ahead->stats.active && monotonic_clock_now_ticks() < quantum_end);
     if (!ahead->stats.active)
         return 0;
     if (result > 0 && ahead->count && ahead->frames[ahead->head].frame == target_frame)
         return 1;
+    if (movie->codec == MOVIE_CODEC_HEVC && result > 0) return 2;
     if (!ahead->producer_failed) ahead_note_failure(movie, ahead);
-    movie->h264.decoder_failed = true;
-    h264_lookahead_cancel(movie);
+    video_decoder_mark_failed(movie);
+    video_lookahead_cancel(movie);
     return -1;
 }
 
-unsigned h264_lookahead_prepared_depth(const Movie *movie, uint32_t target_frame)
+unsigned video_lookahead_prepared_depth(const Movie *movie, uint32_t target_frame)
 {
-    const struct H264Lookahead *ahead;
-    if (!h264_lookahead_active(movie))
+    const struct VideoLookahead *ahead;
+    if (!video_lookahead_active(movie))
         return 0U;
-    ahead = movie->h264_lookahead;
+    ahead = movie->video_lookahead;
     return ahead->have_prepared_frame && ahead->prepared_frame == target_frame
                ? ahead->prepared_depth
                : ahead->count;
 }
 
-int h264_lookahead_finish_target(Movie *movie, uint32_t target_frame)
+int video_lookahead_finish_target(Movie *movie, uint32_t target_frame)
 {
-    int ready = h264_lookahead_prepare_target(movie, target_frame);
-    if (ready <= 0)
+    int ready = video_lookahead_prepare_target(movie, target_frame);
+    if (ready != 1)
         return ready;
-    if (h264_lookahead_take(movie, target_frame))
+    if (video_lookahead_take(movie, target_frame))
         return 1;
     return -1;
 }
 
-int h264_lookahead_finish_realtime_target(Movie *movie, uint32_t target_frame)
+bool video_lookahead_pending_realtime_target(const Movie *movie, uint32_t *target)
 {
-    if (!h264_lookahead_active(movie) || target_frame <= movie->current_frame ||
-        target_frame >= movie->header.frame_count) return 0;
-    struct H264Lookahead *ahead = movie->h264_lookahead;
+    if (!video_lookahead_active(movie) || !movie->video_lookahead->realtime_pending)
+        return false;
+    *target = movie->video_lookahead->realtime_target;
+    return true;
+}
+
+int video_lookahead_finish_realtime_target(Movie *movie, uint32_t target_frame)
+{
+    if (!video_lookahead_active(movie)) return 0;
+    struct VideoLookahead *ahead = movie->video_lookahead;
+    /* HEVC returns to the input loop between CTUs. Finish the chosen image
+     * even if the clock passes it meanwhile, otherwise an overloaded decoder
+     * can discard every picture without ever refreshing the display. */
+    if (ahead->realtime_pending) target_frame = ahead->realtime_target;
+    if (target_frame <= movie->current_frame || target_frame >= movie->header.frame_count) return 0;
     ahead->have_prepared_frame = false;
-    /* Retire only frames older than the clock's target. Buffers stay owned
-     * by the ring, so a timing-mode switch never frees or reloads them. */
     while (ahead->count && ahead->frames[ahead->head].frame < target_frame) {
         ahead->head = (ahead->head + 1U) % ahead->stats.capacity;
         --ahead->count;
     }
     ahead->stats.queued = ahead->count;
-    if (ahead->count) return ahead_take(movie, target_frame, true) ? 1 : 0;
+    if (ahead->count) {
+        bool taken = ahead_take(movie, target_frame, true);
+        if (taken) ahead->realtime_pending = false;
+        return taken ? 1 : 0;
+    }
     if (ahead->next_frame > target_frame) return 0;
-    ++ahead->stats.queue_misses;
+    if (!ahead->realtime_pending) ++ahead->stats.queue_misses;
+        if (NDVIDEO_WITH_HEVC && movie->codec == MOVIE_CODEC_HEVC) {
+        ahead->realtime_pending = true;
+        ahead->realtime_target = target_frame;
+    }
+    uint64_t quantum_end = movie->codec == MOVIE_CODEC_HEVC
+        ? monotonic_clock_now_ticks() + ahead->foreground_slice_ticks : 0;
     while (!ahead->count) {
         int result = ahead_produce(movie, 0U, true, target_frame);
         if (result <= 0) {
             if (!ahead->producer_failed) ahead_note_failure(movie, ahead);
-            movie->h264.decoder_failed = true;
-            h264_lookahead_cancel(movie);
+            video_decoder_mark_failed(movie);
+            video_lookahead_cancel(movie);
             return -1;
         }
+        if (movie->codec == MOVIE_CODEC_HEVC && !ahead->count &&
+            monotonic_clock_now_ticks() >= quantum_end) return 2;
     }
-    return ahead_take(movie, target_frame, false) ? 1 : 0;
+    bool taken = ahead_take(movie, target_frame, false);
+    if (taken) ahead->realtime_pending = false;
+    return taken ? 1 : 0;
 }
 
-void h264_lookahead_cancel(Movie *movie)
+void video_lookahead_cancel(Movie *movie)
 {
-    struct H264Lookahead *ahead;
+    struct VideoLookahead *ahead;
     bool touched;
-    if (!movie || !(ahead = movie->h264_lookahead))
+    if (!movie || !(ahead = movie->video_lookahead))
         return;
     touched = ahead->decoder_touched;
+    /* An inactive queue does not own a picture held by a suspended seek. */
+    if (ahead->picture) video_decoder_release_picture(movie);
     if (ahead->stats.active)
         ++ahead->stats.cancellations;
     ahead->stats.active = false;
     ahead->recovering = ahead->producer_failed = false;
     ahead->recovery_chunk = -1;
     ahead->have_prepared_frame = false;
+    ahead->realtime_pending = false;
+    movie->foreground_pending_ticks = 0;
     ahead->stats.partial = false;
     ahead->head = ahead->count = 0U;
     ahead->stats.queued = 0U;
@@ -873,49 +931,50 @@ void h264_lookahead_cancel(Movie *movie)
     if (touched) {
         /* The decoder removes emulation-prevention bytes in place. Replaying
          * any partly/fully decoded AU requires a fresh compressed chunk. */
-        if (!reset_h264_decoder(movie))
-            movie->h264.decoder_failed = true;
+        if (!video_decoder_reset(movie))
+            video_decoder_mark_failed(movie);
         invalidate_loaded_chunk_state(movie);
     }
 }
 
-void h264_lookahead_destroy(Movie *movie)
+void video_lookahead_destroy(Movie *movie)
 {
-    struct H264Lookahead *ahead;
+    struct VideoLookahead *ahead;
     unsigned i;
-    if (!movie || !(ahead = movie->h264_lookahead))
+    if (!movie || !(ahead = movie->video_lookahead))
         return;
-    for (i = 0U; i < H264_LOOKAHEAD_MAX_FRAMES; ++i) {
+    video_decoder_release_picture(movie);
+    for (i = 0U; i < VIDEO_LOOKAHEAD_MAX_FRAMES; ++i) {
         if (ahead->frames[i].pixels)
             player_free_aligned(ahead->frames[i].pixels, ahead->frames[i].allocation);
     }
     free(ahead);
-    movie->h264_lookahead = NULL;
+    movie->video_lookahead = NULL;
 }
 
-uint32_t h264_lookahead_next_frame(const Movie *movie)
+uint32_t video_lookahead_next_frame(const Movie *movie)
 {
-    return h264_lookahead_active(movie) ? movie->h264_lookahead->next_frame
+    return video_lookahead_active(movie) ? movie->video_lookahead->next_frame
            : movie                      ? movie->current_frame + 1U
                                         : 0U;
 }
 
-unsigned h264_lookahead_queued(const Movie *movie)
+unsigned video_lookahead_queued(const Movie *movie)
 {
-    return h264_lookahead_active(movie) ? movie->h264_lookahead->count : 0U;
+    return video_lookahead_active(movie) ? movie->video_lookahead->count : 0U;
 }
 
-size_t h264_lookahead_memory_bytes(const Movie *movie)
+size_t video_lookahead_memory_bytes(const Movie *movie)
 {
-    return movie && movie->h264_lookahead ? movie->h264_lookahead->stats.allocated_bytes : 0U;
+    return movie && movie->video_lookahead ? movie->video_lookahead->stats.allocated_bytes : 0U;
 }
 
-void h264_lookahead_get_stats(const Movie *movie, H264LookaheadStats *out)
+void video_lookahead_get_stats(const Movie *movie, VideoLookaheadStats *out)
 {
     if (!out)
         return;
-    if (movie && movie->h264_lookahead) {
-        const struct H264Lookahead *ahead = movie->h264_lookahead;
+    if (movie && movie->video_lookahead) {
+        const struct VideoLookahead *ahead = movie->video_lookahead;
         *out = ahead->stats;
         out->color_tail_guard_ticks =
             ahead->have_color_tail_sample ? ahead->color_tail_guard : ahead->color_guard;

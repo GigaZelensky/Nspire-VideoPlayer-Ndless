@@ -58,6 +58,64 @@
 static const i32 levelScale[6][3] = {
     {10,13,16}, {11,14,18}, {13,16,20}, {14,18,23}, {16,20,25}, {18,23,29}};
 
+/* levelScale[qp % 6][column] << (qp / 6), precomputed for all QPs.
+ * These repeat for every residual block; keep them in read-only storage
+ * instead of loading both QP maps and rebuilding three multipliers. */
+static const i32 blockScale[52][3] = {
+    {10,13,16},
+    {11,14,18},
+    {13,16,20},
+    {14,18,23},
+    {16,20,25},
+    {18,23,29},
+    {20,26,32},
+    {22,28,36},
+    {26,32,40},
+    {28,36,46},
+    {32,40,50},
+    {36,46,58},
+    {40,52,64},
+    {44,56,72},
+    {52,64,80},
+    {56,72,92},
+    {64,80,100},
+    {72,92,116},
+    {80,104,128},
+    {88,112,144},
+    {104,128,160},
+    {112,144,184},
+    {128,160,200},
+    {144,184,232},
+    {160,208,256},
+    {176,224,288},
+    {208,256,320},
+    {224,288,368},
+    {256,320,400},
+    {288,368,464},
+    {320,416,512},
+    {352,448,576},
+    {416,512,640},
+    {448,576,736},
+    {512,640,800},
+    {576,736,928},
+    {640,832,1024},
+    {704,896,1152},
+    {832,1024,1280},
+    {896,1152,1472},
+    {1024,1280,1600},
+    {1152,1472,1856},
+    {1280,1664,2048},
+    {1408,1792,2304},
+    {1664,2048,2560},
+    {1792,2304,2944},
+    {2048,2560,3200},
+    {2304,2944,3712},
+    {2560,3328,4096},
+    {2816,3584,4608},
+    {3328,4096,5120},
+    {3584,4608,5888}
+};
+
 /* qp % 6 as a function of qp */
 static const u8 qpMod6[52] = {0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3,4,5,
     0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3,4,5,0,1,2,3};
@@ -102,15 +160,13 @@ u32 h264bsdProcessBlock(i32 *data, u32 qp, u32 skip, u32 coeffMap)
     i32 tmp0, tmp1, tmp2, tmp3;
     i32 d1, d2, d3;
     u32 row,col;
-    u32 qpDiv;
     i32 *ptr;
 
 /* Code */
 
-    qpDiv = qpDiv6[qp];
-    tmp1 = levelScale[qpMod6[qp]][0] << qpDiv;
-    tmp2 = levelScale[qpMod6[qp]][1] << qpDiv;
-    tmp3 = levelScale[qpMod6[qp]][2] << qpDiv;
+    tmp1 = blockScale[qp][0];
+    tmp2 = blockScale[qp][1];
+    tmp3 = blockScale[qp][2];
 
     if (!skip)
         data[0] = (data[0] * tmp1);
@@ -198,10 +254,18 @@ u32 h264bsdProcessBlock(i32 *data, u32 qp, u32 skip, u32 coeffMap)
             /* check that value is in the range [-512,511] */
             if ((u32)(tmp0 + 512) > 1023)
                 return(HANTRO_NOK);
-            data[0] = data[1]  = data[2]  = data[3]  = data[4]  = data[5]  =
-                      data[6]  = data[7]  = data[8]  = data[9]  = data[10] =
-                      data[11] = data[12] = data[13] = data[14] = data[15] =
-                      tmp0;
+#ifdef H264DEC_NEON
+            data[0] = data[1] = data[2] = data[3] = data[4] = data[5] =
+                data[6] = data[7] = data[8] = data[9] = data[10] = data[11] =
+                data[12] = data[13] = data[14] = data[15] = tmp0;
+#else
+            /* A DC-only inverse transform produces one constant over 4x4.
+             * Retain that compact form until prediction is added. */
+            if (!tmp0)
+                MARK_RESIDUAL_EMPTY(data);
+            else
+                MARK_RESIDUAL_DC(data, tmp0);
+#endif
         }
         else /* at least one of the coeffs 1, 5 or 6 is non-zero */
         {
