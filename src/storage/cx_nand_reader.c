@@ -45,7 +45,8 @@ static bool supported_id(const uint8_t id[4])
         (id[1] == 0xa1U || id[1] == 0xf1U || id[1] == 0xd1U) &&
         !(id[2] & 0x0cU) && (id[3] & 0x77U) == 0x15U;
 }
-static unsigned parity(uint32_t word)
+/* Four calls per byte: inline the masked parity calculations in the ECC loop. */
+static inline __attribute__((always_inline)) unsigned parity(uint32_t word)
 {
     word ^= word >> 16;
     word ^= word >> 8;

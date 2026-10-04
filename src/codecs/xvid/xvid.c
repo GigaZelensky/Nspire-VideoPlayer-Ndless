@@ -199,7 +199,9 @@ int xvid_gbl_init(xvid_gbl_init_t * init)
 	interpolate8x8_avg4 = interpolate8x8_avg4_c;
 
 	/* postprocessing */
+#ifndef NDVIDEO_XVID_NO_POSTPROC
 	image_brightness = image_brightness_c;
+#endif
 
 	/* Initialize internal colorspace transformation tables */
 	if (!small_sram && !colorspace_init()) return XVID_ERR_MEMORY;

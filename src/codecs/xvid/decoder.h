@@ -119,11 +119,15 @@ typedef struct
 	IMAGE cur;
 	IMAGE refn[2];				/* 0   -- last I or P VOP */
 								/* 1   -- first I or P */
+#ifndef NDVIDEO_XVID_NO_POSTPROC
 	IMAGE tmp;		/* bframe interpolation, and post processing tmp buffer */
+#endif
 	IMAGE qtmp;		/* quarter pel tmp buffer */
 
 	/* postprocessing */
+#ifndef NDVIDEO_XVID_NO_POSTPROC
 	XVID_POSTPROC postproc;
+#endif
 
 	/* macroblock */
 

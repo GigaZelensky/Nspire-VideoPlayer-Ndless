@@ -45,7 +45,7 @@ AS  = nspire-as
 GXX = nspire-g++
 LD  = nspire-gcc -nodefaultlibs
 
-GCCFLAGS_BASE = -Wall -Wextra -Wno-unused-parameter -std=c99 -marm -mcpu=arm926ej-s -mtune=arm926ej-s -mfloat-abi=soft -ffunction-sections -fdata-sections -Isrc -Isrc/codecs/h264bsd -Isrc/codecs -Isrc/codecs/xvid -DARCH_IS_32BIT -DARCH_IS_ARM -DXVID_DECODER_ONLY -DNDVIDEO_XVID_RGB565_ONLY
+GCCFLAGS_BASE = -Wall -Wextra -Wno-unused-parameter -std=c99 -marm -mcpu=arm926ej-s -mtune=arm926ej-s -mfloat-abi=soft -ffunction-sections -fdata-sections -Isrc -Isrc/codecs/h264bsd -Isrc/codecs -Isrc/codecs/xvid -DARCH_IS_32BIT -DARCH_IS_ARM -DXVID_DECODER_ONLY -DNDVIDEO_XVID_RGB565_ONLY -DNDVIDEO_XVID_NO_POSTPROC
 LDFLAGS = -Wl,--gc-sections -lSDL -lm -flto -O3
 LDFLAGS += -Wl,--wrap=fopen,--wrap=fread,--wrap=fwrite,--wrap=fseek,--wrap=fclose,--wrap=fflush,--wrap=_open,--wrap=_read,--wrap=_write,--wrap=_lseek,--wrap=_close,--wrap=remove,--wrap=nuc_opendir,--wrap=nuc_readdir,--wrap=nuc_closedir
 LOADER_GXXFLAGS = -g -Os -Wall -Wextra -march=armv5te -fPIE -std=c++11 -fno-rtti -fno-exceptions -Wl,-Tldscript -Wl,--gc-sections -nostdlib -nostartfiles -ffreestanding -I ../../include
@@ -82,7 +82,6 @@ XVID_DECODER_SRCS = \
 	src/codecs/xvid/image/font.c \
 	src/codecs/xvid/image/image.c \
 	src/codecs/xvid/image/interpolate8x8.c \
-	src/codecs/xvid/image/postprocessing.c \
 	src/codecs/xvid/image/qpel.c \
 	src/codecs/xvid/image/reduced.c \
 	src/codecs/xvid/motion/estimation_common.c \

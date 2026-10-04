@@ -40,10 +40,12 @@ static void *resolve_host_symbol(const char *name)
     SYMBOL(strtoul);
     SYMBOL(fputs);
 #if NDVIDEO_WITH_MPEG4
+#ifndef NDVIDEO_XVID_NO_POSTPROC
     SYMBOL(rand);
     SYMBOL(srand);
     SYMBOL(log);
     SYMBOL(sqrt);
+#endif
     SYMBOL(vsscanf);
 #endif
     SYMBOL(__errno);

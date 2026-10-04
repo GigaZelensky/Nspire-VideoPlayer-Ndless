@@ -35,10 +35,12 @@ static int (*host_puts)(const char *);
 static void (*host_abort)(void);
 static int *(*host_errno)(void);
 #if defined(NDVIDEO_BUILD_MPEG4_MODULE)
+#ifndef NDVIDEO_XVID_NO_POSTPROC
 static int (*host_rand)(void);
 static void (*host_srand)(unsigned);
 static double (*host_log)(double);
 static double (*host_sqrt)(double);
+#endif
 static int (*host_vsscanf)(const char *, const char *, va_list);
 #endif
 struct _reent *_impure_ptr;
@@ -82,10 +84,12 @@ bool module_runtime_bind(const CodecHostApi *host)
     BIND(host_abort, "abort");
     BIND(host_errno, "__errno");
 #if defined(NDVIDEO_BUILD_MPEG4_MODULE)
+#ifndef NDVIDEO_XVID_NO_POSTPROC
     BIND(host_rand, "rand");
     BIND(host_srand, "srand");
     BIND(host_log, "log");
     BIND(host_sqrt, "sqrt");
+#endif
     BIND(host_vsscanf, "vsscanf");
 #endif
     struct _reent **impure = (struct _reent **)host->resolve("_impure_ptr");
@@ -285,6 +289,7 @@ void abort(void)
     }
 }
 #if defined(NDVIDEO_BUILD_MPEG4_MODULE)
+#ifndef NDVIDEO_XVID_NO_POSTPROC
 int rand(void)
 {
     return host_rand();
@@ -305,6 +310,7 @@ double sqrt(double value)
     return host_sqrt(value);
 }
 
+#endif
 int sscanf(const char *s, const char *f, ...)
 {
     va_list a;

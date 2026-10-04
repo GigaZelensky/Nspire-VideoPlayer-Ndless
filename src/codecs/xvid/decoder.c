@@ -73,7 +73,9 @@ decoder_resize(DECODER * dec)
 	image_destroy(&dec->cur, dec->edged_width, dec->edged_height);
 	image_destroy(&dec->refn[0], dec->edged_width, dec->edged_height);
 	image_destroy(&dec->refn[1], dec->edged_width, dec->edged_height);
+#ifndef NDVIDEO_XVID_NO_POSTPROC
 	image_destroy(&dec->tmp, dec->edged_width, dec->edged_height);
+#endif
 	image_destroy(&dec->qtmp, dec->edged_width, dec->edged_height);
 
 	image_destroy(&dec->gmc, dec->edged_width, dec->edged_height);
@@ -81,7 +83,9 @@ decoder_resize(DECODER * dec)
   image_null(&dec->cur);
   image_null(&dec->refn[0]);
   image_null(&dec->refn[1]);
+#ifndef NDVIDEO_XVID_NO_POSTPROC
   image_null(&dec->tmp);
+#endif
   image_null(&dec->qtmp);
   image_null(&dec->gmc);
 
@@ -103,7 +107,9 @@ decoder_resize(DECODER * dec)
 	if (   image_create(&dec->cur, dec->edged_width, dec->edged_height) 
 	    || image_create(&dec->refn[0], dec->edged_width, dec->edged_height)
 	    || image_create(&dec->refn[1], dec->edged_width, dec->edged_height) 	/* Support B-frame to reference last 2 frame */
+#ifndef NDVIDEO_XVID_NO_POSTPROC
 	    || image_create(&dec->tmp, dec->edged_width, dec->edged_height)
+#endif
 	    || image_create(&dec->qtmp, dec->edged_width, dec->edged_height)
       || image_create(&dec->gmc, dec->edged_width, dec->edged_height) )
     goto memory_error;
@@ -139,7 +145,9 @@ memory_error:
   image_destroy(&dec->cur, dec->edged_width, dec->edged_height);
   image_destroy(&dec->refn[0], dec->edged_width, dec->edged_height);
   image_destroy(&dec->refn[1], dec->edged_width, dec->edged_height);
+#ifndef NDVIDEO_XVID_NO_POSTPROC
   image_destroy(&dec->tmp, dec->edged_width, dec->edged_height);
+#endif
   image_destroy(&dec->qtmp, dec->edged_width, dec->edged_height);
 
   xvid_free(dec);
@@ -192,7 +200,9 @@ decoder_create(xvid_dec_create_t * create)
   image_null(&dec->cur);
   image_null(&dec->refn[0]);
   image_null(&dec->refn[1]);
+#ifndef NDVIDEO_XVID_NO_POSTPROC
   image_null(&dec->tmp);
+#endif
   image_null(&dec->qtmp);
 
   /* image based GMC */
@@ -203,7 +213,9 @@ decoder_create(xvid_dec_create_t * create)
   dec->qscale = NULL;
 
   init_timer();
+#ifndef NDVIDEO_XVID_NO_POSTPROC
   init_postproc(&dec->postproc);
+#endif
   init_mpeg_matrix(dec->mpeg_quant_matrices);
   init_sram_tables();
 
@@ -244,7 +256,9 @@ decoder_destroy(DECODER * dec)
 
   image_destroy(&dec->refn[0], dec->edged_width, dec->edged_height);
   image_destroy(&dec->refn[1], dec->edged_width, dec->edged_height);
+#ifndef NDVIDEO_XVID_NO_POSTPROC
   image_destroy(&dec->tmp, dec->edged_width, dec->edged_height);
+#endif
   image_destroy(&dec->qtmp, dec->edged_width, dec->edged_height);
   image_destroy(&dec->cur, dec->edged_width, dec->edged_height);
   xvid_free(dec->mpeg_quant_matrices);
@@ -1541,6 +1555,7 @@ static void decoder_output(DECODER * dec, IMAGE * img, MACROBLOCK * mbs,
           xvid_dec_frame_t * frame, xvid_dec_stats_t * stats,
           int coding_type, int quant)
 {
+#ifndef NDVIDEO_XVID_NO_POSTPROC
   const int brightness = XVID_VERSION_MINOR(frame->version) >= 1 ? frame->brightness : 0;
 
   if (dec->cartoon_mode)
@@ -1556,6 +1571,8 @@ static void decoder_output(DECODER * dec, IMAGE * img, MACROBLOCK * mbs,
              frame->general, brightness, dec->frames, (coding_type == B_VOP), dec->num_threads);
     img = &dec->tmp;
   }
+
+#endif
 
   if ((frame->output.plane[0] != NULL) && (frame->output.stride[0] >= dec->width)) {
     image_output(img, dec->width, dec->height,
