@@ -71,8 +71,9 @@ files to install, and decoder code stays in RAM throughout playback. The last
 decoder is kept ready for reopening videos in the same format.
 
 This saves roughly **1.2–1.3 MiB of RAM during HEVC or AV1 playback** compared
-with keeping every decoder loaded. Both formats also keep most buffered pictures
-in compact YUV form, converting the next few to screen-ready RGB. The buffer
+with keeping every decoder loaded. H.264, HEVC and AV1 keep most buffered pictures
+in compact YUV form, using 25% less memory per picture than RGB565. The next few
+pictures are converted to screen-ready RGB ahead of presentation. The buffer
 uses measured free RAM while reserving space for decoding and other player work.
 
 Opening a different format can add a short decoder-loading step. Single-codec

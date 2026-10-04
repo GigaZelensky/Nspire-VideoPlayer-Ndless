@@ -82,7 +82,7 @@ struct VideoLookahead {
 
 static inline bool ahead_has_packed(const struct VideoLookahead *ahead)
 {
-    return (NDVIDEO_WITH_HEVC || NDVIDEO_WITH_AV1) && ahead->packed;
+    return (NDVIDEO_WITH_H264 || NDVIDEO_WITH_HEVC || NDVIDEO_WITH_AV1) && ahead->packed;
 }
 
 static inline bool ahead_output_packed(const struct VideoLookahead *ahead)
@@ -505,7 +505,7 @@ bool video_lookahead_begin(Movie *movie)
     if (ahead->frame_bytes != bytes)
         return false;
     if (!ahead_has_packed(ahead) && !ahead->packed_layout_rejected &&
-        movie_uses_planar_decoder(movie) &&
+        movie_uses_decode_ahead(movie) &&
         !(movie->header.video_width & 7U) && !(movie->header.video_height & 1U)) {
         ahead->packed = calloc(1U, sizeof(*ahead->packed));
         if (ahead_has_packed(ahead)) {
@@ -719,7 +719,7 @@ static int ahead_promote_packed(Movie *movie, uint64_t deadline, bool foreground
         }
     }
     size_t rows = movie->header.video_height - packed->promote_row;
-    if (foreground && rows > 16U) rows = 16U;
+    if (foreground && movie_uses_planar_decoder(movie) && rows > 16U) rows = 16U;
     if (!foreground) rows = ahead_color_rows(ahead, rows, deadline);
     if (!rows) return 0;
     VideoFrame view;
@@ -1334,12 +1334,15 @@ static int ahead_prepare_packed(Movie *movie, uint32_t target_frame)
     if (ahead->packed->count) {
         if (ahead->packed->frames[ahead->packed->head].frame != target_frame) return 0;
     } else if (ahead->next_frame != target_frame) return 0;
-    uint64_t quantum_end = monotonic_clock_now_ticks() + ahead->foreground_slice_ticks;
+    /* Keep H.264's synchronous foreground preparation; HEVC/AV1 yield to
+     * the input loop between their longer decode/conversion slices. */
+    uint64_t quantum_end = movie_uses_planar_decoder(movie)
+        ? monotonic_clock_now_ticks() + ahead->foreground_slice_ticks : 0;
     int result;
     do {
         result = ahead_compact_work(movie, 0, true, 0);
     } while (result > 0 && !ahead->count && ahead->stats.active &&
-             monotonic_clock_now_ticks() < quantum_end);
+             (!quantum_end || monotonic_clock_now_ticks() < quantum_end));
     if (!ahead->stats.active) return 0;
     if (ahead->count && ahead->frames[ahead->head].frame == target_frame) return 1;
     if (result > 0) return 2;
@@ -1445,7 +1448,8 @@ static int ahead_finish_packed_realtime(Movie *movie, uint32_t target_frame)
         ahead->realtime_pending = true;
         ahead->realtime_target = target_frame;
     }
-    uint64_t quantum_end = monotonic_clock_now_ticks() + ahead->foreground_slice_ticks;
+    uint64_t quantum_end = movie_uses_planar_decoder(movie)
+        ? monotonic_clock_now_ticks() + ahead->foreground_slice_ticks : 0;
     while (!ahead->count) {
         int result = ahead_compact_work(movie, 0, true, target_frame);
         if (!ahead->stats.active) return 0;
@@ -1455,7 +1459,7 @@ static int ahead_finish_packed_realtime(Movie *movie, uint32_t target_frame)
             video_lookahead_cancel(movie);
             return -1;
         }
-        if (!ahead->count && monotonic_clock_now_ticks() >= quantum_end) return 2;
+        if (!ahead->count && quantum_end && monotonic_clock_now_ticks() >= quantum_end) return 2;
     }
     bool taken = ahead_take(movie, target_frame, false);
     if (taken) ahead->realtime_pending = false;
