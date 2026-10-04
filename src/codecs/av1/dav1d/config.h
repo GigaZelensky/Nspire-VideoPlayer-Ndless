@@ -1,0 +1,107 @@
+/* Scalar 8-bit AV1 decoder for the single-threaded Ndless player. */
+#pragma once
+
+#define ARCH_AARCH64 0
+
+#define ARCH_ARM 1
+
+#define ARCH_LOONGARCH 0
+
+#define ARCH_LOONGARCH32 0
+
+#define ARCH_LOONGARCH64 0
+
+#define ARCH_PPC64LE 0
+
+#define ARCH_RISCV 0
+
+#define ARCH_RV32 0
+
+#define ARCH_RV64 0
+
+#define ARCH_X86 0
+
+#define ARCH_X86_32 0
+
+#define ARCH_X86_64 0
+
+#define CONFIG_16BPC 0
+
+#define CONFIG_8BPC 1
+
+#define CONFIG_LOG 1
+
+#define ENDIANNESS_BIG 0
+
+#define HAVE_ALIGNED_ALLOC 0
+
+#define HAVE_ASM 0
+
+#define HAVE_AS_ARCHEXT_DOTPROD_DIRECTIVE 0
+
+#define HAVE_AS_ARCHEXT_I8MM_DIRECTIVE 0
+
+#define HAVE_AS_ARCHEXT_SVE2_DIRECTIVE 0
+
+#define HAVE_AS_ARCHEXT_SVE_DIRECTIVE 0
+
+#define HAVE_AS_ARCH_DIRECTIVE 0
+
+#define HAVE_AS_FUNC 0
+
+#define HAVE_C11_GENERIC 1
+
+#define HAVE_CLOCK_GETTIME 0
+
+#define HAVE_DLSYM 0
+
+#define HAVE_DOTPROD 0
+
+#define HAVE_ELF_AUX_INFO 0
+
+#define HAVE_GETAUXVAL 0
+
+#define HAVE_I8MM 0
+
+#define HAVE_IO_H 0
+
+#define HAVE_MEMALIGN 0
+
+#define HAVE_POSIX_MEMALIGN 0
+
+#define HAVE_PTHREAD_GETAFFINITY_NP 0
+
+#define HAVE_PTHREAD_NP_H 0
+
+#define HAVE_PTHREAD_SETAFFINITY_NP 0
+
+#define HAVE_PTHREAD_SETNAME_NP 0
+
+#define HAVE_PTHREAD_SET_NAME_NP 0
+
+#define HAVE_SIGACTION 0
+
+#define HAVE_SVE 0
+
+#define HAVE_SVE2 0
+
+#define HAVE_SYS_TYPES_H 1
+
+#define HAVE_UNISTD_H 0
+
+#define TRIM_DSP_FUNCTIONS 1
+
+#define UNICODE 1
+
+#define _CRT_DECLARE_NONSTDC_NAMES 1
+
+#define _FILE_OFFSET_BITS 64
+
+#define _UNICODE 1
+
+#define _WIN32_WINNT 0x0601
+
+#define __USE_MINGW_ANSI_STDIO 1
+
+
+#define NDLESS_SINGLE_THREAD 1

@@ -1,6 +1,18 @@
 #include "player_internal.h"
 #include "playback_render_gate.h"
 #include "playback_pacing.h"
+#if NDVIDEO_CODEC_MODULES
+#include "codecs/codec_module_api.h"
+#include "codecs/modules/h264_module_api.h"
+
+static bool codec_loading_progress(void *userdata, size_t done, size_t total)
+{
+    (void)done;
+    (void)total;
+    loading_progress_tick(userdata, false);
+    return true;
+}
+#endif
 
 /* Cooperative file writes progress independently of diagnostic recording.
  * Keep native file work away from a running frame's commit deadline. */
@@ -9,6 +21,18 @@ static void playback_phase(const Movie *movie,unsigned phase,bool paused,const P
     if (paused || g_display_power_state.off || phase == PLAYER_CRASH_SEEK)
         player_service_writes(movie);
     player_crash_trace_tick(movie,phase,paused,rate);
+}
+
+/* Use one admission rule before decoding and before the idle wait. The
+ * presentation deadline remains unchanged when an empty reserve starts early. */
+static uint64_t playback_work_due(const Movie *movie, bool realtime_frame_skip,
+                                 uint64_t present_due, uint64_t interval, uint32_t tick_hz)
+{
+    if (realtime_frame_skip || movie->current_frame + 1U >= movie->header.frame_count)
+        return present_due;
+    if (video_lookahead_can_prepare_early(movie))
+        return 0U;
+    return playback_decode_due(present_due, interval, tick_hz, movie->foreground_decode_peak_ms);
 }
 
 /* 1: committed for scheduled rendering, 2: decoding is pending or an input-interrupted
@@ -29,7 +53,7 @@ static int prepare_video_presentation(Movie *movie, uint32_t target_frame,
     prepared = monotonic_clock_now_ticks();
     if (capture) playback_capture_stage(movie, CAPTURE_DECODE, started, prepared);
     *decode_elapsed_ms = monotonic_clock_ticks_to_ms(prepared - started);
-    if (movie->codec == MOVIE_CODEC_HEVC) movie->foreground_pending_ticks += prepared - started;
+    if (movie_uses_planar_decoder(movie)) movie->foreground_pending_ticks += prepared - started;
     if (ready == 2) return 2;
     if (ready <= 0) return 0;
 
@@ -44,7 +68,7 @@ static int prepare_video_presentation(Movie *movie, uint32_t target_frame,
     }
     /* Background work can fail/cancel a later image during the wait. Preserve
      * the ordinary decoder's existing reload/recovery path in that case. */
-    if (!video_lookahead_active(movie) || !video_lookahead_queued(movie)) return 0;
+    if (!video_lookahead_active(movie) || !video_lookahead_ready(movie)) return 0;
     started = monotonic_clock_now_ticks();
     if (started < due_ticks) return 2;
 
@@ -60,7 +84,7 @@ static int prepare_video_presentation(Movie *movie, uint32_t target_frame,
     prepared = monotonic_clock_now_ticks();
     if (capture) playback_capture_stage(movie, CAPTURE_DECODE, started, prepared);
     *decode_elapsed_ms += monotonic_clock_ticks_to_ms(prepared - started);
-    if (movie->codec == MOVIE_CODEC_HEVC) movie->foreground_pending_ticks += prepared - started;
+    if (movie_uses_planar_decoder(movie)) movie->foreground_pending_ticks += prepared - started;
     return 1;
 }
 
@@ -354,7 +378,13 @@ int play_movie(
     static bool decoder_platform_attempted;
     if (!decoder_platform_attempted) {
         decoder_platform_attempted = true;
-        if (sram_init() && sram_uses_native_clone() && NDVIDEO_WITH_H264) h264bsdInitSramTables();
+        if (sram_init() && sram_uses_native_clone() && NDVIDEO_WITH_H264) {
+#if NDVIDEO_CODEC_MODULES
+            h264_module_reserve_sram();
+#else
+            h264bsdInitSramTables();
+#endif
+        }
     }
     cleanup_deferred_playback_movie();
     loading_progress_tick(&loading_progress, false);
@@ -362,7 +392,14 @@ int play_movie(
     loading_progress_tick(&loading_progress, false);
     flush_queued_theme_save("loading");
     loading_progress_tick(&loading_progress, false);
-    if (!load_movie(path, &movie, &loading_progress)) {
+#if NDVIDEO_CODEC_MODULES
+    codec_modules_set_progress(codec_loading_progress, &loading_progress);
+#endif
+    bool movie_loaded = load_movie(path, &movie, &loading_progress);
+#if NDVIDEO_CODEC_MODULES
+    codec_modules_set_progress(NULL, NULL);
+#endif
+    if (!movie_loaded) {
         finish_loading_transition(screen, &loading_snapshot, fonts, "Loading");
         report_movie_open_failure(path);
         return -1;
@@ -596,7 +633,7 @@ int play_movie(
         uint64_t capture_input_started = capture_input ? monotonic_clock_now_ticks() : 0;
         if (capture_input) playback_capture_tick(&movie, capture_input_started, paused || help_menu_open || g_display_power_state.off);
         bool scheduled_frame_advanced = false;
-        bool hevc_decode_pending = false;
+        bool video_decode_pending = false;
         bool seek_work = false;
         bool touchpad_click = pointer_update(&pointer);
         if (clock_menu_poll(screen, fonts, &movie, &pointer, false, path)) {
@@ -1772,9 +1809,8 @@ int play_movie(
             /* Keep the final frame for its full interval before repeat,
              * auto-next or the end-of-video pause. There is nothing to decode
              * ahead at that boundary. */
-            uint64_t decode_due = (realtime_frame_skip || movie.current_frame + 1U >= movie.header.frame_count) ? next_frame_due_ticks :
-                playback_decode_due(next_frame_due_ticks, scaled_interval, monotonic_clock_ticks_per_second(),
-                    movie.foreground_decode_peak_ms);
+            uint64_t decode_due = playback_work_due(&movie, realtime_frame_skip, next_frame_due_ticks,
+                scaled_interval, monotonic_clock_ticks_per_second());
             if (now_ticks >= decode_due) {
                 uint64_t elapsed_ticks = now_ticks - playback_anchor_ticks;
                 uint32_t frames_to_advance = movie_frames_from_scaled_ticks(&movie, elapsed_ticks, playback_rate);
@@ -1885,15 +1921,15 @@ int play_movie(
                             }
                             if (capture_decode) playback_capture_stage(&movie, CAPTURE_DECODE, capture_decode_started, monotonic_clock_now_ticks());
                             decode_elapsed_ms = monotonic_clock_now_ms() - decode_start_ms;
-                            if (movie.codec == MOVIE_CODEC_HEVC)
+                            if (movie_uses_planar_decoder(&movie))
                                 movie.foreground_pending_ticks += monotonic_clock_now_ticks() - foreground_started;
                         }
                         scheduled_frame_advanced = !waiting_for_presentation;
-                        hevc_decode_pending = movie.codec == MOVIE_CODEC_HEVC &&
-                            waiting_for_presentation && !video_lookahead_queued(&movie);
-                        if (capture_decode && movie.codec == MOVIE_CODEC_HEVC && waiting_for_presentation)
+                        video_decode_pending = movie_uses_planar_decoder(&movie) &&
+                            waiting_for_presentation && !video_lookahead_ready(&movie);
+                        if (capture_decode && movie_uses_planar_decoder(&movie) && waiting_for_presentation)
                             playback_capture_defer_frame(&movie);
-                        if (movie.codec == MOVIE_CODEC_HEVC) {
+                        if (movie_uses_planar_decoder(&movie)) {
                             decode_elapsed_ms = scheduled_frame_advanced
                                 ? monotonic_clock_ticks_to_ms(movie.foreground_pending_ticks) : 0;
                             if (scheduled_frame_advanced) movie.foreground_pending_ticks = 0;
@@ -2063,10 +2099,10 @@ int play_movie(
                 scheduled_frame_advanced || take_screenshot || seek_delta_ms || pending_seek_ms ||
                     on_edge || woke_from_idle_off ||
                     g_display_power_state.off || g_display_power_state.off_fade_active);
-            /* An overdue HEVC picture can span several input turns. Keep
+            /* An overdue picture can span several input turns. Keep
              * cursor/chrome animations responsive while preserving the last
              * complete image; limit these extra LCD copies to normal UI rate. */
-            if (hevc_decode_pending && (uint32_t)(render_now_ms - render_gate.presented_ms) >= 16U)
+            if (video_decode_pending && (uint32_t)(render_now_ms - render_gate.presented_ms) >= 16U)
                 defer_ui_render = false;
             if (!defer_ui_render && playback_render_needed(&render_gate, movie.current_frame, render_now_ms,
                     render_input_changed || take_screenshot, render_effects)) {
@@ -2222,10 +2258,8 @@ int play_movie(
             }
         } else if (!seek.active && !seek_work) {
             uint64_t after_render_ticks = monotonic_clock_now_ticks();
-            uint64_t work_due_ticks = (realtime_frame_skip || movie.current_frame + 1U >= movie.header.frame_count) ? next_frame_due_ticks :
-                playback_decode_due(next_frame_due_ticks,
-                    movie_frame_time_scaled_ticks(&movie, 1, playback_rate), monotonic_clock_ticks_per_second(),
-                    movie.foreground_decode_peak_ms);
+            uint64_t work_due_ticks = playback_work_due(&movie, realtime_frame_skip, next_frame_due_ticks,
+                movie_frame_time_scaled_ticks(&movie, 1, playback_rate), monotonic_clock_ticks_per_second());
             uint64_t spare_ticks = work_due_ticks > after_render_ticks ? (work_due_ticks - after_render_ticks) : 0;
             uint32_t spare_ms = monotonic_clock_ticks_to_ms(spare_ticks);
             uint64_t wait_target_ticks = work_due_ticks;

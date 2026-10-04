@@ -37,6 +37,8 @@ struct RawPlayerIo {
     uint64_t offset;
     size_t bytes;
     bool requested, running, ready, view, park, failed, stopping, discard_regions;
+    bool cache_witness;
+    uint32_t view_epoch;
     uint32_t started, ended, completed_bytes, refreshes, handoffs, steps, max_step_ticks,
         foreground_ticks, physical_total, regions_total;
     uint32_t crypto_steps, crypto_ticks, crypto_writer_ticks, crypto_max_ticks;
@@ -127,6 +129,25 @@ static uint32_t mutation_generation(void *unused, uint32_t block)
     (void)unused;
     return storage_mutation_block_generation(block);
 }
+static bool mutation_tracking_observed(const RawPlayerIo *ctx)
+{
+    /* Only an initialized, verified SPI writer can witness dispatches and
+     * mutations. Past callbacks alone do not authorize future cache reuse. */
+    return ctx->platform.kind == NAND_PAGE_CX2_SPI && ctx->cache_witness &&
+           storage_mutation_stats().observed != 0U;
+}
+static void observe_native_dispatches(RawPlayerIo *ctx)
+{
+    /* Called once per service batch, with interrupts masked. A new external
+     * dispatch invalidates the epoch before a captured map can be used. No
+     * witness disables owned map reuse without starving an ordinary read. */
+    bool witnessed = app_task_io_observe_inactive();
+    if (ctx->cache_witness && !witnessed)
+        storage_mutation_invalidate();
+    ctx->cache_witness = witnessed;
+    if (!mutation_tracking_observed(ctx))
+        raw_region_cache_clear(&ctx->region_cache);
+}
 static bool initialize_reader(RawPlayerIo *ctx)
 {
     const PortableStorageSnapshot *s = &ctx->snapshot;
@@ -144,22 +165,18 @@ static bool initialize_reader(RawPlayerIo *ctx)
             (RawFileOverlay){s->clean[i].number, (const uint8_t *)(uintptr_t)s->clean[i].address};
     if (!raw_file_metadata_cache(&ctx->reader, ctx->metadata_overlays, s->clean_count))
         return false;
-    RawRegionMutations mutations = {NULL, mutation_epoch, mutation_generation};
-    raw_region_cache_begin_view(&ctx->region_cache, &ctx->reader.map, &ctx->reader.layout,
-                                ctx->reader.state, sizeof(ctx->reader.state), mutations);
+    if (mutation_tracking_observed(ctx)) {
+        RawRegionMutations mutations = {NULL, mutation_epoch, mutation_generation};
+        raw_region_cache_begin_view(&ctx->region_cache, &ctx->reader.map, &ctx->reader.layout,
+                                    ctx->reader.state, sizeof(ctx->reader.state), mutations);
+    } else {
+        raw_region_cache_clear(&ctx->region_cache);
+    }
     return true;
 }
 static bool provider_quiescent(const RawPlayerIo *ctx)
 {
     return !ctx->reader.initialized || ctx->reader.nand.quiescent;
-}
-static bool mutation_tracking_observed(const RawPlayerIo *ctx)
-{
-    /* Only the existing verified SPI writer can call this observer today.
-     * A portable reader does not authorize that writer on another platform.
-     * Before its first observed callback, conservatively drop cross-handoff
-     * map proofs too. Foreground native calls always invalidate separately. */
-    return ctx->platform.kind == NAND_PAGE_CX2_SPI && storage_mutation_stats().observed != 0U;
 }
 static bool release_view(RawPlayerIo *ctx)
 {
@@ -216,6 +233,7 @@ static bool capture_view(RawPlayerIo *ctx)
         }
     }
     ctx->reader.age = 3;
+    ctx->view_epoch = storage_mutation_epoch();
     ctx->view = true;
     ctx->discard_regions = false;
     ++ctx->refreshes;
@@ -351,8 +369,7 @@ static void service_once(RawPlayerIo *ctx)
         }
         return;
     }
-    if (ctx->view && ctx->region_cache.view_active &&
-        storage_mutation_epoch() != ctx->region_cache.view_epoch) {
+    if (ctx->view && storage_mutation_epoch() != ctx->view_epoch) {
         raw_region_cache_clear(&ctx->region_cache);
         ctx->discard_regions = true;
         ctx->park = true;
@@ -440,6 +457,7 @@ static void service(RawPlayerIo *ctx, uint32_t budget)
         return;
     uint32_t start = counter();
     unsigned mask = native_critical_enter();
+    observe_native_dispatches(ctx);
     do {
         uint32_t before = counter();
         uint32_t crypto_before = ctx->crypto_steps;
@@ -474,8 +492,7 @@ bool raw_player_read_step(uint32_t spare_ticks)
     RawPlayerIo *ctx = live;
     if (!ctx || !ctx->requested || !ctx->view || ctx->park || ctx->failed || ctx->ready ||
         storage_native_active() || (native_requested && !ctx->running) ||
-        (ctx->region_cache.view_active &&
-         storage_mutation_epoch() != ctx->region_cache.view_epoch)) return false;
+        storage_mutation_epoch() != ctx->view_epoch) return false;
     /* Record-boundary setup stays within the owned reader; it cannot capture
      * a filesystem view or enter native I/O. Canceled/failed crypto requests
      * still restart through normal service. */
@@ -490,6 +507,11 @@ bool raw_player_read_step(uint32_t spare_ticks)
     if ((uint64_t)spare_ticks <= 33U + step_guard) return false;
     uint32_t started = counter();
     unsigned mask = native_critical_enter();
+    observe_native_dispatches(ctx);
+    if (storage_mutation_epoch() != ctx->view_epoch) {
+        native_critical_leave(mask);
+        return false;
+    }
     service_once(ctx);
     uint32_t elapsed = started - counter();
     ++ctx->steps;

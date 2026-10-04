@@ -59,6 +59,14 @@ static const u32 h264bsdQpCDefault[52] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
     38,38,38,39,39,39,39};
 const u32 *h264bsdQpC = h264bsdQpCDefault;
 
+size_t h264bsdQpCTableBytes(void) { return sizeof(h264bsdQpCDefault); }
+bool h264bsdBindQpCTable(void *memory,size_t bytes)
+{
+    if(!memory) { if(bytes)return false;h264bsdQpC=h264bsdQpCDefault;return true; }
+    if(((uintptr_t)memory&31U) || bytes<sizeof(h264bsdQpCDefault))return false;
+    memcpy(memory,h264bsdQpCDefault,sizeof(h264bsdQpCDefault));h264bsdQpC=memory;return true;
+}
+
 bool h264bsdInitQpCTable(void)
 {
     static u32 initialized = 0;
@@ -313,8 +321,8 @@ void h264bsdSetCurrImageMbPointers(image_t *image, u32 mbNum)
 
     width = image->width;
     height = image->height;
-    row = mbNum / width;
-    col = mbNum % width;
+    row = h264bsdMbRow(mbNum, width);
+    col = mbNum - row * width;
 
     tmp = row * width;
     picSize = width * height;

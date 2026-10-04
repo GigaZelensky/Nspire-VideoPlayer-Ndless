@@ -1,6 +1,7 @@
 #include "player_internal.h"
 #include "video_lookahead.h"
 #include "native_runtime_stats.h"
+#include "frame_view_api.h"
 
 typedef struct {
     uint16_t *pixels;
@@ -10,8 +11,31 @@ typedef struct {
     uint32_t idr_first, idr_end;
 } VideoLookaheadFrame;
 
+typedef struct {
+    uint8_t *pixels, *allocation;
+    uint64_t serial;
+    bool repeats_previous;
+    uint32_t frame;
+    int chunk;
+    uint32_t idr_first, idr_end;
+} VideoLookaheadPackedFrame;
+
+/* Planar decoder-owned planes are copied before release. Front promotion
+ * reads these immutable snapshots independently of any later held picture. */
+typedef struct {
+    VideoLookaheadPackedFrame frames[VIDEO_LOOKAHEAD_MAX_FRAMES];
+    size_t frame_bytes, promote_row;
+    const uint16_t *repeat_pixels;
+    unsigned head, count, capacity, allocated_slots, rgb_capacity;
+    uint32_t copy_guard;
+    bool promote_flat, have_copy_sample, checked_layout;
+} VideoLookaheadPacked;
+
+#define VIDEO_LOOKAHEAD_RGB_FRONT 4U
+
 struct VideoLookahead {
     VideoLookaheadFrame frames[VIDEO_LOOKAHEAD_MAX_FRAMES];
+    VideoLookaheadPacked *packed;
     VideoLookaheadStats stats;
     size_t frame_bytes;
     size_t storage_bound;
@@ -34,7 +58,13 @@ struct VideoLookahead {
     uint8_t *picture;
     size_t color_row;
     bool color_flat;
+    const uint16_t *repeat_pixels;
+    uint64_t previous_rgb_serial;
+    uint32_t previous_rgb_frame;
+    bool have_previous_rgb;
     uint32_t pump_guard, finish_guard, color_guard;
+    uint32_t start_guard[2];
+    bool have_start_sample[2];
     uint32_t pump_ticks_per_mb_q8;
     uint32_t color_ticks_per_row_q8;
     uint32_t color_tail_guard;
@@ -46,7 +76,58 @@ struct VideoLookahead {
     const char *failure_stage;
     bool have_pump_sample, have_finish_sample, have_color_sample;
     bool have_color_tail_sample;
+    bool packed_layout_rejected;
+    bool output_packed; /* Chosen at AU begin; held-picture output never switches tiers. */
 };
+
+static inline bool ahead_has_packed(const struct VideoLookahead *ahead)
+{
+    return (NDVIDEO_WITH_HEVC || NDVIDEO_WITH_AV1) && ahead->packed;
+}
+
+static inline bool ahead_output_packed(const struct VideoLookahead *ahead)
+{
+    return ahead_has_packed(ahead) && ahead->output_packed;
+}
+
+static bool ahead_should_pack(const struct VideoLookahead *ahead)
+{
+    return ahead_has_packed(ahead) &&
+        (ahead->packed->count || ahead->count >= ahead->packed->rgb_capacity);
+}
+
+static unsigned ahead_rgb_capacity(const struct VideoLookahead *ahead)
+{
+    return ahead_has_packed(ahead) ? ahead->packed->rgb_capacity : ahead->stats.capacity;
+}
+
+static unsigned ahead_total_queued(const struct VideoLookahead *ahead)
+{
+    return ahead->count + (ahead_has_packed(ahead) ? ahead->packed->count : 0U);
+}
+
+static void ahead_queue_stats(struct VideoLookahead *ahead)
+{
+    ahead->stats.rgb_ready = ahead->count;
+    ahead->stats.packed_ready = ahead_has_packed(ahead) ? ahead->packed->count : 0U;
+    ahead->stats.packed_capacity = ahead_has_packed(ahead) ? ahead->packed->capacity : 0U;
+    ahead->stats.queued = ahead_total_queued(ahead);
+    if (ahead->stats.queued > ahead->stats.peak_queued)
+        ahead->stats.peak_queued = ahead->stats.queued;
+}
+
+static void ahead_free_packed(struct VideoLookahead *ahead)
+{
+    if (!ahead_has_packed(ahead)) return;
+    VideoLookaheadPacked *packed = ahead->packed;
+    for (unsigned i = 0; i < packed->allocated_slots; ++i) {
+        player_free_aligned(packed->frames[i].pixels, packed->frames[i].allocation);
+        ahead->stats.allocated_bytes -= packed->frame_bytes + PLAYER_CACHE_LINE_SIZE;
+    }
+    ahead->stats.allocated_bytes -= sizeof(*packed);
+    free(packed);
+    ahead->packed = NULL;
+}
 
 static uint32_t ahead_ticks_ms(const struct VideoLookahead *ahead, unsigned ms)
 {
@@ -57,6 +138,39 @@ static uint32_t ahead_elapsed(uint64_t begin, uint64_t end)
 {
     uint64_t elapsed = end - begin;
     return elapsed > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed;
+}
+
+static void ahead_capture_planar_pump(VideoLookaheadStats *stats, uint32_t elapsed,
+                                     uint32_t before_mbs, uint32_t after_mbs,
+                                     unsigned unit_mbs, bool submission)
+{
+    /* Planar progress is expressed in whole CTUs/SBs, scaled to equivalent
+     * 16x16 units by video_decoder_done_units(). Submission resets progress,
+     * so its before_mbs is zero even if the preceding picture completed. */
+    uint32_t decoded_mbs = after_mbs >= before_mbs ? after_mbs - before_mbs : 0U;
+    unsigned units = decoded_mbs / unit_mbs;
+    if (!stats->captured_planar_pumps || elapsed > stats->captured_max_pump_ticks) {
+        stats->captured_max_pump_ticks = elapsed;
+        stats->captured_max_pump_units = units;
+        stats->captured_max_pump_unit_mbs = unit_mbs;
+        stats->captured_max_pump_submission = submission;
+    }
+    ++stats->captured_planar_pumps;
+    if (submission) {
+        if (!stats->captured_submission_pumps || elapsed > stats->captured_max_submission_ticks) {
+            stats->captured_max_submission_ticks = elapsed;
+            stats->captured_max_submission_units = units;
+        }
+        ++stats->captured_submission_pumps;
+    } else if (units == 1U) {
+        ++stats->captured_single_no_submit_pumps;
+        if (elapsed > stats->captured_max_single_no_submit_ticks)
+            stats->captured_max_single_no_submit_ticks = elapsed;
+    } else if (units > 1U) {
+        ++stats->captured_multi_no_submit_pumps;
+        if (elapsed > stats->captured_max_multi_no_submit_ticks)
+            stats->captured_max_multi_no_submit_ticks = elapsed;
+    }
 }
 
 /* A slowly decaying high-water estimate avoids treating one cold-cache sample
@@ -178,7 +292,32 @@ static void ahead_select_capacity(Movie *movie, struct VideoLookahead *ahead)
     if (budget > VIDEO_LOOKAHEAD_MAX_BYTES)
         budget = VIDEO_LOOKAHEAD_MAX_BYTES;
     ahead->stats.budget_bytes = (size_t)budget;
-    capacity = budget > sizeof(*ahead) ? (unsigned)((budget - sizeof(*ahead)) / slot_charge) : 0U;
+    if (ahead_has_packed(ahead)) {
+        VideoLookaheadPacked *packed = ahead->packed;
+        uint64_t fixed = sizeof(*ahead) + sizeof(*packed) +
+                         VIDEO_LOOKAHEAD_RGB_FRONT * (uint64_t)slot_charge;
+        size_t packed_charge = packed->frame_bytes + PLAYER_CACHE_LINE_SIZE +
+                               VIDEO_LOOKAHEAD_ALLOCATION_ALLOWANCE;
+        unsigned packed_capacity = budget > fixed
+            ? (unsigned)((budget - fixed) / packed_charge) : 0U;
+        if (packed_capacity > VIDEO_LOOKAHEAD_MAX_FRAMES - VIDEO_LOOKAHEAD_RGB_FRONT)
+            packed_capacity = VIDEO_LOOKAHEAD_MAX_FRAMES - VIDEO_LOOKAHEAD_RGB_FRONT;
+        if (!packed_capacity) {
+            ahead_free_packed(ahead);
+        } else {
+            for (unsigned i = packed_capacity; i < packed->allocated_slots; ++i) {
+                player_free_aligned(packed->frames[i].pixels, packed->frames[i].allocation);
+                memset(&packed->frames[i], 0, sizeof(packed->frames[i]));
+                ahead->stats.allocated_bytes -= packed->frame_bytes + PLAYER_CACHE_LINE_SIZE;
+            }
+            if (packed->allocated_slots > packed_capacity)
+                packed->allocated_slots = packed_capacity;
+            packed->capacity = packed_capacity;
+            packed->rgb_capacity = VIDEO_LOOKAHEAD_RGB_FRONT;
+        }
+    }
+    capacity = ahead_has_packed(ahead) ? ahead->packed->rgb_capacity :
+        (budget > sizeof(*ahead) ? (unsigned)((budget - sizeof(*ahead)) / slot_charge) : 0U);
     if (capacity > VIDEO_LOOKAHEAD_MAX_FRAMES)
         capacity = VIDEO_LOOKAHEAD_MAX_FRAMES;
     /* Only begin/rebegin calls this with no queued/partial output. Swapping
@@ -191,9 +330,10 @@ static void ahead_select_capacity(Movie *movie, struct VideoLookahead *ahead)
     }
     if (ahead->allocated_slots > capacity)
         ahead->allocated_slots = capacity;
-    ahead->stats.capacity = capacity;
+    ahead->stats.capacity = capacity + (ahead_has_packed(ahead) ? ahead->packed->capacity : 0U);
     if (!capacity)
         ++ahead->stats.memory_denials;
+    ahead_queue_stats(ahead);
 }
 
 static bool ahead_allocate_slot(Movie *movie, struct VideoLookahead *ahead, unsigned slot)
@@ -212,7 +352,9 @@ static bool ahead_allocate_slot(Movie *movie, struct VideoLookahead *ahead, unsi
         /* If the validated counter disappears, stop growth beyond the old
          * conservative budget; never discard already queued pictures. */
         uint64_t charge = (uint64_t)ahead->stats.allocated_bytes +
-                          (uint64_t)ahead->allocated_slots * VIDEO_LOOKAHEAD_ALLOCATION_ALLOWANCE;
+                          (uint64_t)(ahead->allocated_slots +
+                              (ahead_has_packed(ahead) ? ahead->packed->allocated_slots : 0U)) *
+                          VIDEO_LOOKAHEAD_ALLOCATION_ALLOWANCE;
         denied = charge > VIDEO_LOOKAHEAD_FALLBACK_BYTES ||
                  slot_charge > VIDEO_LOOKAHEAD_FALLBACK_BYTES - charge;
     }
@@ -228,6 +370,33 @@ static bool ahead_allocate_slot(Movie *movie, struct VideoLookahead *ahead, unsi
     }
     ++ahead->allocated_slots;
     ahead->stats.allocated_bytes += ahead->frame_bytes + PLAYER_CACHE_LINE_SIZE;
+    return true;
+}
+
+static bool ahead_allocate_packed_slot(Movie *movie, struct VideoLookahead *ahead, unsigned slot)
+{
+    VideoLookaheadPacked *packed = ahead->packed;
+    VideoLookaheadPackedFrame *frame = &packed->frames[slot];
+    if (frame->pixels) return true;
+    size_t bytes = packed->frame_bytes + PLAYER_CACHE_LINE_SIZE;
+    size_t charge = bytes + VIDEO_LOOKAHEAD_ALLOCATION_ALLOWANCE;
+    ahead_memory_sample(movie, ahead, false);
+    bool denied = ahead->storage_bound == SIZE_MAX || ahead->stats.reserve_bytes == SIZE_MAX;
+    if (!denied && ahead->stats.memory_known)
+        denied = ahead->stats.free_bytes_last < ahead->stats.reserve_bytes ||
+                 charge > ahead->stats.free_bytes_last - ahead->stats.reserve_bytes;
+    else if (!denied) {
+        uint64_t used = (uint64_t)ahead->stats.allocated_bytes +
+            (ahead->allocated_slots + packed->allocated_slots) * VIDEO_LOOKAHEAD_ALLOCATION_ALLOWANCE;
+        denied = used > VIDEO_LOOKAHEAD_FALLBACK_BYTES ||
+                 charge > VIDEO_LOOKAHEAD_FALLBACK_BYTES - used;
+    }
+    if (denied) { ++ahead->stats.memory_denials; return false; }
+    frame->pixels = player_malloc_aligned(packed->frame_bytes, PLAYER_CACHE_LINE_SIZE,
+                                         &frame->allocation);
+    if (!frame->pixels) { ++ahead->stats.allocation_failures; return false; }
+    ++packed->allocated_slots;
+    ahead->stats.allocated_bytes += bytes;
     return true;
 }
 
@@ -261,6 +430,24 @@ static unsigned ahead_color_rows(struct VideoLookahead *ahead, size_t remaining,
 bool video_lookahead_active(const Movie *movie)
 {
     return movie && movie->video_lookahead && movie->video_lookahead->stats.active;
+}
+
+/* An empty planar reserve can use the existing bounded foreground quantum
+ * immediately. Limit this to a ready compressed chunk: admitting a synchronous
+ * read or recovery earlier is a separate scheduling decision. */
+bool video_lookahead_can_prepare_early(const Movie *movie)
+{
+    if (!video_lookahead_active(movie) || !movie_uses_planar_decoder(movie))
+        return false;
+    const struct VideoLookahead *ahead = movie->video_lookahead;
+    uint32_t target = movie->current_frame + 1U;
+    if (target >= movie->header.frame_count || ahead_total_queued(ahead) ||
+        ahead->recovering || ahead->producer_failed || ahead->realtime_pending ||
+        ahead->next_frame != target ||
+        movie->loaded_chunk < 0 || (uint32_t)movie->loaded_chunk >= movie->header.chunk_count)
+        return false;
+    const ChunkIndexEntry *entry = &movie->chunk_index[movie->loaded_chunk];
+    return target >= entry->first_frame && target - entry->first_frame < entry->frame_count;
 }
 
 bool video_lookahead_begin(Movie *movie)
@@ -309,13 +496,33 @@ bool video_lookahead_begin(Movie *movie)
         ahead->pump_guard = ahead_ticks_ms(ahead, 2U);
         ahead->pump_ticks_per_mb_q8 = ahead->pump_guard * 32U;
         ahead->finish_guard = ahead_ticks_ms(ahead, 6U);
+        ahead->start_guard[0] = ahead->pump_guard;
+        ahead->start_guard[1] = ahead->wide_floor_ticks;
         ahead->color_guard = ahead->margin_ticks;
         ahead->color_ticks_per_row_q8 = ahead->color_guard * 16U;
         movie->video_lookahead = ahead;
     }
     if (ahead->frame_bytes != bytes)
         return false;
+    if (!ahead_has_packed(ahead) && !ahead->packed_layout_rejected &&
+        movie_uses_planar_decoder(movie) &&
+        !(movie->header.video_width & 7U) && !(movie->header.video_height & 1U)) {
+        ahead->packed = calloc(1U, sizeof(*ahead->packed));
+        if (ahead_has_packed(ahead)) {
+            ahead->packed->frame_bytes = (size_t)(bytes / 2U * 3U / 2U);
+            ahead->packed->copy_guard = ahead->margin_ticks;
+            ahead->stats.allocated_bytes += sizeof(*ahead->packed);
+        }
+    }
+    if (ahead_has_packed(ahead)) {
+        ahead->packed->head = ahead->packed->count = 0U;
+        ahead->packed->promote_row = 0U;
+        ahead->packed->checked_layout = false;
+    }
     ahead->head = ahead->count = 0U;
+    ahead->repeat_pixels = NULL;
+    ahead->have_previous_rgb = false;
+    if (ahead_has_packed(ahead)) ahead->packed->repeat_pixels = NULL;
     ahead->recovering = ahead->producer_failed = false;
     ahead->recovery_chunk = -1;
     ahead->have_prepared_frame = false;
@@ -326,6 +533,7 @@ bool video_lookahead_begin(Movie *movie)
     ahead->picture = NULL;
     ahead->access_unit = NULL;
     ahead->output_slot = NULL;
+    ahead->output_packed = false;
     ahead->color_row = 0U;
     ahead->next_frame = movie->current_frame + 1U;
     ahead->idr_chunk = -1;
@@ -336,7 +544,7 @@ bool video_lookahead_begin(Movie *movie)
     ahead->decoder_touched = false;
     ahead->stats.partial = false;
     ahead->stats.active = true;
-    ahead->stats.queued = 0U;
+    ahead_queue_stats(ahead);
     ahead_select_capacity(movie, ahead);
     if (!ahead->stats.capacity) {
         ahead->stats.active = false;
@@ -357,7 +565,7 @@ static void ahead_note_failure(Movie *movie, struct VideoLookahead *ahead)
     ahead->stats.failed_frame = ahead->next_frame;
     ahead->stats.failure_visible_frame = movie->current_frame;
     ahead->stats.failure_chunk = movie->loaded_chunk;
-    ahead->stats.failure_queued = ahead->count;
+    ahead->stats.failure_queued = ahead_total_queued(ahead);
     snprintf(ahead->stats.failure_reason, sizeof(ahead->stats.failure_reason), "%s: %s",
         ahead->failure_stage ? ahead->failure_stage : "unknown", debug_last_error());
 }
@@ -365,6 +573,9 @@ static void ahead_note_failure(Movie *movie, struct VideoLookahead *ahead)
 static void ahead_recover(Movie *movie, struct VideoLookahead *ahead)
 {
     ahead_note_failure(movie, ahead);
+    ahead->repeat_pixels = NULL;
+    ahead->have_previous_rgb = false;
+    if (ahead_has_packed(ahead)) ahead->packed->repeat_pixels = NULL;
     int chunk = movie_chunk_for_frame(movie, ahead->next_frame);
     /* Never retry indefinitely. Keep valid RGB frames even if rebuilding the
      * decoder fails; the existing foreground fallback handles their end. */
@@ -386,6 +597,7 @@ static void ahead_recover(Movie *movie, struct VideoLookahead *ahead)
     ahead->access_unit = NULL;
     ahead->picture = NULL;
     ahead->output_slot = NULL;
+    ahead->output_packed = false;
     ahead->color_row = 0;
     ahead->stats.partial = false;
     ahead->decoder_touched = true;
@@ -398,6 +610,9 @@ static void ahead_recover(Movie *movie, struct VideoLookahead *ahead)
 static void ahead_discard_picture(Movie *movie, struct VideoLookahead *ahead)
 {
     video_decoder_release_picture(movie);
+    ahead->repeat_pixels = NULL;
+    ahead->have_previous_rgb = false;
+    if (ahead_has_packed(ahead)) ahead->packed->repeat_pixels = NULL;
     movie->decoded_local_frame = (int)ahead->working_local_frame;
     if (ahead->recovering && ahead->next_frame < ahead->recovery_target)
         ++ahead->stats.recovery_frames;
@@ -407,8 +622,176 @@ static void ahead_discard_picture(Movie *movie, struct VideoLookahead *ahead)
     ahead->access_unit = NULL;
     ahead->picture = NULL;
     ahead->output_slot = NULL;
+    ahead->output_packed = false;
     ahead->color_row = 0;
     ahead->stats.partial = false;
+}
+
+/* Publish only a fully owned snapshot. The producer and promoter have separate
+ * row cursors, so a held next picture cannot change a snapshot being colored. */
+static int ahead_pack_picture(Movie *movie, uint64_t deadline, bool foreground)
+{
+    struct VideoLookahead *ahead = movie->video_lookahead;
+    VideoLookaheadPacked *packed = ahead->packed;
+    unsigned tail = (packed->head + packed->count) % packed->capacity;
+    VideoLookaheadPackedFrame *slot = &packed->frames[tail];
+    size_t rows = movie->header.video_height - ahead->color_row;
+    if (rows > 16U) rows = 16U;
+    if (!foreground && !ahead_time_fits(deadline, packed->copy_guard)) return 0;
+    VideoFrame view;
+    if (!video_decoder_get_frame_view(movie, ahead->picture, &view)) return -1;
+    uint64_t started = monotonic_clock_now_ticks();
+    ahead->failure_stage = "packed copy";
+    if (!video_frame_pack_rows(&view, slot->pixels, packed->frame_bytes,
+                              (unsigned)ahead->color_row, (unsigned)rows)) return -1;
+    uint32_t elapsed = ahead_elapsed(started, monotonic_clock_now_ticks());
+    ahead->stats.packed_copy_ticks += elapsed;
+    ++ahead->stats.packed_copy_bands;
+    if (elapsed > ahead->stats.max_packed_copy_ticks)
+        ahead->stats.max_packed_copy_ticks = elapsed;
+    ahead_update_guard(ahead, &packed->copy_guard, &packed->have_copy_sample, elapsed);
+    ahead->color_row += rows;
+    if (ahead->color_row < movie->header.video_height) return 1;
+    slot->frame = ahead->next_frame;
+    slot->chunk = ahead->idr_chunk;
+    slot->idr_first = ahead->idr_first;
+    slot->idr_end = ahead->idr_end;
+    slot->serial = 0;
+    slot->repeats_previous = false;
+    if (NDVIDEO_WITH_AV1 && movie->codec == MOVIE_CODEC_AV1) {
+        slot->serial = av1_frame_serial(movie->av1.decoder);
+        slot->repeats_previous = av1_frame_repeats_previous(movie->av1.decoder);
+    }
+    video_decoder_release_picture(movie);
+    if (ahead->recovering) { ahead->recovering = false; ++ahead->stats.recoveries; }
+    ++ahead->next_frame;
+    ++packed->count;
+    ++ahead->stats.packed_frames;
+    if (foreground) ++ahead->stats.foreground_frames;
+    else ++ahead->stats.background_frames;
+    ahead->consumed = 0;
+    ahead->zero_advance_retries = 0;
+    ahead->picture = NULL;
+    ahead->access_unit = NULL;
+    ahead->output_slot = NULL;
+    ahead->output_packed = false;
+    ahead->color_row = 0;
+    ahead->stats.partial = false;
+    ahead_queue_stats(ahead);
+    return 1;
+}
+
+/* A certified repeat can use only the immediately preceding prepared image.
+ * Its pixels may move from the queue into the display while copying, but cannot
+ * be recycled until this next picture is ready. Seek/discard clears this view. */
+static const uint16_t *ahead_repeat_source(const Movie *movie, const struct VideoLookahead *ahead,
+                                           uint32_t frame, uint64_t serial, bool repeats_previous)
+{
+    if (!NDVIDEO_WITH_AV1 || movie->codec != MOVIE_CODEC_AV1 || !ahead->have_previous_rgb ||
+        ahead->previous_rgb_frame + 1U != frame ||
+        !repeats_previous ||
+        serial != ahead->previous_rgb_serial + 1U)
+        return NULL;
+    if (ahead->count) {
+        unsigned tail = (ahead->head + ahead->count - 1U) % ahead_rgb_capacity(ahead);
+        return ahead->frames[tail].frame == ahead->previous_rgb_frame
+                   ? ahead->frames[tail].pixels : NULL;
+    }
+    return movie->current_frame == ahead->previous_rgb_frame ? movie->framebuffer : NULL;
+}
+
+static int ahead_promote_packed(Movie *movie, uint64_t deadline, bool foreground)
+{
+    struct VideoLookahead *ahead = movie->video_lookahead;
+    if (!ahead_has_packed(ahead)) return 0;
+    VideoLookaheadPacked *packed = ahead->packed;
+    if (!packed->count || ahead->count >= packed->rgb_capacity) return 0;
+    unsigned tail = (ahead->head + ahead->count) % packed->rgb_capacity;
+    if (!ahead->frames[tail].pixels) {
+        if (!foreground && !ahead_time_fits(deadline, ahead->wide_floor_ticks)) return 0;
+        if (!ahead_allocate_slot(movie, ahead, tail)) {
+            if (!ahead->allocated_slots) { video_lookahead_cancel(movie); return 0; }
+            packed->rgb_capacity = ahead->allocated_slots;
+            ahead->stats.capacity = packed->rgb_capacity + packed->capacity;
+            ahead->head %= packed->rgb_capacity;
+            if (ahead->count >= packed->rgb_capacity) return 0;
+            tail = (ahead->head + ahead->count) % packed->rgb_capacity;
+        }
+    }
+    size_t rows = movie->header.video_height - packed->promote_row;
+    if (foreground && rows > 16U) rows = 16U;
+    if (!foreground) rows = ahead_color_rows(ahead, rows, deadline);
+    if (!rows) return 0;
+    VideoFrame view;
+    VideoLookaheadPackedFrame *source = &packed->frames[packed->head];
+    VideoLookaheadFrame *slot = &ahead->frames[tail];
+    if (!packed->promote_row) {
+        /* A repeat can switch to ordinary conversion after producer recovery.
+         * It has not run the row-zero flat probe, so keep that fallback general. */
+        packed->promote_flat = false;
+        packed->repeat_pixels = ahead_repeat_source(movie, ahead, source->frame,
+                                                    source->serial, source->repeats_previous);
+    }
+    if (!video_frame_packed_view(source->pixels, packed->frame_bytes,
+                                movie->header.video_width, movie->header.video_height, &view)) return -1;
+    uint64_t started = monotonic_clock_now_ticks();
+    ahead->failure_stage = "packed color";
+    if (packed->repeat_pixels) {
+        size_t offset = packed->promote_row * movie->header.video_width;
+        size_t bytes = rows * movie->header.video_width * sizeof(uint16_t);
+        player_copy_maybe_fast(slot->pixels + offset, packed->repeat_pixels + offset, bytes);
+    } else if (!blit_planar_picture_rows(movie, &view, slot->pixels, movie->header.video_width,
+                                        packed->promote_row, rows, &packed->promote_flat)) return -1;
+    uint64_t finished = monotonic_clock_now_ticks();
+    uint32_t elapsed = ahead_elapsed(started, finished);
+    if (packed->repeat_pixels)
+        playback_capture_stage(movie, CAPTURE_COLOR, started, finished);
+    ahead->stats.color_ticks += elapsed;
+    if (elapsed > ahead->stats.max_color_ticks) ahead->stats.max_color_ticks = elapsed;
+    if (!foreground && elapsed > ahead->stats.max_background_color_ticks)
+        ahead->stats.max_background_color_ticks = elapsed;
+    if (!foreground) {
+        if (rows == 64U) ++ahead->stats.background_color_bands_64;
+        else if (rows == 32U) ++ahead->stats.background_color_bands_32;
+        else if (rows == 16U) ++ahead->stats.background_color_bands_16;
+        else {
+            ++ahead->stats.background_color_bands_tail;
+            if (elapsed > ahead->stats.max_background_tail_ticks) ahead->stats.max_background_tail_ticks = elapsed;
+            if (!packed->repeat_pixels)
+                ahead_update_guard(ahead, &ahead->color_tail_guard, &ahead->have_color_tail_sample, elapsed);
+        }
+        if (rows >= 16U && !packed->repeat_pixels) {
+            unsigned shift = rows == 64U ? 2U : rows == 32U ? 1U : 0U;
+            uint64_t normalized = ((uint64_t)elapsed + ((1U << shift) - 1U)) >> shift;
+            uint64_t sample_q8 = (uint64_t)elapsed << (4U - shift);
+            uint32_t sample = sample_q8 > UINT32_MAX ? UINT32_MAX : (uint32_t)sample_q8;
+            if (!ahead->have_color_sample) ahead->color_ticks_per_row_q8 = sample;
+            else {
+                uint32_t decayed = ahead->color_ticks_per_row_q8 - ahead->color_ticks_per_row_q8 / 16U;
+                ahead->color_ticks_per_row_q8 = sample > decayed ? sample : decayed;
+            }
+            ahead_update_guard(ahead, &ahead->color_guard, &ahead->have_color_sample, (uint32_t)normalized);
+        }
+    }
+    packed->promote_row += rows;
+    if (packed->promote_row < movie->header.video_height) return 1;
+    slot->frame = source->frame;
+    slot->chunk = source->chunk;
+    slot->idr_first = source->idr_first;
+    slot->idr_end = source->idr_end;
+    if (NDVIDEO_WITH_AV1 && movie->codec == MOVIE_CODEC_AV1) {
+        ahead->previous_rgb_serial = source->serial;
+        ahead->previous_rgb_frame = source->frame;
+        ahead->have_previous_rgb = true;
+        if (packed->repeat_pixels) ++ahead->stats.rgb_repeat_frames;
+    }
+    packed->repeat_pixels = NULL;
+    ++ahead->count;
+    packed->head = (packed->head + 1U) % packed->capacity;
+    --packed->count;
+    packed->promote_row = 0;
+    ahead_queue_stats(ahead);
+    return 1;
 }
 
 /* 1 means work happened, 0 means yield/full/end/not-ready, -1 means failure.
@@ -439,15 +822,19 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
         if (loaded > 0) ahead->recovery_chunk = -1;
         return 1;
     }
-    if (ahead->count >= ahead->stats.capacity || ahead->next_frame >= movie->header.frame_count)
-        return 0;
+    bool output_packed = ahead->access_unit ? ahead_output_packed(ahead) : ahead_should_pack(ahead);
+    if ((output_packed ? ahead->packed->count >= ahead->packed->capacity
+                      : ahead->count >= ahead_rgb_capacity(ahead)) ||
+        ahead->next_frame >= movie->header.frame_count) return 0;
     if (ahead->picture && ahead->next_frame < discard_before) {
         ahead_discard_picture(movie, ahead);
         return 1;
     }
     if (!foreground) {
         uint32_t initial_guard;
-        if (ahead->picture) {
+        if (ahead->picture && ahead_output_packed(ahead)) {
+            initial_guard = ahead->packed->copy_guard;
+        } else if (ahead->picture) {
             size_t remaining_rows = movie->header.video_height - ahead->color_row;
             initial_guard =
                 remaining_rows < VIDEO_LOOKAHEAD_COLOR_ROWS && ahead->have_color_tail_sample
@@ -503,29 +890,68 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
         if (end <= start || end > movie->chunk_size)
             return -1;
 
-        tail = (ahead->head + ahead->count) % ahead->stats.capacity;
-        if (!foreground && !ahead->frames[tail].pixels) {
-            /* Heap growth is not an eight-macroblock operation. Only allocate
-             * with the original full conversion reserve still available; keep
-             * the cheaper measured pump guard for already allocated slots. */
-            uint32_t allocation_guard = ahead->wide_floor_ticks;
-            if (ahead->color_guard > allocation_guard)
-                allocation_guard = ahead->color_guard;
-            if (!ahead_time_fits(deadline, allocation_guard))
-                return 0;
-        }
-        if (!ahead_allocate_slot(movie, ahead, tail)) {
-            /* Slots are first allocated in ascending order before the first wrap.
-             * Retain every completed frame and continue with the smaller ring. */
-            ahead->stats.capacity = ahead->allocated_slots;
-            if (!ahead->stats.capacity) {
-                video_lookahead_cancel(movie);
-                return 0;
+        /* Keep the RGB front ready without an intermediate copy. Once older
+         * packed frames exist, all new output joins that FIFO to preserve order. */
+        ahead->output_packed = ahead_should_pack(ahead);
+        if (ahead_output_packed(ahead)) {
+            VideoLookaheadPacked *packed = ahead->packed;
+            tail = (packed->head + packed->count) % packed->capacity;
+            if (!packed->frames[tail].pixels && !foreground &&
+                !ahead_time_fits(deadline, ahead->wide_floor_ticks)) return 0;
+            if (!ahead_allocate_packed_slot(movie, ahead, tail)) {
+                if (!packed->allocated_slots) {
+                    /* Direct front frames may already wrap around this ring.
+                     * Keep its modulus while those pixels are queued; a later
+                     * rebegin may retry compact storage or choose a larger ring. */
+                    unsigned rgb_capacity = packed->rgb_capacity;
+                    ahead_free_packed(ahead);
+                    ahead->output_packed = false;
+                    if (ahead->count) {
+                        ahead->stats.capacity = rgb_capacity;
+                        ahead_queue_stats(ahead);
+                        return 0;
+                    }
+                    ahead_select_capacity(movie, ahead);
+                    if (!ahead->stats.capacity) { video_lookahead_cancel(movie); return 0; }
+                } else {
+                    packed->capacity = packed->allocated_slots;
+                    packed->head %= packed->capacity;
+                    ahead->stats.capacity = packed->rgb_capacity + packed->capacity;
+                    ahead_queue_stats(ahead);
+                    if (packed->count >= packed->capacity) return 0;
+                }
             }
-            ahead->head %= ahead->stats.capacity;
-            if (ahead->count >= ahead->stats.capacity)
-                return 0;
-            tail = (ahead->head + ahead->count) % ahead->stats.capacity;
+        }
+        if (!ahead_output_packed(ahead)) {
+            tail = (ahead->head + ahead->count) % ahead_rgb_capacity(ahead);
+            if (!foreground && !ahead->frames[tail].pixels) {
+                /* Heap growth is not an eight-macroblock operation. Only allocate
+                 * with the original full conversion reserve still available; keep
+                 * the cheaper measured pump guard for already allocated slots. */
+                uint32_t allocation_guard = ahead->wide_floor_ticks;
+                if (ahead->color_guard > allocation_guard)
+                    allocation_guard = ahead->color_guard;
+                if (!ahead_time_fits(deadline, allocation_guard))
+                    return 0;
+            }
+            if (!ahead_allocate_slot(movie, ahead, tail)) {
+                /* Slots are first allocated in ascending order before the first wrap.
+                 * Retain every completed frame and continue with the smaller ring. */
+                unsigned rgb_capacity = ahead->allocated_slots;
+                if (ahead_has_packed(ahead)) {
+                    ahead->packed->rgb_capacity = rgb_capacity;
+                    ahead->stats.capacity = rgb_capacity + ahead->packed->capacity;
+                } else ahead->stats.capacity = rgb_capacity;
+                ahead_queue_stats(ahead);
+                if (!rgb_capacity) {
+                    video_lookahead_cancel(movie);
+                    return 0;
+                }
+                ahead->head %= rgb_capacity;
+                if (ahead->count >= rgb_capacity)
+                    return 0;
+                tail = (ahead->head + ahead->count) % rgb_capacity;
+            }
         }
         /* Consuming queue entries advances head and reduces count together,
          * so this unpublished tail slot stays fixed until the AU is complete.
@@ -533,22 +959,32 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
         ahead->access_unit = movie->chunk_bytes + start;
         ahead->access_unit_size = end - start;
         ahead->working_local_frame = local;
-        ahead->output_slot = &ahead->frames[tail];
+        ahead->output_slot = ahead_output_packed(ahead) ? NULL : &ahead->frames[tail];
     }
     slot = ahead->output_slot;
 
     if (!ahead->picture) {
         total_mbs = video_decoder_total_units(movie);
         decoded_mbs = ahead->stats.partial ? video_decoder_done_units(movie) : 0U;
-        /* The final batch can also perform full-picture deblocking and DPB
-         * bookkeeping. Reserve its independently measured high-water cost. */
-        macroblock_budget =
-            foreground ? 0U : ahead_macroblock_budget(ahead, total_mbs, decoded_mbs, deadline);
+        bool planar_start = movie_uses_planar_decoder(movie) && !ahead->stats.partial;
+        unsigned start_kind = ahead->working_local_frame == 0U;
+        /* The first planar pump can parse headers and prepare an entire
+         * picture before decoding its first CTU/SB. Give it one coding unit
+         * and its own guard, instead of learning that setup cost per block.
+         * Chunk starts keep a separate estimate from ordinary frame starts. */
+        if (!foreground && planar_start) {
+            if (!ahead_time_fits(deadline, ahead->start_guard[start_kind]))
+                return 0;
+            macroblock_budget = video_decoder_min_units(movie);
+        } else {
+            /* The final batch keeps its separate finishing/deblocking guard. */
+            macroblock_budget = foreground ? 0U :
+                ahead_macroblock_budget(ahead, total_mbs, decoded_mbs, deadline);
+        }
         if (!foreground && !macroblock_budget)
             return 0;
-        if (!foreground && NDVIDEO_WITH_HEVC && movie->codec == MOVIE_CODEC_HEVC) {
-            unsigned ctu = hevc_ctu_size(movie->hevc.decoder);
-            unsigned minimum = ctu ? (ctu / 16U) * (ctu / 16U) : 4U;
+        if (!foreground && movie_uses_planar_decoder(movie)) {
+            unsigned minimum = video_decoder_min_units(movie);
             /* A CTU cannot yield internally. Never admit one using a cost
              * estimate for a smaller batch of 16x16 equivalent units. */
             if (macroblock_budget < minimum) {
@@ -562,16 +998,44 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
                 macroblock_budget = minimum;
             }
         }
+        bool capture_planar_pump = playback_capture_active(movie) && movie_uses_planar_decoder(movie);
+        const uint64_t *submission_count = NULL;
+        uint64_t submissions_before = 0U;
+        uint32_t captured_before_mbs = decoded_mbs;
+        uint32_t captured_after_mbs = 0U;
+        if (capture_planar_pump) {
+            submission_count = movie->codec == MOVIE_CODEC_AV1 ?
+                &movie->av1.submitted_frames : &movie->hevc.submitted_frames;
+            submissions_before = *submission_count;
+            /* A seek may resume an already submitted picture with consumed=0. */
+            if (!ahead->stats.partial)
+                captured_before_mbs = video_decoder_done_units(movie);
+        }
         ahead->stats.partial = true;
         ahead->decoder_touched = true;
         started = monotonic_clock_now_ticks();
         ahead->failure_stage = "decode";
+        uint64_t pump_deadline = 0U;
+        if (!foreground && movie_uses_planar_decoder(movie)) {
+            /* Keep a costly CTU/SB batch from consuming the next presentation
+             * slot. Deadlines are checked between whole coding units; a unit
+             * already in progress and picture finalization must finish. */
+            pump_deadline = started + ahead->slice_ceiling_ticks;
+            if (pump_deadline > deadline) pump_deadline = deadline;
+        }
         if (!video_decoder_pump(movie, ahead->access_unit, ahead->access_unit_size,
                                    &ahead->consumed, &ahead->zero_advance_retries,
-                                   macroblock_budget, &picture_ready, &pending, &picture))
+                                   macroblock_budget, pump_deadline, &picture_ready, &pending, &picture))
             return -1;
         finished = monotonic_clock_now_ticks();
         elapsed = ahead_elapsed(started, finished);
+        if (capture_planar_pump) {
+            bool pump_submission = *submission_count != submissions_before;
+            captured_after_mbs = video_decoder_done_units(movie);
+            ahead_capture_planar_pump(&ahead->stats, elapsed, pump_submission ? 0U : captured_before_mbs,
+                                       captured_after_mbs, video_decoder_min_units(movie),
+                                       pump_submission);
+        }
         ahead->stats.decode_ticks += elapsed;
         ++ahead->stats.decode_slices;
         if (elapsed > ahead->stats.max_pump_ticks)
@@ -587,6 +1051,14 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
                 ++ahead->stats.background_slices_4;
             if (elapsed > ahead->stats.max_background_pump_ticks)
                 ahead->stats.max_background_pump_ticks = elapsed;
+        }
+        /* Planar foreground calls still decode one indivisible CTU/SB. Keep
+         * learning its cost when a stale guard temporarily excludes background
+         * work. H264 foreground calls may decode an entire picture instead. */
+        if (planar_start) {
+            ahead_update_guard(ahead, &ahead->start_guard[start_kind],
+                               &ahead->have_start_sample[start_kind], elapsed);
+        } else if (!foreground || movie_uses_planar_decoder(movie)) {
             if (picture_ready) {
                 uint32_t final_mbs = total_mbs > decoded_mbs ? total_mbs - decoded_mbs : 8U;
                 uint64_t normalized = elapsed;
@@ -599,7 +1071,7 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
                 ahead_update_guard(ahead, &ahead->finish_guard, &ahead->have_finish_sample,
                                    normalized > UINT32_MAX ? UINT32_MAX : (uint32_t)normalized);
             } else {
-                uint32_t after_mbs = video_decoder_done_units(movie);
+                uint32_t after_mbs = capture_planar_pump ? captured_after_mbs : video_decoder_done_units(movie);
                 if (after_mbs > decoded_mbs) {
                     uint32_t actual_mbs = after_mbs - decoded_mbs;
                     uint64_t normalized, sample_q8;
@@ -643,25 +1115,71 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
         }
         ahead->picture = picture;
         movie->decoded_local_frame = (int)ahead->working_local_frame;
+        if (ahead_has_packed(ahead) && !ahead->packed->checked_layout) {
+            VideoFrame view;
+            bool favorable = video_decoder_get_frame_view(movie, picture, &view);
+            if (favorable) {
+                for (unsigned p = 0; p < 3U; ++p)
+                    if (((uintptr_t)view.plane[p] | (unsigned)view.stride[p]) & 3U)
+                        favorable = false;
+            }
+            if (favorable) ahead->packed->checked_layout = true;
+            else {
+                /* Before the first snapshot only: an unfavorable cropped
+                 * layout keeps the existing direct-to-RGB path. Never change
+                 * representation while a packed queue is populated. */
+                ahead->packed_layout_rejected = true;
+                ahead->output_packed = false;
+                ahead_free_packed(ahead);
+                ahead_select_capacity(movie, ahead);
+                if (!ahead->stats.capacity) { video_lookahead_cancel(movie); return 0; }
+                ahead->output_slot = NULL;
+                ahead_queue_stats(ahead);
+            }
+        }
+        ahead->repeat_pixels = NULL;
+        if (!ahead_output_packed(ahead) && NDVIDEO_WITH_AV1 && movie->codec == MOVIE_CODEC_AV1)
+            ahead->repeat_pixels = ahead_repeat_source(movie, ahead, ahead->next_frame,
+                av1_frame_serial(movie->av1.decoder), av1_frame_repeats_previous(movie->av1.decoder));
         /* Conversion gets its own quantum: return to input/presentation after
          * this macroblock batch even when there is more deadline slack. */
         if (!foreground)
             return 1;
     }
+    if (ahead_output_packed(ahead)) return ahead_pack_picture(movie, deadline, foreground);
+    if (!ahead->output_slot) {
+        /* First-picture layout fallback can retain an already held picture;
+         * acquire its RGB destination cooperatively without resubmitting it. */
+        unsigned rgb_tail = (ahead->head + ahead->count) % ahead_rgb_capacity(ahead);
+        if (!ahead->frames[rgb_tail].pixels && !foreground &&
+            !ahead_time_fits(deadline, ahead->wide_floor_ticks)) return 0;
+        if (!ahead_allocate_slot(movie, ahead, rgb_tail)) {
+            video_lookahead_cancel(movie);
+            return 0;
+        }
+        ahead->output_slot = &ahead->frames[rgb_tail];
+    }
+    slot = ahead->output_slot;
     size_t rows = movie->header.video_height - ahead->color_row;
-    if (foreground && movie->codec == MOVIE_CODEC_HEVC && rows > 16U) rows = 16U;
+    if (foreground && movie_uses_planar_decoder(movie) && rows > 16U) rows = 16U;
     if (!foreground)
         rows = ahead_color_rows(ahead, rows, deadline);
     if (!rows)
         return 0;
     started = monotonic_clock_now_ticks();
     ahead->failure_stage = "color";
-    if (!video_blit_picture_rows(movie, ahead->picture, slot->pixels,
-                                          movie->header.video_width, ahead->color_row, rows,
-                                          &ahead->color_flat))
+    if (ahead->repeat_pixels) {
+        size_t offset = ahead->color_row * movie->header.video_width;
+        size_t bytes = rows * movie->header.video_width * sizeof(uint16_t);
+        player_copy_maybe_fast(slot->pixels + offset, ahead->repeat_pixels + offset, bytes);
+    } else if (!video_blit_picture_rows(movie, ahead->picture, slot->pixels,
+                                       movie->header.video_width, ahead->color_row, rows,
+                                       &ahead->color_flat))
         return -1;
     finished = monotonic_clock_now_ticks();
     elapsed = ahead_elapsed(started, finished);
+    if (ahead->repeat_pixels)
+        playback_capture_stage(movie, CAPTURE_COLOR, started, finished);
     ahead->stats.color_ticks += elapsed;
     if (elapsed > ahead->stats.max_color_ticks)
         ahead->stats.max_color_ticks = elapsed;
@@ -681,13 +1199,14 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
             /* Band sizes are multiples of 16, so this Movie's final tail
              * always has the same row count. Learn that exact operation
              * separately without reducing the common 1 ms guard margin. */
-            ahead_update_guard(ahead, &ahead->color_tail_guard, &ahead->have_color_tail_sample,
-                               elapsed);
+            if (!ahead->repeat_pixels)
+                ahead_update_guard(ahead, &ahead->color_tail_guard, &ahead->have_color_tail_sample,
+                                   elapsed);
         }
         /* Short tails contain fixed call/setup work too. Do not magnify it
          * into a per-row estimate for a later full band; the separate tail
          * estimate above measures that fixed operation directly. */
-        if (rows >= 16U) {
+        if (rows >= 16U && !ahead->repeat_pixels) {
             uint32_t shift = rows == 64U ? 2U : rows == 32U ? 1U : 0U;
             uint64_t normalized = ((uint64_t)elapsed + ((1U << shift) - 1U)) >> shift;
             uint64_t sample_q8 = (uint64_t)elapsed << (4U - shift);
@@ -706,6 +1225,13 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
     ahead->color_row += rows;
     if (ahead->color_row < movie->header.video_height)
         return 1;
+    if (NDVIDEO_WITH_AV1 && movie->codec == MOVIE_CODEC_AV1) {
+        ahead->previous_rgb_serial = av1_frame_serial(movie->av1.decoder);
+        ahead->previous_rgb_frame = ahead->next_frame;
+        ahead->have_previous_rgb = true;
+        if (ahead->repeat_pixels) ++ahead->stats.rgb_repeat_frames;
+    }
+    ahead->repeat_pixels = NULL;
     video_decoder_release_picture(movie);
     if (ahead->recovering) {
         ahead->recovering = false;
@@ -716,9 +1242,7 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
     slot->idr_first = ahead->idr_first;
     slot->idr_end = ahead->idr_end;
     ++ahead->count;
-    ahead->stats.queued = ahead->count;
-    if (ahead->count > ahead->stats.peak_queued)
-        ahead->stats.peak_queued = ahead->count;
+    ahead_queue_stats(ahead);
     if (foreground)
         ++ahead->stats.foreground_frames;
     else
@@ -728,9 +1252,20 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
     ahead->picture = NULL;
     ahead->access_unit = NULL;
     ahead->output_slot = NULL;
+    ahead->output_packed = false;
     ahead->color_row = 0U;
     ahead->stats.partial = false;
     return 1;
+}
+
+static int ahead_compact_work(Movie *movie, uint64_t deadline, bool foreground,
+                              uint32_t discard_before)
+{
+    struct VideoLookahead *ahead = movie->video_lookahead;
+    if (ahead_has_packed(ahead) && ahead->packed->count &&
+        ahead->count < ahead->packed->rgb_capacity)
+        return ahead_promote_packed(movie, deadline, foreground);
+    return ahead_produce(movie, deadline, foreground, discard_before);
 }
 
 bool video_lookahead_step(Movie *movie, uint64_t deadline_ticks)
@@ -740,8 +1275,8 @@ bool video_lookahead_step(Movie *movie, uint64_t deadline_ticks)
     if (!video_lookahead_active(movie))
         return false;
     ahead = movie->video_lookahead;
-    if (ahead->producer_failed) return false;
-    result = ahead_produce(movie, deadline_ticks, false, 0);
+    if (ahead->producer_failed && (!ahead_has_packed(ahead) || !ahead->packed->count)) return false;
+    result = ahead_compact_work(movie, deadline_ticks, false, 0);
     if (result < 0) ahead_recover(movie, ahead);
     return result > 0;
 }
@@ -771,9 +1306,9 @@ static bool ahead_take(Movie *movie, uint32_t target_frame, bool queued_hit)
     movie->debug_idr_cache_chunk = slot->chunk;
     movie->debug_idr_cache_start_local = slot->idr_first;
     movie->debug_idr_cache_end_local = slot->idr_end;
-    ahead->head = (ahead->head + 1U) % ahead->stats.capacity;
+    ahead->head = (ahead->head + 1U) % ahead_rgb_capacity(ahead);
     --ahead->count;
-    ahead->stats.queued = ahead->count;
+    ahead_queue_stats(ahead);
     if (ahead->have_prepared_frame && ahead->prepared_frame == target_frame) {
         if (!ahead->prepared_depth)
             queued_hit = false;
@@ -781,7 +1316,7 @@ static bool ahead_take(Movie *movie, uint32_t target_frame, bool queued_hit)
     }
     if (queued_hit)
         ++ahead->stats.queue_hits;
-    if (!ahead->count && !ahead->stats.partial && ahead->next_frame == target_frame + 1U)
+    if (!ahead_total_queued(ahead) && !ahead->stats.partial && ahead->next_frame == target_frame + 1U)
         ahead->decoder_touched = false;
     return true;
 }
@@ -789,6 +1324,29 @@ static bool ahead_take(Movie *movie, uint32_t target_frame, bool queued_hit)
 bool video_lookahead_take(Movie *movie, uint32_t target_frame)
 {
     return ahead_take(movie, target_frame, true);
+}
+
+static int ahead_prepare_packed(Movie *movie, uint32_t target_frame)
+{
+    struct VideoLookahead *ahead = movie->video_lookahead;
+    if (ahead->count)
+        return ahead->frames[ahead->head].frame == target_frame ? 1 : 0;
+    if (ahead->packed->count) {
+        if (ahead->packed->frames[ahead->packed->head].frame != target_frame) return 0;
+    } else if (ahead->next_frame != target_frame) return 0;
+    uint64_t quantum_end = monotonic_clock_now_ticks() + ahead->foreground_slice_ticks;
+    int result;
+    do {
+        result = ahead_compact_work(movie, 0, true, 0);
+    } while (result > 0 && !ahead->count && ahead->stats.active &&
+             monotonic_clock_now_ticks() < quantum_end);
+    if (!ahead->stats.active) return 0;
+    if (ahead->count && ahead->frames[ahead->head].frame == target_frame) return 1;
+    if (result > 0) return 2;
+    if (!ahead->producer_failed) ahead_note_failure(movie, ahead);
+    video_decoder_mark_failed(movie);
+    video_lookahead_cancel(movie);
+    return -1;
 }
 
 int video_lookahead_prepare_target(Movie *movie, uint32_t target_frame)
@@ -802,26 +1360,27 @@ int video_lookahead_prepare_target(Movie *movie, uint32_t target_frame)
         return 0;
     if (!ahead->have_prepared_frame || ahead->prepared_frame != target_frame) {
         ahead->prepared_frame = target_frame;
-        ahead->prepared_depth = ahead->count;
+        ahead->prepared_depth = ahead_total_queued(ahead);
         ahead->have_prepared_frame = true;
-        if (!ahead->count) ++ahead->stats.queue_misses;
+        if (!ahead_total_queued(ahead)) ++ahead->stats.queue_misses;
     }
+    if (ahead_has_packed(ahead)) return ahead_prepare_packed(movie, target_frame);
     if (ahead->count && ahead->frames[ahead->head].frame == target_frame)
         return 1;
     if (target_frame != movie->current_frame + 1U || ahead->count ||
         ahead->next_frame != target_frame)
         return 0;
-    uint64_t quantum_end = movie->codec == MOVIE_CODEC_HEVC
+    uint64_t quantum_end = movie_uses_planar_decoder(movie)
         ? monotonic_clock_now_ticks() + ahead->foreground_slice_ticks : 0;
     do {
         result = ahead_produce(movie, 0U, true, 0);
-    } while (movie->codec == MOVIE_CODEC_HEVC && result > 0 && !ahead->count &&
+    } while (movie_uses_planar_decoder(movie) && result > 0 && !ahead->count &&
              ahead->stats.active && monotonic_clock_now_ticks() < quantum_end);
     if (!ahead->stats.active)
         return 0;
     if (result > 0 && ahead->count && ahead->frames[ahead->head].frame == target_frame)
         return 1;
-    if (movie->codec == MOVIE_CODEC_HEVC && result > 0) return 2;
+    if (movie_uses_planar_decoder(movie) && result > 0) return 2;
     if (!ahead->producer_failed) ahead_note_failure(movie, ahead);
     video_decoder_mark_failed(movie);
     video_lookahead_cancel(movie);
@@ -836,7 +1395,7 @@ unsigned video_lookahead_prepared_depth(const Movie *movie, uint32_t target_fram
     ahead = movie->video_lookahead;
     return ahead->have_prepared_frame && ahead->prepared_frame == target_frame
                ? ahead->prepared_depth
-               : ahead->count;
+               : ahead_total_queued(ahead);
 }
 
 int video_lookahead_finish_target(Movie *movie, uint32_t target_frame)
@@ -857,21 +1416,68 @@ bool video_lookahead_pending_realtime_target(const Movie *movie, uint32_t *targe
     return true;
 }
 
+static int ahead_finish_packed_realtime(Movie *movie, uint32_t target_frame)
+{
+    struct VideoLookahead *ahead = movie->video_lookahead;
+    VideoLookaheadPacked *packed = ahead->packed;
+    ahead->have_prepared_frame = false;
+    while (ahead->count && ahead->frames[ahead->head].frame < target_frame) {
+        ahead->head = (ahead->head + 1U) % packed->rgb_capacity;
+        --ahead->count;
+    }
+    while (packed->count && packed->frames[packed->head].frame < target_frame) {
+        packed->head = (packed->head + 1U) % packed->capacity;
+        --packed->count;
+        packed->promote_row = 0;
+        packed->repeat_pixels = NULL;
+        ahead->have_previous_rgb = false;
+    }
+    ahead_queue_stats(ahead);
+    if (ahead->count) {
+        bool taken = ahead_take(movie, target_frame, true);
+        if (taken) ahead->realtime_pending = false;
+        return taken ? 1 : 0;
+    }
+    if (packed->count && packed->frames[packed->head].frame > target_frame) return 0;
+    if (!packed->count && ahead->next_frame > target_frame) return 0;
+    if (!ahead->realtime_pending) {
+        if (!packed->count) ++ahead->stats.queue_misses;
+        ahead->realtime_pending = true;
+        ahead->realtime_target = target_frame;
+    }
+    uint64_t quantum_end = monotonic_clock_now_ticks() + ahead->foreground_slice_ticks;
+    while (!ahead->count) {
+        int result = ahead_compact_work(movie, 0, true, target_frame);
+        if (!ahead->stats.active) return 0;
+        if (result <= 0) {
+            if (!ahead->producer_failed) ahead_note_failure(movie, ahead);
+            video_decoder_mark_failed(movie);
+            video_lookahead_cancel(movie);
+            return -1;
+        }
+        if (!ahead->count && monotonic_clock_now_ticks() >= quantum_end) return 2;
+    }
+    bool taken = ahead_take(movie, target_frame, false);
+    if (taken) ahead->realtime_pending = false;
+    return taken ? 1 : 0;
+}
+
 int video_lookahead_finish_realtime_target(Movie *movie, uint32_t target_frame)
 {
     if (!video_lookahead_active(movie)) return 0;
     struct VideoLookahead *ahead = movie->video_lookahead;
-    /* HEVC returns to the input loop between CTUs. Finish the chosen image
+    /* Block decoders return to the input loop between coding units. Finish the chosen image
      * even if the clock passes it meanwhile, otherwise an overloaded decoder
      * can discard every picture without ever refreshing the display. */
     if (ahead->realtime_pending) target_frame = ahead->realtime_target;
     if (target_frame <= movie->current_frame || target_frame >= movie->header.frame_count) return 0;
+    if (ahead_has_packed(ahead)) return ahead_finish_packed_realtime(movie, target_frame);
     ahead->have_prepared_frame = false;
     while (ahead->count && ahead->frames[ahead->head].frame < target_frame) {
-        ahead->head = (ahead->head + 1U) % ahead->stats.capacity;
+        ahead->head = (ahead->head + 1U) % ahead_rgb_capacity(ahead);
         --ahead->count;
     }
-    ahead->stats.queued = ahead->count;
+    ahead_queue_stats(ahead);
     if (ahead->count) {
         bool taken = ahead_take(movie, target_frame, true);
         if (taken) ahead->realtime_pending = false;
@@ -879,11 +1485,11 @@ int video_lookahead_finish_realtime_target(Movie *movie, uint32_t target_frame)
     }
     if (ahead->next_frame > target_frame) return 0;
     if (!ahead->realtime_pending) ++ahead->stats.queue_misses;
-        if (NDVIDEO_WITH_HEVC && movie->codec == MOVIE_CODEC_HEVC) {
+    if (movie_uses_planar_decoder(movie)) {
         ahead->realtime_pending = true;
         ahead->realtime_target = target_frame;
     }
-    uint64_t quantum_end = movie->codec == MOVIE_CODEC_HEVC
+    uint64_t quantum_end = movie_uses_planar_decoder(movie)
         ? monotonic_clock_now_ticks() + ahead->foreground_slice_ticks : 0;
     while (!ahead->count) {
         int result = ahead_produce(movie, 0U, true, target_frame);
@@ -893,7 +1499,7 @@ int video_lookahead_finish_realtime_target(Movie *movie, uint32_t target_frame)
             video_lookahead_cancel(movie);
             return -1;
         }
-        if (movie->codec == MOVIE_CODEC_HEVC && !ahead->count &&
+        if (movie_uses_planar_decoder(movie) && !ahead->count &&
             monotonic_clock_now_ticks() >= quantum_end) return 2;
     }
     bool taken = ahead_take(movie, target_frame, false);
@@ -908,6 +1514,9 @@ void video_lookahead_cancel(Movie *movie)
     if (!movie || !(ahead = movie->video_lookahead))
         return;
     touched = ahead->decoder_touched;
+    ahead->repeat_pixels = NULL;
+    ahead->have_previous_rgb = false;
+    if (ahead_has_packed(ahead)) ahead->packed->repeat_pixels = NULL;
     /* An inactive queue does not own a picture held by a suspended seek. */
     if (ahead->picture) video_decoder_release_picture(movie);
     if (ahead->stats.active)
@@ -920,12 +1529,17 @@ void video_lookahead_cancel(Movie *movie)
     movie->foreground_pending_ticks = 0;
     ahead->stats.partial = false;
     ahead->head = ahead->count = 0U;
-    ahead->stats.queued = 0U;
+    if (ahead_has_packed(ahead)) {
+        ahead->packed->head = ahead->packed->count = 0U;
+        ahead->packed->promote_row = 0U;
+    }
+    ahead_queue_stats(ahead);
     ahead->consumed = 0U;
     ahead->zero_advance_retries = 0U;
     ahead->picture = NULL;
     ahead->access_unit = NULL;
     ahead->output_slot = NULL;
+    ahead->output_packed = false;
     ahead->color_row = 0U;
     ahead->decoder_touched = false;
     if (touched) {
@@ -948,6 +1562,7 @@ void video_lookahead_destroy(Movie *movie)
         if (ahead->frames[i].pixels)
             player_free_aligned(ahead->frames[i].pixels, ahead->frames[i].allocation);
     }
+    ahead_free_packed(ahead);
     free(ahead);
     movie->video_lookahead = NULL;
 }
@@ -960,6 +1575,11 @@ uint32_t video_lookahead_next_frame(const Movie *movie)
 }
 
 unsigned video_lookahead_queued(const Movie *movie)
+{
+    return video_lookahead_active(movie) ? ahead_total_queued(movie->video_lookahead) : 0U;
+}
+
+unsigned video_lookahead_ready(const Movie *movie)
 {
     return video_lookahead_active(movie) ? movie->video_lookahead->count : 0U;
 }
@@ -976,6 +1596,8 @@ void video_lookahead_get_stats(const Movie *movie, VideoLookaheadStats *out)
     if (movie && movie->video_lookahead) {
         const struct VideoLookahead *ahead = movie->video_lookahead;
         *out = ahead->stats;
+        out->planar_frame_start_guard_ticks = ahead->start_guard[0];
+        out->planar_chunk_start_guard_ticks = ahead->start_guard[1];
         out->color_tail_guard_ticks =
             ahead->have_color_tail_sample ? ahead->color_tail_guard : ahead->color_guard;
     } else

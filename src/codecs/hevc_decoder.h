@@ -3,12 +3,14 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "video_frame.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 typedef struct hevc_decoder hevc_decoder_t;
+typedef uint64_t (*hevc_clock_fn)(void);
 
 typedef enum hevc_status {
     HEVC_ERROR = -1,
@@ -18,17 +20,9 @@ typedef enum hevc_status {
     HEVC_END = 3
 } hevc_status_t;
 
-typedef struct hevc_frame {
-    /* Planes already point at the conformance-window crop origin. */
-    const uint8_t *plane[3];
-    int stride[3];
-    unsigned width, height;
-    unsigned coded_width, coded_height;
-    unsigned crop_left, crop_top;
-    int64_t pts;
-} hevc_frame_t;
+typedef VideoFrame hevc_frame_t;
 
-/* Single-owner, single-core decoder. No OS threads, SIMD, or callbacks.
+/* Single-owner, single-core decoder. No OS threads or SIMD.
  * Accepts Main 8-bit 4:2:0, <=320x240 coded pixels, CTU32/64, I/P pictures,
  * no tiles/WPP. One complete Annex-B access unit may be pending at a time.
  * Submit copies input and marks its end-of-frame. A held output blocks step
@@ -51,6 +45,16 @@ hevc_status_t hevc_submit_annexb(hevc_decoder_t *decoder,
  * Call repeatedly on PROGRESS. NEED_INPUT permits the next submit.
  */
 hevc_status_t hevc_step(hevc_decoder_t *decoder, unsigned budget_ctus);
+/* As hevc_step, with an optional monotonic tick deadline checked before each
+ * complete CTU. A NULL clock disables the deadline. A non-NULL clock with an
+ * expired deadline yields PROGRESS without starting another CTU, including
+ * when no CTUs have yet been decoded. Headers and picture finalization are
+ * not interrupted, and an in-flight CTU may finish beyond the deadline.
+ * The clock runs synchronously and must not reenter or mutate the decoder.
+ * The decoder never retains the clock or deadline after this call returns.
+ */
+hevc_status_t hevc_step_until(hevc_decoder_t *decoder, unsigned budget_ctus,
+                              uint64_t deadline_ticks, hevc_clock_fn clock);
 const hevc_frame_t *hevc_get_frame(const hevc_decoder_t *decoder);
 void hevc_release_frame(hevc_decoder_t *decoder);
 hevc_status_t hevc_flush(hevc_decoder_t *decoder);

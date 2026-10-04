@@ -7,6 +7,9 @@
 
 #include "decoder.h"
 #include "xvid.h"
+#if defined(NDVIDEO_BUILD_MPEG4_MODULE) && NDVIDEO_BUILD_MPEG4_MODULE
+#include "xvid/utils/mem_align.h"
+#endif
 
 static bool g_xvid_initialized = false;
 static char g_xvid_error[160];
@@ -72,7 +75,13 @@ bool mpeg4_xvid_global_init(void *sram_base, unsigned int sram_size)
     init.sram_base = sram_base;
     init.sram_size = sram_size;
 
+#if defined(NDVIDEO_BUILD_MPEG4_MODULE) && NDVIDEO_BUILD_MPEG4_MODULE
+    xvid_module_track_globals(1);
+#endif
     result = xvid_global(NULL, XVID_GBL_INIT, &init, NULL);
+#if defined(NDVIDEO_BUILD_MPEG4_MODULE) && NDVIDEO_BUILD_MPEG4_MODULE
+    xvid_module_track_globals(0);
+#endif
     if (result < 0) {
         mpeg4_xvid_set_error("xvid global init failed: %s (%d)", mpeg4_xvid_error_name(result), result);
         return false;

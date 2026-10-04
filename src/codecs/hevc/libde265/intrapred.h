@@ -266,12 +266,19 @@ void intra_prediction_planar(pixel_t* dst, int dstStride,
 {
   int Log2_nT = Log2(nT);
 
-  for (int y=0;y<nT;y++)
-    for (int x=0;x<nT;x++)
-      {
-        dst[x+y*dstStride] = ((nT-1-x)*border[-1-y] + (x+1)*border[ 1+nT] +
-                              (nT-1-y)*border[ 1+x] + (y+1)*border[-1-nT] + nT) >> (Log2_nT+1);
-      }
+  // The horizontal contribution changes by topRight-left each pixel.
+  const int topRight = border[1+nT], bottomLeft = border[-1-nT];
+  for (int y=0;y<nT;y++) {
+    const int left = border[-1-y];
+    const int step = topRight - left;
+    const int topWeight = nT - 1 - y;
+    int horizontal = (nT-1)*left + topRight + (y+1)*bottomLeft + nT;
+    pixel_t* row = dst + y*dstStride;
+    for (int x=0;x<nT;x++) {
+      row[x] = (horizontal + topWeight*border[1+x]) >> (Log2_nT+1);
+      horizontal += step;
+    }
+  }
 
 
   logtrace(LogIntraPred,"result of planar prediction\n");
@@ -369,8 +376,12 @@ void intra_prediction_angular(pixel_t* dst, int dstStride,
       pixel_t* row=dst+y*dstStride;
       const pixel_t* in=ref+iIdx+1;
       if (iFact) {
-        for (int x=0;x<nT;x++)
-          row[x]=in[x]+((iFact*(in[x+1]-in[x])+16)>>5);
+        int previous=in[0];
+        for (int x=0;x<nT;x++) {
+          const int next=in[x+1];
+          row[x]=previous+((iFact*(next-previous)+16)>>5);
+          previous=next;
+        }
       }
       else for (int x=0;x<nT;x++) row[x]=in[x];
     }
@@ -406,8 +417,12 @@ void intra_prediction_angular(pixel_t* dst, int dstStride,
       const int iFact=((x+1)*intraPredAngle)&31;
       const pixel_t* in=ref+iIdx+1;
       if (iFact) {
-        for (int y=0;y<nT;y++)
-          dst[x+y*dstStride]=in[y]+((iFact*(in[y+1]-in[y])+16)>>5);
+        int previous=in[0];
+        for (int y=0;y<nT;y++) {
+          const int next=in[y+1];
+          dst[x+y*dstStride]=previous+((iFact*(next-previous)+16)>>5);
+          previous=next;
+        }
       }
       else for (int y=0;y<nT;y++) dst[x+y*dstStride]=in[y];
     }

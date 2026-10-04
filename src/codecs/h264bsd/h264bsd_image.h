@@ -54,6 +54,14 @@ typedef struct
     u8 *cr;
 } image_t;
 
+/* The full calculator width is 20 macroblocks. A constant divisor lets ARM
+ * use a multiply/shift instead of a software division; other widths retain
+ * the generic calculation. */
+static inline u32 h264bsdMbRow(u32 mbNum, u32 width)
+{
+    return width == 20U ? mbNum / 20U : mbNum / width;
+}
+
 /*------------------------------------------------------------------------------
     4. Function prototypes
 ------------------------------------------------------------------------------*/

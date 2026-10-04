@@ -866,7 +866,11 @@ void wait_until_ticks_playback(Movie *movie, uint64_t target_ticks, const Pointe
     PlaybackKeySnapshot previous_keys;
     PlaybackKeySnapshot current_keys;
     uint64_t poll_interval_ticks = ((uint64_t) monotonic_clock_ticks_per_second()) / 1000U;
-    uint64_t touch_interval_ticks = ((uint64_t) monotonic_clock_ticks_per_second() * 4U + 999U) / 1000U;
+    /* A resting touchpad needs fewer I2C reads. Active contact keeps the
+     * 4 ms cadence; keyboard/ON polling and the immediate entry scan stay fast. */
+    unsigned touch_interval_ms = pointer && pointer->tracking ? 4U : 8U;
+    uint64_t touch_interval_ticks =
+        ((uint64_t)monotonic_clock_ticks_per_second() * touch_interval_ms + 999U) / 1000U;
     uint64_t sleep_guard_ticks = (uint64_t) monotonic_clock_ticks_per_second() * (FRAME_PACING_SPIN_MS + 1U) / 1000U;
     uint64_t writer_guard_ticks = ((uint64_t)monotonic_clock_ticks_per_second() * 8U + 999U) / 1000U;
     uint64_t next_poll_ticks = monotonic_clock_now_ticks();
@@ -879,7 +883,7 @@ void wait_until_ticks_playback(Movie *movie, uint64_t target_ticks, const Pointe
     if ((int64_t)(target_ticks - now_ticks) <= 0) return;
 
     /* Keyboard matrix/ON reads are cheap. A touchpad report is a complete
-     * native I2C transaction; keep its own 4 ms cadence during this wait.
+     * native I2C transaction; keep its own contact-aware cadence during this wait.
      * Main-loop/seek snapshots still request a fresh report immediately. */
     playback_wait_snapshot(movie,&previous_keys,true);
 

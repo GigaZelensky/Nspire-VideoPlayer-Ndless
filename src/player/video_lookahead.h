@@ -24,13 +24,27 @@ typedef struct {
     uint32_t background_frames, foreground_frames, queue_hits, queue_misses;
     uint32_t chunk_waits, cancellations, failures, decode_slices;
     uint32_t max_pump_ticks, max_color_ticks;
+    uint32_t planar_frame_start_guard_ticks, planar_chunk_start_guard_ticks;
     uint32_t max_background_pump_ticks, max_background_color_ticks;
+    /* Independent peaks accumulated during active capture periods for this
+     * movie. One planar unit is a complete HEVC CTU or AV1 superblock. */
+    uint32_t captured_planar_pumps, captured_submission_pumps;
+    uint32_t captured_single_no_submit_pumps, captured_multi_no_submit_pumps;
+    uint32_t captured_max_pump_ticks, captured_max_pump_units;
+    uint32_t captured_max_pump_unit_mbs;
+    uint32_t captured_max_single_no_submit_ticks, captured_max_multi_no_submit_ticks;
+    uint32_t captured_max_submission_ticks, captured_max_submission_units;
+    bool captured_max_pump_submission;
     uint32_t background_slices_8, background_slices_16, background_slices_32;
     uint32_t background_slices_4;
     uint32_t background_color_bands_16, background_color_bands_32;
     uint32_t background_color_bands_64, background_color_bands_tail;
     uint32_t max_background_tail_ticks, color_tail_guard_ticks;
     uint64_t decode_ticks, color_ticks;
+    uint32_t rgb_repeat_frames;
+    unsigned rgb_ready, packed_ready, packed_capacity;
+    uint32_t packed_frames, packed_copy_bands, max_packed_copy_ticks;
+    uint64_t packed_copy_ticks;
     uint32_t recoveries, recovery_frames;
     uint32_t failed_frame, failure_visible_frame, failure_queued;
     int failure_chunk;
@@ -42,8 +56,9 @@ typedef struct {
  * decoder must not be changed behind an active lookahead instance. */
 bool video_lookahead_begin(struct Movie *movie);
 bool video_lookahead_active(const struct Movie *movie);
+bool video_lookahead_can_prepare_early(const struct Movie *movie);
 
-/* One macroblock batch or row-band conversion against an absolute deadline.
+/* One macroblock batch, owned-plane copy band, or conversion band against an absolute deadline.
  * Normal decoding uses ready chunks; error recovery may advance a bounded
  * nonblocking reload. Returns whether work was performed. */
 bool video_lookahead_step(struct Movie *movie, uint64_t deadline_ticks);
@@ -57,8 +72,8 @@ bool video_lookahead_take(struct Movie *movie, uint32_t target_frame);
  * frame or framebuffer. 1: ready, 2: more cooperative work needed, 0: seek required, -1: failure. */
 int video_lookahead_prepare_target(struct Movie *movie, uint32_t target_frame);
 
-/* Queue depth at the first preparation attempt, retained through interrupted
- * waits so capture still identifies foreground misses at eventual commit. */
+/* Total decoded depth (RGB plus owned YUV) at the first preparation attempt,
+ * retained through interrupted waits. Use ready() for presentation readiness. */
 unsigned video_lookahead_prepared_depth(const struct Movie *movie, uint32_t target_frame);
 
 /* 1: target presented, 0: inactive/nonsequential (normal seek required),
@@ -79,6 +94,8 @@ void video_lookahead_destroy(struct Movie *movie);
 /* The prefetch horizon follows decoding, independently of presentation. */
 uint32_t video_lookahead_next_frame(const struct Movie *movie);
 unsigned video_lookahead_queued(const struct Movie *movie);
+/* Immediately presentable RGB frames; queued() also includes owned YUV. */
+unsigned video_lookahead_ready(const struct Movie *movie);
 size_t video_lookahead_memory_bytes(const struct Movie *movie);
 void video_lookahead_get_stats(const struct Movie *movie, VideoLookaheadStats *out);
 

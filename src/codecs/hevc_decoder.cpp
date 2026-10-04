@@ -141,7 +141,7 @@ static hevc_status_t hold_frame(hevc_decoder_t *d, const de265_image *image)
     return HEVC_FRAME_READY;
 }
 
-extern "C" hevc_status_t hevc_step(hevc_decoder_t *d, unsigned budget)
+static hevc_status_t hevc_step_core(hevc_decoder_t *d, unsigned budget)
 {
     if (!d || d->failed) return HEVC_ERROR;
     d->last_ctus=0;
@@ -170,6 +170,23 @@ extern "C" hevc_status_t hevc_step(hevc_decoder_t *d, unsigned budget)
         if (!d->ctx->ctu_budget) return HEVC_PROGRESS;
     }
     return HEVC_PROGRESS;
+}
+
+extern "C" hevc_status_t hevc_step_until(hevc_decoder_t *d, unsigned budget,
+                                         uint64_t deadline_ticks, hevc_clock_fn clock)
+{
+    if (!d) return HEVC_ERROR;
+    d->ctx->ctu_clock=clock;
+    d->ctx->ctu_deadline_ticks=deadline_ticks;
+    hevc_status_t status=hevc_step_core(d,budget);
+    d->ctx->ctu_clock=NULL;
+    d->ctx->ctu_deadline_ticks=0;
+    return status;
+}
+
+extern "C" hevc_status_t hevc_step(hevc_decoder_t *d, unsigned budget)
+{
+    return hevc_step_until(d,budget,0,NULL);
 }
 
 extern "C" const hevc_frame_t *hevc_get_frame(const hevc_decoder_t *d)

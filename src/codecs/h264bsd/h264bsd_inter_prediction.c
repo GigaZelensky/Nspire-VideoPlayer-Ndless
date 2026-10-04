@@ -293,7 +293,7 @@ u32 h264bsdInterPrediction(mbStorage_t *pMb, macroblockLayer_t *pMbLayer,
     pFill = ALIGN(fillBuff, 16);
 
     /* set row bits 15:0 */
-    colAndRow = mbNum / currImage->width;
+    colAndRow = h264bsdMbRow(mbNum, currImage->width);
     /*set col to bits 31:16 */
     colAndRow += (mbNum - colAndRow * currImage->width) << 16;
     colAndRow <<= 4;
@@ -465,7 +465,7 @@ u32 h264bsdInterPrediction(mbStorage_t *pMb, macroblockLayer_t *pMbLayer,
         }
     }
 
-    row = mbNum / currImage->width;
+    row = h264bsdMbRow(mbNum, currImage->width);
     col = mbNum - row * currImage->width;
     row *= 16;
     col *= 16;

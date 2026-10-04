@@ -552,8 +552,9 @@ typedef struct {
     storage_t *decoder;
     void *mpeg4_decoder;
     hevc_decoder_t *hevc_decoder;
-    size_t hevc_color_row;
-    bool hevc_flat;
+    av1_decoder_t *av1_decoder;
+    size_t planar_color_row;
+    bool planar_flat;
     bool decoder_initialized;
     bool active;
     bool complete;
@@ -817,6 +818,12 @@ int movie_chunk_for_frame(const Movie *movie, uint32_t frame_index);
 bool decode_h264_frame_with_progress( Movie *movie, uint32_t frame_index, bool blit_output, H264FramePublishPredicate predicate, H264DecodedFrameHook hook, void *userdata );
 bool decode_h264_frame( Movie *movie, uint32_t frame_index, bool blit_output );
 bool decode_mpeg4_frame_with_progress( Movie *movie, uint32_t frame_index, bool blit_output, H264FramePublishPredicate predicate, H264DecodedFrameHook hook, void *userdata );
+bool reset_av1_decoder(Movie *movie);
+bool decode_av1_frame(Movie *movie, uint32_t frame_index, bool blit_output);
+bool decode_av1_seek_step(Movie *movie, uint32_t frame_index,
+    H264FramePublishPredicate predicate, H264DecodedFrameHook hook, VideoDecodePoll poll, void *userdata);
+bool movie_uses_planar_decoder(const Movie *movie);
+unsigned video_decoder_min_units(const Movie *movie);
 bool reset_hevc_decoder(Movie *movie);
 bool decode_hevc_frame(Movie *movie, uint32_t frame_index, bool blit_output);
 bool decode_hevc_frame_with_progress(Movie *movie, uint32_t frame_index, bool blit_output,
@@ -830,11 +837,12 @@ void video_decoder_mark_failed(Movie *movie);
 uint32_t video_decoder_total_units(const Movie *movie);
 uint32_t video_decoder_done_units(const Movie *movie);
 bool video_decoder_pump(Movie *movie, uint8_t *data, size_t size, size_t *consumed,
-    unsigned *retries, unsigned units, bool *ready, bool *pending, uint8_t **picture);
+    unsigned *retries, unsigned units, uint64_t deadline_ticks,
+    bool *ready, bool *pending, uint8_t **picture);
 void video_decoder_release_picture(Movie *movie);
 bool video_blit_picture_rows(Movie *movie, const uint8_t *picture, uint16_t *pixels,
     size_t pitch, size_t first, size_t rows, bool *flat);
-bool blit_hevc_picture_rows(Movie *movie, const hevc_frame_t *picture, uint16_t *pixels,
+bool blit_planar_picture_rows(Movie *movie, const VideoFrame *picture, uint16_t *pixels,
     size_t pitch, size_t first, size_t rows, bool *flat);
 
 bool decode_mpeg4_frame( Movie *movie, uint32_t frame_index, bool blit_output );
@@ -939,6 +947,8 @@ void free_history_store(HistoryStore *history);
 
 /* movie_resources.c */
 bool sram_movie_chunk_buffer_can_hold(const Movie *movie, size_t size);
+av1_decoder_t *player_av1_decoder_create(void);
+void player_av1_decoder_destroy(av1_decoder_t *decoder);
 hevc_decoder_t *player_hevc_decoder_create(void);
 void player_hevc_decoder_destroy(hevc_decoder_t *decoder);
 /* Conservative future compressed-storage bound (SIZE_MAX if unavailable),
@@ -1347,4 +1357,5 @@ void draw_subtitle( SDL_Surface *screen, const Fonts *fonts, const char *text, s
 #define UI_COLOR_BG_TOP (ui_theme()->bg_top)
 #define UI_COLOR_BG_BOTTOM (ui_theme()->bg_bottom)
 
+#include "frame_view_api.h"
 #endif

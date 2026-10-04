@@ -7,8 +7,10 @@ This project targets the **TI-Nspire CX**, **TI-Nspire CX II**, and **TI-Nspire 
 - `_ndvideo.tns`: the Ndless launcher
 - `*.nvp.tns`: movie containers produced by the encoder
 
-`_ndvideo.tns` includes all three codecs. Smaller player builds are also
+`_ndvideo.tns` includes all four codecs. Smaller player builds are also
 available; their filenames list the included codecs (`hevc` means H.265).
+Each build is a single file. Multi-codec builds load only the decoder needed
+for the current video, leaving the rest of that memory available for buffering.
 
 ## Screenshots
 
@@ -25,7 +27,7 @@ available; their filenames list the included codecs (`hevc` means H.265).
 The `.nvp` format used by the current player is:
 
 - H.264 Annex B video bitstream in legacy version 9/10 containers
-- H.264, H.265 (HEVC), or MPEG-4 Part 2 video in version 11 codec-tagged containers
+- H.264, H.265 (HEVC), AV1 or MPEG-4 Part 2 video in version 11 codec-tagged containers
 - chunked container with per-chunk frame tables
 - optional text subtitle tracks stored in the container
 - raw stored chunk payloads
@@ -38,6 +40,7 @@ The `.nvp` format used by the current player is:
 - password-protected videos with authenticated AES-256 encryption
 - H.264 decode through `h264bsd`
 - H.265 / HEVC decode through an optimized `libde265` port
+- AV1 decode through an optimized `dav1d` port
 - MPEG-4 Part 2 decode through vendored Xvid sources
 - RGB565 output
 - direct storage reads on CX and CX II, with decoded frames prepared ahead for smoother playback
@@ -58,6 +61,22 @@ The `.nvp` format used by the current player is:
 - picker filename metadata tooltips from bracketed tags
 - resume history with saved playback, subtitle, and theme settings
 - debug log output and in-player memory/playback overlay
+
+## Decoder Loading and Buffering
+
+All four decoders live inside `_ndvideo.tns`, but only the one needed for the
+current video is loaded into RAM. Switching formats unloads the previous
+decoder once playback and previews have finished using it. There are no extra
+files to install, and decoder code stays in RAM throughout playback. The last
+decoder is kept ready for reopening videos in the same format.
+
+This saves roughly **1.2–1.3 MiB of RAM during HEVC or AV1 playback** compared
+with keeping every decoder loaded. Both formats also keep most buffered pictures
+in compact YUV form, converting the next few to screen-ready RGB. The buffer
+uses measured free RAM while reserving space for decoding and other player work.
+
+Opening a different format can add a short decoder-loading step. Single-codec
+builds load their decoder with the app and remain the smallest download.
 
 ## Current Limits
 
@@ -216,7 +235,7 @@ If you just want to run the player on a calculator, you do not have to build it 
 - ARM GCC toolchain available in `PATH`
 - `make`
 - `bash`
-- `python`
+- Python 3.10 or newer
 - `pyelftools`
 
 ### Build Command
@@ -233,8 +252,8 @@ make CODECS="h264 hevc"
 make release
 ```
 
-Codec choices are `h264`, `mpeg4` and `hevc`, in any order. Each combination
-uses separate build objects. `make release` builds all seven combinations
+Codec choices are `h264`, `mpeg4`, `hevc` and `av1`, in any order. Each combination
+uses separate build objects. `make release` builds all 15 combinations
 and packages them in `release/`.
 
 ### Build Output
@@ -249,28 +268,33 @@ The release contains these player builds:
 
 | File | Included codecs |
 | --- | --- |
-| `_ndvideo.tns` | H.264, MPEG-4 Part 2, H.265 / HEVC |
+| `_ndvideo.tns` | H.264, MPEG-4 Part 2, H.265 / HEVC, AV1 |
 | `_ndvideo-h264.tns` | H.264 |
 | `_ndvideo-mpeg4.tns` | MPEG-4 Part 2 |
 | `_ndvideo-hevc.tns` | H.265 / HEVC |
-| `_ndvideo-h264-mpeg4.tns` | H.264, MPEG-4 Part 2 |
-| `_ndvideo-h264-hevc.tns` | H.264, H.265 / HEVC |
-| `_ndvideo-mpeg4-hevc.tns` | MPEG-4 Part 2, H.265 / HEVC |
+| `_ndvideo-av1.tns` | AV1 |
+
+Every two- and three-codec combination is included too, named in the same
+order: for example, `_ndvideo-h264-hevc-av1.tns`.
 
 The smaller builds have the same controls and features. A video needing an
 omitted codec shows a message identifying the missing support. Movies use the
 same format across builds, including encrypted movies.
 
-`ndvideo-symbols.zip` holds the matching ELF and Zehn files for all seven builds.
+`ndvideo-symbols.zip` holds the matching ELF and Zehn files for all 15 builds.
+It also includes the decoder modules used by the multi-codec builds.
 Checksums and shared license texts are included alongside the players.
 
 ## Encoder
 
 The encoder turns a normal video file into a streamed `.nvp.tns` movie. H.264 is
 the default and writes version 10 containers. `--codec hevc` selects H.265;
-`--codec mpeg4` selects MPEG-4 Part 2. Both use version 11 containers.
+`--codec av1` selects AV1; `--codec mpeg4` selects MPEG-4 Part 2.
+These alternatives use version 11 containers.
 
 ### Python Requirements
+
+Use Python 3.10 or newer, with:
 
 ```bash
 pip install imageio-ffmpeg numpy pillow
@@ -322,6 +346,32 @@ Use `--idr-frames auto` or a frame count. Oversized groups of frames are shorten
 automatically to fit the chunk limit. `--idr-frames byte-auto` and `--level` are
 H.264-only.
 
+### AV1
+
+AV1 offers another option for smaller files, at a higher decoding cost. It has
+been tested on a CX II-T, but demanding scenes can still stutter even at
+492 MHz. Animation at modest frame rates is a useful starting point; H.264
+remains the better choice for playback speed.
+
+Use a build whose name includes `av1`, or the complete `_ndvideo.tns`. The
+example below uses 16 FPS; `--fps source` keeps the original frame rate.
+
+```powershell
+python .\tools\encode_ndless_video.py "C:\path\to\animation.mkv" `
+  --codec av1 --fps 16 --max-width 320 --max-height 180 `
+  --stream-profile quality --crf 42 --preset slow `
+  --max-chunk-kib 64 --idr-frames auto --subtitle embedded `
+  --output ".\dist\animation-av1.nvp.tns"
+```
+
+AV1 requires FFmpeg with `libaom-av1`. CRF is an integer from 0 to 63; lower
+values mean higher quality and larger files. `slow`, `veryslow` and `placebo`
+map to encoder speeds 2, 1 and 0. The encoder selects 8-bit 4:2:0, avoids hidden
+frames and expensive filters, and keeps chunks independently seekable.
+Subtitles, encryption, previews and two-pass bitrate encoding work as usual.
+CRF values are not comparable across codecs, and AV1 encoding can take a long
+time. Smaller output does not guarantee faster playback.
+
 ### Embedded Subtitles
 
 ```powershell
@@ -370,8 +420,11 @@ python .\tools\encode_ndless_video.py "C:\path\to\video.mkv" --output ".\dist\vi
 
 Use CRF when you want the best quality-per-bit without caring about the exact final size. Use `--bitrate-kbps ... --two-pass` when you need a tighter size target.
 
-Chunks are packed by `--max-chunk-kib`; `64` is a useful starting point for smooth
-playback. `--chunk-frames` adds an optional frame-count ceiling (`0` disables it).
+Chunks are packed by `--max-chunk-kib`; `64` is a starting point, not a fixed
+performance target. Very small chunks can force frequent keyframes, increasing
+file size and decoding work, especially with HEVC and AV1. Larger chunks trade
+more RAM and longer seek catch-up for fewer keyframes. `--chunk-frames` adds an
+optional frame-count ceiling (`0` disables it).
 `--idr-frames auto` estimates a fixed keyframe interval from the bitrate and byte cap.
 
 `--idr-frames byte-auto` measures frame sizes and splits oversized GOPs while

@@ -30,7 +30,7 @@
 
 /* initialize tables */
 
-void colorspace_init(void);
+int colorspace_init(void);
 
 
 
@@ -163,7 +163,7 @@ extern planarFuncPtr yv12_to_yv12;
 
 planarFunc yv12_to_yv12_c;
 
-void init_yv12_to_rgb565_tables	(void);
+int init_yv12_to_rgb565_tables	(void);
 void yv12_to_rgb565_concept(
     uint8_t *RESTRICT x_ptr,
     int x_stride,

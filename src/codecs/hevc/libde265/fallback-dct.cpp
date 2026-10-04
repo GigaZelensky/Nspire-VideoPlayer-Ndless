@@ -465,7 +465,7 @@ void transform_idst_4x4_fallback(int32_t *dst, const int16_t *coeffs, int bdShif
 
 
 
-static int8_t mat_dct[32][32] = {
+static const int8_t mat_dct[32][32] = {
   { 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,      64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
   { 90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13,  4,      -4,-13,-22,-31,-38,-46,-54,-61,-67,-73,-78,-82,-85,-88,-90,-90},
   { 90, 87, 80, 70, 57, 43, 25,  9, -9,-25,-43,-57,-70,-80,-87,-90,     -90,-87,-80,-70,-57,-43,-25, -9,  9, 25, 43, 57, 70, 80, 87, 90},
@@ -817,6 +817,13 @@ void transform_idct_32x32_fallback(int32_t *dst, const int16_t *coeffs,
 
 
 
+static inline int ndless_clip16(int value)
+{
+  if ((static_cast<uint32_t>(value) + 32768U) > 65535U)
+    return value < 0 ? -32768 : 32767;
+  return value;
+}
+
 // Ndless scalar inverse transform. Even-frequency terms form an N/2 IDCT;
 // odd terms have opposite signs at mirrored output positions. Preserve the
 // upstream clipping between passes and the exact HEVC 7/12-bit rounding.
@@ -829,12 +836,21 @@ template<int N, int Step> struct ndless_idct_line {
     }
     int32_t even[N/2];
     ndless_idct_line<N/2,Step*2>::run(input,last/2,even);
-    for (int i=0;i<N/2;i++) {
-      int32_t odd=0;
-      for (int j=1;j<=last;j+=2)
-        odd+=mat_dct[(32/N)*j][i]*input[j*Step];
-      output[i]=even[i]+odd;
-      output[N-1-i]=even[i]-odd;
+    if (N == 2) {
+      const int32_t odd=mat_dct[16][0]*input[Step];
+      output[0]=even[0]+odd;
+      output[1]=even[0]-odd;
+    } else for (int i=0;i<N/2;i+=2) {
+      int32_t odd0=0, odd1=0;
+      for (int j=1;j<=last;j+=2) {
+        const int value=input[j*Step];
+        odd0+=mat_dct[(32/N)*j][i]*value;
+        odd1+=mat_dct[(32/N)*j][i+1]*value;
+      }
+      output[i]=even[i]+odd0;
+      output[N-1-i]=even[i]-odd0;
+      output[i+1]=even[i+1]+odd1;
+      output[N-2-i]=even[i+1]-odd1;
     }
   }
 };
@@ -852,7 +868,7 @@ template<int N> static void ndless_idct_add(uint8_t* dst, const int16_t* coeffs,
     while (last>=0 && !coeffs[x+last*N]) --last;
     ndless_idct_line<N,N>::run(coeffs+x,last,output);
     for (int y=0;y<N;y++)
-      intermediate[x+y*N]=Clip3(-32768,32767,(output[y]+64)>>7);
+      intermediate[x+y*N]=ndless_clip16((output[y]+64)>>7);
   }
   for (int y=0;y<N;y++) {
     int last=N-1;
@@ -892,7 +908,7 @@ template<int N> static __attribute__((noinline)) void ndless_sparse_idct_add(uin
     // Vertical-frequency-only residual: the horizontal pass is constant.
     ndless_idct_line<N,N>::run(coeffs,lastRow[0],output);
     for (int y=0;y<N;y++) {
-      const int value=Clip3(-32768,32767,(output[y]+64)>>7);
+      const int value=ndless_clip16((output[y]+64)>>7);
       const int residual=(value+32)>>6;
       for (int x=0;x<N;x++)
         dst[y*stride+x]=Clip1_8bit(dst[y*stride+x]+residual);
@@ -933,7 +949,7 @@ template<int N> static __attribute__((noinline)) void ndless_sparse_idct_add(uin
     }
     ndless_idct_line<N,N>::run(coeffs+x,lastRow[x],output);
     for (int y=0;y<N;y++)
-      intermediate[x+y*N]=Clip3(-32768,32767,(output[y]+64)>>7);
+      intermediate[x+y*N]=ndless_clip16((output[y]+64)>>7);
   }
   for (int y=0;y<N;y++) {
     int last=lastColumn;

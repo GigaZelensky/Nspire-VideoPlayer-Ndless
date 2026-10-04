@@ -1507,6 +1507,8 @@ static bool movie_h264_local_frame_is_idr(const Movie *movie, const ChunkIndexEn
     if (!movie_h264_local_frame_bounds(movie, entry, local_index, &start, &end)) {
         return false;
     }
+    if (NDVIDEO_WITH_AV1 && movie->codec == MOVIE_CODEC_AV1)
+        return av1_packet_is_independent(movie->chunk_bytes + start, end - start);
     if (movie->codec == MOVIE_CODEC_HEVC) {
         const uint8_t *data = movie->chunk_bytes + start;
         size_t bytes = end - start;
@@ -2052,7 +2054,7 @@ int movie_decoded_bar_width(const Movie *movie, int width)
         ? (int) (((uint64_t) width * end) / movie->header.frame_count) : 0;
 }
 
-/* Show only the continuous forward buffer. Decoded RGB frames can bridge
+/* Show only the continuous forward buffer. Decoded pictures can bridge
  * chunks whose compressed storage has already been recycled. A pending read
  * or a disconnected seek-cache entry must not promise buffered playback. */
 int movie_buffered_bar_width(const Movie *movie, int width)
@@ -2695,6 +2697,7 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
     bool is_h264;
     bool is_mpeg4;
     bool is_hevc;
+    bool is_av1;
 
     if (!movie || !preview) {
         return false;
@@ -2704,7 +2707,9 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
     is_h264 = movie_uses_h264(movie);
     is_mpeg4 = movie->codec == MOVIE_CODEC_MPEG4;
     is_hevc = movie->codec == MOVIE_CODEC_HEVC;
-    if ((!is_h264 && !is_mpeg4 && !is_hevc) ||
+    is_av1 = movie->codec == MOVIE_CODEC_AV1;
+    if ((!is_h264 && !is_mpeg4 && !is_hevc && !is_av1) ||
+        (is_av1 && !job->av1_decoder) ||
         (is_hevc && !job->hevc_decoder) ||
         (is_h264 && !job->decoder) ||
         (is_mpeg4 && !job->mpeg4_decoder) ||
@@ -2747,6 +2752,8 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
             h264bsdShutdown(movie->h264.decoder);
         }
         h264bsdFree(movie->h264.decoder);
+    } else if (is_av1 && movie->av1.decoder) {
+        player_av1_decoder_destroy(movie->av1.decoder);
     } else if (is_hevc && movie->hevc.decoder) {
         player_hevc_decoder_destroy(movie->hevc.decoder);
     } else if (NDVIDEO_WITH_MPEG4 && is_mpeg4 && movie->mpeg4.decoder) {
@@ -2761,6 +2768,12 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
         movie->h264.decoder = job->decoder;
         movie->h264.decoder_initialized = job->decoder_initialized;
         movie->h264.decoder_failed = false;
+    } else if (is_av1) {
+        movie->av1.decoder = job->av1_decoder;
+        movie->av1.picture = NULL;
+        movie->av1.access_unit = NULL;
+        movie->av1.access_unit_size = 0;
+        movie->av1.decoder_failed = false;
     } else if (is_hevc) {
         movie->hevc.decoder = job->hevc_decoder;
         movie->hevc.picture = NULL;
@@ -2792,6 +2805,7 @@ bool commit_seek_bar_preview_to_movie(Movie *movie, SeekBarPreviewState *preview
     job->decoder = NULL;
     job->mpeg4_decoder = NULL;
     job->hevc_decoder = NULL;
+    job->av1_decoder = NULL;
     job->decoder_initialized = false;
     job->chunk_storage = NULL;
     job->chunk_storage_size = 0;

@@ -31,7 +31,7 @@
 #include "vlc_codes.h"
 #include "bitstream.h"
 
-void init_vlc_tables(void);
+int init_vlc_tables(void);
 
 int check_resync_marker(Bitstream * bs, int addbits);
 

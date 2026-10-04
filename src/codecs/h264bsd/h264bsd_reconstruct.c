@@ -225,7 +225,8 @@ void h264bsdInterpolateChromaHor(
         cbr = predPartChroma + comp * 8 * 8;
 
         /* 2x2 pels per iteration
-         * bilinear horizontal interpolation */
+         * bilinear horizontal interpolation. The weighted sum is at most
+         * 8*255, so (+4)>>3 is exactly the old (sum*8+32)>>6. */
         for (y = (chromaPartHeight >> 1); y; y--)
         {
             for (x = (chromaPartWidth >> 1); x; x--)
@@ -234,19 +235,15 @@ void h264bsdInterpolateChromaHor(
                 tmp2 = *ptrA++;
                 tmp3 = ptrA[width];
                 tmp4 = *ptrA++;
-                c = ((val * tmp1 + xFrac * tmp3) << 3) + 32;
-                c >>= 6;
+                c = (val * tmp1 + xFrac * tmp3 + 4) >> 3;
                 cbr[8] = (u8)c;
-                c = ((val * tmp2 + xFrac * tmp4) << 3) + 32;
-                c >>= 6;
+                c = (val * tmp2 + xFrac * tmp4 + 4) >> 3;
                 *cbr++ = (u8)c;
                 tmp1 = ptrA[width];
                 tmp2 = *ptrA;
-                c = ((val * tmp3 + xFrac * tmp1) << 3) + 32;
-                c >>= 6;
+                c = (val * tmp3 + xFrac * tmp1 + 4) >> 3;
                 cbr[8] = (u8)c;
-                c = ((val * tmp4 + xFrac * tmp2) << 3) + 32;
-                c >>= 6;
+                c = (val * tmp4 + xFrac * tmp2 + 4) >> 3;
                 *cbr++ = (u8)c;
             }
             cbr += 2*8 - chromaPartWidth;
@@ -321,7 +318,7 @@ void h264bsdInterpolateChromaVer(
         cbr = predPartChroma + comp * 8 * 8;
 
         /* 2x2 pels per iteration
-         * bilinear vertical interpolation */
+         * bilinear vertical interpolation; round directly at eighth-pel precision. */
         for (y = (chromaPartHeight >> 1); y; y--)
         {
             for (x = (chromaPartWidth >> 1); x; x--)
@@ -329,20 +326,16 @@ void h264bsdInterpolateChromaVer(
                 tmp3 = ptrA[width*2];
                 tmp2 = ptrA[width];
                 tmp1 = *ptrA++;
-                c = ((val * tmp2 + yFrac * tmp3) << 3) + 32;
-                c >>= 6;
+                c = (val * tmp2 + yFrac * tmp3 + 4) >> 3;
                 cbr[8] = (u8)c;
-                c = ((val * tmp1 + yFrac * tmp2) << 3) + 32;
-                c >>= 6;
+                c = (val * tmp1 + yFrac * tmp2 + 4) >> 3;
                 *cbr++ = (u8)c;
                 tmp3 = ptrA[width*2];
                 tmp2 = ptrA[width];
                 tmp1 = *ptrA++;
-                c = ((val * tmp2 + yFrac * tmp3) << 3) + 32;
-                c >>= 6;
+                c = (val * tmp2 + yFrac * tmp3 + 4) >> 3;
                 cbr[8] = (u8)c;
-                c = ((val * tmp1 + yFrac * tmp2) << 3) + 32;
-                c >>= 6;
+                c = (val * tmp1 + yFrac * tmp2 + 4) >> 3;
                 *cbr++ = (u8)c;
             }
             cbr += 2*8 - chromaPartWidth;

@@ -3,6 +3,10 @@
 #include "storage_read_stream.h"
 #include "performance_clock.h"
 #include "movie_crypto_session.h"
+#if NDVIDEO_CODEC_MODULES
+#include "codecs/codec_module_api.h"
+#include "codec_module_manifest.h"
+#endif
 
 int main(int argc, char **argv)
 {
@@ -25,6 +29,13 @@ int main(int argc, char **argv)
     }
 
     enable_relative_paths(argv);
+#if NDVIDEO_CODEC_MODULES
+    if (!codec_modules_configure(argv[0], codec_modules_default_host_api()) ||
+        !codec_modules_set_expected_hashes(CODEC_MODULE_EXPECTED_HASHES, CODEC_MODULE_EXPECTED_MASK)) {
+        report_app_failure(argv[0], "startup-failure", codec_module_error());
+        return 1;
+    }
+#endif
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         report_app_failure(argv[0], "startup-failure", "Failed to initialize SDL.");
         return 1;
@@ -33,7 +44,7 @@ int main(int argc, char **argv)
     bool keep_clock;
     unsigned saved_clock = history_load_clock_preference(argv[0], &keep_clock);
     performance_clock_load(saved_clock, keep_clock);
-    performance_clock_start();
+    performance_clock_startup_begin();
     screen = SDL_SetVideoMode(SCREEN_W, SCREEN_H, 16, SDL_SWSURFACE);
     if (!screen) {
         SDL_Quit();
@@ -65,6 +76,9 @@ int main(int argc, char **argv)
     directory[sizeof(directory) - 1] = '\0';
     strip_filename(directory);
     ui_load_theme_for_directory(directory);
+    /* Native startup may reject an early transition or change the clock after
+     * it. Reconcile once here, with genuine SRAM and before app I/O begins. */
+    performance_clock_startup_complete();
 
     while (1) {
         resume_without_prompt = false;
@@ -162,6 +176,11 @@ int main(int argc, char **argv)
     player_standby_shutdown();
     cleanup_deferred_playback_movie();
     clear_movie_picker_cache(&g_picker_cache);
+#if NDVIDEO_CODEC_MODULES
+    char module_shutdown_error[192] = {0};
+    if (!codec_modules_shutdown())
+        snprintf(module_shutdown_error, sizeof(module_shutdown_error), "%s", codec_module_error());
+#endif
     night_mode_shutdown();
     playback_capture_release();
     release_debug_ring_storage();
@@ -172,6 +191,10 @@ int main(int argc, char **argv)
     lcd_init(SCR_TYPE_INVALID);
     SDL_Quit();
     sram_shutdown();
+#if NDVIDEO_CODEC_MODULES
+    if (module_shutdown_error[0])
+        report_app_failure(argv[0], "codec-cleanup-failure", module_shutdown_error);
+#endif
     bool normal_exit = !suspend_after_exit &&
         (result == PLAY_MOVIE_RESULT_EXIT || result == PLAY_MOVIE_RESULT_APP_EXIT ||
          result == PLAY_MOVIE_RESULT_HOME_EXIT || result == PLAY_MOVIE_RESULT_SCRATCHPAD_EXIT);

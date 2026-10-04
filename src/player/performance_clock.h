@@ -7,6 +7,10 @@
 /* Startup/exit and native-standby boundaries only, with original OS SRAM
  * mapped and app I/O drained. Never call from a playback frame or writer. */
 bool performance_clock_start(void);
+/* Two startup boundaries retain the entry settings and reconcile after native
+ * display/font/theme setup. They do not run from playback or background I/O. */
+void performance_clock_startup_begin(void);
+bool performance_clock_startup_complete(void);
 bool performance_clock_restore(void);
 bool performance_clock_finish(bool normal_exit);
 void performance_clock_debug(FILE *file);

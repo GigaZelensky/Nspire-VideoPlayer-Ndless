@@ -32,6 +32,14 @@ files are omitted. Upstream .cc files use .cpp extensions in this tree.
 See src/codecs/README.md for the Ndless integration.
 The bundled MD5 implementation has its own permissive notice below.
 
+AV1: src/codecs/av1/dav1d
+Scalar 8-bit dav1d sources, under BSD-2-Clause.
+https://github.com/videolan/dav1d
+Upstream commit: 7f12cf23560430c02a83e67bb68eec74d93ce5fd
+The port runs serially, yields at superblock boundaries and specializes common
+entropy and interpolation paths for ARM926. SIMD and worker implementations,
+upstream build files and tools are omitted.
+
 MPEG-4 Part 2: src/codecs/xvid
 Vendored decoder sources from the Xvid MPEG-4 video codec project, under
 GPL-2.0-or-later. Individual authors and copyright notices are preserved in
@@ -841,3 +849,30 @@ proprietary programs.  If your program is a subroutine library, you may
 consider it more useful to permit linking proprietary applications with the
 library.  If this is what you want to do, use the GNU Library General
 Public License instead of this License.
+
+DAV1D (BSD-2-CLAUSE)
+====================
+
+Copyright © 2018-2025, VideoLAN and dav1d authors
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

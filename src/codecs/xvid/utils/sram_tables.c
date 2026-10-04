@@ -82,6 +82,12 @@ init_sram_tables(void)
         return;
     }
 
+#if defined(NDVIDEO_BUILD_MPEG4_MODULE) && NDVIDEO_BUILD_MPEG4_MODULE
+    /* Larger pools initialize these shared tables lazily during the first
+     * decoder creation. Preserve that allocation order and nested tracking. */
+    int previous_tracking = xvid_module_track_globals(1);
+#endif
+
     sram_tables_bytes = 0;
 
     /* Priority 1: VLC decoding tables */
@@ -211,4 +217,7 @@ init_sram_tables(void)
     } else {
         sram_scan_tables = (uint16_t*)scan_tables;
     }
+#if defined(NDVIDEO_BUILD_MPEG4_MODULE) && NDVIDEO_BUILD_MPEG4_MODULE
+    xvid_module_track_globals(previous_tracking);
+#endif
 }

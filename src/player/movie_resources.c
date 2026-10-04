@@ -2,11 +2,27 @@
 #include "crash_recorder.h"
 #include "storage_read_stream.h"
 #include "performance_clock.h"
+#if NDVIDEO_CODEC_MODULES
+#include "codecs/codec_module_api.h"
+#include "codecs/modules/h264_module_api.h"
+#endif
 
-/* The large SRAM arena is either a compressed H.264 chunk or HEVC working
- * memory. HEVC main/preview decoders share only CTU-local temporaries. */
+static void decoder_allocation_error(const char *codec)
+{
+#if NDVIDEO_CODEC_MODULES
+    const char *detail = codec_module_error();
+    if (detail && *detail) {
+        debug_failf("open failed: %s: %s", codec, detail);
+        return;
+    }
+#endif
+    debug_failf("open failed: %s decoder allocation", codec);
+}
+
+/* The large SRAM arena holds compressed input or planar decoder scratch.
+ * Same-codec instances share only temporaries between complete decode steps. */
 static Movie *sram_chunk_owner;
-static unsigned hevc_sram_users;
+static unsigned hevc_sram_users, av1_sram_users;
 
 static bool player_is_power_of_two(size_t value)
 {
@@ -22,7 +38,7 @@ unsigned movie_prefetch_slots(const Movie *movie)
 void movie_configure_prefetch(Movie *movie)
 {
     movie->prefetch_slots = PREFETCH_CHUNK_COUNT;
-    if (movie->codec != MOVIE_CODEC_HEVC || movie->header.chunk_count < 8U ||
+    if (!movie_uses_planar_decoder(movie) || movie->header.chunk_count < 8U ||
         !movie->header.fps_num || !movie->header.fps_den) return;
     uint64_t frames = 0;
     for (uint32_t i = 0; i < movie->header.chunk_count; ++i) {
@@ -178,7 +194,7 @@ void player_copy_maybe_fast(void *dest, const void *src, size_t size)
 
 bool sram_movie_chunk_buffer_can_hold(const Movie *movie, size_t size)
 {
-    return g_sram_movie_chunk_buffer && !hevc_sram_users &&
+    return g_sram_movie_chunk_buffer && !hevc_sram_users && !av1_sram_users &&
         (!sram_chunk_owner || sram_chunk_owner == movie) &&
         size > 0 && size <= g_sram_movie_chunk_buffer_size;
 }
@@ -347,7 +363,7 @@ static bool h264_codec_open(Movie *movie)
     init_sram_movie_chunk_buffer();
     movie->h264.decoder = h264bsdAlloc();
     if (!movie->h264.decoder) {
-        debug_failf("open failed: h264 decoder alloc");
+        decoder_allocation_error("H.264");
         return false;
     }
     /* h264bsdInit initializes the full storage; avoid clearing it twice. */
@@ -408,7 +424,7 @@ static bool mpeg4_codec_supports_incremental_seek_preview(const Movie *movie)
 static bool hevc_codec_open(Movie *movie)
 {
     movie->hevc.decoder = player_hevc_decoder_create();
-    if (!movie->hevc.decoder) { debug_failf("open failed: HEVC decoder allocation"); return false; }
+    if (!movie->hevc.decoder) { decoder_allocation_error("HEVC"); return false; }
     return true;
 }
 
@@ -418,6 +434,50 @@ static void hevc_codec_destroy(Movie *movie)
     player_hevc_decoder_destroy(movie->hevc.decoder);
     memset(&movie->hevc, 0, sizeof(movie->hevc));
 }
+
+av1_decoder_t *player_av1_decoder_create(void)
+{
+    if (!NDVIDEO_WITH_AV1) return NULL;
+    init_sram_movie_chunk_buffer();
+    size_t working_bytes = av1_working_memory_size();
+    if (!working_bytes) return NULL;
+    if (g_sram_movie_chunk_buffer && !sram_chunk_owner && !hevc_sram_users &&
+        working_bytes <= g_sram_movie_chunk_buffer_size) {
+        av1_decoder_t *decoder = av1_create_with_memory(
+            g_sram_movie_chunk_buffer, g_sram_movie_chunk_buffer_size);
+        if (decoder) { ++av1_sram_users; return decoder; }
+    }
+    return av1_create();
+}
+
+void player_av1_decoder_destroy(av1_decoder_t *decoder)
+{
+    if (!NDVIDEO_WITH_AV1 || !decoder) return;
+    bool borrowed_sram = av1_external_memory(decoder) == g_sram_movie_chunk_buffer &&
+                         g_sram_movie_chunk_buffer != NULL;
+    av1_destroy(decoder);
+    if (borrowed_sram && av1_sram_users) --av1_sram_users;
+}
+
+static bool av1_codec_open(Movie *movie)
+{
+    movie->av1.decoder = player_av1_decoder_create();
+    if (!movie->av1.decoder) { decoder_allocation_error("AV1"); return false; }
+    return true;
+}
+
+static void av1_codec_destroy(Movie *movie)
+{
+    if (!movie) return;
+    player_av1_decoder_destroy(movie->av1.decoder);
+    memset(&movie->av1, 0, sizeof(movie->av1));
+}
+
+static const MovieCodecOps g_av1_codec_ops = {
+    MOVIE_CODEC_AV1, "av1", init_h264_color_tables, av1_codec_open,
+    av1_codec_destroy, reset_av1_decoder, decode_av1_frame,
+    h264_codec_supports_incremental_seek_preview
+};
 
 static const MovieCodecOps g_hevc_codec_ops = {
     MOVIE_CODEC_HEVC, "hevc", init_h264_color_tables, hevc_codec_open,
@@ -456,6 +516,8 @@ const MovieCodecOps *movie_codec_ops(MovieCodec codec)
         return NDVIDEO_WITH_MPEG4 ? &g_mpeg4_codec_ops : NULL;
     case MOVIE_CODEC_HEVC:
         return NDVIDEO_WITH_HEVC ? &g_hevc_codec_ops : NULL;
+    case MOVIE_CODEC_AV1:
+        return NDVIDEO_WITH_AV1 ? &g_av1_codec_ops : NULL;
     default:
         return NULL;
     }
@@ -592,8 +654,14 @@ bool init_mpeg4_decoder_global(void)
         if (!sram_uses_native_clone()) {
             /* Reserve the compact H.264/color tables before handing Xvid the
              * remaining arena, so switching codecs is independent of order. */
-            if (NDVIDEO_WITH_H264) h264bsdInitSramTables();
-            if (NDVIDEO_WITH_H264 || NDVIDEO_WITH_HEVC) init_h264_color_tables();
+            if (NDVIDEO_WITH_H264) {
+#if NDVIDEO_CODEC_MODULES
+                h264_module_reserve_sram();
+#else
+                h264bsdInitSramTables();
+#endif
+            }
+            if (NDVIDEO_WITH_H264 || NDVIDEO_WITH_HEVC || NDVIDEO_WITH_AV1) init_h264_color_tables();
             size_t used=sram_bytes_used(), capacity=sram_bytes_capacity();
             /* Small color/VLC tables go first in Xvid's partial arena. */
             used=(used+31U)&~(size_t)31U;
@@ -694,8 +762,10 @@ hevc_decoder_t *player_hevc_decoder_create(void)
 {
     if (!NDVIDEO_WITH_HEVC) return NULL;
     init_sram_movie_chunk_buffer();
-    if (g_sram_movie_chunk_buffer && !sram_chunk_owner &&
-        hevc_working_memory_size() <= g_sram_movie_chunk_buffer_size) {
+    size_t working_bytes = hevc_working_memory_size();
+    if (!working_bytes) return NULL;
+    if (g_sram_movie_chunk_buffer && !sram_chunk_owner && !av1_sram_users &&
+        working_bytes <= g_sram_movie_chunk_buffer_size) {
         hevc_decoder_t *decoder = hevc_create_with_memory(
             g_sram_movie_chunk_buffer, g_sram_movie_chunk_buffer_size);
         if (decoder) {
@@ -794,6 +864,12 @@ static bool debug_dump_report(const char *path, const Movie *movie, const char *
     fprintf(log_file, "build=%s %s hwtype=%u hwsubtype=%u ndless_rev=%u os_entry=%08lx\n",
         __DATE__, __TIME__, nl_hwtype(), nl_hwsubtype(), nl_ndless_rev(),
         (unsigned long)*(volatile uint32_t *)0x10000020U);
+#if NDVIDEO_CODEC_MODULES
+    fprintf(log_file, "codec_modules image_allocated_bytes=%lu h264_refs=%u mpeg4_refs=%u hevc_refs=%u av1_refs=%u\n",
+        (unsigned long)codec_modules_loaded_bytes(),
+        codec_module_references(CODEC_MODULE_H264), codec_module_references(CODEC_MODULE_MPEG4),
+        codec_module_references(CODEC_MODULE_HEVC), codec_module_references(CODEC_MODULE_AV1));
+#endif
     storage_read_stream_debug(log_file);
     performance_clock_debug(log_file);
     movie_async_debug(log_file,movie);

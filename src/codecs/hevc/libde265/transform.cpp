@@ -77,10 +77,17 @@ void decode_quantization_parameters(thread_context* tctx, int xC,int yC,
 
   int first_ctb_in_slice_RS = tctx->shdr->SliceAddrRS;
 
-  int SliceStartX = (first_ctb_in_slice_RS % sps.PicWidthInCtbsY) * sps.CtbSizeY;
-  int SliceStartY = (first_ctb_in_slice_RS / sps.PicWidthInCtbsY) * sps.CtbSizeY;
-
-  bool firstQGInSlice = (SliceStartX == xQG && SliceStartY == yQG);
+  // The ordinary single-slice picture starts at the origin. Avoid software
+  // division for every quantization group in that case.
+  bool firstQGInSlice;
+  if (first_ctb_in_slice_RS == 0) {
+    firstQGInSlice = (xQG == 0 && yQG == 0);
+  }
+  else {
+    int SliceStartX = (first_ctb_in_slice_RS % sps.PicWidthInCtbsY) * sps.CtbSizeY;
+    int SliceStartY = (first_ctb_in_slice_RS / sps.PicWidthInCtbsY) * sps.CtbSizeY;
+    firstQGInSlice = (SliceStartX == xQG && SliceStartY == yQG);
+  }
 
   // first QG in tile ?
 

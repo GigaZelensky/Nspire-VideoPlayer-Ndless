@@ -637,6 +637,7 @@ image_output(IMAGE * image,
 */
 
 	switch (csp & ~XVID_CSP_VFLIP) {
+#ifndef NDVIDEO_XVID_RGB565_ONLY
 	case XVID_CSP_RGB555:
 		safe_packed_conv(
 			dst[0], dst_stride[0], image->y, image->u, image->v,
@@ -645,6 +646,7 @@ image_output(IMAGE * image,
 			interlacing?yv12_to_rgb555i_c:yv12_to_rgb555_c, 2, interlacing);
 		return 0;
 
+#endif
 	case XVID_CSP_RGB565:
 		safe_packed_conv(
 			dst[0], dst_stride[0], image->y, image->u, image->v,
@@ -653,6 +655,7 @@ image_output(IMAGE * image,
 			interlacing?yv12_to_rgb565i_c:yv12_to_rgb565_c, 2, interlacing);
 		return 0;
 
+#ifndef NDVIDEO_XVID_RGB565_ONLY
     case XVID_CSP_BGR:
 		safe_packed_conv(
 			dst[0], dst_stride[0], image->y, image->u, image->v,
@@ -755,6 +758,7 @@ image_output(IMAGE * image,
 		dst_stride[2] = edged_width/2;
 		return 0;
 
+#endif
 	case XVID_CSP_NULL:
 	case XVID_CSP_SLICE:
 		return 0;

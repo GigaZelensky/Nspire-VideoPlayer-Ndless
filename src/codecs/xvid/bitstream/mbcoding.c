@@ -83,7 +83,7 @@ int bs_get_spritetrajectory(Bitstream * bs)
 	return -1;
 }
 
-void
+int
 init_vlc_tables(void)
 {
 	uint32_t i, j, k, intra, last, run,  run_esc, level, level_esc, escape, escape_len, offset;
@@ -92,10 +92,12 @@ init_vlc_tables(void)
     /* Allocate DCT3D tables in SRAM (or fallback to SDRAM) */
     if (DCT3D[0] == NULL) {
         DCT3D[0] = (REVERSE_EVENT*)xvid_malloc_sram(sizeof(REVERSE_EVENT) * 4096, CACHE_LINE);
+        if (DCT3D[0] == NULL) return 0;
         memset(DCT3D[0], 0, sizeof(REVERSE_EVENT) * 4096);
     }
     if (DCT3D[1] == NULL) {
         DCT3D[1] = (REVERSE_EVENT*)xvid_malloc_sram(sizeof(REVERSE_EVENT) * 4096, CACHE_LINE);
+        if (DCT3D[1] == NULL) return 0;
         memset(DCT3D[1], 0, sizeof(REVERSE_EVENT) * 4096);
     }
 
@@ -213,6 +215,7 @@ init_vlc_tables(void)
 			sprite_trajectory_code[l+16384].len = k+1;
 		}
 	}
+    return 1;
 }
 
 static __inline void

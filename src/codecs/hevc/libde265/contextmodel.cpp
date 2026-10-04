@@ -20,8 +20,6 @@
 
 #include "slice.h"
 #include <assert.h>
-#include <iomanip>
-#include <sstream>
 
 bool D = false;
 
@@ -163,9 +161,16 @@ std::string context_model_table::debug_dump() const
     hash ^= ((i+7)*model[i].state) & 0xFFFF;
   }
 
-  std::stringstream sstr;
-  sstr << std::hex << hash;
-  return sstr.str();
+  /* The hash is a 16-bit value. Avoid pulling stream/locale initializers
+   * into a demand-loaded decoder for this diagnostic-only formatting. */
+  char text[5];
+  char* out = text + sizeof(text) - 1;
+  *out = '\0';
+  do {
+    *--out = "0123456789abcdef"[hash & 15];
+    hash >>= 4;
+  } while (hash);
+  return out;
 }
 
 

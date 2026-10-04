@@ -32,6 +32,14 @@ enum {
     PW_UNSAFE_RETURN
 };
 
+/* First failing pre-entry gate; active-slice changes have separate counters. */
+enum {
+    PW_PRECONDITION_TASK = 1U << 0,
+    PW_PRECONDITION_PROTECTED = 1U << 1,
+    PW_PRECONDITION_CALLBACK = 1U << 2,
+    PW_PRECONDITION_SPI_BUSY = 1U << 3
+};
+
 /* One initialization observation, including rejection before a fiber starts.
  * These describe the existing checks; they do not grant permission to retry
  * or weaken them. Unavailable fields stay zero and must be gated by valid. */
@@ -86,7 +94,12 @@ typedef struct {
     unsigned error;
     uint32_t slice_start, budget, resumes, yields, callbacks, spi_yields, max_callback_ticks;
     uint32_t protected_callbacks, busy_callbacks, max_slice_ticks;
-    uint32_t dispatch_start, dispatch_delta, mask_changes, task_changes;
+    /* dispatch_start samples the latest active/inactive boundary. Only
+     * dispatch_delta counts dispatches during protected private slices. */
+    uint32_t dispatch_start, dispatch_delta, inactive_dispatches;
+    uint32_t mask_changes, task_changes, precondition_failures;
+    uint32_t first_failure_resume;
+    bool have_first_failure;
     uint32_t commands[8], minimum_stack_remaining;
     PrivateWriterInitDiagnostic init_diagnostic;
 } PrivateWriter;
@@ -99,6 +112,10 @@ const char *private_writer_init_stage_name(unsigned stage);
 unsigned private_writer_submit(PrivateWriter *, void (*job)(void *), void *);
 /* Down-counting 32768 Hz app timer at 900C0004 must be running. */
 bool private_writer_step(PrivateWriter *, uint32_t budget_ticks);
+/* Observe scheduling while this initialized writer is inactive. A new outside
+ * dispatch invalidates map proofs once; it is not a private-slice fault.
+ * False means no trusted witness (including a retained writer fault). */
+bool private_writer_observe_inactive(PrivateWriter *);
 /* A job may voluntarily cooperate outside a native call too. */
 void private_writer_cooperate(void);
 bool private_writer_restored(const PrivateWriter *);

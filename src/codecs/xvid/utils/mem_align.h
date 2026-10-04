@@ -36,4 +36,9 @@ void xvid_free(void *mem_ptr);
 void xvid_init_sram(void *base, unsigned int size);
 void *xvid_malloc_sram(size_t size, uint8_t alignment);
 
+#if defined(NDVIDEO_BUILD_MPEG4_MODULE) && NDVIDEO_BUILD_MPEG4_MODULE
+int xvid_module_track_globals(int enabled);
+int xvid_module_release_globals(void);
+#endif
+
 #endif							/* _MEM_ALIGN_H_ */

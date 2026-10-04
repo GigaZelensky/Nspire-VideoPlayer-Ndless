@@ -83,62 +83,39 @@ void h264bsdWriteMacroblock(image_t *image, u8 *data)
 
 /* Variables */
 
+    typedef struct { u32 word[4]; } row16_t;
+    typedef struct { u32 word[2]; } row8_t;
     u32 i;
-    u32 width;
-    u32 *lum, *cb, *cr;
-    u32 *ptr;
-    u32 tmp1, tmp2;
-
-/* Code */
+    u32 stride;
+    u8 *lum, *cb, *cr;
 
     ASSERT(image);
     ASSERT(data);
-    ASSERT(!((u32)data&0x3));
+    stride = image->width * 16;
+    lum = image->luma;
+    cb = image->cb;
+    cr = image->cr;
+    ASSERT(!((u32)data & 3));
+    ASSERT(!((u32)lum & 3));
+    ASSERT(!((u32)cb & 3));
+    ASSERT(!((u32)cr & 3));
 
-    width = image->width;
-
-    /*lint -save -e826 lum, cb and cr used to copy 4 bytes at the time, disable
-     * "area too small" info message */
-    lum = (u32*)image->luma;
-    cb = (u32*)image->cb;
-    cr = (u32*)image->cr;
-    ASSERT(!((u32)lum&0x3));
-    ASSERT(!((u32)cb&0x3));
-    ASSERT(!((u32)cr&0x3));
-
-    ptr = (u32*)data;
-
-    width *= 4;
-    for (i = 16; i ; i--)
-    {
-        tmp1 = *ptr++;
-        tmp2 = *ptr++;
-        *lum++ = tmp1;
-        *lum++ = tmp2;
-        tmp1 = *ptr++;
-        tmp2 = *ptr++;
-        *lum++ = tmp1;
-        *lum++ = tmp2;
-        lum += width-4;
+    /* Word-aligned row copies let ARM use load/store-multiple instructions. */
+    for (i = 0; i < 16; ++i) {
+        *(row16_t *)lum = *(const row16_t *)data;
+        lum += stride;
+        data += 16;
     }
-
-    width >>= 1;
-    for (i = 8; i ; i--)
-    {
-        tmp1 = *ptr++;
-        tmp2 = *ptr++;
-        *cb++ = tmp1;
-        *cb++ = tmp2;
-        cb += width-2;
+    stride >>= 1;
+    for (i = 0; i < 8; ++i) {
+        *(row8_t *)cb = *(const row8_t *)data;
+        cb += stride;
+        data += 8;
     }
-
-    for (i = 8; i ; i--)
-    {
-        tmp1 = *ptr++;
-        tmp2 = *ptr++;
-        *cr++ = tmp1;
-        *cr++ = tmp2;
-        cr += width-2;
+    for (i = 0; i < 8; ++i) {
+        *(row8_t *)cr = *(const row8_t *)data;
+        cr += stride;
+        data += 8;
     }
 
 }

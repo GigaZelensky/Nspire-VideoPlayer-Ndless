@@ -64,7 +64,8 @@ void playback_seek_request(PlaybackSeek *seek, uint32_t target, int marker_x, bo
 
 bool playback_seek_step(Movie *movie, PlaybackSeek *seek, SeekBarPreviewState *preview, bool *paused)
 {
-    /* HEVC yields between CTUs; each finished picture returns sooner. */
+    /* Incremental decoders yield between blocks; completed pictures return
+     * immediately so the ordinary UI loop can present them and handle input. */
     SeekSlice slice = {monotonic_clock_now_ms() + 8U, seek->target_frame, false};
     if (!seek->active) return true;
     if (*paused && !seek_at_target(movie, seek)) return true;

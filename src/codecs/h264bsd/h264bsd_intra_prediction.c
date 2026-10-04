@@ -161,6 +161,14 @@ static const u8 h264bsdClipDefault[1280] =
 };
 const u8 *h264bsdClip = h264bsdClipDefault;
 
+size_t h264bsdClipTableBytes(void) { return sizeof(h264bsdClipDefault); }
+bool h264bsdBindClipTable(void *memory,size_t bytes)
+{
+    if(!memory) { if(bytes)return false;h264bsdClip=h264bsdClipDefault;return true; }
+    if(((uintptr_t)memory&31U) || bytes<sizeof(h264bsdClipDefault))return false;
+    memcpy(memory,h264bsdClipDefault,sizeof(h264bsdClipDefault));h264bsdClip=memory;return true;
+}
+
 bool h264bsdInitClipTable(void)
 {
     static u32 initialized = 0;
@@ -588,11 +596,11 @@ void h264bsdGetNeighbourPels(image_t *image, u8 *above, u8 *left, u32 mbNum)
 
     width = image->width;
     picSize = width * image->height;
-    row = mbNum / width;
+    row = h264bsdMbRow(mbNum, width);
     col = mbNum - row * width;
 
     width *= 16;
-    ptr = image->data + row * 16 * width  + col * 16;
+    ptr = image->luma;
 
     /* note that luma samples above-right to current macroblock do not make
      * sense when current mb is the right-most mb in a row. Same applies to
@@ -614,7 +622,7 @@ void h264bsdGetNeighbourPels(image_t *image, u8 *above, u8 *left, u32 mbNum)
     }
 
     width >>= 1;
-    ptr = image->data + picSize * 256 + row * 8 * width  + col * 8;
+    ptr = image->cb;
 
     if (row)
     {

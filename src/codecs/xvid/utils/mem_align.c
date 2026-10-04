@@ -32,6 +32,49 @@ static uint8_t *sram_pool_base = NULL;
 static unsigned int sram_pool_size = 0;
 static unsigned int sram_pool_usage = 0;
 
+#if defined(NDVIDEO_BUILD_MPEG4_MODULE) && NDVIDEO_BUILD_MPEG4_MODULE
+/* Global tables normally live for the process lifetime. A module owns their
+ * heap fallbacks and must release them before its static pointers disappear.
+ * Tracking is active only during shared-table initialization, never on the
+ * frame decode path. */
+static void *module_globals[64];
+static unsigned module_global_count;
+static int module_tracking, module_tracking_overflow;
+int xvid_module_track_globals(int enabled)
+{ int previous = module_tracking; module_tracking = enabled; return previous; }
+static void *track_global(void *pointer)
+{
+    if (pointer && module_tracking) {
+        if (module_global_count < sizeof(module_globals)/sizeof(module_globals[0]))
+            module_globals[module_global_count++] = pointer;
+        else
+            module_tracking_overflow = 1;
+    }
+    return pointer;
+}
+static void forget_global(void *pointer)
+{
+    unsigned i;
+    for (i = 0; i < module_global_count; ++i) {
+        if (module_globals[i] == pointer) {
+            module_globals[i] = module_globals[--module_global_count];
+            break;
+        }
+    }
+}
+int xvid_module_release_globals(void)
+{
+    /* Refuse unload if a future table expansion exceeds the bounded registry. */
+    if (module_tracking || module_tracking_overflow) return 0;
+    while (module_global_count) xvid_free(module_globals[module_global_count - 1]);
+    xvid_init_sram(NULL, 0);
+    return 1;
+}
+#else
+#define track_global(pointer) (pointer)
+#define forget_global(pointer) ((void)0)
+#endif
+
 /*****************************************************************************
  * xvid_malloc
  *
@@ -64,7 +107,7 @@ xvid_malloc(size_t size,
 			*mem_ptr = (uint8_t)1;
 
 			/* Return the mem_ptr pointer */
-			return ((void *)(mem_ptr+1));
+			return track_global((void *)(mem_ptr+1));
 		}
 	} else {
 		uint8_t *tmp;
@@ -91,7 +134,7 @@ xvid_malloc(size_t size,
 			*(mem_ptr - 1) = (uint8_t) (mem_ptr - tmp);
 
 			/* Return the aligned pointer */
-			return ((void *)mem_ptr);
+			return track_global((void *)mem_ptr);
 		}
 	}
 
@@ -125,6 +168,7 @@ xvid_free(void *mem_ptr)
 	}
 
 	/* Aligned pointer */
+	forget_global(mem_ptr);
 	ptr = mem_ptr;
 
 	/* *(ptr - 1) holds the offset to the real allocated block

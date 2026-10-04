@@ -11,6 +11,7 @@
 #define MOVIE_CODEC_FLAG_H264 0x0000U
 #define MOVIE_CODEC_FLAG_MPEG4 0x0001U
 #define MOVIE_CODEC_FLAG_HEVC 0x0002U
+#define MOVIE_CODEC_FLAG_AV1 0x0003U
 
 #pragma pack(push, 1)
 typedef struct {
@@ -49,6 +50,7 @@ typedef enum {
     MOVIE_CODEC_H264 = 0,
     MOVIE_CODEC_MPEG4 = 1,
     MOVIE_CODEC_HEVC = 2,
+    MOVIE_CODEC_AV1 = 3,
 } MovieCodec;
 
 static inline MovieCodec movie_codec_from_header(const MovieHeader *header)
@@ -68,6 +70,8 @@ static inline MovieCodec movie_codec_from_header(const MovieHeader *header)
             return MOVIE_CODEC_MPEG4;
         case MOVIE_CODEC_FLAG_HEVC:
             return MOVIE_CODEC_HEVC;
+        case MOVIE_CODEC_FLAG_AV1:
+            return MOVIE_CODEC_AV1;
         default:
             return MOVIE_CODEC_UNKNOWN;
         }
@@ -84,6 +88,8 @@ static inline const char *movie_codec_name(MovieCodec codec)
         return "mpeg4";
     case MOVIE_CODEC_HEVC:
         return "hevc";
+    case MOVIE_CODEC_AV1:
+        return "av1";
     default:
         return "unknown";
     }

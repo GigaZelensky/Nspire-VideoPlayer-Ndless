@@ -222,6 +222,8 @@ decoder_context::decoder_context(void* memory) : base_context(memory)
   // --- parameters ---
 
   ctu_budget = ~0u;
+  ctu_clock = NULL;
+  ctu_deadline_ticks = 0;
   step_ctus = 0;
   picture_ctus_done = picture_ctus_total = picture_ctu_size = 0;
   param_sei_check_hash = false;
@@ -375,6 +377,8 @@ void decoder_context::stop_thread_pool()
 
 void decoder_context::reset()
 {
+  ctu_clock = NULL;
+  ctu_deadline_ticks = 0;
   if (working_memory) working_memory->owner = NULL;
   if (num_worker_threads>0) {
     //flush_thread_pool(&ctx->thread_pool);

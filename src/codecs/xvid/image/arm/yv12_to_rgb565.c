@@ -1,6 +1,7 @@
 #include "../../global.h"
 #include "../colorspace.h"
 #include "../../utils/mem_align.h"
+#include "../../../rgb565.h"
 
 #if defined(__GNUC__) || defined(__clang__)
   typedef uint32_t u32_alias __attribute__((__may_alias__));
@@ -10,7 +11,7 @@
   typedef uint16_t u16_alias;
 #endif
 
-// Tables: 5KB + 1KB clamp = ~6KB total, cache-friendly on ARM926.
+/* Five conversion tables plus one shared RGB565 clamp (5,504 bytes). */
 static int32_t* g_Ytab;   // 298*(Y-16)
 static int32_t* g_UtoB;   // 516*(U-128)
 static int32_t* g_UtoG;   // -100*(U-128)
@@ -19,17 +20,13 @@ static int32_t* g_VtoG;   // -208*(V-128)
 
 static uint8_t* g_Clamp;
 
-enum { CLAMP_CENTER = 1024, CLAMP_SIZE = 2048 };
+enum { CLAMP_SIZE = 384, RB_BIAS = 64 << 11, G_BIAS = 256 << 10 };
 
-// experimental rgb565 shift tables (1.5kb)
-// static uint16_t* g_RedShiftTable;
-// static uint16_t* g_GreenShiftTable;
-// static uint16_t* g_BlueShiftTable;
-// Was profiled and found to be slower than direct packing.
-
-void init_yv12_to_rgb565_tables(void) {
-    // allocate tables in sram: 5 * 256 int32_t values + 2048 byte clamp table + 3 * 256 uint16_t shift tables
+int init_yv12_to_rgb565_tables(void) {
+    if (g_Ytab) return 1;
+    /* The allocator falls back to RAM when the SRAM pool is full. */
     uint8_t* sramTable = xvid_malloc_sram(5 * 256 * sizeof(int32_t) + CLAMP_SIZE, CACHE_LINE);
+    if (!sramTable) return 0;
     g_Ytab = (int32_t*)sramTable;
     g_UtoB = (g_Ytab + 256);
     g_UtoG = (g_UtoB + 256);
@@ -44,34 +41,24 @@ void init_yv12_to_rgb565_tables(void) {
         int u = i - 128;
         int v = i - 128;
 
-        g_UtoB[i] = 516 * u;
-        g_UtoG[i] = -100 * u;
-        g_VtoR[i] = 409 * v;
+        g_UtoB[i] = 516 * u + RB_BIAS;
+        g_UtoG[i] = -100 * u + G_BIAS;
+        g_VtoR[i] = 409 * v + RB_BIAS;
         g_VtoG[i] = -208 * v;
     }
 
+    /* Shift directly to the output precision before clipping. Across all
+     * 8-bit Y/U/V values, red/blue indices fit [29,130], green [213,364].
+     * Keep the negative luma contribution below Y=16, matching Xvid exactly. */
     for (int i = 0; i < CLAMP_SIZE; ++i) {
-        int v = i - CLAMP_CENTER;     // [-1024..1023]
-        if (v < 0) v = 0;
-        if (v > 255) v = 255;
-        g_Clamp[i] = (uint8_t)v;
+        int limit = i < 192 ? 31 : 63;
+        int value = i - (i < 192 ? 64 : 256);
+        if (value < 0) value = 0;
+        if (value > limit) value = limit;
+        g_Clamp[i] = (uint8_t)value;
     }
+    return 1;
 }
-
-__attribute__((hot))
-static uint16_t pack_rgb565(uint8_t r, uint8_t g, uint8_t b) {
-    // r:8 -> 5, g:8 -> 6, b:8 -> 5
-    // const uint16_t r5 = r & 0xF8; // top 5 bits
-    // const uint16_t g6 = g & 0xFC; // top 6 bits
-    // // const uint16_t b5 = b & 0xF8; // b doesnt need a mask since we shift right
-
-    // return (uint16_t)((r5 << 8) | (g6 << 3) | (b >> 3));
-
-    return (uint16_t)(((uint16_t)(r >> 3) << 11) |
-                      ((uint16_t)(g >> 2) << 5)  |
-                      ((uint16_t)(b >> 3) << 0));
-}
-
 
 __attribute__((hot))
 static inline uint16_t yuv_to_rgb565_pixel(
@@ -80,19 +67,14 @@ static inline uint16_t yuv_to_rgb565_pixel(
     int32_t ugvg,
     int32_t ub,
     const int32_t* Ytab,
-    const uint8_t* clamp_centered)
+    const uint8_t* clip)
 {
-    // NOTE: This relies on arithmetic right shift for negative values (true on ARM).
-    int32_t c = Ytab[y];            // includes +128 rounding
-    int r = (c + vr)   >> 8;
-    int g = (c + ugvg) >> 8;
-    int b = (c + ub)   >> 8;
-
-    uint8_t r8 = clamp_centered[r];
-    uint8_t g8 = clamp_centered[g];
-    uint8_t b8 = clamp_centered[b];
-
-    return pack_rgb565(r8, g8, b8);
+    /* Arithmetic shifts retain the original signed rounding. */
+    int32_t c = Ytab[y];
+    unsigned r = clip[(c + vr) >> 11];
+    unsigned g = clip[(c + ugvg) >> 10];
+    unsigned b = clip[(c + ub) >> 11];
+    return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
 __attribute__((hot))
@@ -109,6 +91,23 @@ void yv12_to_rgb565_concept(
     int vflip
 ) {
 
+#if defined(__arm__) && !defined(__thumb__)
+    if (width > 0 && height > 0 && !((width | height) & 1) &&
+        !((uintptr_t)x_ptr & 3U) && !(x_stride & 3)) {
+        int stride = vflip ? -x_stride : x_stride;
+        uint8_t *dst = x_ptr + (vflip ? (height - 1) * x_stride : 0);
+        for (int row = 0; row < height; row += 2) {
+            yuv420_rgb565_pair_rows(y_src, y_src + y_stride, u_src, v_src,
+                (uint16_t *)dst, (uint16_t *)(dst + stride), g_Ytab, (unsigned)width / 2U);
+            y_src += y_stride * 2;
+            u_src += uv_stride;
+            v_src += uv_stride;
+            dst += stride * 2;
+        }
+        return;
+    }
+#endif
+
     // Local table bases (kept in regs more readily)
     const int32_t* Ytab = g_Ytab;
     const int32_t* VtoR = g_VtoR;
@@ -116,8 +115,8 @@ void yv12_to_rgb565_concept(
     const int32_t* UtoB = g_UtoB;
     const int32_t* UtoG = g_UtoG;
 
-    // Center clamp pointer so clamp_centered[val] works with val in [-1024..1023]
-    const uint8_t* clamp_centered = g_Clamp + CLAMP_CENTER;
+    // The conversion tables already include the positive clamp-index bias.
+    const uint8_t* clip = g_Clamp;
 
     // Output setup (word-based stores)
     int dst_stride_words = x_stride >> 2;
@@ -176,10 +175,10 @@ void yv12_to_rgb565_concept(
             uint8_t y10 = (uint8_t)(y1_4);
             uint8_t y11 = (uint8_t)(y1_4 >> 8);
 
-            uint16_t p00 = yuv_to_rgb565_pixel(y00, vr0, ugvg0, ub0, Ytab, clamp_centered);
-            uint16_t p01 = yuv_to_rgb565_pixel(y01, vr0, ugvg0, ub0, Ytab, clamp_centered);
-            uint16_t p10 = yuv_to_rgb565_pixel(y10, vr0, ugvg0, ub0, Ytab, clamp_centered);
-            uint16_t p11 = yuv_to_rgb565_pixel(y11, vr0, ugvg0, ub0, Ytab, clamp_centered);
+            uint16_t p00 = yuv_to_rgb565_pixel(y00, vr0, ugvg0, ub0, Ytab, clip);
+            uint16_t p01 = yuv_to_rgb565_pixel(y01, vr0, ugvg0, ub0, Ytab, clip);
+            uint16_t p10 = yuv_to_rgb565_pixel(y10, vr0, ugvg0, ub0, Ytab, clip);
+            uint16_t p11 = yuv_to_rgb565_pixel(y11, vr0, ugvg0, ub0, Ytab, clip);
 
             // ---- Sample 1 (columns x+2..x+3) ----
             uint8_t u1 = (uint8_t)(u01 >> 8);
@@ -194,10 +193,10 @@ void yv12_to_rgb565_concept(
             uint8_t y12 = (uint8_t)(y1_4 >> 16);
             uint8_t y13 = (uint8_t)(y1_4 >> 24);
 
-            uint16_t p02 = yuv_to_rgb565_pixel(y02, vr1, ugvg1, ub1, Ytab, clamp_centered);
-            uint16_t p03 = yuv_to_rgb565_pixel(y03, vr1, ugvg1, ub1, Ytab, clamp_centered);
-            uint16_t p12 = yuv_to_rgb565_pixel(y12, vr1, ugvg1, ub1, Ytab, clamp_centered);
-            uint16_t p13 = yuv_to_rgb565_pixel(y13, vr1, ugvg1, ub1, Ytab, clamp_centered);
+            uint16_t p02 = yuv_to_rgb565_pixel(y02, vr1, ugvg1, ub1, Ytab, clip);
+            uint16_t p03 = yuv_to_rgb565_pixel(y03, vr1, ugvg1, ub1, Ytab, clip);
+            uint16_t p12 = yuv_to_rgb565_pixel(y12, vr1, ugvg1, ub1, Ytab, clip);
+            uint16_t p13 = yuv_to_rgb565_pixel(y13, vr1, ugvg1, ub1, Ytab, clip);
 
             // Store: 2 pixels per word
             dst0[0] = (uint32_t)p00 | ((uint32_t)p01 << 16);
@@ -219,10 +218,10 @@ void yv12_to_rgb565_concept(
             int32_t vr0 = VtoR[v0];
             int32_t ub0 = UtoB[u0];
             int32_t ugvg0 = UtoG[u0] + VtoG[v0];
-            uint16_t p00 = yuv_to_rgb565_pixel(y0_tail[0], vr0, ugvg0, ub0, Ytab, clamp_centered);
-            uint16_t p01 = yuv_to_rgb565_pixel(y0_tail[1], vr0, ugvg0, ub0, Ytab, clamp_centered);
-            uint16_t p10 = yuv_to_rgb565_pixel(y1_tail[0], vr0, ugvg0, ub0, Ytab, clamp_centered);
-            uint16_t p11 = yuv_to_rgb565_pixel(y1_tail[1], vr0, ugvg0, ub0, Ytab, clamp_centered);
+            uint16_t p00 = yuv_to_rgb565_pixel(y0_tail[0], vr0, ugvg0, ub0, Ytab, clip);
+            uint16_t p01 = yuv_to_rgb565_pixel(y0_tail[1], vr0, ugvg0, ub0, Ytab, clip);
+            uint16_t p10 = yuv_to_rgb565_pixel(y1_tail[0], vr0, ugvg0, ub0, Ytab, clip);
+            uint16_t p11 = yuv_to_rgb565_pixel(y1_tail[1], vr0, ugvg0, ub0, Ytab, clip);
 
             dst0[0] = (uint32_t) p00 | ((uint32_t) p01 << 16);
             dst1[0] = (uint32_t) p10 | ((uint32_t) p11 << 16);

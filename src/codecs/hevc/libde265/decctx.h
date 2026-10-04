@@ -346,6 +346,8 @@ class decoder_context : public base_context {
 
   // Ndless cooperative budget; decremented once per reconstructed CTU.
   unsigned ctu_budget;
+  uint64_t (*ctu_clock)(void);
+  uint64_t ctu_deadline_ticks;
   unsigned step_ctus;
   unsigned picture_ctus_done, picture_ctus_total, picture_ctu_size;
   de265_error decode(int* more);

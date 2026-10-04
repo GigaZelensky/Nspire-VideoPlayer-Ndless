@@ -1,4 +1,5 @@
 #include "player_internal.h"
+#include "codecs/rgb565.h"
 #include "prefetch_io_policy.h"
 
 const PrefetchedChunk *find_prefetched_chunk_const(const Movie *movie, int chunk_index)
@@ -455,6 +456,7 @@ static inline uint32_t h264_rgb565_pair(const uint8_t *row, const int32_t *y_bas
 #endif
 }
 
+#if !defined(__arm__) || defined(__thumb__)
 /* Probe exact repeated colors before choosing the cached loop. Keep the
  * existing conversion loop for gradients and textured pictures. This decision
  * affects speed only; every reused result has an exact 24-bit Y/U/V key. */
@@ -476,14 +478,25 @@ static bool h264_repeated_flat_blocks(const uint8_t *y_plane, const uint8_t *u_p
     }
     return repeated >= 2U;
 }
+#endif
 
-/* Keep the cache's two values out of the ordinary loop's register allocation.
- * Nothing is retained between frames or bands, and no extra buffer is needed. */
+/* Exact repeated colors share one conversion. Keep this loop separate so
+ * the cache does not add register pressure to textured-video conversion. */
 static __attribute__((noinline)) bool h264_convert_repeated_flat_rows(
     const uint8_t *restrict y_plane, const uint8_t *restrict u_plane, const uint8_t *restrict v_plane,
     size_t luma_stride, size_t chroma_stride, uint16_t *restrict dst_pixels,
     size_t dst_pitch_pixels, size_t width, size_t height)
 {
+#if defined(__arm__) && !defined(__thumb__)
+    for (size_t y = 0; y < height; y += 2U) {
+        yuv420_rgb565_flat_pair_rows(y_plane + y * luma_stride,
+            y_plane + (y + 1U) * luma_stride,
+            u_plane + (y / 2U) * chroma_stride, v_plane + (y / 2U) * chroma_stride,
+            dst_pixels + y * dst_pitch_pixels, dst_pixels + (y + 1U) * dst_pitch_pixels,
+            g_h264_color_tables->y_base, width / 2U);
+    }
+    return true;
+#else
     const int32_t *y_base = g_h264_color_tables->y_base;
     const uint8_t *clip = g_h264_color_tables->clip;
     uint32_t last_key = UINT32_MAX, last_pixel = 0;
@@ -516,6 +529,7 @@ static __attribute__((noinline)) bool h264_convert_repeated_flat_rows(
         }
     }
     return true;
+#endif
 }
 
 #if defined(__arm__) && !defined(__thumb__)
@@ -527,16 +541,13 @@ _Static_assert(offsetof(H264ColorTables, u_to_blue) - offsetof(H264ColorTables, 
                offsetof(H264ColorTables, v_to_green) - offsetof(H264ColorTables, y_base) == 4096U &&
                offsetof(H264ColorTables, clip) - offsetof(H264ColorTables, y_base) == 5120U,
                "ARM color table layout");
-extern void h264_rgb565_dense_pair_rows(const uint8_t *y0, const uint8_t *y1,
-    const uint8_t *u, const uint8_t *v, uint16_t *d0, uint16_t *d1,
-    const int32_t *y_table, unsigned pairs);
 
 static bool h264_convert_dense_rows(const uint8_t *y, const uint8_t *u, const uint8_t *v,
     size_t luma_stride, size_t chroma_stride, uint16_t *dst,
     size_t pitch, size_t width, size_t height)
 {
     for (size_t row = 0; row < height; row += 2U) {
-        h264_rgb565_dense_pair_rows(y, y + luma_stride, u, v, dst, dst + pitch,
+        yuv420_rgb565_pair_rows(y, y + luma_stride, u, v, dst, dst + pitch,
                                    g_h264_color_tables->y_base, width / 2U);
         y += 2U * luma_stride;
         u += chroma_stride;
@@ -571,8 +582,12 @@ static inline bool blit_h264_planes_to_rgb565_rows(
         return h264_convert_dense_rows(y_plane, u_plane, v_plane, luma_stride,
             chroma_stride, dst_pixels, dst_pitch_pixels, crop_width, crop_height);
 #endif
-    if (try_flat && !((uintptr_t)dst_pixels & 3U) && !(dst_pitch_pixels & 1U) &&
-        h264_repeated_flat_blocks(y_plane, u_plane, v_plane, luma_stride, chroma_stride, crop_width, crop_height))
+    /* The ARM loop also handles varying flat colors without a second probe. */
+    if (try_flat && !((uintptr_t)dst_pixels & 3U) && !(dst_pitch_pixels & 1U)
+#if !defined(__arm__) || defined(__thumb__)
+        && h264_repeated_flat_blocks(y_plane, u_plane, v_plane, luma_stride, chroma_stride, crop_width, crop_height)
+#endif
+        )
         return h264_convert_repeated_flat_rows(y_plane, u_plane, v_plane, luma_stride, chroma_stride,
             dst_pixels, dst_pitch_pixels, crop_width, crop_height);
     for (y=0;y<crop_height;y+=2U) {
@@ -747,7 +762,7 @@ bool blit_h264_picture_rows_to_target(
     return converted;
 }
 
-bool blit_hevc_picture_rows(Movie *movie, const hevc_frame_t *picture,
+bool blit_planar_picture_rows(Movie *movie, const VideoFrame *picture,
     uint16_t *pixels, size_t pitch, size_t first, size_t rows, bool *flat)
 {
     if (!movie || !picture || !pixels || !flat || !rows || ((first | rows) & 1U) ||
@@ -1592,6 +1607,9 @@ bool begin_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, i
             clear_seek_bar_preview_decode_job(preview);
             return false;
         }
+    } else if (movie->codec == MOVIE_CODEC_AV1) {
+        job->av1_decoder = player_av1_decoder_create();
+        if (!job->av1_decoder) { clear_seek_bar_preview_decode_job(preview); return false; }
     } else if (movie->codec == MOVIE_CODEC_HEVC) {
         job->hevc_decoder = player_hevc_decoder_create();
         if (!job->hevc_decoder) { clear_seek_bar_preview_decode_job(preview); return false; }
@@ -1843,10 +1861,10 @@ static void step_mpeg4_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState
     clear_seek_bar_preview_decode_job(preview);
 }
 
-static void step_hevc_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview,
+static void step_planar_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview,
     uint32_t deadline_ms)
 {
-    if (!NDVIDEO_WITH_HEVC) return;
+    if (!NDVIDEO_WITH_HEVC && !NDVIDEO_WITH_AV1) return;
     SeekPreviewDecodeJob *job = &preview->decode_job;
     if (!read_seek_bar_preview_chunk_step(movie, job, deadline_ms)) goto fail;
     if (!job->frame_offsets || (deadline_ms && prefetch_deadline_reached(deadline_ms))) return;
@@ -1857,31 +1875,47 @@ static void step_hevc_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState 
     size_t start = job->frame_offsets[local];
     size_t end = local + 1U < entry->frame_count ? job->frame_offsets[local+1U] : job->chunk_size;
     if (start >= end || end > job->chunk_size) goto fail;
-    if (!job->consumed_bytes) {
-        if (hevc_submit_annexb(job->hevc_decoder, job->chunk_bytes+start, end-start, job->next_frame) == HEVC_ERROR) goto fail;
+    const VideoFrame *frame;
+    if (NDVIDEO_WITH_AV1 && job->codec == MOVIE_CODEC_AV1) {
+        if (!job->consumed_bytes && av1_submit_obus(job->av1_decoder, job->chunk_bytes+start,
+                end-start, job->next_frame) == AV1_ERROR) goto fail;
         job->consumed_bytes = end-start;
-    }
-    const hevc_frame_t *frame = hevc_get_frame(job->hevc_decoder);
-    if (!frame) {
-        hevc_status_t status = hevc_step(job->hevc_decoder, 1);
-        if (status == HEVC_PROGRESS) return;
-        if (status != HEVC_FRAME_READY) goto fail;
+        frame = av1_get_frame(job->av1_decoder);
+        if (!frame) {
+            av1_status_t status = av1_step(job->av1_decoder, 1);
+            if (status == AV1_PROGRESS) return;
+            if (status != AV1_FRAME_READY) goto fail;
+            frame = av1_get_frame(job->av1_decoder);
+        }
+    } else if (NDVIDEO_WITH_HEVC && job->codec == MOVIE_CODEC_HEVC) {
+        if (!job->consumed_bytes && hevc_submit_annexb(job->hevc_decoder, job->chunk_bytes+start,
+                end-start, job->next_frame) == HEVC_ERROR) goto fail;
+        job->consumed_bytes = end-start;
         frame = hevc_get_frame(job->hevc_decoder);
-    }
-    size_t rows = movie->header.video_height - job->hevc_color_row;
+        if (!frame) {
+            hevc_status_t status = hevc_step(job->hevc_decoder, 1);
+            if (status == HEVC_PROGRESS) return;
+            if (status != HEVC_FRAME_READY) goto fail;
+            frame = hevc_get_frame(job->hevc_decoder);
+        }
+    } else goto fail;
+    size_t rows = movie->header.video_height - job->planar_color_row;
     if (rows > 16U) rows = 16U;
-    if (!blit_hevc_picture_rows(movie, frame, job->pixels, movie->header.video_width,
-            job->hevc_color_row, rows, &job->hevc_flat)) goto fail;
-    job->hevc_color_row += rows;
-    if (job->hevc_color_row < movie->header.video_height) return;
+    if (!blit_planar_picture_rows(movie, frame, job->pixels, movie->header.video_width,
+            job->planar_color_row, rows, &job->planar_flat)) goto fail;
+    job->planar_color_row += rows;
+    if (job->planar_color_row < movie->header.video_height) return;
     if (!publish_seek_bar_preview_pixels(movie, preview, job->next_frame)) goto fail;
-    hevc_release_frame(job->hevc_decoder);
+    if (NDVIDEO_WITH_AV1 && job->codec == MOVIE_CODEC_AV1) av1_release_frame(job->av1_decoder);
+    else if (NDVIDEO_WITH_HEVC) hevc_release_frame(job->hevc_decoder);
     ++job->next_frame;
-    job->consumed_bytes = job->hevc_color_row = 0;
+    job->consumed_bytes = job->planar_color_row = 0;
     if (job->next_frame > job->target_frame) finish_seek_bar_preview_decode_job(preview);
     return;
 fail:
-    debug_tracef("hevc seek preview: %s", hevc_error_string(job->hevc_decoder));
+    debug_tracef("%s seek preview: %s", movie_codec_name(job->codec),
+        NDVIDEO_WITH_AV1 && job->codec == MOVIE_CODEC_AV1 ? av1_error_string(job->av1_decoder) :
+        NDVIDEO_WITH_HEVC ? hevc_error_string(job->hevc_decoder) : "codec unavailable");
     clear_seek_bar_preview_decode_job(preview);
 }
 
@@ -1898,8 +1932,8 @@ void step_seek_bar_preview_decode(Movie *movie, SeekBarPreviewState *preview, ui
     }
 
     job = &preview->decode_job;
-    if (job->codec == MOVIE_CODEC_HEVC) {
-        step_hevc_seek_bar_preview_decode(movie, preview, deadline_ms);
+    if (job->codec == MOVIE_CODEC_HEVC || job->codec == MOVIE_CODEC_AV1) {
+        step_planar_seek_bar_preview_decode(movie, preview, deadline_ms);
         return;
     }
     if (job->codec == MOVIE_CODEC_MPEG4) {
@@ -2028,11 +2062,11 @@ bool finish_seek_bar_preview_pending_frame(Movie *movie, SeekBarPreviewState *pr
     }
 
     job = &preview->decode_job;
-    if (job->codec == MOVIE_CODEC_HEVC) {
+    if (job->codec == MOVIE_CODEC_HEVC || job->codec == MOVIE_CODEC_AV1) {
         while (job->active && job->consumed_bytes) {
             if (poll && !poll(userdata)) return false;
             uint32_t previous = job->next_frame;
-            step_hevc_seek_bar_preview_decode(movie, preview, 0);
+            step_planar_seek_bar_preview_decode(movie, preview, 0);
             if (!job->active && !job->complete) return false;
             if (job->next_frame != previous) break;
         }
@@ -2491,6 +2525,23 @@ bool should_prioritize_next_chunk_io(const Movie *movie, int current_chunk)
     return frames_remaining <= guard_frames;
 }
 
+/* When only the due picture is decoded, protect preparation of its successor.
+ * Two complete chunks beyond the producer remain available; tiny chunks retain
+ * the existing low-runway service. Do not use the displayed chunk here: the
+ * decoder may already have crossed its boundary. */
+static bool prefetch_defer_speculative_request(const Movie *movie, int current_chunk)
+{
+    if (!video_lookahead_active(movie) || video_lookahead_queued(movie) > 1U ||
+        current_chunk < 0 || (uint32_t)(current_chunk + 2) >= movie->header.chunk_count ||
+        !next_chunk_prefetched_ready(movie, current_chunk) ||
+        !next_chunk_prefetched_ready(movie, current_chunk + 1))
+        return false;
+    const ChunkIndexEntry *second = &movie->chunk_index[current_chunk + 2];
+    uint32_t ready_end = second->first_frame + second->frame_count;
+    uint32_t needed = video_lookahead_next_frame(movie);
+    return ready_end > needed && ready_end - needed > PREFETCH_ASYNC_URGENT_FRAMES;
+}
+
 bool prefetch_wait_step(Movie *movie, uint32_t spare_ticks)
 {
     if (!movie_async_enabled(movie) || video_lookahead_reloading(movie)) return false;
@@ -2502,7 +2553,8 @@ bool prefetch_wait_step(Movie *movie, uint32_t spare_ticks)
     if (spare_ticks <= (monotonic_clock_ticks_per_second() * 2U + 999U) / 1000U)
         return false;
     int current_chunk = prefetch_target_chunk(movie);
-    if (current_chunk < 0) return false;
+    if (current_chunk < 0 || prefetch_defer_speculative_request(movie, current_chunk))
+        return false;
     PrefetchedChunk *work = find_prefetch_work_chunk(movie, current_chunk, (int)movie_prefetch_slots(movie));
     if (!work) return false;
     if (!prefetch_read_step(movie, work, true, 0)) work->state = PREFETCH_FAILED;
@@ -2547,6 +2599,11 @@ void prefetch_tick(Movie *movie, bool paused, uint32_t spare_ms, const PointerSt
         uint32_t needed=video_lookahead_active(movie)?video_lookahead_next_frame(movie):movie->current_frame;
         uint32_t runway=buffered_end>needed?buffered_end-needed:0;
         if(!prefetch_async_should_work(paused,runway,spare_ms))return;
+        /* Idle/READY can wait; an active NAND request or parked handoff must
+         * retain its existing service path. Paused filling is unrestricted. */
+        if (!paused && movie_async_needs_request(movie) &&
+            prefetch_defer_speculative_request(movie, current_chunk))
+            return;
         PrefetchedChunk *work = find_prefetch_work_chunk(movie, current_chunk, slot_count);
         bool missing = false;
         for (int distance = 1; !work && distance <= slot_count; ++distance) {
@@ -3104,6 +3161,8 @@ bool decode_to_frame_with_progress(
         movie->decoded_local_frame < (int) local_index) {
         if (movie_uses_h264(movie)) {
             continue_loaded_stream = movie->h264.decoder != NULL;
+        } else if (movie->codec == MOVIE_CODEC_AV1) {
+            continue_loaded_stream = movie->av1.decoder != NULL;
         } else if (movie->codec == MOVIE_CODEC_HEVC) {
             continue_loaded_stream = movie->hevc.decoder != NULL;
         } else if (NDVIDEO_WITH_MPEG4 && movie->codec == MOVIE_CODEC_MPEG4) {
@@ -3152,6 +3211,8 @@ bool decode_to_frame_with_progress(
             }
             return false;
         }
+    } else if (movie->codec == MOVIE_CODEC_AV1) {
+        if (!decode_av1_seek_step(movie, frame_index, predicate, hook, poll, userdata)) return false;
     } else if (movie->codec == MOVIE_CODEC_HEVC) {
         if (!decode_hevc_seek_step(movie, frame_index, predicate, hook, poll, userdata)) return false;
     } else if (NDVIDEO_WITH_MPEG4 && movie->codec == MOVIE_CODEC_MPEG4) {

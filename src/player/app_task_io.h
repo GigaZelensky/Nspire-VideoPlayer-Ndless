@@ -28,11 +28,20 @@ void app_task_io_critical_leave(unsigned);
 bool app_task_io_service(uint32_t budget_ticks);
 bool app_task_io_pending(void);
 bool app_task_io_in_job(void);
+/* Memory-only dispatch witness check for a masked raw-reader service batch.
+ * False means owned physical-map proofs cannot be reused, not that a cold
+ * reader must stop. No witness never advances the mutation epoch by itself. */
+bool app_task_io_observe_inactive(void);
 void app_task_io_drain(void);
 typedef struct {
     uint32_t contexts, active_contexts, resumes, spi_yields;
     uint32_t max_step_ticks, max_callback_ticks, minimum_stack_remaining;
     uint32_t errors, init_stage, io_phases;
+    uint32_t active_dispatches, inactive_dispatches, mask_changes, task_changes;
+    uint32_t precondition_failures;
+    /* Minimum first-failing resume counter among reporting writer contexts. */
+    uint32_t first_failure_resume_min;
+    bool have_first_failure;
     int last_error, init_error;
 } AppTaskIoStats;
 /* Completed and live app-owned contexts; no native scheduler inspection. */

@@ -236,11 +236,12 @@ u32 h264bsdProcessBlock(i32 *data, u32 qp, u32 skip, u32 coeffMap)
             data[4 ] = (tmp1 + tmp2 + 32)>>6;
             data[8 ] = (tmp1 - tmp2 + 32)>>6;
             data[12] = (tmp0 - tmp3 + 32)>>6;
-            /* check that each value is in the range [-512,511] */
-            if (((u32)(data[0] + 512) > 1023) ||
-                ((u32)(data[4] + 512) > 1023) ||
-                ((u32)(data[8] + 512) > 1023) ||
-                ((u32)(data[12] + 512) > 1023) )
+            /* After adding 512, every value must use only its low ten bits.
+             * OR preserves any out-of-range bit across all four samples. */
+            if ((((u32)data[0] + 512U) |
+                 ((u32)data[4] + 512U) |
+                 ((u32)data[8] + 512U) |
+                 ((u32)data[12] + 512U)) > 1023U)
                 return(HANTRO_NOK);
         }
     }
@@ -284,11 +285,12 @@ u32 h264bsdProcessBlock(i32 *data, u32 qp, u32 skip, u32 coeffMap)
             data[5] = data[9] = data[13] = data[1];
             data[6] = data[10] = data[14] = data[2];
             data[7] = data[11] = data[15] = data[3];
-            /* check that each value is in the range [-512,511] */
-            if (((u32)(data[0] + 512) > 1023) ||
-                ((u32)(data[1] + 512) > 1023) ||
-                ((u32)(data[2] + 512) > 1023) ||
-                ((u32)(data[3] + 512) > 1023) )
+            /* After adding 512, every value must use only its low ten bits.
+             * OR preserves any out-of-range bit across all four samples. */
+            if ((((u32)data[0] + 512U) |
+                 ((u32)data[1] + 512U) |
+                 ((u32)data[2] + 512U) |
+                 ((u32)data[3] + 512U)) > 1023U)
                 return(HANTRO_NOK);
         }
     }

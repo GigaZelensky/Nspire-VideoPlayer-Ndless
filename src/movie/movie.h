@@ -10,6 +10,7 @@
 
 #include "codecs/codec.h"
 #include "codecs/hevc_decoder.h"
+#include "codecs/av1_decoder.h"
 #include "codecs/h264bsd/h264bsd_decoder.h"
 #include "movie/nvp_format.h"
 #include "player/playback_cadence.h"
@@ -84,6 +85,15 @@ typedef struct {
     uint64_t submitted_frames, decoded_ctus;
 } HevcDecoderContext;
 
+typedef struct {
+    av1_decoder_t *decoder;
+    const av1_frame_t *picture;
+    const uint8_t *access_unit;
+    size_t access_unit_size;
+    bool decoder_failed;
+    uint64_t submitted_frames, decoded_blocks;
+} Av1DecoderContext;
+
 typedef struct Movie {
     FILE *file;
     struct MovieAsyncIo *async_io;
@@ -134,6 +144,7 @@ typedef struct Movie {
     H264DecoderContext h264;
     Mpeg4DecoderContext mpeg4;
     HevcDecoderContext hevc;
+    Av1DecoderContext av1;
     uint16_t foreground_decode_avg_ms, foreground_decode_peak_ms;
     uint64_t foreground_pending_ticks;
     uint32_t last_read_bytes;

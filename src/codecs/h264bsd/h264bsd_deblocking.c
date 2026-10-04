@@ -126,6 +126,27 @@ static const u8 tc0Default[52][5] = {
 static const u8 (*tc0)[5] = tc0Default;
 #endif
 
+size_t h264bsdDeblockingTableBytes(void)
+{ return sizeof(alphasDefault)+sizeof(betasDefault)+sizeof(tc0Default); }
+bool h264bsdBindDeblockingTables(void *memory,size_t bytes)
+{
+    if(!memory) {
+        if(bytes)return false;
+        alphas=alphasDefault;betas=betasDefault;tc0=tc0Default;return true;
+    }
+    if(((uintptr_t)memory&31U) || bytes<h264bsdDeblockingTableBytes())return false;
+    u8 *p=memory;
+    memcpy(p,alphasDefault,sizeof(alphasDefault));alphas=p;p+=sizeof(alphasDefault);
+    memcpy(p,betasDefault,sizeof(betasDefault));betas=p;p+=sizeof(betasDefault);
+    memcpy(p,tc0Default,sizeof(tc0Default));
+#ifndef H264DEC_OMXDL
+    tc0=(const u8 (*)[3])p;
+#else
+    tc0=(const u8 (*)[5])p;
+#endif
+    return true;
+}
+
 bool h264bsdInitDeblockingTables(void)
 {
     static u32 initialized = 0;

@@ -20,6 +20,23 @@ typedef struct {
 static AppTaskIo *tasks[APP_TASKS], *executing, *storage_owner;
 static unsigned cursor;
 static AppTaskIoStats completed = {.minimum_stack_remaining = UINT32_MAX};
+static uint32_t add_saturated(uint32_t a, uint32_t b)
+{
+    return b > UINT32_MAX - a ? UINT32_MAX : a + b;
+}
+static void accumulate_guards(AppTaskIoStats *stats, const PrivateWriter *writer)
+{
+    stats->active_dispatches = add_saturated(stats->active_dispatches, writer->dispatch_delta);
+    stats->inactive_dispatches = add_saturated(stats->inactive_dispatches, writer->inactive_dispatches);
+    stats->mask_changes = add_saturated(stats->mask_changes, writer->mask_changes);
+    stats->task_changes = add_saturated(stats->task_changes, writer->task_changes);
+    stats->precondition_failures |= writer->precondition_failures;
+    if (writer->have_first_failure && (!stats->have_first_failure ||
+        writer->first_failure_resume < stats->first_failure_resume_min)) {
+        stats->first_failure_resume_min = writer->first_failure_resume;
+        stats->have_first_failure = true;
+    }
+}
 static uint32_t counter(void)
 {
     return *(const volatile uint32_t *)0x900C0004U;
@@ -35,6 +52,23 @@ void app_task_io_critical_leave(unsigned mask)
 bool app_task_io_in_job(void)
 {
     return executing != NULL;
+}
+bool app_task_io_observe_inactive(void)
+{
+    if (executing)
+        return false;
+    bool witnessed = false, valid = true;
+    for (unsigned i = 0; i < APP_TASKS; ++i) {
+        if (!tasks[i] || !tasks[i]->private_state)
+            continue;
+        PrivateWriter *writer = &((AppFiber *)tasks[i]->private_state)->writer;
+        if (!writer->initialized)
+            continue;
+        witnessed = true;
+        if (!private_writer_observe_inactive(writer))
+            valid = false;
+    }
+    return witnessed && valid;
 }
 static bool runnable(AppTaskIo *task)
 {
@@ -231,6 +265,11 @@ int app_task_io_destroy(AppTaskIo *task)
         return NATIVE_FILE_IO_BAD_STATE;
     if (task->private_state) {
         PrivateWriter *w = &((AppFiber *)task->private_state)->writer;
+        /* A surviving global SPI-observed count is not a live dispatch
+         * witness. Retire proofs before this validated context disappears. */
+        if (w->initialized)
+            storage_mutation_invalidate();
+        accumulate_guards(&completed, w);
         ++completed.contexts;
         completed.resumes += w->resumes;
         completed.spi_yields += w->spi_yields;
@@ -283,6 +322,7 @@ void app_task_io_stats(AppTaskIoStats *stats)
     for (unsigned i = 0; i < APP_TASKS; ++i)
         if (tasks[i]) {
             PrivateWriter *w = &((AppFiber *)tasks[i]->private_state)->writer;
+            accumulate_guards(stats, w);
             ++stats->contexts;
             ++stats->active_contexts;
             stats->resumes += w->resumes;
@@ -319,6 +359,12 @@ void app_task_io_debug(FILE *file)
         (unsigned long)stats.minimum_stack_remaining, (unsigned long)stats.io_phases,
         (unsigned long)stats.errors, stats.last_error, (unsigned long)stats.init_stage,
         stats.init_error);
+    fprintf(file,
+        "app_io_guard active_dispatches=%lu inactive_dispatches=%lu mask_changes=%lu task_changes=%lu precondition_failures=%lu failure_seen=%u first_failure_resume_min=%lu\n",
+        (unsigned long)stats.active_dispatches, (unsigned long)stats.inactive_dispatches,
+        (unsigned long)stats.mask_changes, (unsigned long)stats.task_changes,
+        (unsigned long)stats.precondition_failures, stats.have_first_failure ? 1U : 0U,
+        (unsigned long)stats.first_failure_resume_min);
 }
 /* These wrappers never create a task. Native stdio executes on the app fiber. */
 void *app_task_io_file_open(AppTaskIo *b, const char *p)

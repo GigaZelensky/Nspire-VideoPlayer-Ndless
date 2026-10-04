@@ -1365,6 +1365,7 @@ void clear_seek_bar_preview_decode_job(SeekBarPreviewState *preview)
         mpeg4_xvid_destroy(job->mpeg4_decoder);
     }
     if (job->hevc_decoder) player_hevc_decoder_destroy(job->hevc_decoder);
+    if (job->av1_decoder) player_av1_decoder_destroy(job->av1_decoder);
     free(job->chunk_storage);
     free(job->frame_offsets);
     free(job->pixels);

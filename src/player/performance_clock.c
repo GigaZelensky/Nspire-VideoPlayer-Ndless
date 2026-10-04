@@ -21,11 +21,21 @@ static bool preference_keep_after_exit;
 static struct {
     bool supported, owned, active;
     uint32_t asic, target_hz;
+    uint32_t target_pll;
     uint32_t saved_pll, saved_divider, entry_hz, requests;
     uint32_t native_calls, native_entry;
     uint32_t saved_emi74, saved_emi1c, native_hash;
     int status;
 } clock_state;
+
+/* Keep startup evidence separate from the live state: a later manual Apply
+ * must not erase an early refusal or a clock overwritten during setup. */
+static struct {
+    bool begun, completed, entry_valid, first_ok, final_ok;
+    uint32_t saved_pll, saved_divider, saved_emi74, saved_emi1c, entry_hz;
+    uint32_t first_hz, before_final_hz, final_hz, attempts;
+    int first_status, final_status;
+} startup_clock;
 
 static uint32_t cx_cpu_hz(uint32_t config)
 {
@@ -248,6 +258,7 @@ bool performance_clock_start(void)
     uint32_t target = cx
         ? ((mhz / 6U) << 15) | (1U << 21) | (1U << 1) | ((cx_ahb_divisor - 1U) << 12) | (clock_state.saved_pll & 0xC0000000U)
         : ((mhz / 12U) << 24) | (2U << 16) | 0x301U;
+    clock_state.target_pll = target;
     clock_state.active = apply(target, 0U, false) && cpu_hz() == clock_state.target_hz;
     if (!clock_state.active) {
         int failure = clock_state.status ? clock_state.status : -5;
@@ -255,6 +266,67 @@ bool performance_clock_start(void)
             clock_state.status = failure;
     }
     return clock_state.active;
+}
+
+static bool selected_clock_matches(void)
+{
+    if (!clock_state.supported || !clock_state.owned || !clock_state.active ||
+        cpu_hz() != clock_state.target_hz) return false;
+    if (nspire_asic_is_cx(clock_state.asic))
+        return (CLOCK_WORD(CX_CLOCK_CURRENT) & CX_CLOCK_FIELDS) == clock_state.target_pll &&
+               (CLOCK_WORD(CX_CLOCK_LOAD) & CX_CLOCK_FIELDS) == clock_state.target_pll &&
+               !(CLOCK_WORD(CX_CLOCK_PENDING) & 2U);
+    uint32_t control = CLOCK_WORD(CLOCK_DIVIDER);
+    return (CLOCK_WORD(CLOCK_PLL) & CLOCK_PLL_FIELDS) == clock_state.target_pll &&
+           !(control & CLOCK_DIVIDER_FIELDS) && cx2_clock_control_idle(control) &&
+           !(CLOCK_WORD(CLOCK_PENDING) & 1U) &&
+           CLOCK_WORD(EMI_TIMING74) == 0x55U && CLOCK_WORD(EMI_TIMING1C) == 0x528U &&
+           !(CLOCK_WORD(EMI_CONTROL) & 0x40CU);
+}
+
+void performance_clock_startup_begin(void)
+{
+    if (startup_clock.begun) return;
+    startup_clock.begun = true;
+    startup_clock.first_ok = performance_clock_start();
+    startup_clock.first_status = clock_state.status;
+    startup_clock.first_hz = clock_state.supported ? cpu_hz() : 0U;
+    /* start() may have rolled back and relinquished ownership. Retain the
+     * original snapshot so a delayed startup retry still restores the clock
+     * that was present on entry, not an intervening setup/USB clock choice. */
+    startup_clock.entry_valid = clock_state.supported && clock_state.entry_hz != 0U;
+    startup_clock.saved_pll = clock_state.saved_pll;
+    startup_clock.saved_divider = clock_state.saved_divider;
+    startup_clock.saved_emi74 = clock_state.saved_emi74;
+    startup_clock.saved_emi1c = clock_state.saved_emi1c;
+    startup_clock.entry_hz = clock_state.entry_hz;
+}
+
+bool performance_clock_startup_complete(void)
+{
+    if (!startup_clock.begun) performance_clock_startup_begin();
+    if (startup_clock.completed) return startup_clock.final_ok;
+    startup_clock.before_final_hz = clock_state.supported ? cpu_hz() : 0U;
+    bool ok = selected_clock_matches();
+    /* A settled native startup boundary, not a retry in every frame. Keep
+     * the same fingerprint/mapping/idle guards as manual Apply. */
+    while (!ok && clock_state.supported && startup_clock.attempts < 2U) {
+        if (!clock_state.owned && startup_clock.entry_valid) {
+            clock_state.saved_pll = startup_clock.saved_pll;
+            clock_state.saved_divider = startup_clock.saved_divider;
+            clock_state.saved_emi74 = startup_clock.saved_emi74;
+            clock_state.saved_emi1c = startup_clock.saved_emi1c;
+            clock_state.entry_hz = startup_clock.entry_hz;
+            clock_state.owned = true;
+        }
+        ++startup_clock.attempts;
+        ok = performance_clock_start();
+    }
+    startup_clock.completed = true;
+    startup_clock.final_ok = ok;
+    startup_clock.final_status = clock_state.status;
+    startup_clock.final_hz = clock_state.supported ? cpu_hz() : 0U;
+    return ok;
 }
 
 bool performance_clock_restore(void)
@@ -309,6 +381,12 @@ void performance_clock_debug(FILE *file)
         fprintf(file, "performance_clock_native calls=%lu code_hash=%08lx emi74=%08lx emi1c=%08lx\n",
                 (unsigned long)clock_state.native_calls, (unsigned long)clock_state.native_hash,
                 (unsigned long)CLOCK_WORD(EMI_TIMING74), (unsigned long)CLOCK_WORD(EMI_TIMING1C));
+    if (startup_clock.begun)
+        fprintf(file, "performance_clock_startup first_ok=%u first_status=%d first_hz=%lu before_final_hz=%lu completed=%u attempts=%lu final_ok=%u final_status=%d final_hz=%lu entry_hz=%lu\n",
+                startup_clock.first_ok, startup_clock.first_status, (unsigned long)startup_clock.first_hz,
+                (unsigned long)startup_clock.before_final_hz, startup_clock.completed,
+                (unsigned long)startup_clock.attempts, startup_clock.final_ok, startup_clock.final_status,
+                (unsigned long)startup_clock.final_hz, (unsigned long)startup_clock.entry_hz);
 }
 
 /* Pending choices belong to this app session. Only the normal main() exit

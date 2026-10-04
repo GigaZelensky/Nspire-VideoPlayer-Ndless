@@ -523,7 +523,7 @@ yv12_to_yv12_c(uint8_t * y_dst, uint8_t * u_dst, uint8_t * v_dst,
 
 /* initialize rgb lookup tables */
 
-void
+int
 colorspace_init(void)
 {
 	int32_t i;
@@ -536,5 +536,5 @@ colorspace_init(void)
 		R_V_tab[i] = FIX_OUT(R_V_OUT) * (i - V_ADD_OUT);
 	}
 
-	init_yv12_to_rgb565_tables();
+	return init_yv12_to_rgb565_tables();
 }

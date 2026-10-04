@@ -429,7 +429,7 @@ void playback_capture_export(FILE *file, const Movie *movie)
     video_lookahead_get_stats(movie, &ahead);
     fprintf(
         file,
-        "decode_ahead lifetime=1 active=%u capacity=%u queued=%u peak_queued=%u bytes=%lu background_frames=%lu foreground_frames=%lu hits=%lu misses=%lu chunk_waits=%lu cancellations=%lu failures=%lu slices=%lu max_pump_us=%llu max_color_us=%llu max_background_pump_us=%llu max_background_color_us=%llu total_decode_us=%llu total_color_us=%llu partial=%u base_band_rows=%u background_slices_8=%lu background_slices_16=%lu background_slices_32=%lu color_rows_max=64 background_color_bands_16=%lu background_color_bands_32=%lu background_color_bands_64=%lu background_color_bands_tail=%lu background_slices_4=%lu max_background_tail_us=%llu color_tail_guard_us=%llu\n",
+        "decode_ahead lifetime=1 active=%u capacity=%u queued=%u peak_queued=%u bytes=%lu background_frames=%lu foreground_frames=%lu hits=%lu misses=%lu chunk_waits=%lu cancellations=%lu failures=%lu slices=%lu max_pump_us=%llu max_color_us=%llu max_background_pump_us=%llu max_background_color_us=%llu total_decode_us=%llu total_color_us=%llu partial=%u base_band_rows=%u background_slices_8=%lu background_slices_16=%lu background_slices_32=%lu color_rows_max=64 background_color_bands_16=%lu background_color_bands_32=%lu background_color_bands_64=%lu background_color_bands_tail=%lu background_slices_4=%lu max_background_tail_us=%llu color_tail_guard_us=%llu planar_frame_start_guard_us=%llu planar_chunk_start_guard_us=%llu rgb_repeat_frames=%lu rgb_ready=%u packed_ready=%u packed_capacity=%u packed_frames=%lu packed_copy_bands=%lu packed_copy_us=%llu max_packed_copy_us=%llu\n",
         ahead.active ? 1U : 0U, ahead.capacity, ahead.queued, ahead.peak_queued,
         (unsigned long)ahead.allocated_bytes, (unsigned long)ahead.background_frames,
         (unsigned long)ahead.foreground_frames, (unsigned long)ahead.queue_hits,
@@ -452,7 +452,29 @@ void playback_capture_export(FILE *file, const Movie *movie)
         (unsigned long)ahead.background_color_bands_tail, (unsigned long)ahead.background_slices_4,
         (unsigned long long)capture_ticks_to_us(ahead.max_background_tail_ticks,
                                                 g_capture->tick_hz),
-        (unsigned long long)capture_ticks_to_us(ahead.color_tail_guard_ticks, g_capture->tick_hz));
+        (unsigned long long)capture_ticks_to_us(ahead.color_tail_guard_ticks, g_capture->tick_hz),
+        (unsigned long long)capture_ticks_to_us(ahead.planar_frame_start_guard_ticks, g_capture->tick_hz),
+        (unsigned long long)capture_ticks_to_us(ahead.planar_chunk_start_guard_ticks, g_capture->tick_hz),
+        (unsigned long)ahead.rgb_repeat_frames,
+        ahead.rgb_ready, ahead.packed_ready, ahead.packed_capacity,
+        (unsigned long)ahead.packed_frames, (unsigned long)ahead.packed_copy_bands,
+        (unsigned long long)capture_ticks_to_us(ahead.packed_copy_ticks, g_capture->tick_hz),
+        (unsigned long long)capture_ticks_to_us(ahead.max_packed_copy_ticks, g_capture->tick_hz));
+    if (ahead.captured_planar_pumps) {
+        fprintf(file,
+            "decode_ahead_planar_pumps scope=active_capture_periods_for_movie unit=ctu_or_superblock timing=whole_pump_including_row_frame_finish samples=%lu max_pump_including_submission_us=%llu max_pump_decoded_units=%lu max_pump_unit_equiv16=%lu max_pump_had_submission=%u single_no_submit_samples=%lu max_single_unit_no_submission_us=%llu multi_no_submit_samples=%lu max_multi_unit_no_submission_us=%llu submission_samples=%lu max_submission_inclusive_us=%llu max_submission_decoded_units=%lu\n",
+            (unsigned long)ahead.captured_planar_pumps,
+            (unsigned long long)capture_ticks_to_us(ahead.captured_max_pump_ticks, g_capture->tick_hz),
+            (unsigned long)ahead.captured_max_pump_units,
+            (unsigned long)ahead.captured_max_pump_unit_mbs, ahead.captured_max_pump_submission ? 1U : 0U,
+            (unsigned long)ahead.captured_single_no_submit_pumps,
+            (unsigned long long)capture_ticks_to_us(ahead.captured_max_single_no_submit_ticks, g_capture->tick_hz),
+            (unsigned long)ahead.captured_multi_no_submit_pumps,
+            (unsigned long long)capture_ticks_to_us(ahead.captured_max_multi_no_submit_ticks, g_capture->tick_hz),
+            (unsigned long)ahead.captured_submission_pumps,
+            (unsigned long long)capture_ticks_to_us(ahead.captured_max_submission_ticks, g_capture->tick_hz),
+            (unsigned long)ahead.captured_max_submission_units);
+    }
     fprintf(file, "decode_ahead_recovery completed=%lu replayed_frames=%lu failed_frame=%lu visible_frame=%lu queued_at_failure=%lu chunk=%d reason=%s\n",
         (unsigned long)ahead.recoveries, (unsigned long)ahead.recovery_frames,
         (unsigned long)ahead.failed_frame, (unsigned long)ahead.failure_visible_frame,
@@ -479,6 +501,12 @@ void playback_capture_export(FILE *file, const Movie *movie)
             (unsigned long long)movie->hevc.decoded_ctus,
             hevc_ctu_size(movie->hevc.decoder), movie->hevc.decoder_failed ? 1U : 0U,
             (unsigned long)hevc_working_memory_size(), hevc_external_memory(movie->hevc.decoder) ? 1U : 0U);
+    if (NDVIDEO_WITH_AV1 && movie && movie->codec == MOVIE_CODEC_AV1)
+        fprintf(file, "av1 submitted_frames=%llu decoded_blocks=%llu block_size=%u failed=%u workspace_bytes=%lu workspace_sram=%u\n",
+            (unsigned long long)movie->av1.submitted_frames,
+            (unsigned long long)movie->av1.decoded_blocks,
+            av1_block_size(movie->av1.decoder), movie->av1.decoder_failed ? 1U : 0U,
+            (unsigned long)av1_working_memory_size(), av1_external_memory(movie->av1.decoder) ? 1U : 0U);
     fprintf(file,
             "platform_features screen_power_profile=%u standby_profile=%u async_writer_profile=%u detection=driver_code_and_mapping\n",
             native_screen_power_supported() ? 1U : 0U, native_standby_supported() ? 1U : 0U,
@@ -566,7 +594,7 @@ void playback_capture_export(FILE *file, const Movie *movie)
         (unsigned long long)g_capture->io_overwritten,
         (unsigned long)g_capture->interval_overflows);
     fputs(
-        "capture_notes: due is the scheduled render-start time; smooth mode decodes ahead of due and waits before rendering, skip mode retains clock-driven decoding. over_one_frame_budget means present>=due+interval. Stage times are inclusive: IO/color overlap decode, IO overlaps prefetch, night/LCD overlap render. Background decode/color are reported separately in decode_ahead_us/color_ahead_us and overlap wait; frame/chunk identify presentation, not the decoder horizon. wait_input_us is nested in wait, and wait_touchpad_us is nested in wait_input; their timing counts measure actual wait polls and touchpad bus scans. writer_service_us measures explicit after-present/paused service. wait_io_service_us measures explicit roomy-wait I/O turns and overlaps wait; additional implicit idle work remains inside wait. Foreground H264 color conversion has a separate stage; MPEG4 conversion remains inside decode. Rows sum work since the preceding scheduled presentation; UI-only renders are included in render timing but excluded from effective FPS. Settings transitions reset row accumulators, not totals. Bookkeeping/text_format are measured overhead subsets; timer-read/cache overhead is not calibrated. Frame details retain lag windows in bounded RAM until export; gaps between windows are intentionally omitted, and lifetime totals cover the full recording; D also enables the separate asynchronous recovery journal.\n",
+        "capture_notes: due is the scheduled render-start time; smooth mode decodes ahead of due and waits before rendering, skip mode retains clock-driven decoding. over_one_frame_budget means present>=due+interval. Stage times are inclusive: IO/color overlap decode, IO overlaps prefetch, night/LCD overlap render. Background decode/color are reported separately in decode_ahead_us/color_ahead_us and overlap wait; frame/chunk identify presentation, not the decoder horizon. wait_input_us is nested in wait, and wait_touchpad_us is nested in wait_input; their timing counts measure actual wait polls and touchpad bus scans. writer_service_us measures explicit after-present/paused service. wait_io_service_us measures explicit roomy-wait I/O turns and overlaps wait; additional implicit idle work remains inside wait. Foreground H264 color conversion has a separate stage; MPEG4 conversion remains inside decode. For compact HEVC/AV1, ahead depths and queued include RGB plus owned YUV; rgb_ready is immediately displayable. packed_copy totals include foreground and background queue preparation. Rows sum work since the preceding scheduled presentation; UI-only renders are included in render timing but excluded from effective FPS. Settings transitions reset row accumulators, not totals. Bookkeeping/text_format are measured overhead subsets; timer-read/cache overhead is not calibrated. Frame details retain lag windows in bounded RAM until export; gaps between windows are intentionally omitted, and lifetime totals cover the full recording; D also enables the separate asynchronous recovery journal.\n",
         file);
     fputs(
         "frame_flags: 1=presented 2=settings_or_pause_transition 4=timing_saturated 8=night_enabled 16=frame_skip_enabled 32=lag_event\n",

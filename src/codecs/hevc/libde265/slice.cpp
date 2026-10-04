@@ -2371,73 +2371,6 @@ static inline int decode_significant_coeff_flag_lookup(thread_context* tctx,
 
 
 
-static inline int decode_coeff_abs_level_greater1(thread_context* tctx,
-                                                  int cIdx, int i,
-                                                  bool firstCoeffInSubblock,
-                                                  bool firstSubblock,
-                                                  int  lastSubblock_greater1Ctx,
-                                                  int* lastInvocation_greater1Ctx,
-                                                  int* lastInvocation_coeff_abs_level_greater1_flag,
-                                                  int* lastInvocation_ctxSet, int c1)
-{
-  logtrace(LogSlice,"# coeff_abs_level_greater1\n");
-
-  logtrace(LogSlice,"  cIdx:%d i:%d firstCoeffInSB:%d firstSB:%d lastSB>1:%d last>1Ctx:%d lastLev>1:%d lastCtxSet:%d\n", cIdx,i,firstCoeffInSubblock,firstSubblock,lastSubblock_greater1Ctx,
-	   *lastInvocation_greater1Ctx,
-	   *lastInvocation_coeff_abs_level_greater1_flag,
-	   *lastInvocation_ctxSet);
-
-  int lastGreater1Ctx;
-  int greater1Ctx;
-  int ctxSet;
-
-  logtrace(LogSlice,"c1: %d\n",c1);
-
-  if (firstCoeffInSubblock) {
-    // block with real DC -> ctx 0
-    if (i==0 || cIdx>0) { ctxSet=0; }
-    else { ctxSet=2; }
-
-    if (firstSubblock) { lastGreater1Ctx=1; }
-    else { lastGreater1Ctx = lastSubblock_greater1Ctx; }
-
-    if (lastGreater1Ctx==0) { ctxSet++; }
-
-    logtrace(LogSlice,"ctxSet: %d\n",ctxSet);
-
-    greater1Ctx=1;
-  }
-  else { // !firstCoeffInSubblock
-    ctxSet = *lastInvocation_ctxSet;
-    logtrace(LogSlice,"ctxSet (old): %d\n",ctxSet);
-
-    greater1Ctx = *lastInvocation_greater1Ctx;
-    if (greater1Ctx>0) {
-      int lastGreater1Flag=*lastInvocation_coeff_abs_level_greater1_flag;
-      if (lastGreater1Flag==1) greater1Ctx=0;
-      else { /*if (greater1Ctx>0)*/ greater1Ctx++; }
-    }
-  }
-
-  ctxSet = c1; // use HM algo
-
-  int ctxIdxInc = (ctxSet*4) + (greater1Ctx>=3 ? 3 : greater1Ctx);
-
-  if (cIdx>0) { ctxIdxInc+=16; }
-
-  int bit = decode_CABAC_bit(&tctx->cabac_decoder,
-                             &tctx->ctx_model[CONTEXT_MODEL_COEFF_ABS_LEVEL_GREATER1_FLAG + ctxIdxInc]);
-
-  *lastInvocation_greater1Ctx = greater1Ctx;
-  *lastInvocation_coeff_abs_level_greater1_flag = bit;
-  *lastInvocation_ctxSet = ctxSet;
-
-  //logtrace(LogSymbols,"$1 coeff_abs_level_greater1=%d\n",bit);
-
-  return bit;
-}
-
-
 static int decode_coeff_abs_level_greater2(thread_context* tctx,
 					   int cIdx, // int i,int n,
 					   int ctxSet)
@@ -3044,7 +2977,19 @@ int residual_coding(thread_context* tctx,
   logtrace(LogSlice,"LastSignificantCoeff: x=%d;y=%d\n",LastSignificantCoeffX,LastSignificantCoeffY);
 
   const position* ScanOrderSub = get_scan_order(log2TrafoSize-2, scanIdx);
+#ifdef DE265_LOG_TRACE
   const position* ScanOrderPos = get_scan_order(2, scanIdx);
+#endif
+  // Raster offsets of each 4x4 scan position at transform strides 4/8/16/32.
+  // Both significance lookup and coefficient output use the same position.
+  static const uint8_t scanOffsets[4][3][16] = {
+    {{0,4,1,8,5,2,12,9,6,3,13,10,7,14,11,15},{0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15},{0,4,8,12,1,5,9,13,2,6,10,14,3,7,11,15}},
+    {{0,8,1,16,9,2,24,17,10,3,25,18,11,26,19,27},{0,1,2,3,8,9,10,11,16,17,18,19,24,25,26,27},{0,8,16,24,1,9,17,25,2,10,18,26,3,11,19,27}},
+    {{0,16,1,32,17,2,48,33,18,3,49,34,19,50,35,51},{0,1,2,3,16,17,18,19,32,33,34,35,48,49,50,51},{0,16,32,48,1,17,33,49,2,18,34,50,3,19,35,51}},
+    {{0,32,1,64,33,2,96,65,34,3,97,66,35,98,67,99},{0,1,2,3,32,33,34,35,64,65,66,67,96,97,98,99},{0,32,64,96,1,33,65,97,2,34,66,98,3,35,67,99}},
+  };
+  const uint8_t* ScanOffsetPos = scanOffsets[log2TrafoSize-2][scanIdx];
+
 
   logtrace(LogSlice,"ScanOrderPos: ");
   for (int n=0;n<4*4;n++)
@@ -3054,7 +2999,6 @@ int residual_coding(thread_context* tctx,
 
   // --- find last sub block and last scan pos ---
 
-  int xC,yC;
 
   scan_position lastScanP = get_scan_position(LastSignificantCoeffX, LastSignificantCoeffY,
                                               scanIdx, log2TrafoSize);
@@ -3069,23 +3013,23 @@ int residual_coding(thread_context* tctx,
   memset(coded_sub_block_neighbors,0,sbWidth*sbWidth);
 
   int  c1 = 1;
-  bool firstSubblock = true;           // for coeff_abs_level_greater1_flag context model
-  int  lastSubblock_greater1Ctx=false; /* for coeff_abs_level_greater1_flag context model
-                                          (initialization not strictly needed)
-                                       */
 
 #ifdef DE265_LOG_TRACE
   int16_t TransCoeffLevel[32 * 32];
   memset(TransCoeffLevel,0, sizeof(uint16_t)*32*32);
 #endif
 
-  int CoeffStride = 1<<log2TrafoSize;
 
-  int  lastInvocation_greater1Ctx=0;
-  int  lastInvocation_coeff_abs_level_greater1_flag=0;
-  int  lastInvocation_ctxSet=0;
-
-
+  // These decisions remain fixed for every coefficient sub-block in this TU.
+  bool allowSignHiding=pps.sign_data_hiding_flag &&
+    !tctx->cu_transquant_bypass_flag && !tctx->explicit_rdpcm_flag;
+  if (allowSignHiding && PredMode==MODE_INTRA &&
+      sps.range_extension.implicit_rdpcm_enabled_flag && tctx->transform_skip_flag[cIdx]) {
+    const IntraPredMode mode=cIdx ? img->get_IntraPredModeC(x0,y0) : img->get_IntraPredMode(x0,y0);
+    if (mode==10 || mode==26) allowSignHiding=false;
+  }
+  const int fixedSignificanceContext=(sps.range_extension.transform_skip_context_enabled_flag &&
+    (tctx->cu_transquant_bypass_flag || tctx->transform_skip_flag[cIdx])) ? (cIdx ? 43 : 42) : -1;
 
   // ----- decode coefficients -----
 
@@ -3100,6 +3044,7 @@ int residual_coding(thread_context* tctx,
 
   for (int i=lastSubBlock;i>=0;i--) {
     position S = ScanOrderSub[i];
+    const int subBlockOffset=(S.x<<2)+(S.y<<(log2TrafoSize+2));
     int inferSbDcSigCoeffFlag=0;
 
     logtrace(LogSlice,"sub block scan idx: %d\n",i);
@@ -3136,8 +3081,6 @@ int residual_coding(thread_context* tctx,
 
 
     if (sub_block_is_coded) {
-      int x0 = S.x<<2;
-      int y0 = S.y<<2;
 
       int log2w = log2TrafoSize-2;
       int prevCsbf = coded_sub_block_neighbors[S.x+S.y*sbWidth];
@@ -3160,21 +3103,16 @@ int residual_coding(thread_context* tctx,
       // --- decode all coefficients' significant_coeff flags except for the DC coefficient ---
 
       for (int n= last_coeff ; n>0 ; n--) {
-        int subX = ScanOrderPos[n].x;
-        int subY = ScanOrderPos[n].y;
-        xC = x0 + subX;
-        yC = y0 + subY;
 
 
         // for all AC coefficients in sub-block, a significant_coeff flag is coded
 
         int ctxInc;
-        if (sps.range_extension.transform_skip_context_enabled_flag &&
-            (tctx->cu_transquant_bypass_flag || tctx->transform_skip_flag[cIdx])) {
-          ctxInc = ( cIdx == 0 ) ? 42 : (16+27);
+        if (fixedSignificanceContext>=0) {
+          ctxInc=fixedSignificanceContext;
         }
         else {
-          ctxInc = ctxIdxMap[xC+(yC<<log2TrafoSize)];
+          ctxInc = ctxIdxMap[subBlockOffset+ScanOffsetPos[n]];
         }
 
         logtrace(LogSlice,"trafoSize: %d\n",1<<log2TrafoSize);
@@ -3200,12 +3138,11 @@ int residual_coding(thread_context* tctx,
             // if we cannot infert the DC coefficient, it is coded
 
             int ctxInc;
-            if (sps.range_extension.transform_skip_context_enabled_flag &&
-                (tctx->cu_transquant_bypass_flag || tctx->transform_skip_flag[cIdx])) {
-              ctxInc = ( cIdx == 0 ) ? 42 : (16+27);
+            if (fixedSignificanceContext>=0) {
+              ctxInc=fixedSignificanceContext;
             }
             else {
-              ctxInc = ctxIdxMap[x0+(y0<<log2TrafoSize)];
+              ctxInc = ctxIdxMap[subBlockOffset];
             }
 
             int significant_coeff = decode_significant_coeff_flag_lookup(tctx, ctxInc);
@@ -3257,14 +3194,10 @@ int residual_coding(thread_context* tctx,
 
       int lastGreater1Coefficient = libde265_min(8,nCoefficients);
       for (int c=0;c<lastGreater1Coefficient;c++) {
-        int greater1_flag =
-          decode_coeff_abs_level_greater1(tctx, cIdx,i,
-                                          c==0,
-                                          firstSubblock,
-                                          lastSubblock_greater1Ctx,
-                                          &lastInvocation_greater1Ctx,
-                                          &lastInvocation_coeff_abs_level_greater1_flag,
-                                          &lastInvocation_ctxSet, ctxSet);
+        // c1 is the capped greater1 context, updated after each decoded flag.
+        int greater1_flag = decode_CABAC_bit(&tctx->cabac_decoder,
+          &tctx->ctx_model[CONTEXT_MODEL_COEFF_ABS_LEVEL_GREATER1_FLAG +
+                          (cIdx ? 16 : 0) + 4*ctxSet + c1]);
 
         if (greater1_flag) {
           coeff_meta[c]+=0x10;
@@ -3284,44 +3217,21 @@ int residual_coding(thread_context* tctx,
         }
       }
 
-      firstSubblock = false;
-      lastSubblock_greater1Ctx = lastInvocation_greater1Ctx;
 
 
       // --- decode greater-2 flag ---
 
       if (newLastGreater1ScanPos != -1) {
-        int flag = decode_coeff_abs_level_greater2(tctx,cIdx, lastInvocation_ctxSet);
+        int flag = decode_coeff_abs_level_greater2(tctx,cIdx, ctxSet);
         coeff_meta[newLastGreater1ScanPos] += flag ? 0x10 : -0x40;
       }
 
 
       // --- decode coefficient signs ---
 
-      int signHidden;
-
-
-      IntraPredMode predModeIntra;
-      if (cIdx==0) predModeIntra = img->get_IntraPredMode(x0,y0);
-      else         predModeIntra = img->get_IntraPredModeC(x0,y0);
-
-
-      if (tctx->cu_transquant_bypass_flag ||
-          (PredMode == MODE_INTRA &&
-           sps.range_extension.implicit_rdpcm_enabled_flag &&
-           tctx->transform_skip_flag[cIdx] &&
-           ( predModeIntra == 10 || predModeIntra == 26 )) ||
-          tctx->explicit_rdpcm_flag)
-        {
-          signHidden = 0;
-        }
-      else
-        {
-          signHidden = ((coeff_meta[0]&15)-(coeff_meta[nCoefficients-1]&15) > 3);
-        }
-
-
-      const int numSigns=nCoefficients-((pps.sign_data_hiding_flag && signHidden)?1:0);
+      const bool signHidden=allowSignHiding &&
+        ((coeff_meta[0]&15)-(coeff_meta[nCoefficients-1]&15) > 3);
+      const int numSigns=nCoefficients-signHidden;
       uint32_t signs=0;
       if (numSigns>=4) signs=decode_CABAC_bypass_group(&tctx->cabac_decoder,numSigns);
       else {
@@ -3395,7 +3305,7 @@ int residual_coding(thread_context* tctx,
         }
         signs<<=1;
 
-        if (pps.sign_data_hiding_flag && signHidden) {
+        if (signHidden) {
           sumAbsLevel += currCoeff;
 
           if (n==nCoefficients-1 && (sumAbsLevel & 1)) {
@@ -3411,11 +3321,9 @@ int residual_coding(thread_context* tctx,
 
         // put coefficient in list
         int p = coeff_meta[n]&15;
-        xC = (S.x<<2) + ScanOrderPos[p].x;
-        yC = (S.y<<2) + ScanOrderPos[p].y;
 
         outputValues[outputCount] = currCoeff;
-        outputPositions[outputCount] = xC + yC*CoeffStride;
+        outputPositions[outputCount] = subBlockOffset+ScanOffsetPos[p];
         outputCount++;
 
         //printf("%d ",currCoeff);
@@ -4745,6 +4653,10 @@ enum DecodeResult decode_substream(thread_context* tctx,
 
     // Ndless: every call reconstructs at most its caller's CTU budget.
     if (tctx->decctx->ctu_budget == 0) return Decode_Yield;
+    // A CTU is indivisible: observe time only at a resumable CTU boundary.
+    if (tctx->decctx->ctu_clock &&
+        tctx->decctx->ctu_clock() >= tctx->decctx->ctu_deadline_ticks)
+      return Decode_Yield;
     --tctx->decctx->ctu_budget;
     ++tctx->decctx->step_ctus;
     ++tctx->decctx->picture_ctus_done;

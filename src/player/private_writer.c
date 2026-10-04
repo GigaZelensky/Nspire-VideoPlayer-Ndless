@@ -137,6 +137,41 @@ static bool guards(const PrivateWriter *writer)
             return false;
     return true;
 }
+static void record_error(PrivateWriter *writer, unsigned error)
+{
+    writer->error = error;
+    if (!writer->have_first_failure) {
+        writer->have_first_failure = true;
+        writer->first_failure_resume = writer->resumes;
+    }
+}
+
+static uint32_t observe_dispatches(PrivateWriter *writer, uint32_t *total)
+{
+    uint32_t current = WORD(writer->task + 0x1CU);
+    uint32_t delta = current - writer->dispatch_start;
+    writer->dispatch_start = current;
+    /* Counter subtraction permits wrap; the accumulated fault must not wrap
+     * back to zero and make an earlier active-slice violation disappear. */
+    if (delta)
+        *total = delta > UINT32_MAX - *total ? UINT32_MAX : *total + delta;
+    return delta;
+}
+
+bool private_writer_observe_inactive(PrivateWriter *writer)
+{
+    if (!writer || !writer->initialized || writer->running || executing)
+        return false;
+    unsigned saved = lock();
+    /* Observe only our still-current task. No SPI access or writer resume is
+     * needed; a reader may own an in-flight command while checking its view. */
+    bool valid = WORD(TASK_POINTER) == writer->task;
+    if (valid && observe_dispatches(writer, &writer->inactive_dispatches))
+        storage_mutation_invalidate();
+    unlock(saved);
+    return valid && !writer->error;
+}
+
 static void transfer(PrivateWriter *writer)
 {
     uint32_t elapsed = writer->slice_start - counter();
@@ -148,7 +183,7 @@ static void transfer(PrivateWriter *writer)
     }
     if (WORD(TASK_POINTER) != writer->task)
         ++writer->task_changes;
-    writer->dispatch_delta = WORD(writer->task + 0x1CU) - writer->dispatch_start;
+    observe_dispatches(writer, &writer->dispatch_delta);
     stack_get(writer->task, writer->worker_stack);
     if (writer->worker_stack[3] < writer->minimum_stack_remaining)
         writer->minimum_stack_remaining = writer->worker_stack[3];
@@ -226,7 +261,7 @@ static void entry(void *argument)
     PrivateWriter *writer = argument;
     writer->job(writer->argument);
     if (WORD(writer->task + 0x38U) || !spi_idle())
-        writer->error = PW_UNSAFE_RETURN;
+        record_error(writer, PW_UNSAFE_RETURN);
     writer->done = true;
     writer->pending = false;
     transfer(writer);
@@ -346,6 +381,7 @@ unsigned private_writer_init(PrivateWriter *writer, void *stack, size_t bytes)
     writer->stack_bytes = (uint32_t)bytes;
     writer->native_errno = native_errno;
     writer->minimum_stack_remaining = (uint32_t)bytes;
+    writer->dispatch_start = WORD(task + 0x1CU);
     writer->initialized = true;
     error = PW_OK;
 finish:
@@ -381,7 +417,7 @@ unsigned private_writer_submit(PrivateWriter *writer, void (*job)(void *), void 
     writer->worker_errno = 0;
     writer->done = false;
     writer->pending = true;
-    writer->dispatch_start = WORD(writer->task + 0x1CU);
+    (void)private_writer_observe_inactive(writer);
     return PW_OK;
 }
 bool private_writer_step(PrivateWriter *writer, uint32_t budget_ticks)
@@ -389,12 +425,28 @@ bool private_writer_step(PrivateWriter *writer, uint32_t budget_ticks)
     if (!writer || !writer->initialized || !writer->pending || executing || !budget_ticks)
         return false;
     unsigned saved = lock();
-    if (WORD(TASK_POINTER) != writer->task || WORD(writer->task + 0x38U) ||
-        WORD(writer->spi_device + 112U) != writer->original_callback || !spi_idle()) {
-        writer->error = PW_STATE_CHANGED;
+    uint32_t precondition = 0;
+    if (WORD(TASK_POINTER) != writer->task)
+        precondition = PW_PRECONDITION_TASK;
+    else if (WORD(writer->task + 0x38U))
+        precondition = PW_PRECONDITION_PROTECTED;
+    else if (WORD(writer->spi_device + 112U) != writer->original_callback)
+        precondition = PW_PRECONDITION_CALLBACK;
+    else if (!spi_idle())
+        precondition = PW_PRECONDITION_SPI_BUSY;
+    if (precondition) {
+        writer->precondition_failures |= precondition;
+        record_error(writer, PW_STATE_CHANGED);
         storage_mutation_invalidate();
         unlock(saved);
         return false;
+    }
+    /* Scheduling while the private stack is inactive is permitted. Rebase
+     * under the lock so transfer measures only this protected slice. */
+    if (observe_dispatches(writer, &writer->inactive_dispatches)) {
+        /* The OS may have written NAND while our SPI observer was absent.
+         * Invalidate once for this new interval, without latching a fault. */
+        storage_mutation_invalidate();
     }
     stack_get(writer->task, writer->original_stack);
     writer->foreground_errno = *writer->native_errno;
@@ -408,9 +460,9 @@ bool private_writer_step(PrivateWriter *writer, uint32_t budget_ticks)
     ++writer->resumes;
     private_context_swap(&writer->foreground_sp, writer->worker_sp);
     if (!guards(writer))
-        writer->error = PW_STACK_CORRUPT;
+        record_error(writer, PW_STACK_CORRUPT);
     if (writer->dispatch_delta || writer->mask_changes || writer->task_changes)
-        writer->error = PW_STATE_CHANGED;
+        record_error(writer, PW_STATE_CHANGED);
     if (writer->error)
         storage_mutation_invalidate();
     unlock(saved);
