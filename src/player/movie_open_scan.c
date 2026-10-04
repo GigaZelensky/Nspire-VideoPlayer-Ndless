@@ -222,11 +222,13 @@ fail:
     return false;
 }
 
-bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progress)
+bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progress,
+    MovieCodec *missing_codec)
 {
     size_t framebuffer_words;
     long file_size;
 
+    if (missing_codec) *missing_codec = MOVIE_CODEC_UNKNOWN;
     if (!movie) {
         return false;
     }
@@ -271,10 +273,11 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
     movie->codec = movie_codec_from_header(&movie->header);
     movie->codec_ops = movie_codec_ops(movie->codec);
     if (!movie->codec_ops) {
-        if (movie->codec != MOVIE_CODEC_UNKNOWN)
-            debug_failf("%s codec not included in this build. Use _ndvideo.tns.",
+        if (movie->codec != MOVIE_CODEC_UNKNOWN) {
+            if (missing_codec) *missing_codec = movie->codec;
+            debug_failf("%s codec not included in this build.",
                 movie_codec_name(movie->codec));
-        else
+        } else
             debug_failf("open failed: unsupported version=%u flags=0x%04x",
                 (unsigned)movie->header.version, (unsigned)movie->header.flags);
         goto fail;

@@ -142,6 +142,13 @@ int main(int argc, char **argv)
          * and on return to the picker. Never carry a key into the next video. */
         movie_crypto_clear();
         argc = 1;
+        if (result == PLAY_MOVIE_RESULT_ERROR && player_message_pending()) {
+            /* Movie cleanup has finished. Let the picker show the error over
+             * its own scene, without retrying a direct launch or auto-next. */
+            have_queued_movie = false;
+            queued_movie_path[0] = '\0';
+            continue;
+        }
         if (result == PLAY_MOVIE_RESULT_AUTO_NEXT ||
             result == PLAY_MOVIE_RESULT_SWITCH_MOVIE) {
             have_queued_movie = true;

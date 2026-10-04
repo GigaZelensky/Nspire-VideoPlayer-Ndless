@@ -395,13 +395,14 @@ int play_movie(
 #if NDVIDEO_CODEC_MODULES
     codec_modules_set_progress(codec_loading_progress, &loading_progress);
 #endif
-    bool movie_loaded = load_movie(path, &movie, &loading_progress);
+    MovieCodec missing_codec = MOVIE_CODEC_UNKNOWN;
+    bool movie_loaded = load_movie(path, &movie, &loading_progress, &missing_codec);
 #if NDVIDEO_CODEC_MODULES
     codec_modules_set_progress(NULL, NULL);
 #endif
     if (!movie_loaded) {
         finish_loading_transition(screen, &loading_snapshot, fonts, "Loading");
-        report_movie_open_failure(path);
+        report_movie_open_failure(path, missing_codec);
         return -1;
     }
     if (load_history_store(path, &startup_history)) {

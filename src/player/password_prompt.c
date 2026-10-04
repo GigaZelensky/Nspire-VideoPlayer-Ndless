@@ -96,7 +96,8 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
         if (read < 4 || memcmp(prefix, "NVE1", 4)) return 1;
         if (read != sizeof(prefix) || bytes < 0 || (uint64_t)bytes > INT32_MAX ||
             !nve_header_parse(&header, prefix, (uint32_t)bytes)) {
-            show_msgbox("Encrypted video", "The encrypted header is damaged or unsupported.");
+            debug_failf("The encrypted header is damaged or unsupported.");
+            report_movie_open_failure(path, MOVIE_CODEC_UNKNOWN);
             return 0;
         }
     }
@@ -106,7 +107,8 @@ int unlock_movie_prompt(SDL_Surface *screen, const Fonts *fonts, const char *pat
     if (!background || !kdf) {
         if (background) SDL_FreeSurface(background);
         free(kdf);
-        show_msgbox("Encrypted video", "Not enough memory to unlock the video.");
+        debug_failf("Not enough memory to unlock the video.");
+        report_movie_open_failure(path, MOVIE_CODEC_UNKNOWN);
         return 0;
     }
     char password[NVE_PASSWORD_MAX + 1] = {0};

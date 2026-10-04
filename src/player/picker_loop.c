@@ -26,6 +26,13 @@ static void draw_unlock_backdrop(SDL_Surface *screen, void *context, uint32_t cl
         PICKER_EXIT_INACTIVE, 0, NULL, 0, false);
 }
 
+static void draw_message_backdrop(SDL_Surface *screen, void *context, uint32_t closing_elapsed_ms)
+{
+    PickerUnlockBackdrop *view = context;
+    view->scene_ms = monotonic_clock_now_ms();
+    draw_unlock_backdrop(screen, context, closing_elapsed_ms);
+}
+
 int pick_movie(
     SDL_Surface *screen,
     const Fonts *fonts,
@@ -124,6 +131,56 @@ int pick_movie(
     picker_tooltip_hover_reset(&tooltip_hover);
     intro_started_ms = monotonic_clock_now_ms();
     while (1) {
+        PlayerMessage message;
+        if (take_player_message(&message)) {
+            /* Recoverable errors return here after movie/key cleanup. Draw
+             * the actual picker rather than capturing the black loading
+             * screen or allocating another full-screen snapshot. */
+            movie_picker_timing_stop();
+            cleanup_deferred_playback_movie();
+            deferred_movie_cleanup_done = true;
+            size_t draw_start;
+            int draw_offset;
+            uint32_t message_now = monotonic_clock_now_ms();
+            picker_scroll_anim_view(&scroll_anim, scroll_start, message_now, &draw_start, &draw_offset);
+            PickerUnlockBackdrop backdrop = {
+                .fonts = fonts, .files = files, .count = count,
+                .scroll_start = draw_start, .scroll_offset_y = draw_offset,
+                .selected = selected, .previous_selected = previous_selected,
+                .selection_started_ms = selection_anim_started_ms,
+                .selected_mix = selected_start_mix, .previous_mix = previous_start_mix,
+                .pressed_row = pressed_row_index, .pressed_resume = pressed_resume_badge_index,
+                .initial_press_mix = picker_press_anim.current_mix,
+                .scene_ms = message_now, .intro_started_ms = intro_started_ms,
+                .pointer = pointer, .preview = &screenshot_preview
+            };
+            backdrop.pointer.visible = false;
+            int message_result = show_player_message(screen, fonts, &pointer, &message,
+                directory, draw_message_backdrop, &backdrop);
+            if (message_result) {
+                clear_screenshot_preview(&screenshot_preview);
+                movie_picker_cache_remember_position(&g_picker_cache, count, selected, scroll_start);
+                return message_result;
+            }
+            /* The acknowledgement belongs only to the dialog. Held keys or
+             * a center click must not launch the selected video a second time. */
+            pointer.press_edge = pointer.release_edge = false;
+            pointer_hover_guard_lock(&hover_guard, &pointer);
+            picker_tooltip_hover_reset(&tooltip_hover);
+            prev_up = isKeyPressed(KEY_NSPIRE_UP); prev_down = isKeyPressed(KEY_NSPIRE_DOWN);
+            prev_left = isKeyPressed(KEY_NSPIRE_LEFT); prev_right = isKeyPressed(KEY_NSPIRE_RIGHT);
+            prev_enter = isKeyPressed(KEY_NSPIRE_ENTER); prev_esc = isKeyPressed(KEY_NSPIRE_ESC);
+            prev_scratchpad = isKeyPressed(KEY_NSPIRE_SCRATCHPAD); prev_on = on_key_pressed();
+            prev_c = isKeyPressed(KEY_NSPIRE_C); prev_s = isKeyPressed(KEY_NSPIRE_S);
+            prev_2 = isKeyPressed(KEY_NSPIRE_2); prev_4 = isKeyPressed(KEY_NSPIRE_4);
+            prev_5 = isKeyPressed(KEY_NSPIRE_5); prev_6 = isKeyPressed(KEY_NSPIRE_6);
+            prev_8 = isKeyPressed(KEY_NSPIRE_8);
+            pressed_row_index = pressed_resume_badge_index = -1;
+            pressed_selected_fallback = picker_press_canceled = keyboard_resume_focused = false;
+            enter_press_stage = key_scroll_direction = hover_scroll_direction = 0;
+            ui_transition_init(&picker_press_anim, false);
+            continue;
+        }
         screenshot_preview_tick(&screenshot_preview, monotonic_clock_now_ms());
         bool pointer_click = pointer_update(&pointer);
         if (clock_menu_poll(screen, fonts, NULL, &pointer, true, directory)) {

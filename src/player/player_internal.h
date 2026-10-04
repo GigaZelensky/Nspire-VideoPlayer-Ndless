@@ -752,7 +752,8 @@ int player_touchpad_scan(touchpad_report_t *report);
 bool player_touchpad_button_down(void);
 bool player_key_pressed(t_key key);
 bool on_key_pressed_edge(bool *previous_state);
-bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progress);
+bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progress,
+    MovieCodec *missing_codec);
 void ensure_movie_picker_cache(MoviePickerCache *cache, const char *directory);
 bool find_next_movie_path(const char *current_path, char *next_path, size_t next_path_size);
 bool find_previous_movie_path(const char *current_path, char *previous_path, size_t previous_path_size);
@@ -984,6 +985,19 @@ void report_app_failure(const char *app_path, const char *reason, const char *me
 void show_pending_movie_error(void);
 void debug_log_sram_status(void);
 
+/* system_message.c */
+typedef struct {
+    char title[48];
+    char text[192];
+} PlayerMessage;
+typedef void (*MessageBackdropDraw)(SDL_Surface *, void *, uint32_t closing_elapsed_ms);
+void queue_player_message(const char *title, const char *text);
+bool player_message_pending(void);
+bool take_player_message(PlayerMessage *message);
+int show_player_message(SDL_Surface *screen, const Fonts *fonts, PointerState *pointer,
+    const PlayerMessage *message, const char *directory,
+    MessageBackdropDraw draw_backdrop, void *backdrop_context);
+
 /* picker_loop.c */
 int pick_movie( SDL_Surface *screen, const Fonts *fonts, const char *directory, char *selected_path, size_t selected_size, bool *resume_without_prompt );
 
@@ -1110,7 +1124,7 @@ PrefetchedChunk *find_farthest_prefetched_chunk(Movie *movie);
 bool ensure_prefetch_budget(Movie *movie, int requested_chunk, size_t required_bytes);
 void debug_log_path_for_movie(const char *movie_path, char *log_path, size_t log_path_size);
 void report_movie_decode_failure(Movie *movie, const char *movie_path, const char *reason);
-void report_movie_open_failure(const char *movie_path);
+void report_movie_open_failure(const char *movie_path, MovieCodec missing_codec);
 uint16_t read_le16(const uint8_t *src);
 uint32_t read_le32(const uint8_t *src);
 char *dup_string(const char *src);

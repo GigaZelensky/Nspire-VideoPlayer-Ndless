@@ -278,7 +278,8 @@ Every two- and three-codec combination is included too, named in the same
 order: for example, `_ndvideo-h264-hevc-av1.tns`.
 
 The smaller builds have the same controls and features. A video needing an
-omitted codec shows a message identifying the missing support. Movies use the
+omitted codec shows an in-player message naming it; OK returns to the menu,
+including when the video was opened automatically. Movies use the
 same format across builds, including encrypted movies.
 
 `ndvideo-symbols.zip` holds the matching ELF and Zehn files for all 15 builds.

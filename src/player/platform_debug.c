@@ -319,14 +319,12 @@ static void report_path_for_movie(const char *movie_path, const char *name, char
     }
 }
 
-static char pending_movie_error[192];
-
 void show_pending_movie_error(void)
 {
-    if (!pending_movie_error[0]) return;
-    /* main calls this after restoring native SRAM, display and clocks. */
-    show_msgbox("ND Video Player", pending_movie_error);
-    pending_movie_error[0] = '\0';
+    PlayerMessage message;
+    if (!take_player_message(&message)) return;
+    /* Last-resort presentation after teardown, when no picker can show it. */
+    show_msgbox(message.title, message.text);
 }
 
 void debug_log_path_for_movie(const char *movie_path, char *log_path, size_t log_path_size)
@@ -371,28 +369,44 @@ void report_movie_decode_failure(Movie *movie, const char *movie_path, const cha
     } else {
         debug_tracef("decode failed reason=%s", reason ? reason : "unknown");
     }
+    char detail[128], text[192];
+    snprintf(detail, sizeof(detail), "%.120s", debug_last_error());
     bool saved = save_failure_report(movie_path, movie, "decode-failure");
     snprintf(
-        pending_movie_error,
-        sizeof(pending_movie_error),
-        "Movie decode failed.\n%.120s%s",
-        debug_last_error(), saved ? "\nSee ndvideo-error.log.tns." : "\nError report could not be saved."
+        text, sizeof(text), "%s\n%s", detail,
+        saved ? "Details saved to the error log." : "Error report could not be saved."
     );
+    queue_player_message("Playback stopped", text);
 }
 
-void report_movie_open_failure(const char *movie_path)
+void report_movie_open_failure(const char *movie_path, MovieCodec missing_codec)
 {
     player_crash_trace_end(NULL, PLAYER_CRASH_ERROR);
     screenshot_writer_shutdown();
 
     debug_tracef("open failed: %s", debug_last_error());
+    char detail[128], text[192];
+    snprintf(detail, sizeof(detail), "%.120s", debug_last_error());
     bool saved = save_failure_report(movie_path, NULL, "open-failure");
-    snprintf(
-        pending_movie_error,
-        sizeof(pending_movie_error),
-        "Failed to open movie file.\n%.120s%s",
-        debug_last_error(), saved ? "\nSee ndvideo-error.log.tns." : "\nError report could not be saved."
-    );
+    const char *codec = NULL;
+    switch (missing_codec) {
+    case MOVIE_CODEC_H264: codec = "H.264"; break;
+    case MOVIE_CODEC_HEVC: codec = "HEVC"; break;
+    case MOVIE_CODEC_AV1: codec = "AV1"; break;
+    case MOVIE_CODEC_MPEG4: codec = "MPEG-4"; break;
+    default: break;
+    }
+    if (codec) {
+        char title[48];
+        snprintf(title, sizeof(title), "%s not included", codec);
+        snprintf(text, sizeof(text),
+            "This player cannot open the video.\nUse a build with %s support.", codec);
+        queue_player_message(title, text);
+    } else {
+        snprintf(text, sizeof(text), "%s\n%s", detail,
+            saved ? "Details saved to the error log." : "Error report could not be saved.");
+        queue_player_message("Cannot open video", text);
+    }
 }
 
 uint16_t read_le16(const uint8_t *src)
