@@ -39,6 +39,11 @@ typedef struct {
 void init_CABAC_decoder(CABAC_decoder* decoder, uint8_t* bitstream, int length);
 void init_CABAC_decoder_2(CABAC_decoder* decoder);
 int  decode_CABAC_bit(CABAC_decoder* decoder, context_model* model);
+#if defined(__arm__) && !defined(__thumb__)
+extern "C" int ndless_decode_greater1_coeffs(CABAC_decoder*, context_model*, uint8_t*, int);
+extern "C" int ndless_decode_significant_coeffs(CABAC_decoder*, context_model*,
+    const uint8_t* context_map, const uint8_t* scan_offsets, int last, uint8_t* metadata);
+#endif
 int  decode_CABAC_TU(CABAC_decoder* decoder, int cMax, context_model* model);
 int  decode_CABAC_term_bit(CABAC_decoder* decoder);
 

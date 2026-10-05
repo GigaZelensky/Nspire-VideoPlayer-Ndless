@@ -16,8 +16,8 @@ typedef struct {
     uint32_t over_budget_intervals;
 } PlaybackCadence;
 
-static inline uint64_t playback_cadence_present(PlaybackCadence *c, uint64_t now, uint32_t frame,
-                                                uint64_t interval)
+static inline uint64_t playback_cadence_update(PlaybackCadence *c, uint64_t now, uint32_t frame,
+                                              uint64_t interval, bool count_events)
 {
     uint64_t late = 0;
     if (c->valid && frame == c->frame)
@@ -27,8 +27,10 @@ static inline uint64_t playback_cadence_present(PlaybackCadence *c, uint64_t now
         uint64_t expected = (uint64_t)(frame - c->frame) * interval;
         c->elapsed += gap;
         c->expected += expected;
-        c->lag_elapsed += gap;
-        c->lag_expected += expected;
+        if (count_events) {
+            c->lag_elapsed += gap;
+            c->lag_expected += expected;
+        }
         if (gap > c->max_gap)
             c->max_gap = gap;
         if (gap > expected) {
@@ -41,7 +43,7 @@ static inline uint64_t playback_cadence_present(PlaybackCadence *c, uint64_t now
         }
         uint64_t behind = c->lag_elapsed > c->lag_expected ? c->lag_elapsed - c->lag_expected : 0;
         uint32_t skipped = frame - c->frame - 1U;
-        if (behind >= interval || skipped) {
+        if (count_events && (behind >= interval || skipped)) {
             ++c->events;
             uint32_t missed = skipped + (uint32_t)(behind / interval);
             c->missed_intervals += missed;
@@ -58,5 +60,11 @@ static inline uint64_t playback_cadence_present(PlaybackCadence *c, uint64_t now
     c->presented = now;
     c->frame = frame;
     return late;
+}
+
+static inline uint64_t playback_cadence_present(PlaybackCadence *c, uint64_t now, uint32_t frame,
+                                               uint64_t interval)
+{
+    return playback_cadence_update(c, now, frame, interval, true);
 }
 #endif

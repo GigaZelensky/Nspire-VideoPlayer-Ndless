@@ -68,21 +68,36 @@
 .global yuv420_rgb565_pair_rows
 .type yuv420_rgb565_pair_rows, %function
 yuv420_rgb565_pair_rows:
-    push {r4-r11, lr}
-    ldr r4, [sp, #36]
-    ldr r5, [sp, #40]
-    ldr r6, [sp, #44]
-    ldr r8, [sp, #48]
-    add r7, r6, #5120
-    add r8, r0, r8, lsl #1
-    push {r8}
+    push {r4-r11,lr}
+    ldr r4,[sp,#36]
+    ldr r5,[sp,#40]
+    ldr r6,[sp,#44]
+    ldr r8,[sp,#48]
+    cmp r8,#0
+    popeq {r4-r11,pc}
+    add r7,r6,#5120
+    add r11,r0,r8,lsl #1
+    push {r11}
+    ands r8,r8,#3
+    beq 1f
+    cmp r8,#1
+    beq 4f
+    cmp r8,#2
+    beq 3f
+    b 2f
 1:
     convert_dense_block
-    ldr r12, [sp]
-    cmp r0, r12
+2:
+    convert_dense_block
+3:
+    convert_dense_block
+4:
+    convert_dense_block
+    ldr r12,[sp]
+    cmp r0,r12
     blo 1b
-    add sp, sp, #4
-    pop {r4-r11, pc}
+    add sp,sp,#4
+    pop {r4-r11,pc}
 .size yuv420_rgb565_pair_rows, .-yuv420_rgb565_pair_rows
 /* Exact flat/repeated YUV420 blocks, with the same eight arguments as
  * yuv420_rgb565_pair_rows. Last-key and last-pixel live only for these rows. */
@@ -90,19 +105,7 @@ yuv420_rgb565_pair_rows:
 .align 5
 .global yuv420_rgb565_flat_pair_rows
 .type yuv420_rgb565_flat_pair_rows,%function
-yuv420_rgb565_flat_pair_rows:
-    push {r4-r11,lr}
-    ldr r4,[sp,#36]
-    ldr r5,[sp,#40]
-    ldr r6,[sp,#44]
-    ldr r8,[sp,#48]
-    add r7,r6,#5120
-    add r8,r0,r8,lsl #1
-    sub sp,sp,#12
-    str r8,[sp]
-    mvn r12,#0
-    str r12,[sp,#4]
-10:
+.macro convert_flat_block
     ldrb r12,[r0]
     ldrb r11,[r0,#1]
     cmp r12,r11
@@ -151,9 +154,39 @@ yuv420_rgb565_flat_pair_rows:
 12:
     convert_dense_block
 13:
+.endm
+yuv420_rgb565_flat_pair_rows:
+    push {r4-r11,lr}
+    ldr r4,[sp,#36]
+    ldr r5,[sp,#40]
+    ldr r6,[sp,#44]
+    ldr r8,[sp,#48]
+    cmp r8,#0
+    popeq {r4-r11,pc}
+    add r7,r6,#5120
+    add r11,r0,r8,lsl #1
+    sub sp,sp,#12
+    str r11,[sp]
+    mvn r12,#0
+    str r12,[sp,#4]
+    ands r8,r8,#3
+    beq 20f
+    cmp r8,#1
+    beq 23f
+    cmp r8,#2
+    beq 22f
+    b 21f
+20:
+    convert_flat_block
+21:
+    convert_flat_block
+22:
+    convert_flat_block
+23:
+    convert_flat_block
     ldr r12,[sp]
     cmp r0,r12
-    blo 10b
+    blo 20b
     add sp,sp,#12
     pop {r4-r11,pc}
 .size yuv420_rgb565_flat_pair_rows,.-yuv420_rgb565_flat_pair_rows

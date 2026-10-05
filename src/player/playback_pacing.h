@@ -3,6 +3,14 @@
 
 #include <stdint.h>
 
+/* HEVC/AV1 admission already includes the measured coding-unit/conversion
+ * cost and at least 1 ms of margin. Keep a short outer return allowance,
+ * rather than reserving a second 2 ms after every guarded operation. */
+static inline uint32_t playback_planar_return_guard(uint32_t tick_hz)
+{
+    return tick_hz / 2000U + (tick_hz % 2000U != 0U);
+}
+
 /* Smooth playback prepares a frame before its presentation deadline. Bound
  * the lead at low playback rates so UI polling/animations still run between
  * frames; the deadline wait itself remains interruptible by input. */

@@ -1091,6 +1091,7 @@ enum {
 /* Nonexclusive gate reasons, sampled before the render gate mutates its state. */
 void playback_capture_render_reason(const Movie *movie, uint32_t reasons);
 bool playback_capture_available(const Movie *movie);
+size_t playback_capture_storage_bytes(void);
 void playback_capture_failure(const char *reason);
 void playback_capture_decoder_error(const Movie *movie, const storage_t *decoder);
 void playback_capture_decoder_checkpoint(const Movie *movie, uint32_t words[5]);

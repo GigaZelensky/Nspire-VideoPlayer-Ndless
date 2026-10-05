@@ -38,20 +38,29 @@ unsigned movie_prefetch_slots(const Movie *movie)
 void movie_configure_prefetch(Movie *movie)
 {
     movie->prefetch_slots = PREFETCH_CHUNK_COUNT;
-    if (!movie_uses_planar_decoder(movie) || movie->header.chunk_count < 8U ||
+    if (!movie_uses_planar_decoder(movie) || movie->header.chunk_count < 4U ||
         !movie->header.fps_num || !movie->header.fps_den) return;
-    uint64_t frames = 0;
-    for (uint32_t i = 0; i < movie->header.chunk_count; ++i) {
-        frames += movie->chunk_index[i].frame_count;
-        if (i >= 8U) frames -= movie->chunk_index[i - 8U].frame_count;
-        if (i >= 7U && frames * movie->header.fps_den < (uint64_t)movie->header.fps_num * 32U)
+    /* Long chunks can cover ample read-ahead with fewer bins. Four slots
+     * retain at least 16 seconds at 1x (four seconds at 4x); otherwise try
+     * eight slots for that same coverage, then sixteen for shorter chunks. */
+    for (unsigned slots = 4U; slots <= 8U; slots *= 2U) {
+        if (movie->header.chunk_count < slots) continue;
+        uint64_t frames = 0;
+        bool sufficient = true;
+        for (uint32_t i = 0; i < movie->header.chunk_count; ++i) {
+            frames += movie->chunk_index[i].frame_count;
+            if (i >= slots) frames -= movie->chunk_index[i - slots].frame_count;
+            if (i + 1U >= slots && frames * movie->header.fps_den <
+                (uint64_t)movie->header.fps_num * 16U) {
+                sufficient = false;
+                break;
+            }
+        }
+        if (sufficient) {
+            movie->prefetch_slots = slots;
             return;
+        }
     }
-    /* Long HEVC chunks do not need minutes of compressed data in RAM. Keep
-     * at least 32 seconds at 1x (8 seconds at 4x) in every full eight-chunk
-     * window, and give the saved memory to the decoded-frame reserve. Short
-     * chunks retain all sixteen slots. The existing RAM headroom is unchanged. */
-    movie->prefetch_slots = 8U;
 }
 
 size_t movie_lookahead_storage_bound(const Movie *movie)

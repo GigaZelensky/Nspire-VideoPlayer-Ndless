@@ -3102,6 +3102,16 @@ int residual_coding(thread_context* tctx,
 
       // --- decode all coefficients' significant_coeff flags except for the DC coefficient ---
 
+#if defined(__arm__) && !defined(__thumb__) && !defined(DE265_LOG_TRACE)
+      if (fixedSignificanceContext < 0 && last_coeff >= 4) {
+        const int found = ndless_decode_significant_coeffs(&tctx->cabac_decoder,
+            &tctx->ctx_model[CONTEXT_MODEL_SIGNIFICANT_COEFF_FLAG],
+            ctxIdxMap + subBlockOffset, ScanOffsetPos, last_coeff,
+            coeff_meta + nCoefficients);
+        nCoefficients += found;
+        if (found) inferSbDcSigCoeffFlag = 0;
+      } else
+#endif
       for (int n= last_coeff ; n>0 ; n--) {
 
 
@@ -3193,6 +3203,16 @@ int residual_coding(thread_context* tctx,
       int newLastGreater1ScanPos=-1;
 
       int lastGreater1Coefficient = libde265_min(8,nCoefficients);
+#if defined(__arm__) && !defined(__thumb__) && !defined(DE265_LOG_TRACE)
+      if (lastGreater1Coefficient>=2) {
+        const int decoded=ndless_decode_greater1_coeffs(&tctx->cabac_decoder,
+          &tctx->ctx_model[CONTEXT_MODEL_COEFF_ABS_LEVEL_GREATER1_FLAG +
+                          (cIdx ? 16 : 0) + 4*ctxSet],
+          coeff_meta,lastGreater1Coefficient);
+        c1=decoded>>4;
+        newLastGreater1ScanPos=(decoded&15)-1;
+      } else
+#endif
       for (int c=0;c<lastGreater1Coefficient;c++) {
         // c1 is the capped greater1 context, updated after each decoded flag.
         int greater1_flag = decode_CABAC_bit(&tctx->cabac_decoder,

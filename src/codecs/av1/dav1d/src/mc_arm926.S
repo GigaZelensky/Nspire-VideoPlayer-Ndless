@@ -57,11 +57,24 @@
 .endif
 .endm
 
-.macro horizontal name, taps, direct
+.macro horizontal name, taps, direct, fixed=0
 .align 5
 .global \name
 .type \name,%function
 \name:
+.if !\direct && !\fixed
+.if \taps == 4
+    cmp r3,#2
+    beq dav1d_mc_h4_w2_8bpc_arm
+    cmp r3,#4
+    beq dav1d_mc_h4_w4_8bpc_arm
+.else
+    cmp r3,#8
+    beq dav1d_mc_h6_w8_8bpc_arm
+    cmp r3,#16
+    beq dav1d_mc_h6_w16_8bpc_arm
+.endif
+.endif
     push {r4-r11,lr}
     ldr lr,[sp,#36]
     ldr r12,[sp,#40]
@@ -112,6 +125,45 @@
     ldrb lr,[r1],#1
     orr r9,r9,lr,lsl #16
 .endif
+.if \fixed
+    .set hpair,0
+    .rept (\fixed/2)
+    .if \taps == 6
+        .if (hpair%3) == 0
+            horizontal_pair \taps,\direct,r7,r8,r9
+        .elseif (hpair%3) == 1
+            horizontal_pair \taps,\direct,r8,r9,r7
+        .else
+            horizontal_pair \taps,\direct,r9,r7,r8
+        .endif
+    .else
+        .if (hpair%2) == 0
+            horizontal_pair \taps,\direct,r7,r8,r9
+        .else
+            horizontal_pair \taps,\direct,r8,r7,r9
+        .endif
+    .endif
+    .if hpair+1 < (\fixed/2)
+        ldrb lr,[r1],#1
+        .if \taps == 6
+            .if (hpair%3) == 0
+                orr r7,r12,lr,lsl #16
+            .elseif (hpair%3) == 1
+                orr r8,r12,lr,lsl #16
+            .else
+                orr r9,r12,lr,lsl #16
+            .endif
+        .else
+            .if (hpair%2) == 0
+                orr r7,r12,lr,lsl #16
+            .else
+                orr r8,r12,lr,lsl #16
+            .endif
+        .endif
+    .endif
+    .set hpair,hpair+1
+    .endr
+.else
     ldr lr,[sp,#8]
     add r2,r0,lr
 2:
@@ -139,6 +191,7 @@
     orr r8,r12,lr,lsl #16
 .endif
     b 2b
+.endif
 3:
     ldr lr,[sp]
     add r0,r0,lr
@@ -157,6 +210,13 @@ horizontal dav1d_mc_h4_8bpc_arm, 4, 0
 horizontal dav1d_mc_h6_8bpc_arm, 6, 0
 horizontal dav1d_mc_put_h4_8bpc_arm, 4, 1
 horizontal dav1d_mc_put_h6_8bpc_arm, 6, 1
+
+/* Common intermediate widths need no per-pair end tests. Dispatch above is
+ * before saving registers; the same sample window and row strides are used. */
+horizontal dav1d_mc_h4_w2_8bpc_arm, 4, 0, 2
+horizontal dav1d_mc_h4_w4_8bpc_arm, 4, 0, 4
+horizontal dav1d_mc_h6_w8_8bpc_arm, 6, 0, 8
+horizontal dav1d_mc_h6_w16_8bpc_arm, 6, 0, 16
 
 .macro load_filter_pair reg, off
     ldrsb \reg,[r12,#\off]

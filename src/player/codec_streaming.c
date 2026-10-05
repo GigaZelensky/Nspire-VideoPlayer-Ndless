@@ -1,6 +1,7 @@
 #include "player_internal.h"
 #include "codecs/rgb565.h"
 #include "prefetch_io_policy.h"
+#include "playback_pacing.h"
 
 const PrefetchedChunk *find_prefetched_chunk_const(const Movie *movie, int chunk_index)
 {
@@ -3231,7 +3232,9 @@ bool playback_prepare_ahead(Movie *movie,uint64_t target_ticks,const PointerStat
 {
     if(!video_lookahead_active(movie))return false;
     uint64_t now=monotonic_clock_now_ticks();
-    uint32_t guard=monotonic_clock_ticks_per_second()*2U/1000U;
+    uint32_t storage_guard=monotonic_clock_ticks_per_second()*2U/1000U;
+    uint32_t guard=movie_uses_planar_decoder(movie)
+        ? playback_planar_return_guard(monotonic_clock_ticks_per_second()) : storage_guard;
     if(target_ticks<=now || target_ticks-now<=guard)return false;
     bool read_progress = false;
     uint32_t read_guard = (monotonic_clock_ticks_per_second() * 8U + 999U) / 1000U;
@@ -3258,8 +3261,8 @@ bool playback_prepare_ahead(Movie *movie,uint64_t target_ticks,const PointerStat
     playback_capture_stage(movie,CAPTURE_AHEAD,started,ended);
     if(!progressed && movie_async_enabled(movie) &&
        video_lookahead_next_frame(movie)<movie->header.frame_count &&
-       target_ticks>ended && target_ticks-ended>guard){
-        uint32_t spare=monotonic_clock_ticks_to_ms(target_ticks-ended-guard);
+       target_ticks>ended && target_ticks-ended>storage_guard){
+        uint32_t spare=monotonic_clock_ticks_to_ms(target_ticks-ended-storage_guard);
         if(spare>4U)spare=4U;
         if(spare){
             prefetch_tick(movie,false,spare,pointer);

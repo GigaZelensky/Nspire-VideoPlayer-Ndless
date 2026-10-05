@@ -12,6 +12,7 @@ struct VideoLookahead;
 #define VIDEO_LOOKAHEAD_MAX_BYTES (24U * 1024U * 1024U)
 #define VIDEO_LOOKAHEAD_FALLBACK_BYTES (10U * 1024U * 1024U)
 #define VIDEO_LOOKAHEAD_HEADROOM_BYTES (6U * 1024U * 1024U)
+#define VIDEO_LOOKAHEAD_RECORDING_BYTES (768U * 1024U)
 #define VIDEO_LOOKAHEAD_ALLOCATION_ALLOWANCE 128U
 #define VIDEO_LOOKAHEAD_COLOR_ROWS 16U
 
@@ -19,6 +20,7 @@ typedef struct {
     unsigned capacity, queued, peak_queued;
     size_t allocated_bytes;
     size_t budget_bytes, reserve_bytes, free_bytes_at_begin, free_bytes_last;
+    size_t recording_credit_bytes;
     uint32_t memory_checks, memory_denials, allocation_failures;
     bool memory_known_at_begin, memory_known;
     uint32_t background_frames, foreground_frames, queue_hits, queue_misses;
@@ -42,8 +44,9 @@ typedef struct {
     uint32_t max_background_tail_ticks, color_tail_guard_ticks;
     uint64_t decode_ticks, color_ticks;
     uint32_t rgb_repeat_frames;
-    unsigned rgb_ready, packed_ready, packed_capacity;
-    uint32_t packed_frames, packed_copy_bands, max_packed_copy_ticks;
+    /* Packed ready counts logical frames; storage/capacity count owned snapshots. */
+    unsigned rgb_ready, packed_ready, packed_capacity, packed_storage_ready;
+    uint32_t packed_frames, packed_repeat_frames, packed_copy_bands, max_packed_copy_ticks;
     uint64_t packed_copy_ticks;
     uint32_t recoveries, recovery_frames;
     uint32_t failed_frame, failure_visible_frame, failure_queued;

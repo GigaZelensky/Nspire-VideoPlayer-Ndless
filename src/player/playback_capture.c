@@ -29,6 +29,7 @@ typedef struct {
     uint64_t presented, skipped, presentation_late, over_budget, lateness_ticks, max_lateness;
     uint64_t first_present, last_present;
     PlaybackCadence cadence;
+    uint32_t lag_events_begin, lag_missed_begin;
     bool ahead_scope;
     uint32_t settings_changes, loops, format_events, interval_overflows;
     CaptureSettings first_settings, settings;
@@ -90,6 +91,13 @@ bool playback_capture_available(const Movie *movie)
     return g_capture && (!movie || movie == g_capture->movie);
 }
 
+size_t playback_capture_storage_bytes(void)
+{
+    /* Frozen recordings still own their buffers after D is switched off. */
+    return (g_capture ? sizeof(*g_capture) : 0U) +
+        (g_debug_ring ? DEBUG_RING_SIZE * sizeof(*g_debug_ring) : 0U);
+}
+
 void playback_capture_render_reason(const Movie *movie, uint32_t reasons)
 {
     unsigned i;
@@ -132,6 +140,8 @@ bool playback_capture_start(const Movie *movie, const char *movie_path)
     g_capture->transition = true;
     g_capture->tick_hz = monotonic_clock_ticks_per_second();
     g_capture->start_frame = movie ? movie->current_frame : 0;
+    g_capture->lag_events_begin = movie ? movie->cadence.events : 0;
+    g_capture->lag_missed_begin = movie ? movie->cadence.missed_intervals : 0;
     snprintf(g_capture->media_name, sizeof(g_capture->media_name), "%s", name);
     g_capture->started = monotonic_clock_now_ticks();
     g_capture->accounted = g_capture->started;
@@ -259,7 +269,12 @@ static void capture_finish_frame(const Movie *movie, uint64_t now, bool presente
     uint32_t previous_events = g_capture->cadence.events;
     uint32_t previous_missed = g_capture->cadence.missed_intervals;
     if (presented) {
-        playback_cadence_present(&g_capture->cadence, now, frame->frame, frame->interval_ticks);
+        /* Keep interval statistics for the recording, but use the player's
+         * L counter for event windows. A separate observer can disagree due
+         * to D's start time and fractional-frame timer rounding. */
+        playback_cadence_update(&g_capture->cadence, now, frame->frame, frame->interval_ticks, false);
+        g_capture->cadence.events = movie->cadence.events - g_capture->lag_events_begin;
+        g_capture->cadence.missed_intervals = movie->cadence.missed_intervals - g_capture->lag_missed_begin;
         uint64_t late = now > frame->due_ticks ? now - frame->due_ticks : 0;
         frame->flags |= CAPTURE_FRAME_PRESENTED;
         ++g_capture->presented;
@@ -429,7 +444,7 @@ void playback_capture_export(FILE *file, const Movie *movie)
     video_lookahead_get_stats(movie, &ahead);
     fprintf(
         file,
-        "decode_ahead lifetime=1 active=%u capacity=%u queued=%u peak_queued=%u bytes=%lu background_frames=%lu foreground_frames=%lu hits=%lu misses=%lu chunk_waits=%lu cancellations=%lu failures=%lu slices=%lu max_pump_us=%llu max_color_us=%llu max_background_pump_us=%llu max_background_color_us=%llu total_decode_us=%llu total_color_us=%llu partial=%u base_band_rows=%u background_slices_8=%lu background_slices_16=%lu background_slices_32=%lu color_rows_max=64 background_color_bands_16=%lu background_color_bands_32=%lu background_color_bands_64=%lu background_color_bands_tail=%lu background_slices_4=%lu max_background_tail_us=%llu color_tail_guard_us=%llu planar_frame_start_guard_us=%llu planar_chunk_start_guard_us=%llu rgb_repeat_frames=%lu rgb_ready=%u packed_ready=%u packed_capacity=%u packed_frames=%lu packed_copy_bands=%lu packed_copy_us=%llu max_packed_copy_us=%llu\n",
+        "decode_ahead lifetime=1 active=%u capacity=%u queued=%u peak_queued=%u bytes=%lu background_frames=%lu foreground_frames=%lu hits=%lu misses=%lu chunk_waits=%lu cancellations=%lu failures=%lu slices=%lu max_pump_us=%llu max_color_us=%llu max_background_pump_us=%llu max_background_color_us=%llu total_decode_us=%llu total_color_us=%llu partial=%u base_band_rows=%u background_slices_8=%lu background_slices_16=%lu background_slices_32=%lu color_rows_max=64 background_color_bands_16=%lu background_color_bands_32=%lu background_color_bands_64=%lu background_color_bands_tail=%lu background_slices_4=%lu max_background_tail_us=%llu color_tail_guard_us=%llu planar_frame_start_guard_us=%llu planar_chunk_start_guard_us=%llu rgb_repeat_frames=%lu rgb_ready=%u packed_ready=%u packed_capacity=%u packed_frames=%lu packed_copy_bands=%lu packed_copy_us=%llu max_packed_copy_us=%llu packed_storage_ready=%u packed_repeat_frames=%lu\n",
         ahead.active ? 1U : 0U, ahead.capacity, ahead.queued, ahead.peak_queued,
         (unsigned long)ahead.allocated_bytes, (unsigned long)ahead.background_frames,
         (unsigned long)ahead.foreground_frames, (unsigned long)ahead.queue_hits,
@@ -459,7 +474,8 @@ void playback_capture_export(FILE *file, const Movie *movie)
         ahead.rgb_ready, ahead.packed_ready, ahead.packed_capacity,
         (unsigned long)ahead.packed_frames, (unsigned long)ahead.packed_copy_bands,
         (unsigned long long)capture_ticks_to_us(ahead.packed_copy_ticks, g_capture->tick_hz),
-        (unsigned long long)capture_ticks_to_us(ahead.max_packed_copy_ticks, g_capture->tick_hz));
+        (unsigned long long)capture_ticks_to_us(ahead.max_packed_copy_ticks, g_capture->tick_hz),
+        ahead.packed_storage_ready, (unsigned long)ahead.packed_repeat_frames);
     if (ahead.captured_planar_pumps) {
         fprintf(file,
             "decode_ahead_planar_pumps scope=active_capture_periods_for_movie unit=ctu_or_superblock timing=whole_pump_including_row_frame_finish samples=%lu max_pump_including_submission_us=%llu max_pump_decoded_units=%lu max_pump_unit_equiv16=%lu max_pump_had_submission=%u single_no_submit_samples=%lu max_single_unit_no_submission_us=%llu multi_no_submit_samples=%lu max_multi_unit_no_submission_us=%llu submission_samples=%lu max_submission_inclusive_us=%llu max_submission_decoded_units=%lu\n",
@@ -481,12 +497,12 @@ void playback_capture_export(FILE *file, const Movie *movie)
         (unsigned long)ahead.failure_queued, ahead.failure_chunk, ahead.failure_reason);
     fprintf(
         file,
-        "decode_ahead_memory compressed_slots=%u budget_bytes=%lu reserve_bytes=%lu free_begin_valid=%u free_begin_bytes=%lu free_last_valid=%u free_last_bytes=%lu checks=%lu headroom_denials=%lu allocation_failures=%lu (DYNA_available_is_not_largest_contiguous_block; checks_only_at_begin_or_new_slot)\n",
+        "decode_ahead_memory compressed_slots=%u budget_bytes=%lu reserve_bytes=%lu free_begin_valid=%u free_begin_bytes=%lu free_last_valid=%u free_last_bytes=%lu checks=%lu headroom_denials=%lu allocation_failures=%lu recording_credit_bytes=%lu (DYNA_available_is_not_largest_contiguous_block; checks_only_at_begin_or_new_slot)\n",
         movie_prefetch_slots(movie), (unsigned long)ahead.budget_bytes, (unsigned long)ahead.reserve_bytes,
         ahead.memory_known_at_begin ? 1U : 0U, (unsigned long)ahead.free_bytes_at_begin,
         ahead.memory_known ? 1U : 0U, (unsigned long)ahead.free_bytes_last,
         (unsigned long)ahead.memory_checks, (unsigned long)ahead.memory_denials,
-        (unsigned long)ahead.allocation_failures);
+        (unsigned long)ahead.allocation_failures, (unsigned long)ahead.recording_credit_bytes);
     fprintf(
         file,
         "device hwtype=%u cx2=%u color=1 touchpad=%u lcd=%d clock_hw=%u tick_hz=%lu timer_control_saved=%08x timer_speed_saved=%08x\n",
@@ -565,6 +581,9 @@ void playback_capture_export(FILE *file, const Movie *movie)
         (unsigned long long)capture_ticks_to_us(g_capture->cadence.max_excess, g_capture->tick_hz),
         (unsigned long long)capture_ticks_to_us(g_capture->cadence.max_gap, g_capture->tick_hz),
         (unsigned long)g_capture->cadence.over_budget_intervals);
+    fprintf(file, "lag_counter source=player capture_start=%lu capture_end=%lu\n",
+        (unsigned long)g_capture->lag_events_begin,
+        (unsigned long)(g_capture->lag_events_begin + g_capture->cadence.events));
     for (i = 0; i < CAPTURE_STAGE_COUNT; ++i)
         fprintf(
             file, "timing %s count=%lu total_us=%llu max_us=%llu\n", stage_names[i],
@@ -594,7 +613,7 @@ void playback_capture_export(FILE *file, const Movie *movie)
         (unsigned long long)g_capture->io_overwritten,
         (unsigned long)g_capture->interval_overflows);
     fputs(
-        "capture_notes: due is the scheduled render-start time; smooth mode decodes ahead of due and waits before rendering, skip mode retains clock-driven decoding. over_one_frame_budget means present>=due+interval. Stage times are inclusive: IO/color overlap decode, IO overlaps prefetch, night/LCD overlap render. Background decode/color are reported separately in decode_ahead_us/color_ahead_us and overlap wait; frame/chunk identify presentation, not the decoder horizon. wait_input_us is nested in wait, and wait_touchpad_us is nested in wait_input; their timing counts measure actual wait polls and touchpad bus scans. writer_service_us measures explicit after-present/paused service. wait_io_service_us measures explicit roomy-wait I/O turns and overlaps wait; additional implicit idle work remains inside wait. Foreground H264 color conversion has a separate stage; MPEG4 conversion remains inside decode. For compact H264/HEVC/AV1, ahead depths and queued include RGB plus owned YUV; rgb_ready is immediately displayable. packed_copy totals include foreground and background queue preparation. Rows sum work since the preceding scheduled presentation; UI-only renders are included in render timing but excluded from effective FPS. Settings transitions reset row accumulators, not totals. Bookkeeping/text_format are measured overhead subsets; timer-read/cache overhead is not calibrated. Frame details retain lag windows in bounded RAM until export; gaps between windows are intentionally omitted, and lifetime totals cover the full recording; D also enables the separate asynchronous recovery journal.\n",
+        "capture_notes: due is the scheduled render-start time; smooth mode decodes ahead of due and waits before rendering, skip mode retains clock-driven decoding. over_one_frame_budget means present>=due+interval. Stage times are inclusive: IO/color overlap decode, IO overlaps prefetch, night/LCD overlap render. Background decode/color are reported separately in decode_ahead_us/color_ahead_us and overlap wait; frame/chunk identify presentation, not the decoder horizon. wait_input_us is nested in wait, and wait_touchpad_us is nested in wait_input; their timing counts measure actual wait polls and touchpad bus scans. writer_service_us measures explicit after-present/paused service. wait_io_service_us measures explicit roomy-wait I/O turns and overlaps wait; additional implicit idle work remains inside wait. Foreground H264 color conversion has a separate stage; MPEG4 conversion remains inside decode. For compact H264/HEVC/AV1, ahead depths and queued include RGB plus logical owned-YUV frames; rgb_ready is immediately displayable. Certified AV1 repeats can share a packed snapshot: packed_storage_ready counts snapshots, packed_ready counts frames, capacity counts storage slots, logical queued frames are capped at 512. packed_copy totals include foreground and background queue preparation. Rows sum work since the preceding scheduled presentation; UI-only renders are included in render timing but excluded from effective FPS. Settings transitions reset row accumulators, not totals. Bookkeeping/text_format are measured overhead subsets; timer-read/cache overhead is not calibrated. Frame details retain lag windows in bounded RAM until export; gaps between windows are intentionally omitted, and lifetime totals cover the full recording; D also enables the separate asynchronous recovery journal.\n",
         file);
     fputs(
         "frame_flags: 1=presented 2=settings_or_pause_transition 4=timing_saturated 8=night_enabled 16=frame_skip_enabled 32=lag_event\n",

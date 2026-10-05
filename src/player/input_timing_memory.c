@@ -2,6 +2,7 @@
 #include "timing_math.h"
 #include "app_task_io.h"
 #include "player_idle.h"
+#include "playback_pacing.h"
 
 static touchpad_report_t g_input_touchpad_report;
 static bool g_input_touchpad_sampled;
@@ -872,11 +873,14 @@ void wait_until_ticks_playback(Movie *movie, uint64_t target_ticks, const Pointe
     uint64_t touch_interval_ticks =
         ((uint64_t)monotonic_clock_ticks_per_second() * touch_interval_ms + 999U) / 1000U;
     uint64_t sleep_guard_ticks = (uint64_t) monotonic_clock_ticks_per_second() * (FRAME_PACING_SPIN_MS + 1U) / 1000U;
+    uint64_t ahead_guard_ticks = movie_uses_planar_decoder(movie)
+        ? playback_planar_return_guard(monotonic_clock_ticks_per_second()) : sleep_guard_ticks;
     uint64_t writer_guard_ticks = ((uint64_t)monotonic_clock_ticks_per_second() * 8U + 999U) / 1000U;
     uint64_t next_poll_ticks = monotonic_clock_now_ticks();
     uint64_t next_touch_ticks;
     uint64_t now_ticks = next_poll_ticks;
     bool writer_turn = true;
+    bool ahead_tail_exhausted = false;
 
     /* Prefetch/writer service may have consumed the remaining slack. Do not
      * delay an already-due presentation with a fresh bus transaction. */
@@ -921,12 +925,16 @@ void wait_until_ticks_playback(Movie *movie, uint64_t target_ticks, const Pointe
             if(now_ticks>=target_ticks || now_ticks>=next_poll_ticks ||
                (is_touchpad && now_ticks>=next_touch_ticks))continue;
         }
-        /* Service app-owned storage jobs and use a protected hardware sleep
-         * when idle. Spin only near the frame deadline. */
-        if(target_ticks>now_ticks && target_ticks-now_ticks>sleep_guard_ticks) {
+        /* Decoder admission has its own measured guard. It may use the short
+         * tail where sleeping or starting a native writer is already barred. */
+        if(!ahead_tail_exhausted && target_ticks>now_ticks && target_ticks-now_ticks>ahead_guard_ticks) {
             bool progressed=playback_prepare_ahead(movie,target_ticks,pointer);
             now_ticks=monotonic_clock_now_ticks();
             if(progressed){writer_turn=true;continue;}
+            /* Less time cannot make the same coding unit fit. Avoid repeatedly
+             * probing it during the final spin; input and I/O polling continue. */
+            if (target_ticks>now_ticks && target_ticks-now_ticks<=sleep_guard_ticks)
+                ahead_tail_exhausted=true;
         }
         /* Physical storage keeps its conservative deadline guard. Already-read
          * crypto data has small, measured CPU quanta, so use the short tail

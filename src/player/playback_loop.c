@@ -2155,11 +2155,6 @@ int play_movie(
                 );
                 uint64_t presented_ticks=monotonic_clock_now_ticks();
                 playback_render_observed(&render_gate, presented_ticks - capture_render_started);
-                if (capture_render) {
-                    uint64_t capture_render_ended = presented_ticks;
-                    playback_capture_stage(&movie, CAPTURE_RENDER, capture_render_started, capture_render_ended);
-                    playback_capture_presented(&movie, capture_render_ended);
-                }
                 if (scheduled_frame_advanced) {
                     /* Always account actual on-screen intervals, including
                      * decode/render/I/O overruns hidden by smooth rebasing. */
@@ -2170,6 +2165,10 @@ int play_movie(
                     movie.diag_max_lag_frames=movie.cadence.max_missed_intervals;
                     movie.diag_max_late_ms=monotonic_clock_ticks_to_ms(movie.cadence.max_lag);
                     if(collect_render_metrics)record_debug_displayed_frame(&movie,monotonic_clock_ticks_to_ms(presented_ticks));
+                }
+                if (capture_render) {
+                    playback_capture_stage(&movie, CAPTURE_RENDER, capture_render_started, presented_ticks);
+                    playback_capture_presented(&movie, presented_ticks);
                 }
                 if (scheduled_frame_advanced) {
                     player_crash_trace_presented(&movie);

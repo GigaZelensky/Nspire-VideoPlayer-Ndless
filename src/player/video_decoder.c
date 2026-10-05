@@ -1,4 +1,7 @@
 #include "player_internal.h"
+#if defined(__arm__) || defined(__ARM_ARCH)
+void FastMemcpyRows(void *, const void *, uint32_t, uint32_t, uint32_t);
+#endif
 #include <limits.h>
 
 bool movie_uses_planar_decoder(const Movie *movie)
@@ -446,6 +449,13 @@ bool video_frame_pack_rows(const VideoFrame *src, uint8_t *packed, size_t packed
         if ((unsigned)src->stride[p] == width) {
             player_copy_maybe_fast(dst, input, (size_t)count * width);
         } else {
+#if defined(__arm__) || defined(__ARM_ARCH)
+            if (!(width & 31U) &&
+                !(((uintptr_t)dst | (uintptr_t)input | (unsigned)src->stride[p]) & 3U)) {
+                FastMemcpyRows(dst, input, width / 32U, count, (unsigned)src->stride[p]);
+                continue;
+            }
+#endif
             for (unsigned y = 0; y < count; ++y) {
                 player_copy_maybe_fast(dst, input, width);
                 dst += width;

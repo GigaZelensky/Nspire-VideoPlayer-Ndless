@@ -115,6 +115,15 @@ void decode_quantization_parameters(thread_context* tctx, int xC,int yC,
 
   int qPYA,qPYB;
 
+  if (!pps.tiles_enabled_flag && !pps.entropy_coding_sync_enabled_flag &&
+      shdr->SliceAddrRS==0) {
+    // A left/top neighbor within this CTB precedes the current QG in Z order
+    // and shares its slice/tile. Across the CTB boundary the original rule
+    // always falls back to qPY_PRED. QP deltas and metadata still update below.
+    qPYA=(xQG & ctbLSBMask) ? tctx->img->get_QPY(xQG-1,yQG) : qPY_PRED;
+    qPYB=(yQG & ctbLSBMask) ? tctx->img->get_QPY(xQG,yQG-1) : qPY_PRED;
+  }
+  else {
   if (tctx->img->available_zscan(xQG,yQG, xQG-1,yQG)) {
     int xTmp = (xQG-1) >> sps.Log2MinTrafoSize;
     int yTmp = (yQG  ) >> sps.Log2MinTrafoSize;
@@ -145,6 +154,8 @@ void decode_quantization_parameters(thread_context* tctx, int xC,int yC,
   }
   else {
     qPYB = qPY_PRED;
+  }
+
   }
 
   qPY_PRED = (qPYA + qPYB + 1)>>1;
@@ -397,6 +408,9 @@ void scale_coefficients_internal(thread_context* tctx,
 
   coeff = tctx->coeffBuf;
   coeffStride = nT;
+  const int coefficient_count = tctx->nCoeff[cIdx];
+  const int16_t* const levels = tctx->coeffList[cIdx];
+  const int16_t* const positions = tctx->coeffPos[cIdx];
 
 
 
@@ -428,9 +442,9 @@ void scale_coefficients_internal(thread_context* tctx,
 
 
     // TODO: we could fold the coefficient rotation into the coefficient expansion here:
-    for (int i=0;i<tctx->nCoeff[cIdx];i++) {
-      int32_t currCoeff = tctx->coeffList[cIdx][i];
-      tctx->coeffBuf[ tctx->coeffPos[cIdx][i] ] = currCoeff;
+    for (int i=0;i<coefficient_count;i++) {
+      int32_t currCoeff = levels[i];
+      coeff[ positions[i] ] = currCoeff;
     }
 
     if (rotateCoeffs) {
@@ -480,20 +494,21 @@ void scale_coefficients_internal(thread_context* tctx,
       const int offset = (1<<(bdShift-1));
       const int fact = m_x_y * levelScale[qP%6] << (qP/6);
 
-      for (int i=0;i<tctx->nCoeff[cIdx];i++) {
+      for (int i=0;i<coefficient_count;i++) {
 
         // usually, this needs to be 64bit, but because we modify the shift above, we can use 16 bit
-        int32_t currCoeff  = tctx->coeffList[cIdx][i];
+        int32_t currCoeff  = levels[i];
 
-        //logtrace(LogTransform,"coefficient[%d] = %d\n",tctx->coeffPos[cIdx][i],
-        //tctx->coeffList[cIdx][i]);
+        //logtrace(LogTransform,"coefficient[%d] = %d\n",positions[i],
+        //levels[i]);
 
-        currCoeff = Clip3(-32768,32767,
-                          ( (currCoeff * fact + offset ) >> bdShift));
+        currCoeff = (currCoeff * fact + offset) >> bdShift;
+        if (uint32_t(currCoeff) + 32768U > 65535U)
+          currCoeff = currCoeff < 0 ? -32768 : 32767;
 
         //logtrace(LogTransform," -> %d\n",currCoeff);
 
-        tctx->coeffBuf[ tctx->coeffPos[cIdx][i] ] = currCoeff;
+        coeff[ positions[i] ] = currCoeff;
       }
     }
     else {
@@ -519,18 +534,19 @@ void scale_coefficients_internal(thread_context* tctx,
       default: assert(0);
       }
 
-      for (int i=0;i<tctx->nCoeff[cIdx];i++) {
-        int pos = tctx->coeffPos[cIdx][i];
+      for (int i=0;i<coefficient_count;i++) {
+        int pos = positions[i];
 
         const int m_x_y = sclist[pos];
         const int fact = m_x_y * levelScale[qP%6] << (qP/6);
 
-        int64_t currCoeff  = tctx->coeffList[cIdx][i];
+        int64_t currCoeff  = levels[i];
 
-        currCoeff = Clip3(-32768,32767,
-                          ( (currCoeff * fact + offset ) >> bdShift));
+        currCoeff = (currCoeff * fact + offset) >> bdShift;
+        if (uint32_t(currCoeff) + 32768U > 65535U)
+          currCoeff = currCoeff < 0 ? -32768 : 32767;
 
-        tctx->coeffBuf[ tctx->coeffPos[cIdx][i] ] = currCoeff;
+        coeff[ positions[i] ] = currCoeff;
       }
     }
 
@@ -616,7 +632,7 @@ void scale_coefficients_internal(thread_context* tctx,
       assert(rdpcmMode==0);
 
 
-      if (sizeof(pixel_t)==1 && trType==0 && tctx->nCoeff[cIdx]==1 &&
+      if (sizeof(pixel_t)==1 && trType==0 && coefficient_count==1 &&
           tctx->coeffPos[cIdx][0]==0 &&
           !pps.range_extension.cross_component_prediction_enabled_flag) {
         // Ndless: entropy decoding already tells us that only DC is present.
@@ -637,9 +653,9 @@ void scale_coefficients_internal(thread_context* tctx,
                                         pred, stride, bit_depth, cIdx);
       }
       else if (sizeof(pixel_t)==1 && trType==0 && nT>=8 &&
-               tctx->nCoeff[cIdx]<=(nT==8 ? 4 : nT)) {
+               coefficient_count<=(nT==8 ? 4 : nT)) {
         transform_sparse_add_8_ndless(reinterpret_cast<uint8_t*>(pred),coeff,stride,nT,
-                                      tctx->coeffPos[cIdx],tctx->nCoeff[cIdx]);
+                                      tctx->coeffPos[cIdx],coefficient_count);
       }
       else {
         transform_coefficients(&tctx->decctx->acceleration, coeff, coeffStride, nT, trType,
@@ -663,8 +679,8 @@ void scale_coefficients_internal(thread_context* tctx,
 
   // zero out scrap coefficient buffer again
 
-  for (int i=0;i<tctx->nCoeff[cIdx];i++) {
-    tctx->coeffBuf[ tctx->coeffPos[cIdx][i] ] = 0;
+  for (int i=0;i<coefficient_count;i++) {
+    coeff[ positions[i] ] = 0;
   }
 }
 

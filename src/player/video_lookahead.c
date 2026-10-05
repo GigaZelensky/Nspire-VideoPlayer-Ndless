@@ -15,7 +15,7 @@ typedef struct {
     uint8_t *pixels, *allocation;
     uint64_t serial;
     bool repeats_previous;
-    uint32_t frame;
+    uint32_t frame, last_frame;
     int chunk;
     uint32_t idr_first, idr_end;
 } VideoLookaheadPackedFrame;
@@ -26,7 +26,7 @@ typedef struct {
     VideoLookaheadPackedFrame frames[VIDEO_LOOKAHEAD_MAX_FRAMES];
     size_t frame_bytes, promote_row;
     const uint16_t *repeat_pixels;
-    unsigned head, count, capacity, allocated_slots, rgb_capacity;
+    unsigned head, count, queued_frames, capacity, allocated_slots, rgb_capacity;
     uint32_t copy_guard;
     bool promote_flat, have_copy_sample, checked_layout;
 } VideoLookaheadPacked;
@@ -103,13 +103,14 @@ static unsigned ahead_rgb_capacity(const struct VideoLookahead *ahead)
 
 static unsigned ahead_total_queued(const struct VideoLookahead *ahead)
 {
-    return ahead->count + (ahead_has_packed(ahead) ? ahead->packed->count : 0U);
+    return ahead->count + (ahead_has_packed(ahead) ? ahead->packed->queued_frames : 0U);
 }
 
 static void ahead_queue_stats(struct VideoLookahead *ahead)
 {
     ahead->stats.rgb_ready = ahead->count;
-    ahead->stats.packed_ready = ahead_has_packed(ahead) ? ahead->packed->count : 0U;
+    ahead->stats.packed_ready = ahead_has_packed(ahead) ? ahead->packed->queued_frames : 0U;
+    ahead->stats.packed_storage_ready = ahead_has_packed(ahead) ? ahead->packed->count : 0U;
     ahead->stats.packed_capacity = ahead_has_packed(ahead) ? ahead->packed->capacity : 0U;
     ahead->stats.queued = ahead_total_queued(ahead);
     if (ahead->stats.queued > ahead->stats.peak_queued)
@@ -261,9 +262,16 @@ static void ahead_memory_sample(Movie *movie, struct VideoLookahead *ahead, bool
     ahead->stats.memory_known = (memory.valid_flags & NATIVE_RUNTIME_STATS_DYNAMIC_POOL) != 0;
     ahead->stats.free_bytes_last =
         ahead->stats.memory_known ? memory.dynamic_pool_available_bytes : 0U;
-    ahead->stats.reserve_bytes = growth > SIZE_MAX - VIDEO_LOOKAHEAD_HEADROOM_BYTES
+    /* Headroom includes switching D on after the queue has filled. Credit
+     * only fixed recording buffers already charged to the free-pool sample,
+     * so enabling D early does not reserve room for those same buffers twice. */
+    size_t recording = playback_capture_storage_bytes();
+    if (recording > VIDEO_LOOKAHEAD_RECORDING_BYTES) recording = VIDEO_LOOKAHEAD_RECORDING_BYTES;
+    ahead->stats.recording_credit_bytes = recording;
+    size_t headroom = VIDEO_LOOKAHEAD_HEADROOM_BYTES - recording;
+    ahead->stats.reserve_bytes = growth > SIZE_MAX - headroom
                                      ? SIZE_MAX
-                                     : VIDEO_LOOKAHEAD_HEADROOM_BYTES + growth;
+                                     : headroom + growth;
     if (beginning) {
         ahead->stats.memory_known_at_begin = ahead->stats.memory_known;
         ahead->stats.free_bytes_at_begin = ahead->stats.free_bytes_last;
@@ -515,7 +523,7 @@ bool video_lookahead_begin(Movie *movie)
         }
     }
     if (ahead_has_packed(ahead)) {
-        ahead->packed->head = ahead->packed->count = 0U;
+        ahead->packed->head = ahead->packed->count = ahead->packed->queued_frames = 0U;
         ahead->packed->promote_row = 0U;
         ahead->packed->checked_layout = false;
     }
@@ -635,37 +643,53 @@ static int ahead_pack_picture(Movie *movie, uint64_t deadline, bool foreground)
     VideoLookaheadPacked *packed = ahead->packed;
     unsigned tail = (packed->head + packed->count) % packed->capacity;
     VideoLookaheadPackedFrame *slot = &packed->frames[tail];
-    size_t rows = movie->header.video_height - ahead->color_row;
-    if (rows > 16U) rows = 16U;
-    if (!foreground && !ahead_time_fits(deadline, packed->copy_guard)) return 0;
-    VideoFrame view;
-    if (!video_decoder_get_frame_view(movie, ahead->picture, &view)) return -1;
-    uint64_t started = monotonic_clock_now_ticks();
-    ahead->failure_stage = "packed copy";
-    if (!video_frame_pack_rows(&view, slot->pixels, packed->frame_bytes,
-                              (unsigned)ahead->color_row, (unsigned)rows)) return -1;
-    uint32_t elapsed = ahead_elapsed(started, monotonic_clock_now_ticks());
-    ahead->stats.packed_copy_ticks += elapsed;
-    ++ahead->stats.packed_copy_bands;
-    if (elapsed > ahead->stats.max_packed_copy_ticks)
-        ahead->stats.max_packed_copy_ticks = elapsed;
-    ahead_update_guard(ahead, &packed->copy_guard, &packed->have_copy_sample, elapsed);
-    ahead->color_row += rows;
-    if (ahead->color_row < movie->header.video_height) return 1;
-    slot->frame = ahead->next_frame;
-    slot->chunk = ahead->idr_chunk;
-    slot->idr_first = ahead->idr_first;
-    slot->idr_end = ahead->idr_end;
-    slot->serial = 0;
-    slot->repeats_previous = false;
-    if (NDVIDEO_WITH_AV1 && movie->codec == MOVIE_CODEC_AV1) {
-        slot->serial = av1_frame_serial(movie->av1.decoder);
-        slot->repeats_previous = av1_frame_repeats_previous(movie->av1.decoder);
+    uint64_t serial = NDVIDEO_WITH_AV1 && movie->codec == MOVIE_CODEC_AV1
+        ? av1_frame_serial(movie->av1.decoder) : 0;
+    bool repeats = NDVIDEO_WITH_AV1 && movie->codec == MOVIE_CODEC_AV1 &&
+        av1_frame_repeats_previous(movie->av1.decoder);
+    VideoLookaheadPackedFrame *previous = packed->count
+        ? &packed->frames[(packed->head + packed->count - 1U) % packed->capacity] : NULL;
+    /* The certificate describes the immediate preceding decoded image. Keep
+     * its owned YUV snapshot and extend only an adjacent run in the same
+     * chunk/IDR and decoder-serial sequence. No decoder pointer is borrowed. */
+    bool extend = !ahead->color_row && repeats && previous &&
+        previous->last_frame + 1U == ahead->next_frame &&
+        serial == previous->serial + (previous->last_frame - previous->frame) + 1U &&
+        previous->chunk == ahead->idr_chunk && previous->idr_first == ahead->idr_first &&
+        previous->idr_end == ahead->idr_end;
+    if (extend) {
+        previous->last_frame = ahead->next_frame;
+        ++ahead->stats.packed_repeat_frames;
+    } else {
+        size_t rows = movie->header.video_height - ahead->color_row;
+        if (rows > 16U) rows = 16U;
+        if (!foreground && !ahead_time_fits(deadline, packed->copy_guard)) return 0;
+        VideoFrame view;
+        if (!video_decoder_get_frame_view(movie, ahead->picture, &view)) return -1;
+        uint64_t started = monotonic_clock_now_ticks();
+        ahead->failure_stage = "packed copy";
+        if (!video_frame_pack_rows(&view, slot->pixels, packed->frame_bytes,
+                                  (unsigned)ahead->color_row, (unsigned)rows)) return -1;
+        uint32_t elapsed = ahead_elapsed(started, monotonic_clock_now_ticks());
+        ahead->stats.packed_copy_ticks += elapsed;
+        ++ahead->stats.packed_copy_bands;
+        if (elapsed > ahead->stats.max_packed_copy_ticks)
+            ahead->stats.max_packed_copy_ticks = elapsed;
+        ahead_update_guard(ahead, &packed->copy_guard, &packed->have_copy_sample, elapsed);
+        ahead->color_row += rows;
+        if (ahead->color_row < movie->header.video_height) return 1;
+        slot->frame = slot->last_frame = ahead->next_frame;
+        slot->chunk = ahead->idr_chunk;
+        slot->idr_first = ahead->idr_first;
+        slot->idr_end = ahead->idr_end;
+        slot->serial = serial;
+        slot->repeats_previous = repeats;
+        ++packed->count;
     }
+    ++packed->queued_frames;
     video_decoder_release_picture(movie);
     if (ahead->recovering) { ahead->recovering = false; ++ahead->stats.recoveries; }
     ++ahead->next_frame;
-    ++packed->count;
     ++ahead->stats.packed_frames;
     if (foreground) ++ahead->stats.foreground_frames;
     else ++ahead->stats.background_frames;
@@ -787,8 +811,15 @@ static int ahead_promote_packed(Movie *movie, uint64_t deadline, bool foreground
     }
     packed->repeat_pixels = NULL;
     ++ahead->count;
-    packed->head = (packed->head + 1U) % packed->capacity;
-    --packed->count;
+    --packed->queued_frames;
+    if (source->frame < source->last_frame) {
+        ++source->frame;
+        ++source->serial;
+        source->repeats_previous = true;
+    } else {
+        packed->head = (packed->head + 1U) % packed->capacity;
+        --packed->count;
+    }
     packed->promote_row = 0;
     ahead_queue_stats(ahead);
     return 1;
@@ -822,6 +853,7 @@ static int ahead_produce(Movie *movie, uint64_t deadline, bool foreground, uint3
         if (loaded > 0) ahead->recovery_chunk = -1;
         return 1;
     }
+    if (ahead_total_queued(ahead) >= VIDEO_LOOKAHEAD_MAX_FRAMES) return 0;
     bool output_packed = ahead->access_unit ? ahead_output_packed(ahead) : ahead_should_pack(ahead);
     if ((output_packed ? ahead->packed->count >= ahead->packed->capacity
                       : ahead->count >= ahead_rgb_capacity(ahead)) ||
@@ -1429,11 +1461,21 @@ static int ahead_finish_packed_realtime(Movie *movie, uint32_t target_frame)
         --ahead->count;
     }
     while (packed->count && packed->frames[packed->head].frame < target_frame) {
-        packed->head = (packed->head + 1U) % packed->capacity;
-        --packed->count;
+        VideoLookaheadPackedFrame *source = &packed->frames[packed->head];
         packed->promote_row = 0;
         packed->repeat_pixels = NULL;
         ahead->have_previous_rgb = false;
+        if (source->last_frame >= target_frame) {
+            unsigned skipped = target_frame - source->frame;
+            packed->queued_frames -= skipped;
+            source->frame = target_frame;
+            source->serial += skipped;
+            source->repeats_previous = false;
+            break;
+        }
+        packed->queued_frames -= source->last_frame - source->frame + 1U;
+        packed->head = (packed->head + 1U) % packed->capacity;
+        --packed->count;
     }
     ahead_queue_stats(ahead);
     if (ahead->count) {
@@ -1534,7 +1576,7 @@ void video_lookahead_cancel(Movie *movie)
     ahead->stats.partial = false;
     ahead->head = ahead->count = 0U;
     if (ahead_has_packed(ahead)) {
-        ahead->packed->head = ahead->packed->count = 0U;
+        ahead->packed->head = ahead->packed->count = ahead->packed->queued_frames = 0U;
         ahead->packed->promote_row = 0U;
     }
     ahead_queue_stats(ahead);

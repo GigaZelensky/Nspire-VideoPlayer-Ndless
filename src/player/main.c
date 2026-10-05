@@ -78,7 +78,17 @@ int main(int argc, char **argv)
     ui_load_theme_for_directory(directory);
     /* Native startup may reject an early transition or change the clock after
      * it. Reconcile once here, with genuine SRAM and before app I/O begins. */
-    performance_clock_startup_complete();
+    if (!performance_clock_startup_complete()) {
+        unsigned selected = performance_clock_selection();
+        unsigned actual = performance_clock_current_mhz();
+        if (actual && (selected || actual != performance_clock_default_mhz())) {
+            char message[160];
+            snprintf(message, sizeof(message),
+                "Could not apply %u MHz.\nCurrent speed: %u MHz.\nO opens processor speed.",
+                selected ? selected : performance_clock_default_mhz(), actual);
+            queue_player_message("Processor speed unavailable", message);
+        }
+    }
 
     while (1) {
         resume_without_prompt = false;

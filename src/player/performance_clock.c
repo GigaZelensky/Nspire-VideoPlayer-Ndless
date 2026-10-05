@@ -108,6 +108,75 @@ static bool cx2_clock_control_idle(uint32_t control)
     return command == 0U || command == 0x10000000U || command == 0x80000000U;
 }
 
+typedef struct {
+    uint32_t pll, control, timing74, timing1c, emi_control;
+} ClockReadback;
+
+typedef struct {
+    ClockReadback initial, final;
+    uint32_t pll, divider, timing74, timing1c;
+    uint32_t initial_mask, final_mask, polls;
+    bool restoring;
+} ClockVerification;
+
+/* Retain the first unsettled return even if later retries or manual Apply
+ * succeed. A rollback otherwise replaces the evidence with the entry clock. */
+static struct {
+    unsigned delayed, failed;
+    ClockVerification first, last;
+} clock_verification;
+
+static uint32_t cx2_clock_readback(ClockReadback *state, uint32_t pll,
+    uint32_t divider, uint32_t timing74, uint32_t timing1c)
+{
+    state->pll = CLOCK_WORD(CLOCK_PLL);
+    state->control = CLOCK_WORD(CLOCK_DIVIDER);
+    state->timing74 = CLOCK_WORD(EMI_TIMING74);
+    state->timing1c = CLOCK_WORD(EMI_TIMING1C);
+    state->emi_control = CLOCK_WORD(EMI_CONTROL);
+    return (((state->pll & CLOCK_PLL_FIELDS) != pll) ? 1U : 0U) |
+        (((state->control & CLOCK_DIVIDER_FIELDS) != divider) ? 2U : 0U) |
+        (!cx2_clock_control_idle(state->control) ? 4U : 0U) |
+        ((state->timing74 != timing74) ? 8U : 0U) |
+        ((state->timing1c != timing1c) ? 16U : 0U) |
+        ((state->emi_control & 0x40CU) ? 32U : 0U);
+}
+
+static bool cx2_clock_verify(uint32_t pll, uint32_t divider,
+    uint32_t timing74, uint32_t timing1c, bool restoring)
+{
+    ClockVerification check = {0};
+    check.initial_mask = cx2_clock_readback(&check.initial, pll, divider, timing74, timing1c);
+    if (!check.initial_mask) return true;
+
+    check.final = check.initial;
+    check.final_mask = check.initial_mask;
+    check.pll = pll;
+    check.divider = divider;
+    check.timing74 = timing74;
+    check.timing1c = timing1c;
+    check.restoring = restoring;
+    check.polls = 1U;
+    /* The SRAM worker waits for the EMI exit request to clear, not for all
+     * of these readbacks. Keep the same predicates while allowing settling.
+     * The 32 kHz timer may be restored/stopped at a standby boundary, so an
+     * iteration limit also bounds the wait when that timer is unavailable. */
+    bool timed = (CLOCK_WORD(0x900C0008U) & 0xCFU) == 0x82U &&
+                 CLOCK_WORD(0x900C0080U) == 0x0AU;
+    uint32_t started = timed ? CLOCK_WORD(0x900C0004U) : 0U;
+    while (check.final_mask && check.polls < 4096U) {
+        if (timed && started - CLOCK_WORD(0x900C0004U) >= 66U) break;
+        check.final_mask = cx2_clock_readback(&check.final, pll, divider, timing74, timing1c);
+        ++check.polls;
+    }
+    if (!clock_verification.delayed && !clock_verification.failed)
+        clock_verification.first = check;
+    clock_verification.last = check;
+    if (check.final_mask) ++clock_verification.failed;
+    else ++clock_verification.delayed;
+    return check.final_mask == 0U;
+}
+
 static bool apply_cx2(uint32_t pll_fields, uint32_t divider_fields, bool restoring)
 {
     unsigned saved = native_critical_enter();
@@ -151,11 +220,7 @@ static bool apply_cx2(uint32_t pll_fields, uint32_t divider_fields, bool restori
      * 0x90140020, updates EMI timings, exits self-refresh and acknowledges
      * the PMU. It touches neither the DRAM stack nor app code in that span. */
     ((void (*)(uint32_t, uint32_t, uint32_t))(uintptr_t)CX2_CLOCK_ENTRY)(pll, timing74, timing1c);
-    control = CLOCK_WORD(CLOCK_DIVIDER);
-    ok = (CLOCK_WORD(CLOCK_PLL) & CLOCK_PLL_FIELDS) == pll_fields &&
-         (control & CLOCK_DIVIDER_FIELDS) == divider_fields && cx2_clock_control_idle(control) &&
-         CLOCK_WORD(EMI_TIMING74) == timing74 && CLOCK_WORD(EMI_TIMING1C) == timing1c &&
-         !(CLOCK_WORD(EMI_CONTROL) & 0x40CU);
+    ok = cx2_clock_verify(pll_fields, divider_fields, timing74, timing1c, restoring);
     clock_state.status = ok ? 0 : -4;
 done:
     native_critical_leave(saved);
@@ -354,6 +419,22 @@ bool performance_clock_finish(bool normal_exit)
     return true;
 }
 
+static void clock_verification_debug(FILE *file, const char *name, const ClockVerification *check)
+{
+    fprintf(file,
+        "performance_clock_verify_%s restoring=%u polls=%lu initial_mask=%02lx final_mask=%02lx target_pll=%08lx target_divider=%08lx target_emi74=%08lx target_emi1c=%08lx initial_pll=%08lx initial_control=%08lx initial_emi74=%08lx initial_emi1c=%08lx initial_emi_control=%08lx final_pll=%08lx final_control=%08lx final_emi74=%08lx final_emi1c=%08lx final_emi_control=%08lx\n",
+        name, check->restoring, (unsigned long)check->polls,
+        (unsigned long)check->initial_mask, (unsigned long)check->final_mask,
+        (unsigned long)check->pll, (unsigned long)check->divider,
+        (unsigned long)check->timing74, (unsigned long)check->timing1c,
+        (unsigned long)check->initial.pll, (unsigned long)check->initial.control,
+        (unsigned long)check->initial.timing74, (unsigned long)check->initial.timing1c,
+        (unsigned long)check->initial.emi_control,
+        (unsigned long)check->final.pll, (unsigned long)check->final.control,
+        (unsigned long)check->final.timing74, (unsigned long)check->final.timing1c,
+        (unsigned long)check->final.emi_control);
+}
+
 void performance_clock_debug(FILE *file)
 {
     if (!file) return;
@@ -387,6 +468,13 @@ void performance_clock_debug(FILE *file)
                 (unsigned long)startup_clock.before_final_hz, startup_clock.completed,
                 (unsigned long)startup_clock.attempts, startup_clock.final_ok, startup_clock.final_status,
                 (unsigned long)startup_clock.final_hz, (unsigned long)startup_clock.entry_hz);
+    if (clock_verification.delayed || clock_verification.failed) {
+        fprintf(file, "performance_clock_verify delayed=%u failed=%u mask_bits=1:pll,2:divider,4:control,8:emi74,16:emi1c,32:emi_busy\n",
+            clock_verification.delayed, clock_verification.failed);
+        clock_verification_debug(file, "first", &clock_verification.first);
+        if (clock_verification.delayed + clock_verification.failed > 1U)
+            clock_verification_debug(file, "last", &clock_verification.last);
+    }
 }
 
 /* Pending choices belong to this app session. Only the normal main() exit
