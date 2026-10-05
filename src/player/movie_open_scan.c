@@ -275,7 +275,7 @@ bool load_movie(const char *path, Movie *movie, LoadingProgress *loading_progres
     if (!movie->codec_ops) {
         if (movie->codec != MOVIE_CODEC_UNKNOWN) {
             if (missing_codec) *missing_codec = movie->codec;
-            debug_failf("%s codec not included in this build.",
+            debug_tracef("%s codec not included in this build.",
                 movie_codec_name(movie->codec));
         } else
             debug_failf("open failed: unsupported version=%u flags=0x%04x",

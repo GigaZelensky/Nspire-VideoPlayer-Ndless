@@ -381,13 +381,7 @@ void report_movie_decode_failure(Movie *movie, const char *movie_path, const cha
 
 void report_movie_open_failure(const char *movie_path, MovieCodec missing_codec)
 {
-    player_crash_trace_end(NULL, PLAYER_CRASH_ERROR);
-    screenshot_writer_shutdown();
-
-    debug_tracef("open failed: %s", debug_last_error());
-    char detail[128], text[192];
-    snprintf(detail, sizeof(detail), "%.120s", debug_last_error());
-    bool saved = save_failure_report(movie_path, NULL, "open-failure");
+    char text[192];
     const char *codec = NULL;
     switch (missing_codec) {
     case MOVIE_CODEC_H264: codec = "H.264"; break;
@@ -402,11 +396,18 @@ void report_movie_open_failure(const char *movie_path, MovieCodec missing_codec)
         snprintf(text, sizeof(text),
             "This player cannot open the video.\nUse a build with %s support.", codec);
         queue_player_message(title, text);
-    } else {
-        snprintf(text, sizeof(text), "%s\n%s", detail,
-            saved ? "Details saved to the error log." : "Error report could not be saved.");
-        queue_player_message("Cannot open video", text);
+        return; /* A smaller build lacking a codec is an ordinary notice. */
     }
+
+    player_crash_trace_end(NULL, PLAYER_CRASH_ERROR);
+    screenshot_writer_shutdown();
+    debug_tracef("open failed: %s", debug_last_error());
+    char detail[128];
+    snprintf(detail, sizeof(detail), "%.120s", debug_last_error());
+    bool saved = save_failure_report(movie_path, NULL, "open-failure");
+    snprintf(text, sizeof(text), "%s\n%s", detail,
+        saved ? "Details saved to the error log." : "Error report could not be saved.");
+    queue_player_message("Cannot open video", text);
 }
 
 uint16_t read_le16(const uint8_t *src)
